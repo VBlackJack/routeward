@@ -90,6 +90,7 @@ pub struct NetworkConstants {
     pub max_concurrent_connections: usize,
     pub pid_fallback_retries: u32,
     pub pid_fallback_delay_ms: u64,
+    pub pending_syn_timeout_ms: u64,
     pub windivert_priority: i16,
     pub windivert_dll_paths: Vec<String>,
 }

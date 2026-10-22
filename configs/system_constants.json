@@ -13,6 +13,7 @@
     "maxConcurrentConnections": 4096,
     "pidFallbackRetries": 4,
     "pidFallbackDelayMs": 2,
+    "pendingSynTimeoutMs": 40,
     "windivertPriority": 0,
     "windivertDllPaths": [
       "WinDivert.dll",

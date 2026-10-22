@@ -28,20 +28,22 @@ use crate::config::{RuleAction, TransportProtocol};
 #[cfg(windows)]
 use crate::interceptor::nat::{
     parse_ipv4_tcp_meta, reflect_outbound_to_local_relay, reflect_relay_reply_to_client,
-    NatSessionEntry,
+    Ipv4TcpPacketMeta, NatSessionEntry, PendingSynOutcome, PendingSynQueue, PidResolutionSource,
 };
 #[cfg(windows)]
 use crate::process::ProcessResolver;
 #[cfg(windows)]
 use crate::rules::ConnectionRequest;
 #[cfg(windows)]
-use crate::telemetry::{ConnectionStatus, LogLevel, TrackedConnection};
+use crate::telemetry::{ConnectionStatus, LogLevel, TelemetryHub, TrackedConnection};
 #[cfg(windows)]
 use chrono::Utc;
 #[cfg(windows)]
 use std::ffi::{c_char, c_void, CString};
 #[cfg(windows)]
 use std::path::Path;
+#[cfg(windows)]
+use std::process::Command;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 #[cfg(windows)]
@@ -51,6 +53,8 @@ const BACKEND_NAME: &str = "WinDivert";
 
 #[cfg(windows)]
 const COMPONENT_WINDIVERT: &str = "WinDivert";
+#[cfg(windows)]
+const COMPONENT_FIREWALL: &str = "WindowsFirewall";
 #[cfg(windows)]
 const ENV_WINDIVERT_DLL_PATH: &str = "ROUTEWARD_WINDIVERT_DLL_PATH";
 #[cfg(windows)]
@@ -76,7 +80,7 @@ const BIT_IMPOSTOR: u64 = 1 << 19;
 
 /// Binary-compatible representation of WinDivert 2.2 `WINDIVERT_ADDRESS` (80 bytes).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WinDivertAddress {
     pub timestamp: i64,
     pub flags_bitfield: u64,
@@ -182,6 +186,8 @@ struct ActiveHandles {
     api: WinDivertApi,
     socket_handle: usize,
     network_handle: usize,
+    firewall_rule_name: String,
+    telemetry: TelemetryHub,
 }
 
 /// Windows transparent packet interceptor backed by dynamic runtime loading of `WinDivert.dll`.
@@ -208,6 +214,266 @@ impl WinDivertInterceptor {
             handles: Arc::new(Mutex::new(None)),
             #[cfg(not(windows))]
             _handles: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(windows)]
+    fn create_scoped_firewall_rule(relay_port: u16, telemetry: &TelemetryHub) -> String {
+        let rule_name = format!("RouteWard_TransparentRelay_{relay_port}");
+        let exe_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.canonicalize().ok().or(Some(p)))
+            .map(|p| {
+                let s = p.to_string_lossy().into_owned();
+                s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+            })
+            .unwrap_or_else(|| "routeward.exe".to_string());
+
+        // Remove any stale rule with the same name first
+        let _ = Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                &format!("name={rule_name}"),
+            ])
+            .output();
+
+        let port_arg = format!("localport={relay_port}");
+        let name_arg = format!("name={rule_name}");
+        let prog_arg = format!("program={exe_path}");
+
+        match Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &name_arg,
+                "dir=in",
+                "action=allow",
+                &prog_arg,
+                "enable=yes",
+                "profile=any",
+                "protocol=TCP",
+                &port_arg,
+            ])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_FIREWALL,
+                    format!(
+                        "Created scoped inbound firewall rule \"{rule_name}\" (program=\"{exe_path}\", protocol=TCP, port={relay_port}, profile=any)"
+                    ),
+                );
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                telemetry.push_log(
+                    LogLevel::Warn,
+                    COMPONENT_FIREWALL,
+                    format!(
+                        "Failed to create scoped inbound firewall rule \"{rule_name}\" (exit={:?}): {}",
+                        out.status.code(),
+                        stderr.trim()
+                    ),
+                );
+            }
+            Err(err) => {
+                telemetry.push_log(
+                    LogLevel::Warn,
+                    COMPONENT_FIREWALL,
+                    format!("Could not invoke netsh for firewall rule \"{rule_name}\": {err}"),
+                );
+            }
+        }
+
+        rule_name
+    }
+
+    #[cfg(windows)]
+    fn remove_scoped_firewall_rule(rule_name: &str, telemetry: &TelemetryHub) {
+        let name_arg = format!("name={rule_name}");
+        match Command::new("netsh")
+            .args(["advfirewall", "firewall", "delete", "rule", &name_arg])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_FIREWALL,
+                    format!("Removed scoped inbound firewall rule \"{rule_name}\""),
+                );
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                telemetry.push_log(
+                    LogLevel::Warn,
+                    COMPONENT_FIREWALL,
+                    format!(
+                        "Could not remove firewall rule \"{rule_name}\" (exit={:?}): {}",
+                        out.status.code(),
+                        stderr.trim()
+                    ),
+                );
+            }
+            Err(err) => {
+                telemetry.push_log(
+                    LogLevel::Warn,
+                    COMPONENT_FIREWALL,
+                    format!("Failed invoking netsh to remove firewall rule \"{rule_name}\": {err}"),
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn dispatch_resolved_syn(
+        ctrl: &RouteWardController,
+        api: &WinDivertApi,
+        net_handle: *mut c_void,
+        packet: &mut [u8],
+        addr: &mut WinDivertAddress,
+        meta: Ipv4TcpPacketMeta,
+        resolved: Option<(u32, PidResolutionSource)>,
+    ) {
+        let relay_port = ctrl.nat_table.transparent_relay_port();
+        let pid_opt = resolved.map(|(p, _)| p);
+
+        if !ctrl.nat_table.is_loop_or_excluded(
+            pid_opt,
+            meta.src_ip,
+            meta.src_port,
+            meta.dst_ip,
+            meta.dst_port,
+        ) {
+            let (pid, res_source) = resolved.unwrap_or((0, PidResolutionSource::TcpTableFallback));
+            let proc_id = ctrl.process_resolver.resolve_by_pid(pid);
+            let dst_ip_str = meta.dst_ip.to_string();
+
+            let eval = ctrl.evaluate_rule(&ConnectionRequest {
+                process_name: proc_id.name.clone(),
+                process_path: Some(proc_id.executable_path.clone()),
+                target_host: dst_ip_str.clone(),
+                target_ip: Some(dst_ip_str.clone()),
+                target_port: meta.dst_port,
+                protocol: TransportProtocol::Tcp,
+            });
+
+            match &eval.action {
+                RuleAction::Proxy { .. } | RuleAction::Chain { .. } => {
+                    ctrl.telemetry.push_log(
+                        LogLevel::Info,
+                        COMPONENT_WINDIVERT,
+                        format!(
+                            "Intercepted SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} [rule=\"{}\"]",
+                            proc_id.pid,
+                            proc_id.name,
+                            proc_id.executable_path,
+                            res_source.as_str(),
+                            meta.src_ip,
+                            meta.src_port,
+                            meta.dst_ip,
+                            meta.dst_port,
+                            eval.matched_rule_name
+                        ),
+                    );
+
+                    ctrl.nat_table.insert_session(NatSessionEntry {
+                        client_ip: meta.src_ip,
+                        client_port: meta.src_port,
+                        orig_dst_ip: meta.dst_ip,
+                        orig_dst_port: meta.dst_port,
+                        pid: proc_id.pid,
+                        process_name: proc_id.name,
+                        process_path: proc_id.executable_path,
+                        resolution_source: res_source,
+                        action: eval.action,
+                        matched_rule_name: eval.matched_rule_name,
+                        created_at: Instant::now(),
+                    });
+
+                    if reflect_outbound_to_local_relay(packet, relay_port) {
+                        addr.set_outbound(false);
+                        addr.clear_impostor();
+                        unsafe {
+                            let _ = (api.calc_checksums)(
+                                packet.as_mut_ptr() as *mut c_void,
+                                packet.len() as u32,
+                                addr as *mut WinDivertAddress,
+                                0,
+                            );
+                        }
+                    }
+                }
+                RuleAction::Block => {
+                    ctrl.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_WINDIVERT,
+                        format!(
+                            "Blocked SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\"]",
+                            proc_id.pid,
+                            proc_id.name,
+                            proc_id.executable_path,
+                            res_source.as_str(),
+                            meta.dst_ip,
+                            meta.dst_port,
+                            eval.matched_rule_name
+                        ),
+                    );
+                    ctrl.telemetry.record_connection(
+                        TrackedConnection {
+                            id: Uuid::new_v4().to_string(),
+                            pid: proc_id.pid,
+                            process_name: proc_id.name,
+                            process_path: proc_id.executable_path,
+                            target_host: dst_ip_str,
+                            resolved_domain: eval.effective_domain,
+                            target_port: meta.dst_port,
+                            protocol: TransportProtocol::Tcp,
+                            matched_rule: eval.matched_rule_name,
+                            route_label: "BLOCKED".to_string(),
+                            latency_ms: 0,
+                            rx_bytes: 0,
+                            tx_bytes: 0,
+                            status: ConnectionStatus::Blocked,
+                            started_at: Utc::now(),
+                        },
+                        false,
+                    );
+                    // Drop packet by skipping WinDivertSend
+                    return;
+                }
+                RuleAction::Direct => {
+                    ctrl.telemetry.push_log(
+                        LogLevel::Info,
+                        COMPONENT_WINDIVERT,
+                        format!(
+                            "Direct pass-through SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{}",
+                            proc_id.pid,
+                            proc_id.name,
+                            proc_id.executable_path,
+                            res_source.as_str(),
+                            meta.dst_ip,
+                            meta.dst_port
+                        ),
+                    );
+                }
+            }
+        }
+
+        let mut send_len: u32 = 0;
+        unsafe {
+            let _ = (api.send)(
+                net_handle,
+                packet.as_ptr() as *const c_void,
+                packet.len() as u32,
+                &mut send_len,
+                addr as *const WinDivertAddress,
+            );
         }
     }
 
@@ -373,6 +639,10 @@ impl Interceptor for WinDivertInterceptor {
             });
         }
 
+        let relay_port = controller.nat_table.transparent_relay_port();
+        let firewall_rule_name =
+            Self::create_scoped_firewall_rule(relay_port, &controller.telemetry);
+
         self.active.store(true, Ordering::SeqCst);
         let sock_handle_usize = socket_handle as usize;
         let net_handle_usize = network_handle as usize;
@@ -381,7 +651,12 @@ impl Interceptor for WinDivertInterceptor {
             api,
             socket_handle: sock_handle_usize,
             network_handle: net_handle_usize,
+            firewall_rule_name,
+            telemetry: controller.telemetry.clone(),
         });
+
+        let pending_syn_queue: PendingSynQueue<(Vec<u8>, WinDivertAddress)> =
+            PendingSynQueue::new();
 
         // 1. Spawn WINDIVERT_LAYER_SOCKET listener thread
         let active_sock = Arc::clone(&self.active);
@@ -408,16 +683,81 @@ impl Interceptor for WinDivertInterceptor {
             }
         });
 
-        // 2. Spawn WINDIVERT_LAYER_NETWORK packet reflection thread
+        // 2. Spawn dedicated Pending SYN worker thread (polls unresolved SYNs outside the receive loop)
+        let active_syn = Arc::clone(&self.active);
+        let ctrl_syn = controller.clone();
+        let syn_queue_worker = pending_syn_queue.clone();
+        std::thread::spawn(move || {
+            let handle = net_handle_usize as *mut c_void;
+            let poll_interval =
+                Duration::from_millis(ctrl_syn.constants.network.pid_fallback_delay_ms.max(1));
+            let syn_timeout =
+                Duration::from_millis(ctrl_syn.constants.network.pending_syn_timeout_ms);
+
+            while active_syn.load(Ordering::Relaxed) {
+                let outcomes = syn_queue_worker.poll_ready(
+                    &ctrl_syn.nat_table,
+                    syn_timeout,
+                    ProcessResolver::find_pid_for_tcp_port,
+                );
+
+                for outcome in outcomes {
+                    match outcome {
+                        PendingSynOutcome::Resolved {
+                            payload: (mut pkt, mut addr),
+                            meta,
+                            pid,
+                            source,
+                        } => {
+                            Self::dispatch_resolved_syn(
+                                &ctrl_syn,
+                                &api,
+                                handle,
+                                &mut pkt,
+                                &mut addr,
+                                meta,
+                                Some((pid, source)),
+                            );
+                        }
+                        PendingSynOutcome::TimedOutFailOpen {
+                            payload: (pkt, addr),
+                            meta,
+                            elapsed_ms,
+                        } => {
+                            ctrl_syn.telemetry.push_log(
+                                LogLevel::Warn,
+                                COMPONENT_WINDIVERT,
+                                format!(
+                                    "Pending SYN PID resolution timed out after {}ms for {}:{} -> {}:{}, reinjecting unmodified (fail-open)",
+                                    elapsed_ms, meta.src_ip, meta.src_port, meta.dst_ip, meta.dst_port
+                                ),
+                            );
+                            let mut send_len: u32 = 0;
+                            unsafe {
+                                let _ = (api.send)(
+                                    handle,
+                                    pkt.as_ptr() as *const c_void,
+                                    pkt.len() as u32,
+                                    &mut send_len,
+                                    &addr as *const WinDivertAddress,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                std::thread::sleep(poll_interval);
+            }
+        });
+
+        // 3. Spawn non-blocking WINDIVERT_LAYER_NETWORK packet reflection thread
         let active_net = Arc::clone(&self.active);
         let ctrl_net = controller.clone();
+        let syn_queue_producer = pending_syn_queue;
         std::thread::spawn(move || {
             let handle = net_handle_usize as *mut c_void;
             let mut packet_buf = vec![0u8; PACKET_BUFFER_SIZE];
             let relay_port = ctrl_net.nat_table.transparent_relay_port();
-            let max_retries = ctrl_net.constants.network.pid_fallback_retries;
-            let retry_delay =
-                Duration::from_millis(ctrl_net.constants.network.pid_fallback_delay_ms);
 
             while active_net.load(Ordering::Relaxed) {
                 let mut recv_len: u32 = 0;
@@ -441,7 +781,10 @@ impl Interceptor for WinDivertInterceptor {
                 if let Some(meta) = parse_ipv4_tcp_meta(packet) {
                     // Case A: Outbound reply from our local transparent relay back to the client
                     if meta.src_port == relay_port {
-                        if let Some(session) = ctrl_net.nat_table.get_session(meta.dst_port) {
+                        if let Some(session) = ctrl_net
+                            .nat_table
+                            .get_session_by_relay_peer(meta.dst_ip, meta.dst_port)
+                        {
                             if reflect_relay_reply_to_client(packet, &session) {
                                 addr.set_outbound(false);
                                 addr.clear_impostor();
@@ -455,10 +798,11 @@ impl Interceptor for WinDivertInterceptor {
                                 }
                             }
                         }
-                    } else if let Some(existing_session) =
-                        ctrl_net.nat_table.get_session(meta.src_port)
+                    } else if let Some(existing_session) = ctrl_net
+                        .nat_table
+                        .get_session_by_flow(&meta.outbound_flow_key())
                     {
-                        // Case B: Subsequent packets of an already-redirected client TCP flow
+                        // Case B: Subsequent packets of an already-redirected 4-tuple flow
                         if matches!(
                             existing_session.action,
                             RuleAction::Proxy { .. } | RuleAction::Chain { .. }
@@ -476,138 +820,25 @@ impl Interceptor for WinDivertInterceptor {
                             }
                         }
                     } else if meta.is_syn_only() {
-                        // Case C: New outbound TCP SYN -> resolve PID (SOCKET layer or GetExtendedTcpTable fallback)
-                        let resolved = ctrl_net.nat_table.resolve_pid_with_fallback(
+                        // Case C: New outbound TCP SYN -> try immediate non-blocking PID lookup
+                        if let Some(resolved) = ctrl_net.nat_table.try_resolve_pid_nonblocking(
                             meta.src_port,
-                            max_retries,
-                            retry_delay,
                             ProcessResolver::find_pid_for_tcp_port,
-                        );
-                        let pid_opt = resolved.map(|(p, _)| p);
-
-                        if !ctrl_net.nat_table.is_loop_or_excluded(
-                            pid_opt,
-                            meta.src_ip,
-                            meta.src_port,
-                            meta.dst_ip,
-                            meta.dst_port,
                         ) {
-                            let (pid, res_source) = resolved.unwrap_or((
-                                0,
-                                crate::interceptor::nat::PidResolutionSource::TcpTableFallback,
-                            ));
-                            let proc_id = ctrl_net.process_resolver.resolve_by_pid(pid);
-                            let dst_ip_str = meta.dst_ip.to_string();
-
-                            let eval = ctrl_net.evaluate_rule(&ConnectionRequest {
-                                process_name: proc_id.name.clone(),
-                                process_path: Some(proc_id.executable_path.clone()),
-                                target_host: dst_ip_str.clone(),
-                                target_ip: Some(dst_ip_str.clone()),
-                                target_port: meta.dst_port,
-                                protocol: TransportProtocol::Tcp,
-                            });
-
-                            match &eval.action {
-                                RuleAction::Proxy { .. } | RuleAction::Chain { .. } => {
-                                    ctrl_net.telemetry.push_log(
-                                        LogLevel::Info,
-                                        COMPONENT_WINDIVERT,
-                                        format!(
-                                            "Intercepted SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} [rule=\"{}\"]",
-                                            proc_id.pid,
-                                            proc_id.name,
-                                            proc_id.executable_path,
-                                            res_source.as_str(),
-                                            meta.src_ip,
-                                            meta.src_port,
-                                            meta.dst_ip,
-                                            meta.dst_port,
-                                            eval.matched_rule_name
-                                        ),
-                                    );
-
-                                    ctrl_net.nat_table.insert_session(NatSessionEntry {
-                                        client_ip: meta.src_ip,
-                                        client_port: meta.src_port,
-                                        orig_dst_ip: meta.dst_ip,
-                                        orig_dst_port: meta.dst_port,
-                                        pid: proc_id.pid,
-                                        process_name: proc_id.name,
-                                        process_path: proc_id.executable_path,
-                                        resolution_source: res_source,
-                                        action: eval.action,
-                                        matched_rule_name: eval.matched_rule_name,
-                                        created_at: Instant::now(),
-                                    });
-
-                                    if reflect_outbound_to_local_relay(packet, relay_port) {
-                                        addr.set_outbound(false);
-                                        addr.clear_impostor();
-                                        unsafe {
-                                            let _ = (api.calc_checksums)(
-                                                packet.as_mut_ptr() as *mut c_void,
-                                                pkt_len as u32,
-                                                &mut addr as *mut WinDivertAddress,
-                                                0,
-                                            );
-                                        }
-                                    }
-                                }
-                                RuleAction::Block => {
-                                    ctrl_net.telemetry.push_log(
-                                        LogLevel::Warn,
-                                        COMPONENT_WINDIVERT,
-                                        format!(
-                                            "Blocked SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\"]",
-                                            proc_id.pid,
-                                            proc_id.name,
-                                            proc_id.executable_path,
-                                            res_source.as_str(),
-                                            meta.dst_ip,
-                                            meta.dst_port,
-                                            eval.matched_rule_name
-                                        ),
-                                    );
-                                    ctrl_net.telemetry.record_connection(
-                                        TrackedConnection {
-                                            id: Uuid::new_v4().to_string(),
-                                            pid: proc_id.pid,
-                                            process_name: proc_id.name,
-                                            process_path: proc_id.executable_path,
-                                            target_host: dst_ip_str,
-                                            resolved_domain: eval.effective_domain,
-                                            target_port: meta.dst_port,
-                                            protocol: TransportProtocol::Tcp,
-                                            matched_rule: eval.matched_rule_name,
-                                            route_label: "BLOCKED".to_string(),
-                                            latency_ms: 0,
-                                            rx_bytes: 0,
-                                            tx_bytes: 0,
-                                            status: ConnectionStatus::Blocked,
-                                            started_at: Utc::now(),
-                                        },
-                                        false,
-                                    );
-                                    // Drop packet by skipping WinDivertSend
-                                    continue;
-                                }
-                                RuleAction::Direct => {
-                                    ctrl_net.telemetry.push_log(
-                                        LogLevel::Info,
-                                        COMPONENT_WINDIVERT,
-                                        format!(
-                                            "Direct pass-through SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{}",
-                                            proc_id.pid,
-                                            proc_id.name,
-                                            proc_id.executable_path,
-                                            res_source.as_str(),
-                                            meta.dst_ip,
-                                            meta.dst_port
-                                        ),
-                                    );
-                                }
-                            }
+                            Self::dispatch_resolved_syn(
+                                &ctrl_net,
+                                &api,
+                                handle,
+                                packet,
+                                &mut addr,
+                                meta,
+                                Some(resolved),
+                            );
+                            continue;
+                        } else {
+                            // Enqueue into non-blocking PendingSynQueue so the receive loop never stalls
+                            syn_queue_producer.enqueue((packet.to_vec(), addr), meta);
+                            continue;
                         }
                     }
                 }
@@ -649,6 +880,7 @@ impl Interceptor for WinDivertInterceptor {
                     let _ = (handles.api.shutdown)(net, WINDIVERT_SHUTDOWN_BOTH);
                     let _ = (handles.api.close)(net);
                 }
+                Self::remove_scoped_firewall_rule(&handles.firewall_rule_name, &handles.telemetry);
             }
         }
     }

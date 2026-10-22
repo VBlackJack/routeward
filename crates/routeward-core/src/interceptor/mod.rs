@@ -38,7 +38,7 @@ use crate::telemetry::{ConnectionStatus, LogLevel, TelemetryHub, TrackedConnecti
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -224,7 +224,7 @@ impl RouteWardController {
                         let conn_ctrl = trans_ctrl.clone();
                         tokio::spawn(async move {
                             let _ = conn_ctrl
-                                .handle_transparent_tcp_client(client_stream, peer_addr.port())
+                                .handle_transparent_tcp_client(client_stream, peer_addr)
                                 .await;
                         });
                     }
@@ -684,9 +684,17 @@ impl RouteWardController {
     async fn handle_transparent_tcp_client(
         &self,
         mut client: TcpStream,
-        client_port: u16,
+        peer_addr: SocketAddr,
     ) -> RouteWardResult<()> {
-        let Some(session) = self.nat_table.get_session(client_port) else {
+        let Some(session) = self.nat_table.validate_relay_peer_addr(peer_addr) else {
+            let _ = client.shutdown().await;
+            self.telemetry.push_log(
+                LogLevel::Warn,
+                COMPONENT_TRANSPARENT,
+                format!(
+                    "Rejected unauthorized connection on transparent relay from {peer_addr}: no matching live NAT session"
+                ),
+            );
             return Ok(());
         };
 
@@ -713,7 +721,8 @@ impl RouteWardController {
                         err
                     ),
                 );
-                self.nat_table.remove_session(client_port);
+                self.nat_table
+                    .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
                 return Err(err);
             }
         };
@@ -758,7 +767,8 @@ impl RouteWardController {
             self.telemetry.update_connection_traffic(&conn_id, rx, tx);
         }
         self.telemetry.mark_connection_closed(&conn_id);
-        self.nat_table.remove_session(client_port);
+        self.nat_table
+            .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
 
         Ok(())
     }
@@ -860,5 +870,41 @@ impl RouteWardController {
         {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn transparent_relay_rejects_and_logs_unknown_peer_connection() {
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        let controller = RouteWardController::new(constants, profile, "en");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let client_task = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.expect("connect");
+            let mut buf = [0u8; 8];
+            client.read(&mut buf).await.expect("read EOF")
+        });
+
+        let (server_stream, peer_addr) = listener.accept().await.expect("accept");
+        controller
+            .handle_transparent_tcp_client(server_stream, peer_addr)
+            .await
+            .expect("handled");
+
+        let bytes_read = client_task.await.expect("join");
+        assert_eq!(bytes_read, 0);
+
+        let logs = controller.telemetry.list_logs();
+        assert!(logs.iter().any(|l| l.level == LogLevel::Warn
+            && l.component == COMPONENT_TRANSPARENT
+            && l.message.contains("Rejected unauthorized connection")));
     }
 }

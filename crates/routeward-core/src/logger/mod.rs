@@ -15,7 +15,7 @@
  */
 
 use crate::telemetry::LogLevel;
-use chrono::Utc;
+use chrono::Local;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
@@ -59,12 +59,12 @@ impl FileLogger {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Enqueues a structured log line `[yyyy-MM-dd HH:mm:ss] [LEVEL] message` and flushes the queue.
+    /// Enqueues a structured log line `[yyyy-MM-dd HH:mm:ss +HH:MM] [LEVEL] message` and flushes the queue.
     pub fn log(&self, level: LogLevel, component: &str, message: &str) {
         if !self.is_enabled() {
             return;
         }
-        let now = Utc::now().format("%Y-%m-%d %H:%M:%S");
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S %:z");
         let level_str = match level {
             LogLevel::Info => "INFO",
             LogLevel::Warn => "WARN",
@@ -104,7 +104,7 @@ impl FileLogger {
             return;
         }
 
-        let date_suffix = Utc::now().format("%Y%m%d");
+        let date_suffix = Local::now().format("%Y%m%d");
         let file_name = format!("{}_{}.log", self.app_name, date_suffix);
         let file_path = self.log_dir.join(file_name);
 
@@ -139,7 +139,7 @@ mod tests {
         logger.log(LogLevel::Warn, "UnitTest", "Should not be written");
         logger.flush();
 
-        let date_suffix = Utc::now().format("%Y%m%d");
+        let date_suffix = Local::now().format("%Y%m%d");
         let expected_file = temp_dir.join(format!("RouteWard_{date_suffix}.log"));
         let content = fs::read_to_string(&expected_file).expect("Log file created");
         assert!(content.contains("[INFO] [UnitTest] Initialized test logger session id=1"));

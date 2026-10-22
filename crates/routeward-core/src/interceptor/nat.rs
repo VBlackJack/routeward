@@ -16,9 +16,10 @@
 
 use crate::config::RuleAction;
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
+use std::collections::VecDeque;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,7 +39,7 @@ const SOCKET_CACHE_TTL_SECS: u64 = 30;
 pub enum PidResolutionSource {
     /// Resolved via a prior `WINDIVERT_LAYER_SOCKET` event.
     SocketLayer,
-    /// Resolved by holding the SYN briefly and querying `GetExtendedTcpTable`.
+    /// Resolved via `GetExtendedTcpTable`.
     TcpTableFallback,
 }
 
@@ -52,7 +53,16 @@ impl PidResolutionSource {
     }
 }
 
-/// Active NAT redirection entry keyed by the originating client TCP port.
+/// Full 4-tuple key identifying an outbound IPv4 TCP connection from the local host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OutboundFlowKey {
+    pub local_ip: Ipv4Addr,
+    pub local_port: u16,
+    pub remote_ip: Ipv4Addr,
+    pub remote_port: u16,
+}
+
+/// Active NAT redirection entry keyed by the outbound 4-tuple and indexed by the reflected relay peer tuple.
 #[derive(Debug, Clone)]
 pub struct NatSessionEntry {
     pub client_ip: Ipv4Addr,
@@ -68,6 +78,23 @@ pub struct NatSessionEntry {
     pub created_at: Instant,
 }
 
+impl NatSessionEntry {
+    /// Returns the outbound 4-tuple key `(local_ip, local_port, remote_ip, remote_port)` for this session.
+    pub fn outbound_flow_key(&self) -> OutboundFlowKey {
+        OutboundFlowKey {
+            local_ip: self.client_ip,
+            local_port: self.client_port,
+            remote_ip: self.orig_dst_ip,
+            remote_port: self.orig_dst_port,
+        }
+    }
+
+    /// Returns the `(peer_ip, peer_port)` tuple seen by the local transparent relay after `streamdump` reflection.
+    pub fn relay_peer_key(&self) -> (Ipv4Addr, u16) {
+        (self.orig_dst_ip, self.client_port)
+    }
+}
+
 /// Parsed IPv4 + TCP packet header metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv4TcpPacketMeta {
@@ -81,6 +108,16 @@ pub struct Ipv4TcpPacketMeta {
 }
 
 impl Ipv4TcpPacketMeta {
+    /// Returns the outbound 4-tuple key `(src_ip, src_port, dst_ip, dst_port)` for this packet.
+    pub fn outbound_flow_key(&self) -> OutboundFlowKey {
+        OutboundFlowKey {
+            local_ip: self.src_ip,
+            local_port: self.src_port,
+            remote_ip: self.dst_ip,
+            remote_port: self.dst_port,
+        }
+    }
+
     /// Returns `true` if this packet is an initial TCP SYN (SYN set, ACK not set).
     pub fn is_syn_only(&self) -> bool {
         (self.tcp_flags & TCP_FLAG_SYN) != 0 && (self.tcp_flags & TCP_FLAG_ACK) == 0
@@ -92,11 +129,123 @@ impl Ipv4TcpPacketMeta {
     }
 }
 
+/// Queued outbound SYN packet awaiting asynchronous PID resolution outside the network receive loop.
+#[derive(Debug, Clone)]
+pub struct PendingSynEntry<T> {
+    pub payload: T,
+    pub meta: Ipv4TcpPacketMeta,
+    pub enqueued_at: Instant,
+}
+
+/// Outcome of polling a queued SYN packet in `PendingSynQueue`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSynOutcome<T> {
+    /// PID was resolved before timeout via `SocketLayer` or `TcpTableFallback`.
+    Resolved {
+        payload: T,
+        meta: Ipv4TcpPacketMeta,
+        pid: u32,
+        source: PidResolutionSource,
+    },
+    /// Timeout expired without resolving a PID; caller must reinject the SYN unmodified (fail-open).
+    TimedOutFailOpen {
+        payload: T,
+        meta: Ipv4TcpPacketMeta,
+        elapsed_ms: u64,
+    },
+}
+
+/// Non-blocking queue holding unresolved outbound SYN packets so the main `NETWORK` receive loop never sleeps.
+#[derive(Clone)]
+pub struct PendingSynQueue<T> {
+    inner: Arc<Mutex<VecDeque<PendingSynEntry<T>>>>,
+}
+
+impl<T> Default for PendingSynQueue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> PendingSynQueue<T> {
+    /// Creates an empty `PendingSynQueue`.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    /// Enqueues an unresolved SYN packet with the current timestamp.
+    pub fn enqueue(&self, payload: T, meta: Ipv4TcpPacketMeta) {
+        self.inner.lock().push_back(PendingSynEntry {
+            payload,
+            meta,
+            enqueued_at: Instant::now(),
+        });
+    }
+
+    /// Returns the number of currently queued SYN packets.
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+
+    /// Returns `true` if no SYN packets are waiting in the queue.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+
+    /// Polls all queued SYN packets without sleeping, returning resolved or timed-out (fail-open) outcomes
+    /// and keeping still-pending entries in the queue.
+    pub fn poll_ready<F>(
+        &self,
+        nat: &TransparentNatTable,
+        timeout: Duration,
+        fallback_fn: F,
+    ) -> Vec<PendingSynOutcome<T>>
+    where
+        F: Fn(u16) -> Option<u32>,
+    {
+        let mut queue = self.inner.lock();
+        let count = queue.len();
+        let mut outcomes = Vec::new();
+
+        for _ in 0..count {
+            let Some(entry) = queue.pop_front() else {
+                break;
+            };
+            if let Some((pid, source)) =
+                nat.try_resolve_pid_nonblocking(entry.meta.src_port, &fallback_fn)
+            {
+                outcomes.push(PendingSynOutcome::Resolved {
+                    payload: entry.payload,
+                    meta: entry.meta,
+                    pid,
+                    source,
+                });
+            } else {
+                let elapsed = entry.enqueued_at.elapsed();
+                if elapsed >= timeout {
+                    outcomes.push(PendingSynOutcome::TimedOutFailOpen {
+                        payload: entry.payload,
+                        meta: entry.meta,
+                        elapsed_ms: elapsed.as_millis() as u64,
+                    });
+                } else {
+                    queue.push_back(entry);
+                }
+            }
+        }
+
+        outcomes
+    }
+}
+
 /// Thread-safe NAT state table and loop-prevention registry for transparent TCP redirection.
 #[derive(Clone)]
 pub struct TransparentNatTable {
     socket_pid_cache: Arc<DashMap<u16, (u32, Instant)>>,
-    sessions: Arc<DashMap<u16, NatSessionEntry>>,
+    sessions_by_flow: Arc<DashMap<OutboundFlowKey, NatSessionEntry>>,
+    peer_to_flow: Arc<DashMap<(Ipv4Addr, u16), OutboundFlowKey>>,
     self_pid: u32,
     transparent_relay_port: u16,
     local_socks_port: u16,
@@ -114,7 +263,8 @@ impl TransparentNatTable {
     ) -> Self {
         Self {
             socket_pid_cache: Arc::new(DashMap::new()),
-            sessions: Arc::new(DashMap::new()),
+            sessions_by_flow: Arc::new(DashMap::new()),
+            peer_to_flow: Arc::new(DashMap::new()),
             self_pid,
             transparent_relay_port,
             local_socks_port,
@@ -136,15 +286,12 @@ impl TransparentNatTable {
         }
     }
 
-    /// Resolves the owning PID for `local_port`, handling the race between `SOCKET` and `NETWORK` layers.
+    /// Attempts to resolve the owning PID for `local_port` immediately without sleeping.
     ///
-    /// First checks the `SOCKET` layer cache; if absent, holds the SYN briefly and queries `fallback_fn`
-    /// (`GetExtendedTcpTable`) up to `max_retries` times.
-    pub fn resolve_pid_with_fallback<F>(
+    /// First checks the `SOCKET` layer cache; if absent, performs a single non-blocking call to `fallback_fn`.
+    pub fn try_resolve_pid_nonblocking<F>(
         &self,
         local_port: u16,
-        max_retries: u32,
-        retry_delay: Duration,
         fallback_fn: F,
     ) -> Option<(u32, PidResolutionSource)>
     where
@@ -156,21 +303,10 @@ impl TransparentNatTable {
             }
         }
 
-        let attempts = max_retries.max(1);
-        for attempt in 0..attempts {
-            if let Some(pid) = fallback_fn(local_port) {
-                if pid != 0 {
-                    self.record_socket_event(local_port, pid);
-                    return Some((pid, PidResolutionSource::TcpTableFallback));
-                }
-            }
-
-            if let Some(entry) = self.socket_pid_cache.get(&local_port) {
-                return Some((entry.value().0, PidResolutionSource::SocketLayer));
-            }
-
-            if attempt + 1 < attempts && !retry_delay.is_zero() {
-                std::thread::sleep(retry_delay);
+        if let Some(pid) = fallback_fn(local_port) {
+            if pid != 0 {
+                self.record_socket_event(local_port, pid);
+                return Some((pid, PidResolutionSource::TcpTableFallback));
             }
         }
 
@@ -178,12 +314,6 @@ impl TransparentNatTable {
     }
 
     /// Checks whether a connection must bypass interception to prevent routing loops.
-    ///
-    /// Excludes:
-    /// - Traffic originating from RouteWard itself (`pid == self_pid`).
-    /// - Loopback, broadcast, multicast, or unspecified addresses.
-    /// - Traffic targeting RouteWard's own relay listeners (`transparent_relay_port`, `local_socks_port`, `local_http_port`).
-    /// - Traffic targeting any configured upstream proxy endpoint `(ip, port)`.
     pub fn is_loop_or_excluded(
         &self,
         pid: Option<u32>,
@@ -217,19 +347,47 @@ impl TransparentNatTable {
             .any(|(up_ip, up_port)| *up_ip == dst_ip && *up_port == dst_port)
     }
 
-    /// Inserts or updates a NAT session entry keyed by `entry.client_port`.
+    /// Inserts a NAT session entry keyed by its full outbound 4-tuple and indexed by its reflected relay peer tuple.
     pub fn insert_session(&self, entry: NatSessionEntry) {
-        self.sessions.insert(entry.client_port, entry);
+        let flow_key = entry.outbound_flow_key();
+        let peer_key = entry.relay_peer_key();
+        self.peer_to_flow.insert(peer_key, flow_key);
+        self.sessions_by_flow.insert(flow_key, entry);
     }
 
-    /// Retrieves a cloned NAT session entry for `client_port`.
-    pub fn get_session(&self, client_port: u16) -> Option<NatSessionEntry> {
-        self.sessions.get(&client_port).map(|e| e.value().clone())
+    /// Retrieves a cloned NAT session entry by its full outbound 4-tuple `(local_ip, local_port, remote_ip, remote_port)`.
+    pub fn get_session_by_flow(&self, flow_key: &OutboundFlowKey) -> Option<NatSessionEntry> {
+        self.sessions_by_flow
+            .get(flow_key)
+            .map(|e| e.value().clone())
     }
 
-    /// Removes the NAT session entry for `client_port`.
-    pub fn remove_session(&self, client_port: u16) -> Option<NatSessionEntry> {
-        self.sessions.remove(&client_port).map(|(_, v)| v)
+    /// Retrieves a cloned NAT session entry by the reflected `(peer_ip, peer_port)` tuple seen by the relay.
+    pub fn get_session_by_relay_peer(
+        &self,
+        peer_ip: Ipv4Addr,
+        peer_port: u16,
+    ) -> Option<NatSessionEntry> {
+        let flow_key = *self.peer_to_flow.get(&(peer_ip, peer_port))?.value();
+        self.get_session_by_flow(&flow_key)
+    }
+
+    /// Validates a peer `SocketAddr` accepted by the transparent TCP relay against live NAT sessions.
+    pub fn validate_relay_peer_addr(&self, peer_addr: SocketAddr) -> Option<NatSessionEntry> {
+        match peer_addr.ip() {
+            IpAddr::V4(peer_ipv4) => self.get_session_by_relay_peer(peer_ipv4, peer_addr.port()),
+            IpAddr::V6(_) => None,
+        }
+    }
+
+    /// Removes the NAT session entry associated with the reflected relay peer `(peer_ip, peer_port)`.
+    pub fn remove_session_by_relay_peer(
+        &self,
+        peer_ip: Ipv4Addr,
+        peer_port: u16,
+    ) -> Option<NatSessionEntry> {
+        let (_, flow_key) = self.peer_to_flow.remove(&(peer_ip, peer_port))?;
+        self.sessions_by_flow.remove(&flow_key).map(|(_, v)| v)
     }
 
     /// Returns the transparent relay TCP port.
@@ -278,9 +436,6 @@ pub fn parse_ipv4_tcp_meta(packet: &[u8]) -> Option<Ipv4TcpPacketMeta> {
 
 /// Rewrites an outbound client TCP packet (`A:C -> B:D`) using the WinDivert `streamdump`
 /// reflection technique (`B:C -> A:relay_port`) and updates RFC 1071 IPv4 and TCP checksums.
-///
-/// When reinjected with `Outbound = 0` (inbound), the Windows TCP stack delivers the packet
-/// directly to the local transparent listener bound to `0.0.0.0:relay_port`.
 pub fn reflect_outbound_to_local_relay(packet: &mut [u8], relay_port: u16) -> bool {
     let Some(meta) = parse_ipv4_tcp_meta(packet) else {
         return false;
@@ -336,7 +491,6 @@ pub fn recompute_ipv4_and_tcp_checksums(packet: &mut [u8], ihl: usize) {
     packet[ihl + 17] = 0;
 
     let mut sum: u32 = 0;
-    // Pseudo-header: src_ip (4B), dst_ip (4B), zero + protocol (2B), tcp_len (2B)
     for chunk in packet[12..20].chunks_exact(2) {
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
     }
@@ -373,16 +527,16 @@ mod tests {
         dst_port: u16,
     ) -> Vec<u8> {
         let mut pkt = vec![0u8; 40];
-        pkt[0] = 0x45; // IPv4, IHL = 5 (20 bytes)
+        pkt[0] = 0x45;
         pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
-        pkt[8] = 64; // TTL
+        pkt[8] = 64;
         pkt[9] = IPPROTO_TCP;
         pkt[12..16].copy_from_slice(&src_ip.octets());
         pkt[16..20].copy_from_slice(&dst_ip.octets());
 
         pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
         pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
-        pkt[32] = 0x50; // Data offset = 5 (20 bytes)
+        pkt[32] = 0x50;
         pkt[33] = TCP_FLAG_SYN;
         pkt[34..36].copy_from_slice(&64240u16.to_be_bytes());
 
@@ -391,28 +545,123 @@ mod tests {
     }
 
     #[test]
-    fn resolves_pid_from_socket_layer_and_tcp_table_fallback() {
+    fn nonblocking_pending_syn_queue_resolves_or_times_out_fail_open() {
         let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        let queue: PendingSynQueue<Vec<u8>> = PendingSynQueue::new();
 
-        // 1. Direct hit from SOCKET layer cache
-        nat.record_socket_event(51000, 4242);
-        let res_socket =
-            nat.resolve_pid_with_fallback(51000, 3, Duration::from_millis(1), |_| Some(1111));
-        assert_eq!(res_socket, Some((4242, PidResolutionSource::SocketLayer)));
+        let client_ip = Ipv4Addr::new(192, 168, 31, 136);
+        let dst_ip = Ipv4Addr::new(93, 184, 215, 14);
+        let pkt_resolved = build_sample_ipv4_tcp_syn(client_ip, dst_ip, 51001, 80);
+        let meta_resolved = parse_ipv4_tcp_meta(&pkt_resolved).unwrap();
 
-        // 2. Race condition: SYN arrives before SOCKET event -> resolved via GetExtendedTcpTable fallback
-        let res_fallback =
-            nat.resolve_pid_with_fallback(52000, 3, Duration::from_millis(1), |port| {
-                if port == 52000 {
-                    Some(7777)
-                } else {
-                    None
-                }
-            });
+        let pkt_timeout = build_sample_ipv4_tcp_syn(client_ip, dst_ip, 51002, 80);
+        let meta_timeout = parse_ipv4_tcp_meta(&pkt_timeout).unwrap();
+
+        // Both SYNs arrive before SOCKET event or TCP table entry exists
+        assert!(nat.try_resolve_pid_nonblocking(51001, |_| None).is_none());
+        queue.enqueue(pkt_resolved.clone(), meta_resolved);
+        queue.enqueue(pkt_timeout.clone(), meta_timeout);
+        assert_eq!(queue.len(), 2);
+
+        // Poll 1: neither is resolved yet, timeout (50 ms) has not elapsed -> both remain queued
+        let outcomes_1 = queue.poll_ready(&nat, Duration::from_millis(50), |_| None);
+        assert!(outcomes_1.is_empty());
+        assert_eq!(queue.len(), 2);
+
+        // Late SOCKET event arrives for port 51001
+        nat.record_socket_event(51001, 4632);
+        let outcomes_2 = queue.poll_ready(&nat, Duration::from_millis(50), |_| None);
+        assert_eq!(outcomes_2.len(), 1);
         assert_eq!(
-            res_fallback,
-            Some((7777, PidResolutionSource::TcpTableFallback))
+            outcomes_2[0],
+            PendingSynOutcome::Resolved {
+                payload: pkt_resolved,
+                meta: meta_resolved,
+                pid: 4632,
+                source: PidResolutionSource::SocketLayer,
+            }
         );
+        assert_eq!(queue.len(), 1);
+
+        // Poll 3 with 0ms timeout: remaining unresolved SYN (port 51002) times out and triggers fail-open
+        let outcomes_3 = queue.poll_ready(&nat, Duration::ZERO, |_| None);
+        assert_eq!(outcomes_3.len(), 1);
+        match &outcomes_3[0] {
+            PendingSynOutcome::TimedOutFailOpen { payload, meta, .. } => {
+                assert_eq!(payload, &pkt_timeout);
+                assert_eq!(meta.src_port, 51002);
+            }
+            other => panic!("Expected TimedOutFailOpen, got {other:?}"),
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn nat_sessions_keyed_by_4_tuple_and_validated_by_relay_peer_tuple() {
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        let local_ip = Ipv4Addr::new(192, 168, 31, 136);
+        let remote_ip_a = Ipv4Addr::new(93, 184, 215, 14);
+        let remote_ip_b = Ipv4Addr::new(1, 1, 1, 1);
+
+        let entry_a = NatSessionEntry {
+            client_ip: local_ip,
+            client_port: 55000,
+            orig_dst_ip: remote_ip_a,
+            orig_dst_port: 80,
+            pid: 4632,
+            process_name: "curl.exe".to_string(),
+            process_path: "C:\\Windows\\System32\\curl.exe".to_string(),
+            resolution_source: PidResolutionSource::SocketLayer,
+            action: RuleAction::Proxy {
+                target_id: "proxy-socks5-primary".to_string(),
+            },
+            matched_rule_name: "CLI Tools via SOCKS5 Proxy".to_string(),
+            created_at: Instant::now(),
+        };
+        nat.insert_session(entry_a);
+
+        // Exact 4-tuple lookup succeeds
+        let key_a = OutboundFlowKey {
+            local_ip,
+            local_port: 55000,
+            remote_ip: remote_ip_a,
+            remote_port: 80,
+        };
+        assert!(nat.get_session_by_flow(&key_a).is_some());
+
+        // Different remote IP or remote port on the same local port does NOT falsely match
+        let key_different_remote = OutboundFlowKey {
+            local_ip,
+            local_port: 55000,
+            remote_ip: remote_ip_b,
+            remote_port: 443,
+        };
+        assert!(nat.get_session_by_flow(&key_different_remote).is_none());
+
+        // Relay peer validation accepts the matching reflected peer tuple (remote_ip_a:55000)
+        let valid_peer = SocketAddr::new(IpAddr::V4(remote_ip_a), 55000);
+        let validated = nat
+            .validate_relay_peer_addr(valid_peer)
+            .expect("matching live NAT session");
+        assert_eq!(validated.pid, 4632);
+        assert_eq!(validated.orig_dst_port, 80);
+
+        // Relay peer validation rejects unknown/unauthorized LAN connections to 0.0.0.0:10810
+        let unauthorized_peer_wrong_ip = SocketAddr::new(IpAddr::V4(remote_ip_b), 55000);
+        assert!(nat
+            .validate_relay_peer_addr(unauthorized_peer_wrong_ip)
+            .is_none());
+        let unauthorized_peer_wrong_port = SocketAddr::new(IpAddr::V4(remote_ip_a), 55001);
+        assert!(nat
+            .validate_relay_peer_addr(unauthorized_peer_wrong_port)
+            .is_none());
+
+        // Removing session cleans up both maps
+        assert!(nat
+            .remove_session_by_relay_peer(remote_ip_a, 55000)
+            .is_some());
+        assert!(nat.get_session_by_flow(&key_a).is_none());
+        assert!(nat.validate_relay_peer_addr(valid_peer).is_none());
     }
 
     #[test]
@@ -425,10 +674,7 @@ mod tests {
         let client_ip = Ipv4Addr::new(192, 168, 1, 50);
         let external_ip = Ipv4Addr::new(93, 184, 215, 14);
 
-        // RouteWard's own PID must be excluded
         assert!(nat.is_loop_or_excluded(Some(self_pid), client_ip, 50000, external_ip, 443));
-
-        // Loopback destination must be excluded
         assert!(nat.is_loop_or_excluded(
             Some(4321),
             client_ip,
@@ -436,11 +682,7 @@ mod tests {
             Ipv4Addr::new(127, 0, 0, 1),
             443
         ));
-
-        // Upstream SOCKS5 server IP:port must be excluded
         assert!(nat.is_loop_or_excluded(Some(4321), client_ip, 50000, upstream_ip, 1080));
-
-        // Normal external connection from curl.exe (PID 4321) must NOT be excluded
         assert!(!nat.is_loop_or_excluded(Some(4321), client_ip, 50000, external_ip, 443));
     }
 
@@ -457,17 +699,14 @@ mod tests {
         let meta_before = parse_ipv4_tcp_meta(&syn_pkt).expect("valid IPv4 TCP packet");
         assert!(meta_before.is_syn_only());
 
-        // 1. Outbound reflection toward local transparent relay
         assert!(reflect_outbound_to_local_relay(&mut syn_pkt, relay_port));
         let meta_reflected = parse_ipv4_tcp_meta(&syn_pkt).expect("valid reflected packet");
         assert_eq!(meta_reflected.src_ip, orig_dst_ip);
         assert_eq!(meta_reflected.dst_ip, client_ip);
         assert_eq!(meta_reflected.src_port, client_port);
         assert_eq!(meta_reflected.dst_port, relay_port);
-        // Verify IPv4 header checksum validates to 0
         assert_eq!(ones_complement_checksum(&syn_pkt[..20], 0), 0);
 
-        // 2. Return path reflection from local relay back to client
         let session = NatSessionEntry {
             client_ip,
             client_port,
