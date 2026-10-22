@@ -27,13 +27,15 @@ param(
     [string]$ExpectedSha256 = '63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15',
 
     [Parameter(Mandatory = $false)]
-    [ValidateNotNullOrEmpty()]
-    [string]$OutputDirectory = (Join-Path -Path $PSScriptRoot -ChildPath '..\third_party\windivert\bin')
+    [string]$OutputDirectory = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $OutputDirectory = Join-Path -Path $PSScriptRoot -ChildPath '..\third_party\windivert\bin'
+}
 $resolvedOutputDir = [System.IO.Path]::GetFullPath($OutputDirectory)
 $tempZipPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'WinDivert-2.2.2-A.zip'
 $tempExtractDir = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'WinDivert-2.2.2-A-Extract'
