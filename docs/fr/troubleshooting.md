@@ -10,9 +10,11 @@ La technique de reflexion `streamdump` de WinDivert reecrit les paquets sortants
 
 **Gestion automatique et nettoyage manuel** :
 - Au demarrage, `WinDivertInterceptor` cree automatiquement une regle entrante restreinte (`RouteWard_TransparentRelay_10810`, limitee au chemin de l'executable `routeward.exe`, `protocol=TCP`, `localport=10810`, `profile=any`) et la supprime a l'arret propre (`Ctrl+C` ou `--duration-secs`), en journalisant les deux actions sous `[WindowsFirewall]`.
-- Si le processus a ete interrompu brutalement avant le nettoyage, supprimer la regle manuellement dans PowerShell en Administrateur :
+- Si le processus a ete interrompu brutalement avant le nettoyage, lancer `routeward cleanup` ou supprimer la regle manuellement dans PowerShell en Administrateur :
 
 ```powershell
+routeward cleanup
+# ou directement :
 netsh advfirewall firewall delete rule name="RouteWard_TransparentRelay_10810"
 ```
 
@@ -49,7 +51,23 @@ powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
 **Solution** :
 L'ouverture du filtre WinDivert requiert les droits **Administrateur**. Ouvrir PowerShell en tant qu'Administrateur dans la VM de test et lancer `routeward run --duration-secs 60`.
 
-## 5. `routeward-desktop` echoue a la compilation car `ui/dist` est absent
+## 5. Interception `nftables` sous Linux et Nettoyage d'une Table Orpheline (`table ip routeward`)
+
+**Symptome** :
+- `routeward run` s'arrete avec `errors.interceptor.not_root` ou `errors.interceptor.nft_missing`.
+- Ou, si `routeward` et son processus watchdog ont ete tues simultanement, le trafic TCP IPv4 sortant reste redirige vers `:10810` et echoue.
+
+**Solution** :
+- Executer `routeward` en tant que `root` (`sudo routeward run`) et verifier que le paquet `nftables` (binaire `nft`) est installe.
+- Pour supprimer a tout moment une table `table ip routeward` orpheline :
+
+```bash
+sudo routeward cleanup
+# ou directement :
+sudo nft delete table ip routeward
+```
+
+## 6. `routeward-desktop` echoue a la compilation car `ui/dist` est absent
 
 **Symptome** :
 Erreur de compilation dans `apps/desktop/src/main.rs` indiquant que `../../../ui/dist/index.html` est introuvable.

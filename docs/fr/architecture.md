@@ -5,43 +5,51 @@
 RouteWard est organise en workspace Rust comprenant trois crates (`routeward-core`, `routeward-cli` et `routeward-desktop` dans `apps/desktop`) ainsi qu'une interface React + TypeScript (`ui/`).
 
 ### Etat du Milestone 1 (Interception TCP IPv4 sous Windows)
-- **Trait `Interceptor` enfichable (`routeward-core::interceptor::backend`)** : Abstrait l'interception de paquets derriere le trait `Interceptor` afin de pouvoir brancher d'autres moteurs (comme un pilote WFP sous Windows ou `nftables`/TUN sous Linux au Milestone 2) sans toucher au moteur de regles.
+- **Trait `Interceptor` enfichable (`routeward-core::interceptor::backend`)** : Abstrait l'interception de paquets derriere le trait `Interceptor` afin que les moteurs OS (`WinDivertInterceptor` sous Windows, `NftablesInterceptor` sous Linux) partagent le meme moteur de regles et le meme connecteur proxy.
 - **Backend WinDivert 2.2 (`routeward-core::interceptor::windivert`)** : Charge dynamiquement `WinDivert.dll` au runtime via `LoadLibraryExW` et `GetProcAddress` (conformite LGPLv3 par liaison dynamique; aucun binaire WinDivert n'est versionne dans le depot).
-- **Resolution de la course SOCKET / NETWORK (`routeward-core::interceptor::nat`)** : Ouvre simultanement `WINDIVERT_LAYER_SOCKET` (sniff lecture seule) et `WINDIVERT_LAYER_NETWORK`. Comme l'evenement `SOCKET` et le premier paquet `SYN` arrivent sur deux handles distincts, si le `SYN` arrive avant l'evenement `SOCKET`, RouteWard retient brievement le `SYN` et resout le PID via `GetExtendedTcpTable` (`tcp_table_fallback`), en journalisant la source de resolution (`resolvedVia=socket_layer` ou `resolvedVia=tcp_table_fallback`).
-- **Redirection locale par reflexion `streamdump`** : Les paquets TCP IPv4 rediriges utilisent la technique `reflect` de l'exemple officiel `streamdump` de WinDivert (`reflect_outbound_to_local_relay` et `reflect_relay_reply_to_client` dans `nat.rs`). Les paquets sortants du client (`client_ip:client_port -> orig_dst_ip:orig_dst_port`) voient leurs adresses IPv4 permutees (`orig_dst_ip:client_port -> client_ip:10810`), leur port de destination reecrit vers le relais TCP transparent (`0.0.0.0:10810`), leur direction basculee en entrant (`Outbound = 0`) et leurs sommes de controle RFC 1071 recalculees avant reinjection. Les paquets de reponse issus du port `10810` sont reflechis en sens inverse (`orig_dst_ip:orig_dst_port -> client_ip:client_port`, `Outbound = 0`).
-- **Exclusion anti-boucle** : Les connexions emises par le PID de RouteWard lui-meme, le trafic loopback et les connexions vers les serveurs proxies en amont sont automatiquement exclus.
-- **Non implemente a ce stade** : Interception IPv6 et UDP, capture DNS transparente, interception sous Linux (Milestone 2) et branchement IPC complet de l'interface graphique (Milestone 3).
+- **Resolution de la course SOCKET / NETWORK (`routeward-core::interceptor::nat`)** : Ouvre simultanement `WINDIVERT_LAYER_SOCKET` (sniff lecture seule) et `WINDIVERT_LAYER_NETWORK`. Si un `SYN` arrive avant l'evenement `SOCKET`, RouteWard place le `SYN` dans une file non bloquante `PendingSynQueue` et resout le PID via `GetExtendedTcpTable` (`tcp_table_fallback`), en journalisant la source (`resolvedVia=socket_layer` ou `resolvedVia=tcp_table_fallback`).
+- **Redirection locale par reflexion `streamdump`** : Les paquets TCP IPv4 rediriges utilisent la technique `reflect` de l'exemple officiel `streamdump` de WinDivert (`reflect_outbound_to_local_relay` et `reflect_relay_reply_to_client` dans `nat.rs`).
+
+### Etat du Milestone 2 (Interception TCP IPv4 sous Linux)
+- **Backend `nftables` (`routeward-core::interceptor::nftables`)** : S'execute en tant que `root` (`geteuid() == 0`) et installe une table dediee (`table ip routeward`, `chain output`, `type nat hook output priority -100`) qui redirige les connexions TCP IPv4 sortantes vers le relais TCP transparent local (`0.0.0.0:10810`).
+- **Recuperation de la destination d'origine** : Le relais transparent recupere l'adresse IPv4 et le port d'origine avant DNAT sur le socket accepte via `getsockopt(SOL_IP, SO_ORIGINAL_DST)`. Les connexions directes non redirigees vers `127.0.0.1:10810` sont rejetees et journalisees.
+- **Anti-boucle par `SO_MARK` (`fwmark`)** : Toutes les connexions sortantes ouvertes par RouteWard (vers un proxy amont ou en mode `Direct`) appliquent `setsockopt(SOL_SOCKET, SO_MARK, linuxFwmark)` (`0x5257` / `21079`) avant l'appel a `connect()`. La chaine `nftables` commence par `meta mark 21079 return` et `ip daddr 127.0.0.0/8 return`, evitant toute boucle de redirection.
+- **Attribution de processus et cas limites (`routeward-core::process`)** : Associe le port source du client dans `/proc/net/tcp` a l'inode du socket, puis parcourt `/proc/<pid>/fd` pour trouver `socket:[<inode>]` :
+  - `Single` : Un seul processus detient le socket (`resolvedVia=procfs_single`).
+  - `Shared` : Plusieurs PID partagent le socket apres un `fork()` (`resolvedVia=procfs_shared_fork`); RouteWard journalise la liste des PID candidats et attribue la connexion au PID principal (le plus bas).
+  - `Unknown` : Si le client ferme le socket avant la fin de l'inspection, RouteWard journalise le cas (`resolvedVia=procfs_unknown`) et applique l'action configurable `securityPolicy.unknownProcessAction` (`Direct`, `Block` ou `Proxy`).
+- **Comportement de `Block` sous Linux vs Windows** : Sous Windows (`WinDivert`), une regle `Block` jette le paquet `SYN` initial avant l'etablissement de la connexion. Sous Linux (`nftables redirect`), le noyau termine le handshake TCP sur l'ecouteur local avant que l'espace utilisateur n'accepte le socket; RouteWard applique immediatement `SO_LINGER(1, 0)` et ferme le socket, ce qui envoie un `TCP RST` au client.
+- **Watchdog fail-open et commande `routeward cleanup`** : `NftablesInterceptor` lance un processus watchdog lie par pipe (`sh -c "cat >/dev/null; nft delete table ip routeward"`) dans son propre groupe de processus. Si `routeward` est tue par `SIGKILL` (`kill -9`), le noyau ferme immediatement le descripteur du pipe et le watchdog supprime `table ip routeward`. Si le watchdog est egalement tue, la commande `routeward cleanup` supprime toute table `nftables` orpheline (ou la regle de pare-feu Windows).
+- **Dette technique connue (Milestone 2)** : Le parcours de `/proc/*/fd` a chaque connexion acceptee a un cout `O(processus * descripteurs)`. Son remplacement ou enrichissement par `NETLINK_SOCK_DIAG` ou un cache eBPF est note comme dette technique post-Milestone 2.
+- **Non implemente a ce stade** : Interception IPv6 et UDP, capture DNS transparente, mode sans root par capacites Linux, et branchement IPC complet de l'interface graphique (Milestone 3).
 
 ## Diagramme des Composants
 
 ```mermaid
 flowchart TD
-    subgraph ClientApp["Application Windows non modifiee (ex. curl.exe)"]
-        Curl["SYN TCP IPv4 sortant (client_ip:C -> dst_ip:D)"]
+    subgraph ClientApp["Application non modifiee (curl.exe / curl)"]
+        Curl["TCP IPv4 sortant (client_ip:C -> dst_ip:D)"]
     end
 
-    subgraph WinDivert["WinDivertBackend (Trait Interceptor)"]
-        SockLayer["WINDIVERT_LAYER_SOCKET (Cache PID)"]
-        NetLayer["WINDIVERT_LAYER_NETWORK (Reflexion streamdump)"]
-        PidFallback["Secours GetExtendedTcpTable (si SYN arrive en premier)"]
+    subgraph OSBackend["Backend d'interception OS (Trait Interceptor)"]
+        WinBackend["Windows: WinDivert 2.2 (Reflexion SOCKET + NETWORK)"]
+        LinBackend["Linux: nftables table ip routeward + SO_ORIGINAL_DST + SO_MARK"]
     end
 
     subgraph Core["Moteur Coeur (crates/routeward-core)"]
-        NatTable["TransparentNatTable (Session C -> orig_dst_ip:D, PID, Exe)"]
+        ProcRes["ProcessResolver (GetExtendedTcpTable / Scan Inode procfs)"]
         TransRelay["Ecouteur TCP Transparent (0.0.0.0:10810)"]
         RuleEngine["RuleEngine (Priorite, Processus, Domaine, CIDR, Port)"]
-        ProxyConnector["ProxyConnector (SOCKS5 / HTTP CONNECT)"]
+        ProxyConnector["ProxyConnector (SOCKS5 / HTTP CONNECT + SO_MARK)"]
         Telemetry["TelemetryHub + FileLogger (logs/RouteWard_yyyyMMdd.log)"]
     end
 
-    Curl --> SockLayer
-    Curl --> NetLayer
-    SockLayer --> NatTable
-    NetLayer --> PidFallback
-    PidFallback --> NatTable
-    NetLayer --> RuleEngine
-    NetLayer -->|"Reflechi en Entrant (dst_ip:C -> client_ip:10810)"| TransRelay
-    TransRelay --> NatTable
+    Curl --> WinBackend
+    Curl --> LinBackend
+    WinBackend --> TransRelay
+    LinBackend --> TransRelay
+    TransRelay --> ProcRes
+    TransRelay --> RuleEngine
     TransRelay --> ProxyConnector
     TransRelay --> Telemetry
 ```
@@ -50,8 +58,9 @@ flowchart TD
 
 | Chemin | Crate / Paquet | Responsabilite |
 | :--- | :--- | :--- |
-| `crates/routeward-core` | `routeward-core` | Trait `Interceptor`, `WinDivertInterceptor`, `TransparentNatTable` (reflexion `streamdump` + secours PID), `RuleEngine`, `ProxyConnector` et `FileLogger` quotidien. |
-| `crates/routeward-cli` | `routeward-cli` (`routeward`) | Interface en ligne de commande (`run --duration-secs`, `check`, `eval`, `fake-ip`). |
+| `crates/routeward-core` | `routeward-core` | Trait `Interceptor`, `WinDivertInterceptor` (Windows), `NftablesInterceptor` (Linux), `TransparentNatTable`, `ProcessResolver`, `RuleEngine`, `ProxyConnector` et `FileLogger` quotidien. |
+| `crates/routeward-cli` | `routeward-cli` (`routeward`) | Interface en ligne de commande (`run --duration-secs`, `cleanup`, `check`, `eval`, `fake-ip`). |
 | `apps/desktop` | `routeward-desktop` | Application bureau native basee sur `tao` et `wry` embarquant le bundle `ui/dist`. |
 | `ui` | `routeward-ui` | Interface React 18 + TypeScript + Tailwind CSS avec palettes ThemeForge. |
 | `tools/fetch-windivert.ps1` | Script PowerShell | Telecharge WinDivert 2.2.2-A officiel, verifie le SHA-256 et extrait `WinDivert.dll` et `WinDivert64.sys` dans `third_party/windivert/bin/`. |
+| `tests/linux/` | Suite de Tests Conteneur | Scenarios d'integration automatises sous Docker Debian 12 + `nftables` (`run-scenarios.sh`). |

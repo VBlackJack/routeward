@@ -491,8 +491,10 @@ pub fn recompute_ipv4_and_tcp_checksums(packet: &mut [u8], ihl: usize) {
     packet[ihl + 17] = 0;
 
     let mut sum: u32 = 0;
-    for chunk in packet[12..20].chunks_exact(2) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    let mut addr_idx = 12;
+    while addr_idx < 20 {
+        sum += u16::from_be_bytes([packet[addr_idx], packet[addr_idx + 1]]) as u32;
+        addr_idx += 2;
     }
     sum += IPPROTO_TCP as u32;
     sum += tcp_len as u32;
@@ -503,12 +505,13 @@ pub fn recompute_ipv4_and_tcp_checksums(packet: &mut [u8], ihl: usize) {
 
 fn ones_complement_checksum(bytes: &[u8], initial_sum: u32) -> u16 {
     let mut sum = initial_sum;
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    let mut idx = 0;
+    while idx + 1 < bytes.len() {
+        sum += u16::from_be_bytes([bytes[idx], bytes[idx + 1]]) as u32;
+        idx += 2;
     }
-    if let Some(&rem) = chunks.remainder().first() {
-        sum += u16::from_be_bytes([rem, 0]) as u32;
+    if idx < bytes.len() {
+        sum += u16::from_be_bytes([bytes[idx], 0]) as u32;
     }
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);

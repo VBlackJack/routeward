@@ -10,9 +10,11 @@ The WinDivert `streamdump` reflection technique rewrites outbound client packets
 
 **Automatic Handling and Manual Cleanup**:
 - On startup, `WinDivertInterceptor` automatically creates a scoped inbound rule (`RouteWard_TransparentRelay_10810`, restricted to the `routeward.exe` executable path, `protocol=TCP`, `localport=10810`, `profile=any`) and removes it on clean exit (`Ctrl+C` or `--duration-secs`), logging both actions under `[WindowsFirewall]`.
-- If the process was forcefully terminated (`kill -9` / power loss) before cleanup, you can remove the rule manually in an Administrator PowerShell:
+- If the process was forcefully terminated before cleanup, run `routeward cleanup` or remove the rule manually in an Administrator PowerShell:
 
 ```powershell
+routeward cleanup
+# or directly:
 netsh advfirewall firewall delete rule name="RouteWard_TransparentRelay_10810"
 ```
 
@@ -49,7 +51,23 @@ powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
 **Resolution**:
 Loading and opening the WinDivert kernel filter requires **Administrator** privileges. Launch PowerShell as Administrator inside your test VM and run `routeward run --duration-secs 60`.
 
-## 5. `routeward-desktop` Fails to Compile Because `ui/dist` Is Missing
+## 5. Linux `nftables` Interception and Orphaned Table Cleanup (`table ip routeward`)
+
+**Symptom**:
+- `routeward run` exits with `errors.interceptor.not_root` or `errors.interceptor.nft_missing`.
+- Or, if both `routeward` and its pipe-linked fail-open watchdog were killed simultaneously, outbound IPv4 TCP traffic remains redirected to `:10810` and fails to connect.
+
+**Resolution**:
+- Ensure `routeward` is executed as `root` (`sudo routeward run`) and that the `nftables` package (`nft` binary) is installed.
+- To remove an orphaned `table ip routeward` ruleset at any time, run:
+
+```bash
+sudo routeward cleanup
+# or directly:
+sudo nft delete table ip routeward
+```
+
+## 6. `routeward-desktop` Fails to Compile Because `ui/dist` Is Missing
 
 **Symptom**:
 Compiler error in `apps/desktop/src/main.rs` complaining that `../../../ui/dist/index.html` does not exist.

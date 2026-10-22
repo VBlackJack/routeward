@@ -1,0 +1,5 @@
+target/
+ui/node_modules/
+logs/
+third_party/windivert/bin/
+.git/

@@ -64,6 +64,23 @@ enum Commands {
         #[arg(long)]
         domain: String,
     },
+    /// Remove orphaned OS interception rules (Linux nftables table or Windows firewall rule)
+    Cleanup,
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[tokio::main]
@@ -121,11 +138,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Some(secs) = duration_secs {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
+                    _ = wait_for_shutdown_signal() => {},
                     _ = tokio::time::sleep(Duration::from_secs(secs)) => {},
                 }
             } else {
-                tokio::signal::ctrl_c().await?;
+                wait_for_shutdown_signal().await;
             }
 
             controller.stop_engine();
@@ -169,6 +186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "entries": controller.dns.list_entries()
                 }))?
             );
+        }
+        Commands::Cleanup => {
+            controller.cleanup_orphaned_rules()?;
+            println!("{}", controller.i18n.t("cli.engine.cleanup.completed"));
         }
     }
 

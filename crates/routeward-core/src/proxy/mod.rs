@@ -40,6 +40,52 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncTunnelStream for T {}
 pub struct ProxyConnector;
 
 impl ProxyConnector {
+    /// Opens an outbound TCP stream, setting `SO_MARK` (`fwmark`) prior to `connect()` on Linux
+    /// so RouteWard's own outbound traffic bypasses the `nftables` `output` NAT hook.
+    pub async fn connect_tcp_marked(addr: &str, fwmark: u32) -> std::io::Result<TcpStream> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            use tokio::net::{lookup_host, TcpSocket};
+
+            let mut last_err = None;
+            for sock_addr in lookup_host(addr).await? {
+                let socket = match &sock_addr {
+                    SocketAddr::V4(_) => TcpSocket::new_v4()?,
+                    SocketAddr::V6(_) => TcpSocket::new_v6()?,
+                };
+                if fwmark != 0 {
+                    let mark: libc::c_uint = fwmark;
+                    unsafe {
+                        let _ = libc::setsockopt(
+                            socket.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_MARK,
+                            &mark as *const libc::c_uint as *const libc::c_void,
+                            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                        );
+                    }
+                }
+                match socket.connect(sock_addr).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(err) => last_err = Some(err),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "could not resolve any socket address",
+                )
+            }))
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = fwmark;
+            TcpStream::connect(addr).await
+        }
+    }
+
     pub async fn connect_single(
         node: &ProxyNode,
         target_host: &str,
@@ -48,14 +94,18 @@ impl ProxyConnector {
     ) -> RouteWardResult<TcpStream> {
         let connect_timeout = Duration::from_millis(constants.network.tcp_connect_timeout_ms);
         let handshake_timeout = Duration::from_millis(constants.network.proxy_handshake_timeout_ms);
+        let fwmark = constants.network.linux_fwmark;
 
         let proxy_addr = format!("{}:{}", node.host, node.port);
-        let mut stream = timeout(connect_timeout, TcpStream::connect(&proxy_addr))
-            .await
-            .map_err(|_| RouteWardError::ConnectionTimeout {
-                key: ERR_KEY_CONNECTION_TIMEOUT,
-            })?
-            .map_err(RouteWardError::Io)?;
+        let mut stream = timeout(
+            connect_timeout,
+            Self::connect_tcp_marked(&proxy_addr, fwmark),
+        )
+        .await
+        .map_err(|_| RouteWardError::ConnectionTimeout {
+            key: ERR_KEY_CONNECTION_TIMEOUT,
+        })?
+        .map_err(RouteWardError::Io)?;
 
         timeout(
             handshake_timeout,
@@ -89,15 +139,19 @@ impl ProxyConnector {
 
         let connect_timeout = Duration::from_millis(constants.network.tcp_connect_timeout_ms);
         let handshake_timeout = Duration::from_millis(constants.network.proxy_handshake_timeout_ms);
+        let fwmark = constants.network.linux_fwmark;
 
         let first_hop = &hops[0];
         let entry_addr = format!("{}:{}", first_hop.host, first_hop.port);
-        let mut stream = timeout(connect_timeout, TcpStream::connect(&entry_addr))
-            .await
-            .map_err(|_| RouteWardError::ConnectionTimeout {
-                key: ERR_KEY_CONNECTION_TIMEOUT,
-            })?
-            .map_err(RouteWardError::Io)?;
+        let mut stream = timeout(
+            connect_timeout,
+            Self::connect_tcp_marked(&entry_addr, fwmark),
+        )
+        .await
+        .map_err(|_| RouteWardError::ConnectionTimeout {
+            key: ERR_KEY_CONNECTION_TIMEOUT,
+        })?
+        .map_err(RouteWardError::Io)?;
 
         for idx in 0..hops.len() {
             let current_hop = &hops[idx];

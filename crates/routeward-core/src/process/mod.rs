@@ -16,19 +16,32 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const UNKNOWN_PROCESS_NAME: &str = "system";
 const PATH_SEPARATORS: &[char] = &['/', '\\'];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub name: String,
     pub executable_path: String,
+}
+
+/// Result of attributing a local TCP port to an OS process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessAttribution {
+    /// Exactly one process owns the socket.
+    Single(ProcessIdentity),
+    /// Multiple processes share the socket descriptor (for example after `fork`).
+    Shared {
+        primary: ProcessIdentity,
+        candidate_pids: Vec<u32>,
+    },
+    /// No owning process could be determined (for example socket closed before `/proc` scan or `inode == 0`).
+    Unknown { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +90,65 @@ impl ProcessResolver {
             return self.resolve_by_pid(pid);
         }
         ProcessIdentity::default()
+    }
+
+    /// Resolves the owning process(es) for `local_port`, distinguishing single-owner,
+    /// multi-PID shared sockets (`fork`), and unknown/already-closed sockets.
+    pub fn resolve_tcp_port_attribution(&self, local_port: u16) -> ProcessAttribution {
+        match Self::find_all_pids_for_tcp_port(local_port) {
+            Ok(pids) => self.classify_pids_for_socket(pids, local_port),
+            Err(reason) => ProcessAttribution::Unknown { reason },
+        }
+    }
+
+    /// Classifies a list of candidate PIDs owning a socket into `Single`, `Shared`, or `Unknown`.
+    pub fn classify_pids_for_socket(
+        &self,
+        mut pids: Vec<u32>,
+        local_port: u16,
+    ) -> ProcessAttribution {
+        pids.retain(|&p| p != 0);
+        pids.sort_unstable();
+        pids.dedup();
+
+        match pids.len() {
+            0 => ProcessAttribution::Unknown {
+                reason: format!("no process fd matched local_port={local_port}"),
+            },
+            1 => ProcessAttribution::Single(self.resolve_by_pid(pids[0])),
+            _ => {
+                // Prefer the most recently spawned child process (highest PID) after fork
+                let primary_pid = *pids.last().unwrap_or(&pids[0]);
+                ProcessAttribution::Shared {
+                    primary: self.resolve_by_pid(primary_pid),
+                    candidate_pids: pids,
+                }
+            }
+        }
+    }
+
+    /// Parses `/proc/net/tcp` text content and returns the non-zero socket inode for `local_port`.
+    pub fn parse_proc_net_tcp_inode(content: &str, local_port: u16) -> Result<u64, String> {
+        let hex_port = format!("{local_port:04X}");
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() > 9 {
+                if let Some((_ip, port)) = fields[1].split_once(':') {
+                    if port.eq_ignore_ascii_case(&hex_port) {
+                        let inode = fields[9].parse::<u64>().unwrap_or(0);
+                        if inode == 0 {
+                            return Err(format!(
+                                "socket for local_port={local_port} has inode=0 (closed/TIME_WAIT)"
+                            ));
+                        }
+                        return Ok(inode);
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "local_port={local_port} not found in /proc/net/tcp"
+        ))
     }
 
     pub fn scan_established_tcp_sockets(&self, max_entries: usize) -> Vec<ActiveOsSocket> {
@@ -130,17 +202,11 @@ impl ProcessResolver {
     }
 
     pub fn extract_basename(path_str: &str) -> String {
-        Path::new(path_str)
-            .file_name()
-            .and_then(|os| os.to_str())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| {
-                path_str
-                    .rsplit(PATH_SEPARATORS)
-                    .next()
-                    .unwrap_or(UNKNOWN_PROCESS_NAME)
-                    .to_string()
-            })
+        path_str
+            .rsplit(PATH_SEPARATORS)
+            .find(|s| !s.is_empty())
+            .unwrap_or(UNKNOWN_PROCESS_NAME)
+            .to_string()
     }
 
     #[cfg(windows)]
@@ -299,44 +365,63 @@ impl ProcessResolver {
         Some(String::from_utf16_lossy(&wide_buf[..size as usize]))
     }
 
+    #[cfg(windows)]
+    fn find_all_pids_for_tcp_port(local_port: u16) -> Result<Vec<u32>, String> {
+        match Self::find_pid_for_tcp_port(local_port) {
+            Some(pid) if pid != 0 => Ok(vec![pid]),
+            _ => Err(format!(
+                "local_port={local_port} not found in GetExtendedTcpTable"
+            )),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub fn find_pid_for_tcp_port(local_port: u16) -> Option<u32> {
+        Self::find_all_pids_for_tcp_port(local_port)
+            .ok()
+            .and_then(|pids| pids.into_iter().last())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn find_all_pids_for_tcp_port(local_port: u16) -> Result<Vec<u32>, String> {
         use std::fs;
-        let hex_port = format!("{:04X}", local_port);
-        let content = fs::read_to_string("/proc/net/tcp").ok()?;
-        let mut target_inode: Option<String> = None;
-
-        for line in content.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() > 9 {
-                if let Some((_ip, port)) = fields[1].split_once(':') {
-                    if port.eq_ignore_ascii_case(&hex_port) {
-                        target_inode = Some(fields[9].to_string());
-                        break;
-                    }
-                }
-            }
-        }
-
-        let inode = target_inode?;
+        let content = fs::read_to_string("/proc/net/tcp")
+            .map_err(|e| format!("failed reading /proc/net/tcp: {e}"))?;
+        let inode = Self::parse_proc_net_tcp_inode(&content, local_port)?;
         let socket_tag = format!("socket:[{inode}]");
-        for proc_entry in fs::read_dir("/proc").ok()?.flatten() {
+        let self_pid = std::process::id();
+        let mut matched_pids = Vec::new();
+
+        let proc_dir = fs::read_dir("/proc").map_err(|e| format!("failed reading /proc: {e}"))?;
+        for proc_entry in proc_dir.flatten() {
             let file_name = proc_entry.file_name();
-            let pid_str = file_name.to_str()?;
+            let Some(pid_str) = file_name.to_str() else {
+                continue;
+            };
             if let Ok(pid) = pid_str.parse::<u32>() {
+                if pid == self_pid {
+                    continue;
+                }
                 let fd_dir = proc_entry.path().join("fd");
                 if let Ok(fds) = fs::read_dir(fd_dir) {
                     for fd in fds.flatten() {
                         if let Ok(link) = fs::read_link(fd.path()) {
                             if link.to_string_lossy() == socket_tag {
-                                return Some(pid);
+                                matched_pids.push(pid);
+                                break;
                             }
                         }
                     }
                 }
             }
         }
-        None
+
+        if matched_pids.is_empty() {
+            return Err(format!(
+                "socket inode={inode} for local_port={local_port} not found in /proc/*/fd"
+            ));
+        }
+        Ok(matched_pids)
     }
 
     #[cfg(target_os = "linux")]
@@ -357,7 +442,68 @@ impl ProcessResolver {
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
+    fn find_all_pids_for_tcp_port(local_port: u16) -> Result<Vec<u32>, String> {
+        Err(format!("unsupported platform for local_port={local_port}"))
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
     fn query_executable_path(_pid: u32) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_PROC_NET_TCP: &str = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:2A38 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 18420 1 0000000000000000 100 0 0 10 0
+   1: 881FA8C0:C350 0ED7B85D:0050 01 00000000:00000000 00:00000000 00000000  1000        0 49215 1 0000000000000000 20 4 30 10 -1
+   2: 881FA8C0:C351 0ED7B85D:0050 06 00000000:00000000 03:0000012C 00000000     0        0 0 3 0000000000000000";
+
+    #[test]
+    fn parses_proc_net_tcp_inode_and_handles_closed_or_missing_sockets() {
+        // Port 50000 (0xC350) -> active socket with inode 49215
+        assert_eq!(
+            ProcessResolver::parse_proc_net_tcp_inode(SAMPLE_PROC_NET_TCP, 50000),
+            Ok(49215)
+        );
+
+        // Port 50001 (0xC351) -> TIME_WAIT socket with inode 0 -> returns Err
+        let err_closed = ProcessResolver::parse_proc_net_tcp_inode(SAMPLE_PROC_NET_TCP, 50001)
+            .expect_err("inode 0 must be treated as closed");
+        assert!(err_closed.contains("inode=0"));
+
+        // Non-existent port 55555 -> returns Err
+        let err_missing = ProcessResolver::parse_proc_net_tcp_inode(SAMPLE_PROC_NET_TCP, 55555)
+            .expect_err("missing port must return Err");
+        assert!(err_missing.contains("not found"));
+    }
+
+    #[test]
+    fn classifies_single_shared_fork_and_unknown_socket_pids() {
+        let resolver = ProcessResolver::new(5000);
+
+        let unknown = resolver.classify_pids_for_socket(vec![], 50000);
+        assert!(matches!(unknown, ProcessAttribution::Unknown { .. }));
+
+        let single = resolver.classify_pids_for_socket(vec![1010], 50000);
+        match single {
+            ProcessAttribution::Single(id) => assert_eq!(id.pid, 1010),
+            other => panic!("Expected Single, got {other:?}"),
+        }
+
+        let shared = resolver.classify_pids_for_socket(vec![1010, 2048, 1010], 50000);
+        match shared {
+            ProcessAttribution::Shared {
+                primary,
+                candidate_pids,
+            } => {
+                assert_eq!(primary.pid, 2048);
+                assert_eq!(candidate_pids, vec![1010, 2048]);
+            }
+            other => panic!("Expected Shared, got {other:?}"),
+        }
     }
 }

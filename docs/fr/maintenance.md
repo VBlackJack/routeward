@@ -4,8 +4,8 @@
 
 Toutes les constantes operationnelles, le profil par defaut et les palettes de couleurs se trouvent dans `configs/` :
 
-- `configs/system_constants.json` : Definit les ports locaux par defaut (`10808`, `10809`, `10853`), les delais d'attente, le sous-reseau Fake-IP (`198.18.0.0/15`), le dossier de journaux (`logs`), le prefixe de fichier (`RouteWard`) et les modeles de regles.
-- `configs/default_profile.json` : Definit le profil de routage initial, les serveurs proxies, les chaines, les regles et les options (`enableLogging`, `blockUdpQuic`, `forceRemoteDns`).
+- `configs/system_constants.json` : Definit les ports locaux par defaut (`10808`, `10809`, `10810`, `10853`), les constantes `nftables` sous Linux (`linuxFwmark`: `21079` / `0x5257`, `linuxNftBinary`: `"nft"`, `linuxNftTableName`: `"routeward"`, `linuxNftChainName`: `"output"`), les delais d'attente, le sous-reseau Fake-IP (`198.18.0.0/15`), le dossier de journaux (`logs`), le prefixe de fichier (`RouteWard`) et les modeles de regles.
+- `configs/default_profile.json` : Definit le profil de routage initial, les serveurs proxies, les chaines, les regles et la politique de securite (`enableLogging`, `blockUdpQuic`, `forceRemoteDns`, `unknownProcessAction`).
 - `configs/themeforge_palettes.json` : Contient les 16 palettes Oklab canoniques de ThemeForge (`Dracula`, `Drakul`, `Striga`, `Cinder`, `Bracken`, `Tarn`, `Mortis`, `Slate`, `Voivode`, `Carmilla`, `Whitby`, `Vesper`, `Parchment`, `Folio`, `Wormwood`, `Sconce`), `HighContrast` et les 9 teintes d'accent.
 
 Comme `routeward-core` embarque ces fichiers JSON via `include_str!`, il faut recompiler le workspace Rust apres toute modification dans `configs/`.
@@ -19,7 +19,7 @@ Comme `routeward-core` embarque ces fichiers JSON via `include_str!`, il faut re
 ## Journalisation (`logs/`)
 
 - `FileLogger` (`crates/routeward-core/src/logger/mod.rs`) ecrit un fichier quotidien dans `logs/RouteWard_<yyyyMMdd>.log`.
-- Format : `[yyyy-MM-dd HH:mm:ss] [LEVEL] [Component] message`.
+- Format : `[yyyy-MM-dd HH:mm:ss] [LEVEL] [Component] message` (heure locale).
 - La journalisation est activee par defaut (`enableLogging: true` dans `ProfileConfig`) et peut etre activee ou desactivee a chaud sans redemarrer l'application.
 - Le dossier `logs/` est ignore par Git.
 

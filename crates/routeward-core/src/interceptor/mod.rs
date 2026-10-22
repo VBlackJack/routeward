@@ -16,6 +16,7 @@
 
 pub mod backend;
 pub mod nat;
+pub mod nftables;
 pub mod windivert;
 
 use crate::checker::{ProxyChecker, ProxyHealthReport};
@@ -28,7 +29,12 @@ use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_PROXY_NOT_FOUND};
 use crate::i18n::I18nRegistry;
 use crate::interceptor::backend::Interceptor;
 use crate::interceptor::nat::TransparentNatTable;
+#[cfg(not(windows))]
+use crate::interceptor::nftables::NftablesInterceptor;
+#[cfg(windows)]
 use crate::interceptor::windivert::WinDivertInterceptor;
+#[cfg(not(windows))]
+use crate::process::ProcessAttribution;
 use crate::process::ProcessResolver;
 use crate::proxy::sni::TlsSniExtractor;
 use crate::proxy::uri::ProxyUriCodec;
@@ -105,6 +111,11 @@ impl RouteWardController {
             .collect();
         nat_table.set_upstream_endpoints(upstream_endpoints);
 
+        #[cfg(windows)]
+        let interceptor_backend: Arc<dyn Interceptor> = Arc::new(WinDivertInterceptor::new());
+        #[cfg(not(windows))]
+        let interceptor_backend: Arc<dyn Interceptor> = Arc::new(NftablesInterceptor::new());
+
         let controller = Self {
             constants: Arc::new(constants),
             profile: Arc::new(RwLock::new(profile)),
@@ -113,7 +124,7 @@ impl RouteWardController {
             process_resolver,
             telemetry,
             nat_table,
-            interceptor_backend: Arc::new(WinDivertInterceptor::new()),
+            interceptor_backend,
             running: Arc::new(AtomicBool::new(false)),
         };
 
@@ -257,6 +268,28 @@ impl RouteWardController {
             self.i18n.t("app.header.engine.stopped"),
         );
         self.telemetry.flush_file_logger();
+    }
+
+    /// Removes orphaned OS interception rules (Linux `nftables` table or Windows firewall rule).
+    pub fn cleanup_orphaned_rules(&self) -> RouteWardResult<()> {
+        #[cfg(windows)]
+        {
+            let rule_name = format!(
+                "RouteWard_TransparentRelay_{}",
+                self.constants.network.default_transparent_tcp_port
+            );
+            WinDivertInterceptor::remove_scoped_firewall_rule(&rule_name, &self.telemetry);
+        }
+        #[cfg(not(windows))]
+        {
+            NftablesInterceptor::delete_nft_table(
+                &self.constants.network.linux_nft_binary,
+                &self.constants.network.linux_nft_table_name,
+                &self.telemetry,
+            )?;
+        }
+        self.telemetry.flush_file_logger();
+        Ok(())
     }
 
     pub fn set_enable_logging(&self, enable: bool) {
@@ -686,90 +719,286 @@ impl RouteWardController {
         mut client: TcpStream,
         peer_addr: SocketAddr,
     ) -> RouteWardResult<()> {
-        let Some(session) = self.nat_table.validate_relay_peer_addr(peer_addr) else {
-            let _ = client.shutdown().await;
+        if let Some(session) = self.nat_table.validate_relay_peer_addr(peer_addr) {
+            let target_host = session.orig_dst_ip.to_string();
+            let target_port = session.orig_dst_port;
+            let route_label = self.format_action_label(&session.action);
+
+            let mut outbound = match self
+                .open_outbound_stream(&session.action, &target_host, target_port)
+                .await
+            {
+                Ok(stream) => stream,
+                Err(err) => {
+                    self.telemetry.push_log(
+                        LogLevel::Error,
+                        COMPONENT_TRANSPARENT,
+                        format!(
+                            "Failed upstream connect for PID={} process=\"{}\" exe=\"{}\" -> {}:{}: {}",
+                            session.pid,
+                            session.process_name,
+                            session.process_path,
+                            target_host,
+                            target_port,
+                            err
+                        ),
+                    );
+                    self.nat_table
+                        .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
+                    return Err(err);
+                }
+            };
+
             self.telemetry.push_log(
-                LogLevel::Warn,
+                LogLevel::Info,
                 COMPONENT_TRANSPARENT,
                 format!(
-                    "Rejected unauthorized connection on transparent relay from {peer_addr}: no matching live NAT session"
+                    "Routed PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} via {} [rule=\"{}\"]",
+                    session.pid,
+                    session.process_name,
+                    session.process_path,
+                    session.resolution_source.as_str(),
+                    target_host,
+                    target_port,
+                    route_label,
+                    session.matched_rule_name
                 ),
             );
+
+            let conn_id = Uuid::new_v4().to_string();
+            let tracked = TrackedConnection {
+                id: conn_id.clone(),
+                pid: session.pid,
+                process_name: session.process_name,
+                process_path: session.process_path,
+                target_host,
+                resolved_domain: None,
+                target_port,
+                protocol: TransportProtocol::Tcp,
+                matched_rule: session.matched_rule_name,
+                route_label,
+                latency_ms: 10,
+                rx_bytes: 0,
+                tx_bytes: 0,
+                status: ConnectionStatus::Active,
+                started_at: Utc::now(),
+            };
+            self.telemetry.record_connection(tracked, true);
+
+            if let Ok((tx, rx)) = tokio::io::copy_bidirectional(&mut client, &mut outbound).await {
+                self.telemetry.update_connection_traffic(&conn_id, rx, tx);
+            }
+            self.telemetry.mark_connection_closed(&conn_id);
+            self.nat_table
+                .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
+
             return Ok(());
-        };
+        }
 
-        let target_host = session.orig_dst_ip.to_string();
-        let target_port = session.orig_dst_port;
-        let route_label = self.format_action_label(&session.action);
-
-        let mut outbound = match self
-            .open_outbound_stream(&session.action, &target_host, target_port)
-            .await
+        #[cfg(not(windows))]
         {
-            Ok(stream) => stream,
-            Err(err) => {
+            let relay_port = self.constants.network.default_transparent_tcp_port;
+            if let Some(orig_dst) = NftablesInterceptor::query_original_dst(&client, relay_port) {
+                let target_host = orig_dst.ip().to_string();
+                let target_port = orig_dst.port();
+                let client_port = peer_addr.port();
+
+                let attribution = self
+                    .process_resolver
+                    .resolve_tcp_port_attribution(client_port);
+
+                let (pid, proc_name, proc_path, eval_action, matched_rule_name, res_source) =
+                    match attribution {
+                        ProcessAttribution::Single(identity) => {
+                            let eval = self.evaluate_rule(&ConnectionRequest {
+                                process_name: identity.name.clone(),
+                                process_path: Some(identity.executable_path.clone()),
+                                target_host: target_host.clone(),
+                                target_ip: Some(target_host.clone()),
+                                target_port,
+                                protocol: TransportProtocol::Tcp,
+                            });
+                            (
+                                identity.pid,
+                                identity.name,
+                                identity.executable_path,
+                                eval.action,
+                                eval.matched_rule_name,
+                                "procfs_single",
+                            )
+                        }
+                        ProcessAttribution::Shared {
+                            primary,
+                            candidate_pids,
+                        } => {
+                            self.telemetry.push_log(
+                                LogLevel::Warn,
+                                COMPONENT_TRANSPARENT,
+                                format!(
+                                    "Shared socket across forked PIDs {:?} on client port {}; attributing to primary PID={} process=\"{}\" exe=\"{}\"",
+                                    candidate_pids,
+                                    client_port,
+                                    primary.pid,
+                                    primary.name,
+                                    primary.executable_path
+                                ),
+                            );
+                            let eval = self.evaluate_rule(&ConnectionRequest {
+                                process_name: primary.name.clone(),
+                                process_path: Some(primary.executable_path.clone()),
+                                target_host: target_host.clone(),
+                                target_ip: Some(target_host.clone()),
+                                target_port,
+                                protocol: TransportProtocol::Tcp,
+                            });
+                            (
+                                primary.pid,
+                                primary.name,
+                                primary.executable_path,
+                                eval.action,
+                                eval.matched_rule_name,
+                                "procfs_shared_fork",
+                            )
+                        }
+                        ProcessAttribution::Unknown { reason } => {
+                            let unknown_action = self
+                                .profile
+                                .read()
+                                .security_policy
+                                .unknown_process_action
+                                .clone();
+                            self.telemetry.push_log(
+                                LogLevel::Warn,
+                                COMPONENT_TRANSPARENT,
+                                format!(
+                                    "Unattributed socket on client port {} -> {}:{} (reason={}); applying unknownProcessAction={:?}",
+                                    client_port, target_host, target_port, reason, unknown_action
+                                ),
+                            );
+                            (
+                                0,
+                                "unknown".to_string(),
+                                "unknown".to_string(),
+                                unknown_action,
+                                "SecurityPolicy:unknownProcessAction".to_string(),
+                                "procfs_unknown",
+                            )
+                        }
+                    };
+
+                if eval_action == RuleAction::Block {
+                    self.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_TRANSPARENT,
+                        format!(
+                            "Blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\"] (TCP RST)",
+                            pid,
+                            proc_name,
+                            proc_path,
+                            res_source,
+                            target_host,
+                            target_port,
+                            matched_rule_name
+                        ),
+                    );
+                    self.telemetry.record_connection(
+                        TrackedConnection {
+                            id: Uuid::new_v4().to_string(),
+                            pid,
+                            process_name: proc_name,
+                            process_path: proc_path,
+                            target_host,
+                            resolved_domain: None,
+                            target_port,
+                            protocol: TransportProtocol::Tcp,
+                            matched_rule: matched_rule_name,
+                            route_label: ROUTE_BLOCK_LABEL.to_string(),
+                            latency_ms: 0,
+                            rx_bytes: 0,
+                            tx_bytes: 0,
+                            status: ConnectionStatus::Blocked,
+                            started_at: Utc::now(),
+                        },
+                        false,
+                    );
+                    NftablesInterceptor::reset_and_close_tcp_stream(client);
+                    return Ok(());
+                }
+
+                let route_label = self.format_action_label(&eval_action);
+                let mut outbound = match self
+                    .open_outbound_stream(&eval_action, &target_host, target_port)
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        self.telemetry.push_log(
+                            LogLevel::Error,
+                            COMPONENT_TRANSPARENT,
+                            format!(
+                                "Failed upstream connect for PID={} process=\"{}\" exe=\"{}\" -> {}:{}: {}",
+                                pid, proc_name, proc_path, target_host, target_port, err
+                            ),
+                        );
+                        return Err(err);
+                    }
+                };
+
                 self.telemetry.push_log(
-                    LogLevel::Error,
+                    LogLevel::Info,
                     COMPONENT_TRANSPARENT,
                     format!(
-                        "Failed upstream connect for PID={} process=\"{}\" exe=\"{}\" -> {}:{}: {}",
-                        session.pid,
-                        session.process_name,
-                        session.process_path,
+                        "Routed PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} via {} [rule=\"{}\"]",
+                        pid,
+                        proc_name,
+                        proc_path,
+                        res_source,
                         target_host,
                         target_port,
-                        err
+                        route_label,
+                        matched_rule_name
                     ),
                 );
-                self.nat_table
-                    .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
-                return Err(err);
-            }
-        };
 
+                let conn_id = Uuid::new_v4().to_string();
+                let is_proxied = !matches!(eval_action, RuleAction::Direct);
+                let tracked = TrackedConnection {
+                    id: conn_id.clone(),
+                    pid,
+                    process_name: proc_name,
+                    process_path: proc_path,
+                    target_host,
+                    resolved_domain: None,
+                    target_port,
+                    protocol: TransportProtocol::Tcp,
+                    matched_rule: matched_rule_name,
+                    route_label,
+                    latency_ms: 10,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    status: ConnectionStatus::Active,
+                    started_at: Utc::now(),
+                };
+                self.telemetry.record_connection(tracked, is_proxied);
+
+                if let Ok((tx, rx)) =
+                    tokio::io::copy_bidirectional(&mut client, &mut outbound).await
+                {
+                    self.telemetry.update_connection_traffic(&conn_id, rx, tx);
+                }
+                self.telemetry.mark_connection_closed(&conn_id);
+                return Ok(());
+            }
+        }
+
+        let _ = client.shutdown().await;
         self.telemetry.push_log(
-            LogLevel::Info,
+            LogLevel::Warn,
             COMPONENT_TRANSPARENT,
             format!(
-                "Routed PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} via {} [rule=\"{}\"]",
-                session.pid,
-                session.process_name,
-                session.process_path,
-                session.resolution_source.as_str(),
-                target_host,
-                target_port,
-                route_label,
-                session.matched_rule_name
+                "Rejected unauthorized connection on transparent relay from {peer_addr}: no matching live NAT session"
             ),
         );
-
-        let conn_id = Uuid::new_v4().to_string();
-        let tracked = TrackedConnection {
-            id: conn_id.clone(),
-            pid: session.pid,
-            process_name: session.process_name,
-            process_path: session.process_path,
-            target_host,
-            resolved_domain: None,
-            target_port,
-            protocol: TransportProtocol::Tcp,
-            matched_rule: session.matched_rule_name,
-            route_label,
-            latency_ms: 10,
-            rx_bytes: 0,
-            tx_bytes: 0,
-            status: ConnectionStatus::Active,
-            started_at: Utc::now(),
-        };
-        self.telemetry.record_connection(tracked, true);
-
-        if let Ok((tx, rx)) = tokio::io::copy_bidirectional(&mut client, &mut outbound).await {
-            self.telemetry.update_connection_traffic(&conn_id, rx, tx);
-        }
-        self.telemetry.mark_connection_closed(&conn_id);
-        self.nat_table
-            .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
-
         Ok(())
     }
 
@@ -782,7 +1011,9 @@ impl RouteWardController {
         match action {
             RuleAction::Direct => {
                 let addr = format!("{target_host}:{target_port}");
-                TcpStream::connect(&addr).await.map_err(RouteWardError::Io)
+                ProxyConnector::connect_tcp_marked(&addr, self.constants.network.linux_fwmark)
+                    .await
+                    .map_err(RouteWardError::Io)
             }
             RuleAction::Proxy { target_id } => {
                 let node = {
@@ -864,7 +1095,7 @@ impl RouteWardController {
         }
         #[cfg(target_os = "linux")]
         {
-            std::env::var("USER").map(|u| u == "root").unwrap_or(false)
+            unsafe { libc::geteuid() == 0 }
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {

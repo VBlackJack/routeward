@@ -11,7 +11,10 @@
   "securityPolicy": {
     "killSwitchEnabled": true,
     "blockUdpOnTcpOnlyProxy": true,
-    "strictDnsNoLocalFallback": true
+    "strictDnsNoLocalFallback": true,
+    "unknownProcessAction": {
+      "type": "direct"
+    }
   },
   "defaultAction": {
     "type": "direct"

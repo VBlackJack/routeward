@@ -574,6 +574,9 @@
       },
       "rule_eval": {
         "matched": "Évaluation de la règle terminée"
+      },
+      "cleanup": {
+        "completed": "Nettoyage des règles d'interception terminé"
       }
     }
   },
@@ -595,7 +598,10 @@
     },
     "interceptor": {
       "driver_missing": "Bibliothèque ou pilote WinDivert introuvable (exécutez tools/fetch-windivert.ps1)",
-      "open_failed": "Impossible d'ouvrir le filtre noyau WinDivert (droits Administrateur requis)"
+      "open_failed": "Impossible d'ouvrir le filtre noyau WinDivert (droits Administrateur requis)",
+      "not_root": "Privilèges root requis sous Linux pour l'interception nftables (EUID != 0)",
+      "nft_missing": "Binaire nftables (nft) introuvable sur le système",
+      "nft_failed": "Échec de l'exécution de la commande nftables"
     }
   },
   "themeforge": {

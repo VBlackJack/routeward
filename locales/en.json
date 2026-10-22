@@ -574,6 +574,9 @@
       },
       "rule_eval": {
         "matched": "Rule evaluation completed"
+      },
+      "cleanup": {
+        "completed": "Interception rules cleanup completed"
       }
     }
   },
@@ -595,7 +598,10 @@
     },
     "interceptor": {
       "driver_missing": "WinDivert library or driver not found (run tools/fetch-windivert.ps1)",
-      "open_failed": "Failed to open WinDivert kernel filter (Administrator privileges required)"
+      "open_failed": "Failed to open WinDivert kernel filter (Administrator privileges required)",
+      "not_root": "Root privileges required on Linux for nftables interception (EUID != 0)",
+      "nft_missing": "nftables binary (nft) was not found on the system",
+      "nft_failed": "Failed to execute nftables command"
     }
   },
   "themeforge": {

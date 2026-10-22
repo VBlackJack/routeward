@@ -18,7 +18,11 @@
     "windivertDllPaths": [
       "WinDivert.dll",
       "third_party/windivert/bin/WinDivert.dll"
-    ]
+    ],
+    "linuxFwmark": 21079,
+    "linuxNftBinary": "nft",
+    "linuxNftTableName": "routeward",
+    "linuxNftChainName": "output"
   },
   "dns": {
     "fakeIpCidr": "198.18.0.0/15",

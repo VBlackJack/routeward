@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-use crate::error::{
-    RouteWardError, RouteWardResult, ERR_KEY_INTERCEPTOR_DRIVER, ERR_KEY_INTERCEPTOR_OPEN,
-};
+#[cfg(windows)]
+use crate::error::ERR_KEY_INTERCEPTOR_OPEN;
+use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_INTERCEPTOR_DRIVER};
 use crate::interceptor::backend::Interceptor;
 use crate::interceptor::RouteWardController;
 use parking_lot::Mutex;
@@ -73,9 +73,7 @@ const SOCKET_FILTER_TCP_OUTBOUND: &str = "outbound and !loopback and tcp";
 const NETWORK_FILTER_IPV4_TCP_OUTBOUND: &str = "outbound and !loopback and ip and tcp";
 #[cfg(windows)]
 const PACKET_BUFFER_SIZE: usize = 65535;
-#[cfg(windows)]
 const BIT_OUTBOUND: u64 = 1 << 17;
-#[cfg(windows)]
 const BIT_IMPOSTOR: u64 = 1 << 19;
 
 /// Binary-compatible representation of WinDivert 2.2 `WINDIVERT_ADDRESS` (80 bytes).
@@ -295,7 +293,7 @@ impl WinDivertInterceptor {
     }
 
     #[cfg(windows)]
-    fn remove_scoped_firewall_rule(rule_name: &str, telemetry: &TelemetryHub) {
+    pub(crate) fn remove_scoped_firewall_rule(rule_name: &str, telemetry: &TelemetryHub) {
         let name_arg = format!("name={rule_name}");
         match Command::new("netsh")
             .args(["advfirewall", "firewall", "delete", "rule", &name_arg])

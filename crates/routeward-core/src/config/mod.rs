@@ -93,6 +93,30 @@ pub struct NetworkConstants {
     pub pending_syn_timeout_ms: u64,
     pub windivert_priority: i16,
     pub windivert_dll_paths: Vec<String>,
+    #[serde(default = "default_linux_fwmark")]
+    pub linux_fwmark: u32,
+    #[serde(default = "default_linux_nft_binary")]
+    pub linux_nft_binary: String,
+    #[serde(default = "default_linux_nft_table_name")]
+    pub linux_nft_table_name: String,
+    #[serde(default = "default_linux_nft_chain_name")]
+    pub linux_nft_chain_name: String,
+}
+
+fn default_linux_fwmark() -> u32 {
+    0x5257
+}
+
+fn default_linux_nft_binary() -> String {
+    "nft".to_string()
+}
+
+fn default_linux_nft_table_name() -> String {
+    "routeward".to_string()
+}
+
+fn default_linux_nft_chain_name() -> String {
+    "output".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +257,12 @@ pub struct SecurityPolicyConfig {
     pub kill_switch_enabled: bool,
     pub block_udp_on_tcp_only_proxy: bool,
     pub strict_dns_no_local_fallback: bool,
+    #[serde(default = "default_unknown_process_action")]
+    pub unknown_process_action: RuleAction,
+}
+
+fn default_unknown_process_action() -> RuleAction {
+    RuleAction::Direct
 }
 
 impl Default for SecurityPolicyConfig {
@@ -241,6 +271,7 @@ impl Default for SecurityPolicyConfig {
             kill_switch_enabled: true,
             block_udp_on_tcp_only_proxy: true,
             strict_dns_no_local_fallback: true,
+            unknown_process_action: RuleAction::Direct,
         }
     }
 }

@@ -27,6 +27,9 @@ pub const ERR_KEY_INVALID_URI: &str = "errors.proxy.invalid_uri";
 pub const ERR_KEY_RULE_BLOCKED: &str = "errors.rule.blocked_by_policy";
 pub const ERR_KEY_INTERCEPTOR_DRIVER: &str = "errors.interceptor.driver_missing";
 pub const ERR_KEY_INTERCEPTOR_OPEN: &str = "errors.interceptor.open_failed";
+pub const ERR_KEY_INTERCEPTOR_NOT_ROOT: &str = "errors.interceptor.not_root";
+pub const ERR_KEY_INTERCEPTOR_NFT_MISSING: &str = "errors.interceptor.nft_missing";
+pub const ERR_KEY_INTERCEPTOR_NFT_FAILED: &str = "errors.interceptor.nft_failed";
 
 #[derive(Debug, Error)]
 pub enum RouteWardError {
