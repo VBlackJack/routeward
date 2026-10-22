@@ -34,13 +34,23 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $OutputDirectory = Join-Path -Path $PSScriptRoot -ChildPath '..\third_party\windivert\bin'
+    $leafName = Split-Path -Path $PSScriptRoot -Leaf
+    if ($leafName -ieq 'tools') {
+        $OutputDirectory = Join-Path -Path $PSScriptRoot -ChildPath '..\third_party\windivert\bin'
+    } else {
+        $OutputDirectory = Join-Path -Path $PSScriptRoot -ChildPath 'third_party\windivert\bin'
+    }
 }
+
 $resolvedOutputDir = [System.IO.Path]::GetFullPath($OutputDirectory)
-$tempZipPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'WinDivert-2.2.2-A.zip'
-$tempExtractDir = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'WinDivert-2.2.2-A-Extract'
+$tempZipPath = Join-Path -Path $resolvedOutputDir -ChildPath 'WinDivert-2.2.2-A.zip'
+$tempExtractDir = Join-Path -Path $resolvedOutputDir -ChildPath '_extract_tmp'
 
 if ($PSCmdlet.ShouldProcess($resolvedOutputDir, "Download WinDivert 2.2.2-A from $DownloadUrl and extract x64 binaries")) {
+    if (-not (Test-Path -LiteralPath $resolvedOutputDir)) {
+        New-Item -ItemType Directory -Path $resolvedOutputDir -Force | Out-Null
+    }
+
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     Write-Output "Downloading WinDivert archive from $DownloadUrl ..."
@@ -51,7 +61,7 @@ if ($PSCmdlet.ShouldProcess($resolvedOutputDir, "Download WinDivert 2.2.2-A from
     $expectedHashNormalized = $ExpectedSha256.ToLowerInvariant()
 
     if ($actualHash -ne $expectedHashNormalized) {
-        Remove-Item -Path $tempZipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tempZipPath -Force -ErrorAction SilentlyContinue
         throw "SHA-256 verification failed for $tempZipPath. Expected: $expectedHashNormalized, Actual: $actualHash"
     }
 
@@ -59,9 +69,6 @@ if ($PSCmdlet.ShouldProcess($resolvedOutputDir, "Download WinDivert 2.2.2-A from
 
     if (Test-Path -LiteralPath $tempExtractDir) {
         Remove-Item -LiteralPath $tempExtractDir -Recurse -Force
-    }
-    if (-not (Test-Path -LiteralPath $resolvedOutputDir)) {
-        New-Item -ItemType Directory -Path $resolvedOutputDir -Force | Out-Null
     }
 
     Expand-Archive -LiteralPath $tempZipPath -DestinationPath $tempExtractDir -Force
