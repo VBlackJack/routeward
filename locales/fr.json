@@ -1,0 +1,687 @@
+{
+  "app": {
+    "titlebar": {
+      "minimize": "Réduire",
+      "maximize": "Agrandir / Restaurer",
+      "close": "Fermer",
+      "native_badge": "Bureau Natif"
+    },
+    "launcher": {
+      "button": "Lancer App via Proxy",
+      "modal": {
+        "title": "Lancer un Exécutable via RouteWard",
+        "subtitle": "Démarre un programme cible avec injection automatique des variables d'environnement ALL_PROXY, HTTP_PROXY et HTTPS_PROXY vers le relais local.",
+        "executable_label": "Chemin ou Nom de l'Exécutable",
+        "executable_placeholder": "ex. curl.exe, firefox.exe ou C:\\Program Files\\App\\app.exe",
+        "args_label": "Arguments de ligne de commande (Optionnel)",
+        "args_placeholder": "ex. https://api.ipify.org?format=json",
+        "submit": "Lancer avec RouteWard",
+        "cancel": "Annuler"
+      }
+    },
+    "system_proxy": {
+      "active": "Proxy Système Actif",
+      "inactive": "Proxy Système Off",
+      "tooltip": "Activer / Désactiver le Proxy Système Windows (127.0.0.1:10809)"
+    },
+    "experience_mode": {
+      "simple": "Mode Simple",
+      "expert": "Mode Expert",
+      "tooltip": "Basculer entre l'interface simplifiée guidée (Débutant) et la vue ingénieur complète (SysAdmin)"
+    },
+    "help": {
+      "wizard_button": "Assistant de Démarrage",
+      "glossary_button": "Lexique & Aide",
+      "what_is_this": "À quoi ça sert ?"
+    },
+    "header": {
+      "brand": {
+        "title": "RouteWard",
+        "subtitle": "Intercepteur Réseau par Processus Multi-Plateforme"
+      },
+      "engine": {
+        "running": "Intercepteur Actif",
+        "stopped": "Intercepteur en Pause",
+        "toggle_start": "Démarrer le Moteur",
+        "toggle_stop": "Arrêter le Moteur"
+      },
+      "mode": {
+        "hybrid": "Hybride (Fake-IP + Pilote/Relais)",
+        "driver": "Pilote Noyau (WinDivert / eBPF)",
+        "relay": "Relais Local Espace Utilisateur"
+      },
+      "language": {
+        "switch": "Changer de langue",
+        "en": "English",
+        "fr": "Français"
+      },
+      "profile": {
+        "import": "Importer un Profil",
+        "export": "Exporter le Profil",
+        "save": "Enregistrer"
+      },
+      "theme": {
+        "button": "ThemeForge"
+      },
+      "command_palette": {
+        "button": "Palette de Commandes",
+        "shortcut": "Ctrl+K"
+      }
+    },
+    "nav": {
+      "dashboard": {
+        "tab": "Tableau de Bord"
+      },
+      "connections": {
+        "tab": "Connexions Temps Réel"
+      },
+      "proxies": {
+        "tab": "Proxies & Chaînes"
+      },
+      "rules": {
+        "tab": "Règles de Routage"
+      },
+      "dns": {
+        "tab": "DNS Fake-IP"
+      },
+      "logs": {
+        "tab": "Journaux d'Événements"
+      }
+    },
+    "statusbar": {
+      "relay": {
+        "label": "Relais SOCKS5"
+      },
+      "dns": {
+        "label": "Pool Fake-IP"
+      },
+      "killswitch": {
+        "active": "Kill-Switch Armé",
+        "inactive": "Kill-Switch Désactivé"
+      },
+      "shortcut": {
+        "hint": "Appuyez sur Ctrl+K pour les commandes rapides"
+      }
+    },
+    "toast": {
+      "rule": {
+        "created": "Règle de routage créée et appliquée immédiatement",
+        "updated": "Règle de routage mise à jour",
+        "deleted": "Règle de routage supprimée"
+      },
+      "proxy": {
+        "added": "Serveur proxy ajouté au profil",
+        "imported_uris": "Serveurs proxies importés depuis la liste d'URI",
+        "copied_uri": "URI du proxy copiée dans le presse-papiers",
+        "tested": "Test de latence et de santé du proxy terminé"
+      },
+      "connection": {
+        "terminated": "Socket de connexion terminé",
+        "os_scanned": "Sockets TCP réels du système analysés et importés"
+      },
+      "system": {
+        "proxy_enabled": "Proxy Système Windows activé sur le relais local",
+        "proxy_disabled": "Proxy Système Windows désactivé",
+        "process_launched": "Processus démarré avec injection proxy"
+      },
+      "wizard": {
+        "completed": "Configuration appliquée avec succès via l'Assistant"
+      },
+      "dns": {
+        "flushed": "Cache DNS Fake-IP purgé"
+      },
+      "profile": {
+        "imported": "Profil de configuration importé",
+        "exported": "Profil exporté au format JSON"
+      }
+    }
+  },
+  "command_palette": {
+    "modal": {
+      "search_placeholder": "Rechercher une commande, une vue, une règle, un proxy ou un thème (Échap pour fermer)...",
+      "empty": "Aucune commande ou ressource correspondante.",
+      "group_navigation": "Navigation Rapide",
+      "group_actions": "Actions du Moteur",
+      "group_themes": "Palettes ThemeForge"
+    },
+    "actions": {
+      "toggle_engine": "Démarrer / Mettre en pause le moteur d'interception",
+      "test_all_proxies": "Tester la latence et l'IP de sortie de tous les proxies",
+      "simulate_traffic": "Simuler une connexion réseau de processus",
+      "flush_dns": "Vider le cache DNS anti-fuite Fake-IP",
+      "toggle_killswitch": "Activer / Désactiver le Kill-Switch strict",
+      "open_themeforge": "Ouvrir ThemeForge Studio",
+      "switch_language": "Basculer la langue de l'interface (FR / EN)"
+    }
+  },
+  "dashboard": {
+    "health_banner": {
+      "protected_title": "Tout fonctionne - Votre connexion est protégée",
+      "protected_desc": "RouteWard intercepte automatiquement le trafic de vos applications selon vos règles et empêche toute fuite d'adresse IP ou de DNS.",
+      "paused_title": "Protection en pause - Vos applications se connectent en direct",
+      "paused_desc": "Le moteur d'interception est actuellement arrêté. Cliquez sur \"Démarrer\" pour réactiver le routage via votre proxy.",
+      "quick_wizard_cta": "Configuration Guidée en 3 Clics",
+      "choose_apps_cta": "Choisir mes Applications",
+      "switch_expert_cta": "Voir les Diagnostics Avancés (Expert)",
+      "status_badge_ok": "Bouclier Actif",
+      "status_badge_off": "Inactif"
+    },
+    "tooltips": {
+      "active_connections": "Nombre de programmes sur votre ordinateur qui échangent actuellement des données avec Internet.",
+      "download_speed": "Vitesse à laquelle vous recevez des données (pages web, vidéos, téléchargements).",
+      "upload_speed": "Vitesse à laquelle votre ordinateur envoie des données vers Internet.",
+      "dns_mappings": "Le DNS traduit les noms de sites (ex. google.com) en adresses IP. Le mode Fake-IP empêche votre fournisseur d'accès de voir quels sites vous visitez.",
+      "killswitch": "Coupe immédiatement Internet pour les applications protégées si votre serveur proxy tombe en panne, afin que votre vraie adresse IP ne soit jamais révélée par accident.",
+      "udp_guard": "Certains jeux ou appels vidéo utilisent le protocole UDP. Si votre proxy ne gère que le TCP, cette option bloque l'UDP pour éviter une fuite d'IP.",
+      "dns_guard": "Force les recherches de noms de domaine à passer à l'intérieur du tunnel proxy chiffré plutôt que par la box Internet locale."
+    },
+    "kpi": {
+      "active_connections": {
+        "label": "Connexions Actives",
+        "subtext": "Sockets de processus suivis simultanément"
+      },
+      "download_speed": {
+        "label": "Débit Descendant",
+        "subtext": "Bande passante entrante totale"
+      },
+      "upload_speed": {
+        "label": "Débit Montant",
+        "subtext": "Bande passante sortante totale"
+      },
+      "dns_mappings": {
+        "label": "Cache DNS Fake-IP",
+        "subtext": "Associations de domaines anti-fuite actives"
+      }
+    },
+    "chart": {
+      "bandwidth": {
+        "title": "Débit Réseau en Temps Réel",
+        "download": "Entrant (RX)",
+        "upload": "Sortant (TX)",
+        "empty": "En attente d'activité réseau..."
+      },
+      "distribution": {
+        "title": "Répartition des Actions",
+        "proxied": "Via Proxy",
+        "direct": "Direct",
+        "blocked": "Bloqué"
+      }
+    },
+    "top_talkers": {
+      "panel": {
+        "title": "Processus les Plus Actifs (Top-Talkers)",
+        "subtitle": "Consommation réseau et sockets actifs par exécutable",
+        "sockets": "sockets",
+        "empty": "Aucun trafic de processus enregistré."
+      }
+    },
+    "security_shield": {
+      "panel": {
+        "title": "Bouclier de Confidentialité & Anti-Fuite",
+        "subtitle": "Politiques de sécurité zéro-fuite",
+        "killswitch_title": "Kill-Switch Proxy Strict",
+        "killswitch_desc": "Bloque le trafic sortant si le proxy ou la chaîne cible est injoignable",
+        "udp_guard_title": "Protection Anti-Fuite UDP",
+        "udp_guard_desc": "Bloque les paquets UDP non supportés sur les proxies TCP uniquement",
+        "dns_guard_title": "Résolution DNS Distante via Fake-IP",
+        "dns_guard_desc": "Intercepte les requêtes DNS vers 198.18.0.0/15 et résout côté proxy"
+      }
+    },
+    "system": {
+      "status": {
+        "title": "Diagnostics des Sous-Systèmes",
+        "os_label": "Système d'Exploitation",
+        "driver_label": "Moteur d'Interception",
+        "relay_tcp_label": "Relais Local SOCKS5/TCP",
+        "relay_http_label": "Relais Local HTTP",
+        "dns_server_label": "Écouteur DNS Fake-IP",
+        "admin_elevated": "Privilèges Élevés (Hooks Noyau Prêts)",
+        "admin_standard": "Utilisateur Standard (Relais Local Actif)"
+      }
+    }
+  },
+  "connections": {
+    "toolbar": {
+      "search": {
+        "placeholder": "Filtrer par processus, domaine, IP, règle ou proxy..."
+      },
+      "status_filter": {
+        "all": "Tous les états",
+        "active": "Actifs",
+        "blocked": "Bloqués",
+        "closed": "Fermés"
+      },
+      "simulate": {
+        "button": "Simuler une Connexion"
+      },
+      "scan_os": {
+        "button": "Scanner Sockets OS Réels"
+      },
+      "clear": {
+        "button": "Purger les Fermées"
+      }
+    },
+    "table": {
+      "process": {
+        "header": "Processus (PID)"
+      },
+      "target": {
+        "header": "Destination (Domaine / Fake-IP)"
+      },
+      "protocol": {
+        "header": "Proto"
+      },
+      "rule": {
+        "header": "Règle Appliquée"
+      },
+      "route": {
+        "header": "Route / Proxy"
+      },
+      "latency": {
+        "header": "Latence"
+      },
+      "traffic": {
+        "header": "RX / TX"
+      },
+      "status": {
+        "header": "État",
+        "active": "ACTIF",
+        "closed": "FERMÉ",
+        "blocked": "BLOQUÉ"
+      },
+      "empty": {
+        "message": "Aucune connexion ne correspond au filtre actuel."
+      }
+    },
+    "inspector": {
+      "drawer": {
+        "title": "Inspecteur de Socket & Connexion",
+        "subtitle": "Créez une règle de routage instantanée en 1 clic à partir de ce processus ou domaine",
+        "process_section": "Attribution du Processus Système",
+        "pid_label": "Identifiant PID",
+        "executable_label": "Exécutable",
+        "path_label": "Chemin Complet",
+        "destination_section": "Destination & DNS Anti-Fuite",
+        "remote_endpoint": "Hôte Distant",
+        "resolved_domain": "Domaine Original (Fake-IP)",
+        "routing_section": "Routage Appliqué & Télémétrie",
+        "matched_rule": "Règle Appliquée",
+        "upstream_route": "Tunnel / Route",
+        "quick_actions_title": "Création de Règle en 1 Clic & Contrôle Socket",
+        "route_process_proxy": "Router ce Processus via Proxy",
+        "route_process_direct": "Exempter ce Processus (DIRECT)",
+        "block_process": "Bloquer cet Exécutable",
+        "block_domain": "Bloquer ce Domaine Cible",
+        "terminate_socket": "Fermer la Connexion Active",
+        "close": "Fermer l'Inspecteur"
+      }
+    }
+  },
+  "proxies": {
+    "section": {
+      "servers": {
+        "title": "Serveurs Proxy en Amont",
+        "add": "Ajouter un Serveur Proxy",
+        "import_uri": "Importer URI (socks5://, http://, https://)",
+        "test_all": "Tester Tous les Proxies"
+      },
+      "chains": {
+        "title": "Chaînes Multi-Sauts & Groupes Intelligents",
+        "subtitle": "Encapsulation séquentielle (Multi-Hop) ou bascule automatique (Failover / Latence Minimale)",
+        "add": "Créer une Chaîne / Groupe",
+        "hops": "Noeuds"
+      }
+    },
+    "strategy": {
+      "mode": {
+        "sequence": "Séquence Multi-Sauts (Entrée -> Sortie)",
+        "failover": "Bascule Haute-Disponibilité (Failover)",
+        "lowest_latency": "Latence Minimale Automatique (Auto-RTT)",
+        "load_balance": "Répartition de Charge (Round-Robin)"
+      }
+    },
+    "card": {
+      "action": {
+        "test": "Tester Latence & UDP",
+        "testing": "Test en cours...",
+        "copy_uri": "Copier l'URI",
+        "delete": "Supprimer",
+        "toggle": "Activer / Désactiver"
+      },
+      "badge": {
+        "udp_ready": "Support UDP",
+        "tcp_only": "TCP Uniquement",
+        "tls_enabled": "TLS",
+        "untested": "Non testé",
+        "online": "En ligne",
+        "offline": "Injoignable",
+        "exit_ip": "IP de sortie"
+      }
+    },
+    "modal": {
+      "add_proxy": {
+        "title": "Configurer un Serveur Proxy",
+        "name_label": "Nom d'affichage",
+        "protocol_label": "Protocole",
+        "host_label": "Hôte / Adresse IP",
+        "port_label": "Port",
+        "username_label": "Identifiant (Optionnel)",
+        "password_label": "Mot de passe (Optionnel)",
+        "sni_label": "Nom d'hôte SNI TLS",
+        "udp_label": "Activer UDP Associate",
+        "tls_label": "Activer le transport TLS",
+        "submit": "Enregistrer le Proxy",
+        "cancel": "Annuler"
+      },
+      "import_uri": {
+        "title": "Import en Lot de Proxies (URI ou Abonnement Base64)",
+        "subtitle": "Collez des URI de proxy (socks5://, http://, https://) ou une charge d'abonnement encodée en Base64",
+        "placeholder": "socks5://user:pass@127.0.0.1:1080#LocalSocks\nhttps://user:pass@edge.example.com:443?sni=edge.example.com#EdgeHttps",
+        "submit": "Importer les Proxies",
+        "cancel": "Annuler"
+      },
+      "add_chain": {
+        "title": "Construire une Chaîne ou un Groupe Intelligent",
+        "name_label": "Nom de la chaîne / du groupe",
+        "strategy_label": "Stratégie de Routage",
+        "select_hop": "Ajouter un noeud proxy",
+        "sequence_label": "Noeuds sélectionnés",
+        "submit": "Enregistrer la Chaîne",
+        "cancel": "Annuler"
+      }
+    }
+  },
+  "rules": {
+    "header": {
+      "title": "Règles de Routage par Processus et Destination",
+      "subtitle": "Les règles sont évaluées par ordre de priorité croissant. La première correspondance s'applique.",
+      "add_button": "Nouvelle Règle",
+      "presets_button": "Modèles de Règles en 1 Clic"
+    },
+    "presets": {
+      "dev_toolchains": {
+        "name": "Outils de Développement (git, cargo, npm, docker)",
+        "desc": "Route les outils CLI et dépôts de paquets via votre proxy principal"
+      },
+      "privacy_browsers": {
+        "name": "Navigateurs Web via Chaîne Furtive",
+        "desc": "Route le trafic HTTP/HTTPS de Firefox, Brave, Chrome et Edge via une chaîne multi-sauts"
+      },
+      "block_telemetry": {
+        "name": "Bloquer la Télémétrie OS & Applications",
+        "desc": "Bloque les processus de télémétrie en arrière-plan et les domaines d'analyse"
+      },
+      "rfc1918_direct": {
+        "name": "Exempter le Réseau Local & RFC 1918 (DIRECT)",
+        "desc": "Garantit un accès direct aux sous-réseaux privés (127.0.0.0/8, 192.168.0.0/16, 10.0.0.0/8, *.local)"
+      }
+    },
+    "visual_apps": {
+      "section_title": "Mes Applications - Routage Visuel en 1 Clic",
+      "section_subtitle": "Choisissez comment chaque catégorie d'application doit se connecter à Internet, sans avoir à connaître les noms de fichiers .exe ou les ports.",
+      "action_proxy": "Protéger via Proxy",
+      "action_direct": "Connexion Directe (Normal)",
+      "action_block": "Bloquer Internet",
+      "browsers": {
+        "name": "Navigateurs Web",
+        "desc": "Firefox, Chrome, Brave, Edge, Opera, Vivaldi"
+      },
+      "messaging": {
+        "name": "Messageries & VoIP",
+        "desc": "Discord, Telegram, Signal, Slack"
+      },
+      "gaming": {
+        "name": "Jeux & Lanceurs",
+        "desc": "Steam, Epic Games, Battle.net, Minecraft"
+      },
+      "dev": {
+        "name": "Outils Développeur & IA",
+        "desc": "VS Code, Git, Cargo, Node.js, Python, Docker"
+      },
+      "media": {
+        "name": "Musique, Vidéo & Streaming",
+        "desc": "Spotify, VLC, OBS Studio"
+      },
+      "telemetry": {
+        "name": "Télémétrie & Espions OS",
+        "desc": "Rapports de diagnostic Windows et collecteurs de crash"
+      }
+    },
+    "simulator": {
+      "title": "Testeur d'Évaluation de Règles en Direct",
+      "process_placeholder": "Exécutable (ex. firefox.exe ou /usr/bin/curl)",
+      "host_placeholder": "Hôte ou IP cible (ex. api.github.com ou 10.0.0.5)",
+      "port_placeholder": "Port (ex. 443)",
+      "test_button": "Évaluer la Règle",
+      "matched_rule": "Règle Retenue",
+      "resulting_action": "Action",
+      "fake_ip_resolved": "Résolu depuis Fake-IP"
+    },
+    "table": {
+      "enabled": {
+        "header": "Actif"
+      },
+      "priority": {
+        "header": "Priorité"
+      },
+      "name": {
+        "header": "Nom de la Règle"
+      },
+      "processes": {
+        "header": "Processus",
+        "any": "Tous les processus"
+      },
+      "targets": {
+        "header": "Domaines / CIDR",
+        "any": "Toutes les destinations"
+      },
+      "ports": {
+        "header": "Ports",
+        "any": "Tous les ports"
+      },
+      "action": {
+        "header": "Action",
+        "direct": "DIRECT",
+        "block": "BLOQUER",
+        "proxy": "PROXY",
+        "chain": "CHAÎNE"
+      },
+      "controls": {
+        "header": "Ordre & Actions",
+        "move_up": "Monter la priorité",
+        "move_down": "Descendre la priorité",
+        "delete": "Supprimer"
+      }
+    },
+    "modal": {
+      "add": {
+        "title": "Nouvelle Règle de Routage",
+        "name_label": "Nom de la règle",
+        "priority_label": "Priorité (Plus petit exécuté en premier)",
+        "processes_label": "Noms d'exécutables / Globs (séparés par virgule)",
+        "domains_label": "Masques de domaines (séparés par virgule, ex. *.example.com)",
+        "cidrs_label": "Sous-réseaux IP / CIDR (séparés par virgule, ex. 192.168.0.0/16)",
+        "ports_label": "Port ou Plage (ex. 80, 443, 8000-9000)",
+        "protocol_label": "Protocole",
+        "action_type_label": "Action de Routage",
+        "action_target_label": "Proxy ou Chaîne Cible",
+        "submit": "Enregistrer la Règle",
+        "cancel": "Annuler"
+      }
+    }
+  },
+  "dns": {
+    "header": {
+      "title": "Moteur DNS Anti-Fuite Fake-IP",
+      "subtitle": "Associe les requêtes DNS à des IP virtuelles RFC 2544 (198.18.0.0/15) pour éviter toute fuite DNS locale et conserver le nom de domaine exact.",
+      "flush_button": "Vider le Cache Fake-IP",
+      "allocate_button": "Tester une Allocation"
+    },
+    "allocate": {
+      "placeholder": "Saisir un nom de domaine (ex. stealth.torproject.org)",
+      "submit": "Allouer Fake-IP"
+    },
+    "table": {
+      "fake_ip": {
+        "header": "Fake-IP Virtuelle"
+      },
+      "domain": {
+        "header": "Nom de Domaine Original"
+      },
+      "hits": {
+        "header": "Requêtes"
+      },
+      "expires": {
+        "header": "TTL Restant"
+      },
+      "empty": {
+        "message": "La table Fake-IP est actuellement vide."
+      }
+    }
+  },
+  "logs": {
+    "toolbar": {
+      "filter_all": "Tous les niveaux",
+      "filter_info": "INFO",
+      "filter_warn": "WARN",
+      "filter_error": "ERROR",
+      "clear": "Effacer le Journal"
+    },
+    "table": {
+      "timestamp": "Horodatage",
+      "level": "Niveau",
+      "component": "Sous-Système",
+      "message": "Description de l'événement",
+      "empty": "Aucun événement enregistré."
+    }
+  },
+  "cli": {
+    "engine": {
+      "startup": {
+        "banner": "Démarrage du moteur RouteWard",
+        "loaded_profile": "Profil de configuration chargé",
+        "listening_socks": "Relais transparent SOCKS5 en écoute",
+        "listening_http": "Relais HTTP CONNECT en écoute",
+        "ready": "Moteur d'interception actif. Appuyez sur Ctrl+C pour arrêter."
+      },
+      "check": {
+        "testing": "Test de connectivité du serveur proxy en amont",
+        "result_online": "Proxy joignable",
+        "result_offline": "Échec du test de connexion au proxy"
+      },
+      "rule_eval": {
+        "matched": "Évaluation de la règle terminée"
+      }
+    }
+  },
+  "errors": {
+    "config": {
+      "load_failed": "Impossible de charger le fichier de configuration",
+      "invalid_json": "Structure JSON invalide dans la configuration"
+    },
+    "proxy": {
+      "not_found": "L'identifiant de proxy spécifié est introuvable",
+      "chain_empty": "La chaîne de proxies doit contenir au moins un saut",
+      "handshake_failed": "Échec de la négociation protocolaire avec le proxy",
+      "connection_timeout": "Délai d'attente dépassé lors de la connexion au proxy",
+      "auth_rejected": "Le serveur proxy a rejeté les identifiants d'authentification",
+      "invalid_uri": "Format d'URI de proxy invalide"
+    },
+    "rule": {
+      "blocked_by_policy": "Connexion bloquée par une règle de routage"
+    }
+  },
+  "themeforge": {
+    "modal": {
+      "title": "ThemeForge Studio - Palette & Teinte d'Accent",
+      "subtitle": "Sélectionnez l'une des palettes canoniques Oklab de ThemeForge ou Contraste Élevé, ainsi qu'une teinte d'accent.",
+      "palette_label": "Palette de Thème",
+      "accent_label": "Teinte d'Accent",
+      "preview_label": "Aperçu des Jetons Sémantiques",
+      "import_palette": "Charger une Palette JSON ThemeForge v1",
+      "close": "Fermer"
+    },
+    "families": {
+      "Root": "Racine (Dracula / Drakul)",
+      "Dark": "Sombre (Oklab L* Uniforme)",
+      "Light": "Surfaces Claires",
+      "Alt": "Signature Alternative"
+    },
+    "accents": {
+      "Default": "Accent par défaut",
+      "Blue": "Bleu",
+      "Cyan": "Cyan",
+      "Green": "Vert",
+      "Orange": "Orange",
+      "Pink": "Rose",
+      "Purple": "Violet",
+      "Red": "Rouge",
+      "Yellow": "Jaune"
+    }
+  },
+  "wizard": {
+    "modal": {
+      "title": "Assistant de Configuration Rapide",
+      "subtitle": "Configurez RouteWard en 3 étapes simples, même sans connaissances réseau.",
+      "step_indicator": "Étape",
+      "step1_title": "1. Quel est votre objectif principal ?",
+      "step1_privacy_title": "Confidentialité & Navigation Anonyme",
+      "step1_privacy_desc": "Masquer mon adresse IP sur mes navigateurs et messageries tout en bloquant les pisteurs.",
+      "step1_work_title": "Télétravail & Outils de Développement",
+      "step1_work_desc": "Passer mes outils (Git, VS Code, Terminal, Navigateur) par un proxy d'entreprise ou SSH.",
+      "step1_gaming_title": "Jeux en Ligne & Performances",
+      "step1_gaming_desc": "Laisser mes jeux en connexion directe ultra-rapide et router uniquement Discord/Navigateur.",
+      "step2_title": "2. Quel serveur Proxy souhaitez-vous utiliser ?",
+      "step2_use_existing": "Utiliser le serveur proxy configuré par défaut",
+      "step2_paste_uri": "Ou collez un lien de connexion (socks5://, http://, https:// ou abonnement Base64) :",
+      "step2_uri_placeholder": "socks5://127.0.0.1:1080#MonProxy",
+      "step3_title": "3. Niveau d'interface préféré",
+      "step3_simple_title": "Mode Simple (Recommandé pour débuter)",
+      "step3_simple_desc": "Explications claires, sélecteur d'applications par icônes et diagnostic visuel rassurant.",
+      "step3_expert_title": "Mode Expert (SysAdmin Linux / Windows)",
+      "step3_expert_desc": "Accès complet aux tables de sockets PID, règles CIDR/Ports, Fake-IP RFC 2544 et journaux temps réel.",
+      "back": "Précédent",
+      "next": "Suivant",
+      "finish": "Appliquer ma Configuration"
+    }
+  },
+  "glossary": {
+    "modal": {
+      "title": "Comprendre RouteWard - Guide & Lexique",
+      "subtitle": "Explications simples des concepts réseau pour les débutants et rappels techniques pour les administrateurs.",
+      "close": "J'ai compris"
+    },
+    "items": {
+      "proxy": {
+        "term": "Serveur Proxy (SOCKS5 / HTTP / HTTPS)",
+        "simple": "Un serveur intermédiaire qui relaye votre connexion Internet. Les sites web voient l'adresse IP du proxy au lieu de la vôtre.",
+        "expert": "Tunnel de transport L4/L7 supportant l'encapsulation TCP, UDP Associate (RFC 1928) et HTTP CONNECT."
+      },
+      "chain": {
+        "term": "Chaîne de Proxies & Groupes Intelligents",
+        "simple": "Permet de traverser plusieurs proxies à la suite pour plus d'anonymat, ou de basculer automatiquement sur un proxy de secours si le premier est lent.",
+        "expert": "Chaînage multi-sauts séquentiel (Entry -> Exit), bascule haute-disponibilité (Failover) ou sélection dynamique par RTT minimal."
+      },
+      "fake_ip": {
+        "term": "DNS Anti-Fuite (Fake-IP 198.18.0.0/15)",
+        "simple": "Empêche votre fournisseur d'accès Internet de savoir quels sites vous consultez en attribuant une adresse virtuelle temporaire à chaque domaine.",
+        "expert": "Allocateur RFC 2544 bidirectionnel en mémoire qui intercepte les requêtes DNS et permet au moteur de règles de matcher le FQDN exact sur des flux TCP/UDP bruts."
+      },
+      "killswitch": {
+        "term": "Kill-Switch (Coupe-Circuit d'Urgence)",
+        "simple": "Un garde-fou qui bloque immédiatement Internet pour une application si le proxy se déconnecte, évitant que votre vraie IP ne fuite.",
+        "expert": "Politique d'abandon strict (DROP) lorsque le noeud en amont est injoignable ou lorsqu'un flux UDP tente de traverser un proxy TCP uniquement."
+      },
+      "rules": {
+        "term": "Règles de Routage par Application",
+        "simple": "Vos instructions : par exemple \"Firefox passe par le Proxy\", \"Steam se connecte en Direct\" et \"La télémétrie Windows est Bloquée\".",
+        "expert": "Moteur d'évaluation déterministe par priorité croissante supportant les globs d'exécutables, masques de domaines, sous-réseaux CIDR IPv4/IPv6 et plages de ports."
+      },
+      "system_proxy": {
+        "term": "Proxy Système vs Lanceur d'Application",
+        "simple": "Le \"Proxy Système\" configure tout Windows en 1 clic. Le \"Lanceur\" démarre uniquement un logiciel précis à travers le proxy.",
+        "expert": "Modification du registre HKCU Internet Settings ou injection ciblée des variables d'environnement ALL_PROXY / HTTP_PROXY / HTTPS_PROXY sur le processus enfant."
+      }
+    }
+  }
+}

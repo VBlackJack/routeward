@@ -1,0 +1,687 @@
+{
+  "app": {
+    "titlebar": {
+      "minimize": "Minimize",
+      "maximize": "Maximize / Restore",
+      "close": "Close",
+      "native_badge": "Native Desktop"
+    },
+    "launcher": {
+      "button": "Run App via Proxy",
+      "modal": {
+        "title": "Run Executable with RouteWard",
+        "subtitle": "Spawns a target program with ALL_PROXY, HTTP_PROXY, and HTTPS_PROXY environment variables automatically injected toward the local relay.",
+        "executable_label": "Executable Path or Binary Name",
+        "executable_placeholder": "e.g. curl.exe, firefox.exe, or C:\\Program Files\\App\\app.exe",
+        "args_label": "Command-Line Arguments (Optional)",
+        "args_placeholder": "e.g. https://api.ipify.org?format=json",
+        "submit": "Launch with RouteWard",
+        "cancel": "Cancel"
+      }
+    },
+    "system_proxy": {
+      "active": "System Proxy On",
+      "inactive": "System Proxy Off",
+      "tooltip": "Toggle Windows System Proxy Registry (127.0.0.1:10809)"
+    },
+    "experience_mode": {
+      "simple": "Simple Mode",
+      "expert": "Expert Mode",
+      "tooltip": "Switch between guided beginner interface and full SysAdmin engineering view"
+    },
+    "help": {
+      "wizard_button": "Quick Setup Wizard",
+      "glossary_button": "Glossary & Help",
+      "what_is_this": "What is this?"
+    },
+    "header": {
+      "brand": {
+        "title": "RouteWard",
+        "subtitle": "Cross-Platform Process Network Interceptor"
+      },
+      "engine": {
+        "running": "Interceptor Active",
+        "stopped": "Interceptor Paused",
+        "toggle_start": "Start Engine",
+        "toggle_stop": "Stop Engine"
+      },
+      "mode": {
+        "hybrid": "Hybrid (Fake-IP + Driver/Relay)",
+        "driver": "Kernel Driver (WinDivert / eBPF)",
+        "relay": "User-Space Local Relay"
+      },
+      "language": {
+        "switch": "Switch Language",
+        "en": "English",
+        "fr": "Français"
+      },
+      "profile": {
+        "import": "Import Profile",
+        "export": "Export Profile",
+        "save": "Save Profile"
+      },
+      "theme": {
+        "button": "ThemeForge"
+      },
+      "command_palette": {
+        "button": "Command Palette",
+        "shortcut": "Ctrl+K"
+      }
+    },
+    "nav": {
+      "dashboard": {
+        "tab": "Dashboard"
+      },
+      "connections": {
+        "tab": "Live Connections"
+      },
+      "proxies": {
+        "tab": "Proxies & Chains"
+      },
+      "rules": {
+        "tab": "Routing Rules"
+      },
+      "dns": {
+        "tab": "Fake-IP DNS"
+      },
+      "logs": {
+        "tab": "Event Logs"
+      }
+    },
+    "statusbar": {
+      "relay": {
+        "label": "SOCKS5 Relay"
+      },
+      "dns": {
+        "label": "Fake-IP Pool"
+      },
+      "killswitch": {
+        "active": "Kill-Switch Armed",
+        "inactive": "Kill-Switch Off"
+      },
+      "shortcut": {
+        "hint": "Press Ctrl+K for quick commands"
+      }
+    },
+    "toast": {
+      "rule": {
+        "created": "Routing rule created and applied immediately",
+        "updated": "Routing rule updated",
+        "deleted": "Routing rule removed"
+      },
+      "proxy": {
+        "added": "Upstream proxy added to profile",
+        "imported_uris": "Imported proxy servers from URI list",
+        "copied_uri": "Proxy URI copied to clipboard",
+        "tested": "Proxy health and latency check completed"
+      },
+      "connection": {
+        "terminated": "Connection socket terminated",
+        "os_scanned": "Scanned and ingested real established OS TCP sockets"
+      },
+      "system": {
+        "proxy_enabled": "Windows System Proxy enabled on local relay",
+        "proxy_disabled": "Windows System Proxy disabled",
+        "process_launched": "Process launched with injected proxy tunnel"
+      },
+      "wizard": {
+        "completed": "Configuration applied via Quick Setup Wizard"
+      },
+      "dns": {
+        "flushed": "Fake-IP DNS cache flushed"
+      },
+      "profile": {
+        "imported": "Profile configuration imported",
+        "exported": "Profile exported to JSON"
+      }
+    }
+  },
+  "command_palette": {
+    "modal": {
+      "search_placeholder": "Type a command, view, rule, proxy, or theme (Esc to close)...",
+      "empty": "No matching command or resource found.",
+      "group_navigation": "Navigation",
+      "group_actions": "Quick Engine Actions",
+      "group_themes": "ThemeForge Palettes"
+    },
+    "actions": {
+      "toggle_engine": "Toggle Interceptor Engine Start / Stop",
+      "test_all_proxies": "Probe All Upstream Proxies (Latency & Exit IP)",
+      "simulate_traffic": "Simulate Process Network Connection",
+      "flush_dns": "Flush Fake-IP Anti-Leak DNS Cache",
+      "toggle_killswitch": "Toggle Strict Proxy Kill-Switch",
+      "open_themeforge": "Open ThemeForge Studio",
+      "switch_language": "Switch Interface Language (FR / EN)"
+    }
+  },
+  "dashboard": {
+    "health_banner": {
+      "protected_title": "Everything is working - Your connection is protected",
+      "protected_desc": "RouteWard is actively routing your applications according to your rules and preventing IP or DNS leaks.",
+      "paused_title": "Protection paused - Applications are connecting directly",
+      "paused_desc": "The interception engine is currently stopped. Click 'Start Engine' to resume proxy routing.",
+      "quick_wizard_cta": "3-Step Guided Setup",
+      "choose_apps_cta": "Choose My Applications",
+      "switch_expert_cta": "Show Advanced Diagnostics (Expert)",
+      "status_badge_ok": "Shield Active",
+      "status_badge_off": "Paused"
+    },
+    "tooltips": {
+      "active_connections": "Number of apps on your computer currently exchanging data with the Internet.",
+      "download_speed": "Speed at which your computer is receiving data (web pages, videos, downloads).",
+      "upload_speed": "Speed at which your computer is sending data out to the Internet.",
+      "dns_mappings": "DNS translates website names (like google.com) into IP addresses. Fake-IP prevents your ISP from seeing which websites you visit.",
+      "killswitch": "Immediately cuts off Internet access for protected apps if your proxy server goes offline, ensuring your real IP address never leaks.",
+      "udp_guard": "Some games or voice calls use the UDP protocol. If your proxy only supports TCP, this blocks unproxied UDP packets to prevent leaks.",
+      "dns_guard": "Forces website name lookups to travel inside the encrypted proxy tunnel instead of using your local router."
+    },
+    "kpi": {
+      "active_connections": {
+        "label": "Active Connections",
+        "subtext": "Concurrent tracked process sockets"
+      },
+      "download_speed": {
+        "label": "Download Throughput",
+        "subtext": "Total ingress bandwidth"
+      },
+      "upload_speed": {
+        "label": "Upload Throughput",
+        "subtext": "Total egress bandwidth"
+      },
+      "dns_mappings": {
+        "label": "Fake-IP DNS Cache",
+        "subtext": "Active anti-leak domain mappings"
+      }
+    },
+    "chart": {
+      "bandwidth": {
+        "title": "Real-Time Traffic Throughput",
+        "download": "Ingress (RX)",
+        "upload": "Egress (TX)",
+        "empty": "Waiting for network activity..."
+      },
+      "distribution": {
+        "title": "Action Distribution",
+        "proxied": "Proxied",
+        "direct": "Direct",
+        "blocked": "Blocked"
+      }
+    },
+    "top_talkers": {
+      "panel": {
+        "title": "Top Processes by Bandwidth",
+        "subtitle": "Per-executable network consumption & active sockets",
+        "sockets": "sockets",
+        "empty": "No process traffic recorded yet."
+      }
+    },
+    "security_shield": {
+      "panel": {
+        "title": "Privacy Shield & Anti-Leak Controls",
+        "subtitle": "Zero-leak enforcement policies",
+        "killswitch_title": "Strict Proxy Kill-Switch",
+        "killswitch_desc": "Block outbound traffic if target proxy or chain is unreachable",
+        "udp_guard_title": "UDP Leak Guard",
+        "udp_guard_desc": "Block unproxied UDP packets when routed to TCP-only proxies",
+        "dns_guard_title": "Fake-IP Remote DNS Enforcement",
+        "dns_guard_desc": "Intercept all DNS queries into 198.18.0.0/15 and resolve remotely"
+      }
+    },
+    "system": {
+      "status": {
+        "title": "Subsystem Diagnostics",
+        "os_label": "Operating System",
+        "driver_label": "Interception Backend",
+        "relay_tcp_label": "Local SOCKS5/TCP Relay",
+        "relay_http_label": "Local HTTP Relay",
+        "dns_server_label": "Fake-IP DNS Listener",
+        "admin_elevated": "Elevated (Kernel Hooks Ready)",
+        "admin_standard": "Standard User (Local Relay Fallback)"
+      }
+    }
+  },
+  "connections": {
+    "toolbar": {
+      "search": {
+        "placeholder": "Filter by process, domain, IP, rule, or proxy..."
+      },
+      "status_filter": {
+        "all": "All States",
+        "active": "Active",
+        "blocked": "Blocked",
+        "closed": "Closed"
+      },
+      "simulate": {
+        "button": "Simulate Connection"
+      },
+      "scan_os": {
+        "button": "Scan Real OS Sockets"
+      },
+      "clear": {
+        "button": "Clear Closed"
+      }
+    },
+    "table": {
+      "process": {
+        "header": "Process (PID)"
+      },
+      "target": {
+        "header": "Destination (Domain / Fake-IP)"
+      },
+      "protocol": {
+        "header": "Proto"
+      },
+      "rule": {
+        "header": "Matched Rule"
+      },
+      "route": {
+        "header": "Route / Upstream"
+      },
+      "latency": {
+        "header": "Latency"
+      },
+      "traffic": {
+        "header": "RX / TX"
+      },
+      "status": {
+        "header": "State",
+        "active": "ACTIVE",
+        "closed": "CLOSED",
+        "blocked": "BLOCKED"
+      },
+      "empty": {
+        "message": "No connections recorded matching the current filter."
+      }
+    },
+    "inspector": {
+      "drawer": {
+        "title": "Connection Socket Inspector",
+        "subtitle": "Click any action below to create an instant routing rule from this socket",
+        "process_section": "Owning Process Attribution",
+        "pid_label": "Process ID (PID)",
+        "executable_label": "Executable Name",
+        "path_label": "Binary Path",
+        "destination_section": "Destination & Anti-Leak DNS",
+        "remote_endpoint": "Remote Endpoint",
+        "resolved_domain": "Fake-IP Original Domain",
+        "routing_section": "Applied Routing & Telemetry",
+        "matched_rule": "Matched Rule",
+        "upstream_route": "Upstream Tunnel",
+        "quick_actions_title": "1-Click Rule Creation & Socket Control",
+        "route_process_proxy": "Route Process via Proxy",
+        "route_process_direct": "Bypass Process (DIRECT)",
+        "block_process": "Block Process Always",
+        "block_domain": "Block Target Domain",
+        "terminate_socket": "Terminate Active Socket",
+        "close": "Close Inspector"
+      }
+    }
+  },
+  "proxies": {
+    "section": {
+      "servers": {
+        "title": "Upstream Proxy Servers",
+        "add": "Add Proxy Server",
+        "import_uri": "Import URI (socks5://, http://, https://)",
+        "test_all": "Test All Proxies"
+      },
+      "chains": {
+        "title": "Smart Proxy Chains & Failover Groups",
+        "subtitle": "Tunnel sequentially (Multi-Hop) or balance/failover across multiple upstream nodes",
+        "add": "Create Chain / Group",
+        "hops": "Nodes"
+      }
+    },
+    "strategy": {
+      "mode": {
+        "sequence": "Multi-Hop Sequence (Entry -> Exit)",
+        "failover": "High-Availability Failover",
+        "lowest_latency": "Smart Lowest Latency (Auto-RTT)",
+        "load_balance": "Round-Robin Load Balance"
+      }
+    },
+    "card": {
+      "action": {
+        "test": "Test Latency & UDP",
+        "testing": "Testing...",
+        "copy_uri": "Copy URI",
+        "delete": "Remove",
+        "toggle": "Toggle Enable"
+      },
+      "badge": {
+        "udp_ready": "UDP Ready",
+        "tcp_only": "TCP Only",
+        "tls_enabled": "TLS",
+        "untested": "Untested",
+        "online": "Online",
+        "offline": "Unreachable",
+        "exit_ip": "Exit IP"
+      }
+    },
+    "modal": {
+      "add_proxy": {
+        "title": "Configure Upstream Proxy",
+        "name_label": "Display Name",
+        "protocol_label": "Protocol",
+        "host_label": "Server Host / IP",
+        "port_label": "Port",
+        "username_label": "Username (Optional)",
+        "password_label": "Password (Optional)",
+        "sni_label": "TLS SNI Hostname",
+        "udp_label": "Enable UDP Associate",
+        "tls_label": "Enable TLS Transport",
+        "submit": "Save Proxy",
+        "cancel": "Cancel"
+      },
+      "import_uri": {
+        "title": "Batch Import Proxies (URIs or Base64 Subscription)",
+        "subtitle": "Paste proxy URIs (socks5://, http://, https://) or a Base64-encoded subscription payload",
+        "placeholder": "socks5://user:pass@127.0.0.1:1080#LocalSocks\nhttps://user:pass@edge.example.com:443?sni=edge.example.com#EdgeHttps",
+        "submit": "Import Proxies",
+        "cancel": "Cancel"
+      },
+      "add_chain": {
+        "title": "Build Proxy Chain or Smart Group",
+        "name_label": "Chain / Group Name",
+        "strategy_label": "Routing Strategy",
+        "select_hop": "Add Proxy Node",
+        "sequence_label": "Ordered Proxy Nodes",
+        "submit": "Save Chain",
+        "cancel": "Cancel"
+      }
+    }
+  },
+  "rules": {
+    "header": {
+      "title": "Process & Destination Routing Rules",
+      "subtitle": "Rules are evaluated in ascending priority order. First match wins.",
+      "add_button": "Add Routing Rule",
+      "presets_button": "1-Click Rule Templates"
+    },
+    "presets": {
+      "dev_toolchains": {
+        "name": "Developer Toolchains (git, cargo, npm, docker)",
+        "desc": "Routes CLI developer tools and package registries through your primary proxy"
+      },
+      "privacy_browsers": {
+        "name": "Privacy Web Browsers via Stealth Chain",
+        "desc": "Routes Firefox, Brave, Chrome, and Edge HTTP/HTTPS traffic through a multi-hop chain"
+      },
+      "block_telemetry": {
+        "name": "Block OS & App Telemetry",
+        "desc": "Blocks background telemetry processes and analytics domains"
+      },
+      "rfc1918_direct": {
+        "name": "Bypass Local LAN & RFC 1918 Subnets",
+        "desc": "Ensures local network traffic (127.0.0.0/8, 192.168.0.0/16, 10.0.0.0/8, *.local) connects directly"
+      }
+    },
+    "visual_apps": {
+      "section_title": "My Applications - 1-Click Visual Routing",
+      "section_subtitle": "Choose how each category of application connects to the Internet without typing .exe names or port numbers.",
+      "action_proxy": "Protect via Proxy",
+      "action_direct": "Direct Connection (Normal)",
+      "action_block": "Block Internet",
+      "browsers": {
+        "name": "Web Browsers",
+        "desc": "Firefox, Chrome, Brave, Edge, Opera, Vivaldi"
+      },
+      "messaging": {
+        "name": "Messaging & Voice",
+        "desc": "Discord, Telegram, Signal, Slack"
+      },
+      "gaming": {
+        "name": "Games & Launchers",
+        "desc": "Steam, Epic Games, Battle.net, Minecraft"
+      },
+      "dev": {
+        "name": "Developer & CLI Tools",
+        "desc": "VS Code, Git, Cargo, Node.js, Python, Docker"
+      },
+      "media": {
+        "name": "Music, Video & Streaming",
+        "desc": "Spotify, VLC, OBS Studio"
+      },
+      "telemetry": {
+        "name": "OS Telemetry & Trackers",
+        "desc": "Windows diagnostic runners and background crash reporters"
+      }
+    },
+    "simulator": {
+      "title": "Live Rule Evaluation Tester",
+      "process_placeholder": "Executable (e.g. firefox.exe or /usr/bin/curl)",
+      "host_placeholder": "Target Host or IP (e.g. api.github.com or 10.0.0.5)",
+      "port_placeholder": "Port (e.g. 443)",
+      "test_button": "Evaluate Rule",
+      "matched_rule": "Matched Rule",
+      "resulting_action": "Action",
+      "fake_ip_resolved": "Resolved from Fake-IP"
+    },
+    "table": {
+      "enabled": {
+        "header": "On"
+      },
+      "priority": {
+        "header": "Priority"
+      },
+      "name": {
+        "header": "Rule Name"
+      },
+      "processes": {
+        "header": "Processes",
+        "any": "Any Process"
+      },
+      "targets": {
+        "header": "Domains / CIDRs",
+        "any": "Any Destination"
+      },
+      "ports": {
+        "header": "Ports",
+        "any": "All Ports"
+      },
+      "action": {
+        "header": "Action",
+        "direct": "DIRECT",
+        "block": "BLOCK",
+        "proxy": "PROXY",
+        "chain": "CHAIN"
+      },
+      "controls": {
+        "header": "Order & Actions",
+        "move_up": "Move Priority Up",
+        "move_down": "Move Priority Down",
+        "delete": "Delete"
+      }
+    },
+    "modal": {
+      "add": {
+        "title": "New Routing Rule",
+        "name_label": "Rule Name",
+        "priority_label": "Priority (Lower runs first)",
+        "processes_label": "Process Names / Globs (comma-separated)",
+        "domains_label": "Domain Wildcards (comma-separated, e.g. *.example.com)",
+        "cidrs_label": "IP / CIDR Subnets (comma-separated, e.g. 192.168.0.0/16)",
+        "ports_label": "Port or Range (e.g. 80, 443, 8000-9000)",
+        "protocol_label": "Protocol",
+        "action_type_label": "Routing Action",
+        "action_target_label": "Target Proxy or Chain",
+        "submit": "Save Rule",
+        "cancel": "Cancel"
+      }
+    }
+  },
+  "dns": {
+    "header": {
+      "title": "Fake-IP Anti-Leak DNS Engine",
+      "subtitle": "Maps domain queries to virtual RFC 2544 IPs (198.18.0.0/15) so applications never leak DNS locally and rules match exact domain names.",
+      "flush_button": "Flush Fake-IP Cache",
+      "allocate_button": "Test Domain Allocation"
+    },
+    "allocate": {
+      "placeholder": "Enter domain name (e.g. stealth.torproject.org)",
+      "submit": "Allocate Fake-IP"
+    },
+    "table": {
+      "fake_ip": {
+        "header": "Virtual Fake-IP"
+      },
+      "domain": {
+        "header": "Original Domain Name"
+      },
+      "hits": {
+        "header": "Lookup Hits"
+      },
+      "expires": {
+        "header": "TTL Remaining"
+      },
+      "empty": {
+        "message": "Fake-IP table is currently empty."
+      }
+    }
+  },
+  "logs": {
+    "toolbar": {
+      "filter_all": "All Levels",
+      "filter_info": "INFO",
+      "filter_warn": "WARN",
+      "filter_error": "ERROR",
+      "clear": "Clear Logs"
+    },
+    "table": {
+      "timestamp": "Timestamp",
+      "level": "Level",
+      "component": "Subsystem",
+      "message": "Event Description",
+      "empty": "No log events recorded."
+    }
+  },
+  "cli": {
+    "engine": {
+      "startup": {
+        "banner": "Starting RouteWard Engine",
+        "loaded_profile": "Loaded profile configuration",
+        "listening_socks": "Local SOCKS5 transparent relay listening",
+        "listening_http": "Local HTTP CONNECT relay listening",
+        "ready": "Interception engine active. Press Ctrl+C to stop."
+      },
+      "check": {
+        "testing": "Probing upstream proxy connectivity",
+        "result_online": "Proxy reachable",
+        "result_offline": "Proxy probe failed"
+      },
+      "rule_eval": {
+        "matched": "Rule evaluation completed"
+      }
+    }
+  },
+  "errors": {
+    "config": {
+      "load_failed": "Failed to load configuration file",
+      "invalid_json": "Invalid JSON structure in configuration"
+    },
+    "proxy": {
+      "not_found": "Specified proxy identifier was not found",
+      "chain_empty": "Proxy chain must contain at least one upstream hop",
+      "handshake_failed": "Upstream proxy protocol handshake failed",
+      "connection_timeout": "Timed out while connecting to upstream proxy",
+      "auth_rejected": "Upstream proxy rejected authentication credentials",
+      "invalid_uri": "Invalid proxy URI format"
+    },
+    "rule": {
+      "blocked_by_policy": "Connection blocked by routing policy rule"
+    }
+  },
+  "themeforge": {
+    "modal": {
+      "title": "ThemeForge Studio - Palette & Accent",
+      "subtitle": "Select one of the canonical ThemeForge Oklab palettes or High Contrast, and apply an optional accent tint.",
+      "palette_label": "Theme Palette",
+      "accent_label": "Accent Tint",
+      "preview_label": "Semantic Token Preview",
+      "import_palette": "Load External ThemeForge v1 JSON",
+      "close": "Done"
+    },
+    "families": {
+      "Root": "Root (Dracula / Drakul)",
+      "Dark": "Dark (Uniform Oklab L*)",
+      "Light": "Light Surfaces",
+      "Alt": "Alternative Signature"
+    },
+    "accents": {
+      "Default": "Theme Default",
+      "Blue": "Blue",
+      "Cyan": "Cyan",
+      "Green": "Green",
+      "Orange": "Orange",
+      "Pink": "Pink",
+      "Purple": "Purple",
+      "Red": "Red",
+      "Yellow": "Yellow"
+    }
+  },
+  "wizard": {
+    "modal": {
+      "title": "Quick Setup Wizard",
+      "subtitle": "Configure RouteWard in 3 easy steps - no networking background required.",
+      "step_indicator": "Step",
+      "step1_title": "1. What is your main goal?",
+      "step1_privacy_title": "Privacy & Anonymous Browsing",
+      "step1_privacy_desc": "Hide my IP address on web browsers and messaging apps while blocking OS trackers.",
+      "step1_work_title": "Remote Work & Developer Tools",
+      "step1_work_desc": "Route developer tools (Git, VS Code, Terminal, Browsers) through a corporate or SSH proxy.",
+      "step1_gaming_title": "Low-Latency Gaming & Split Tunneling",
+      "step1_gaming_desc": "Keep games on a fast direct connection while routing Discord and browsers through the proxy.",
+      "step2_title": "2. Which Proxy Server do you want to use?",
+      "step2_use_existing": "Use the default pre-configured proxy server",
+      "step2_paste_uri": "Or paste a connection link (socks5://, http://, https:// or Base64 subscription):",
+      "step2_uri_placeholder": "socks5://127.0.0.1:1080#MyProxy",
+      "step3_title": "3. Preferred Interface Experience",
+      "step3_simple_title": "Simple Mode (Recommended for most users)",
+      "step3_simple_desc": "Plain-language explanations, visual app cards, and a reassuring protection summary.",
+      "step3_expert_title": "Expert Mode (Linux / Windows SysAdmin)",
+      "step3_expert_desc": "Full access to PID socket tables, CIDR/Port rules, Fake-IP RFC 2544 pool, and live event logs.",
+      "back": "Back",
+      "next": "Next",
+      "finish": "Apply My Setup"
+    }
+  },
+  "glossary": {
+    "modal": {
+      "title": "Understanding RouteWard - Guide & Glossary",
+      "subtitle": "Plain-language explanations for beginners alongside technical specifications for system engineers.",
+      "close": "Got It"
+    },
+    "items": {
+      "proxy": {
+        "term": "Proxy Server (SOCKS5 / HTTP / HTTPS)",
+        "simple": "An intermediary relay server. Websites see the proxy server's IP address and location instead of yours.",
+        "expert": "L4/L7 transport tunnel supporting TCP relay, RFC 1928 UDP Associate, and HTTP CONNECT."
+      },
+      "chain": {
+        "term": "Proxy Chains & Smart Groups",
+        "simple": "Routes your traffic through multiple proxies in a row for extra privacy, or automatically switches to a backup proxy if one goes down.",
+        "expert": "Sequential multi-hop tunneling (Entry -> Exit), high-availability failover, or automatic lowest-RTT node selection."
+      },
+      "fake_ip": {
+        "term": "Anti-Leak DNS (Fake-IP 198.18.0.0/15)",
+        "simple": "Prevents your Internet provider from spying on which websites you visit by assigning a temporary virtual IP to every domain.",
+        "expert": "Bidirectional in-memory RFC 2544 allocator that intercepts DNS queries and recovers exact FQDNs on raw TCP/UDP socket connections."
+      },
+      "killswitch": {
+        "term": "Kill-Switch (Emergency Cutoff)",
+        "simple": "A safety lock that immediately blocks an app's Internet access if the proxy disconnects, so your real IP is never exposed.",
+        "expert": "Strict DROP enforcement when the target upstream node fails or when UDP datagrams hit a TCP-only upstream proxy."
+      },
+      "rules": {
+        "term": "Per-Application Routing Rules",
+        "simple": "Your custom traffic laws: e.g., 'Firefox goes through Proxy', 'Steam connects Directly', and 'Windows Telemetry is Blocked'.",
+        "expert": "Deterministic ascending-priority evaluator matching process globs, domain wildcards, IPv4/IPv6 CIDR subnets, and port ranges."
+      },
+      "system_proxy": {
+        "term": "System Proxy vs App Launcher",
+        "simple": "'System Proxy' configures all of Windows in 1 click. 'Run App via Proxy' launches a single chosen program inside the proxy tunnel.",
+        "expert": "Toggles HKCU Internet Settings registry keys or spawns a child process with injected ALL_PROXY / HTTP_PROXY / HTTPS_PROXY environment variables."
+      }
+    }
+  }
+}

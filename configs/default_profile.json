@@ -1,0 +1,179 @@
+{
+  "profileId": "00000000-0000-4000-8000-000000000001",
+  "name": "Default Security Profile",
+  "version": "2026.1022.00",
+  "enableLogging": true,
+  "interceptionMode": "hybrid",
+  "themeConfig": {
+    "theme": "Drakul",
+    "accent": "Default"
+  },
+  "securityPolicy": {
+    "killSwitchEnabled": true,
+    "blockUdpOnTcpOnlyProxy": true,
+    "strictDnsNoLocalFallback": true
+  },
+  "defaultAction": {
+    "type": "direct"
+  },
+  "dnsConfig": {
+    "enableFakeIp": true,
+    "remoteDnsResolution": true,
+    "fakeIpCidr": "198.18.0.0/15",
+    "upstreamDns": "1.1.1.1:53",
+    "bypassDomains": [
+      "localhost",
+      "*.local",
+      "*.lan",
+      "*.internal"
+    ]
+  },
+  "proxies": [
+    {
+      "id": "proxy-socks5-primary",
+      "name": "Local SOCKS5 Gateway",
+      "protocol": "socks5",
+      "host": "127.0.0.1",
+      "port": 1080,
+      "auth": null,
+      "udpEnabled": true,
+      "tls": false,
+      "sni": null,
+      "enabled": true,
+      "lastLatencyMs": null,
+      "exitIp": null
+    },
+    {
+      "id": "proxy-http-corp",
+      "name": "HTTP Connect Relay",
+      "protocol": "http",
+      "host": "127.0.0.1",
+      "port": 8080,
+      "auth": null,
+      "udpEnabled": false,
+      "tls": false,
+      "sni": null,
+      "enabled": true,
+      "lastLatencyMs": null,
+      "exitIp": null
+    }
+  ],
+  "chains": [
+    {
+      "id": "chain-multi-hop-stealth",
+      "name": "Multi-Hop Stealth Chain",
+      "strategy": "sequence",
+      "proxyIds": [
+        "proxy-http-corp",
+        "proxy-socks5-primary"
+      ],
+      "enabled": true
+    },
+    {
+      "id": "chain-smart-failover",
+      "name": "Smart Lowest-Latency Group",
+      "strategy": "lowest_latency",
+      "proxyIds": [
+        "proxy-socks5-primary",
+        "proxy-http-corp"
+      ],
+      "enabled": true
+    }
+  ],
+  "rules": [
+    {
+      "id": "rule-local-loopback",
+      "name": "Localhost & Loopback Bypass",
+      "enabled": true,
+      "priority": 10,
+      "processPatterns": [],
+      "domainPatterns": [
+        "localhost",
+        "*.local"
+      ],
+      "ipCidrs": [
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1/128"
+      ],
+      "portRanges": [],
+      "protocol": "any",
+      "action": {
+        "type": "direct"
+      }
+    },
+    {
+      "id": "rule-browsers-socks5",
+      "name": "Web Browsers via SOCKS5",
+      "enabled": true,
+      "priority": 20,
+      "processPatterns": [
+        "firefox.exe",
+        "firefox",
+        "chrome.exe",
+        "chrome",
+        "msedge.exe",
+        "brave.exe"
+      ],
+      "domainPatterns": [],
+      "ipCidrs": [],
+      "portRanges": [
+        {
+          "start": 80,
+          "end": 80
+        },
+        {
+          "start": 443,
+          "end": 443
+        }
+      ],
+      "protocol": "any",
+      "action": {
+        "type": "proxy",
+        "targetId": "proxy-socks5-primary"
+      }
+    },
+    {
+      "id": "rule-cli-tools-chain",
+      "name": "CLI Tools via Multi-Hop Chain",
+      "enabled": true,
+      "priority": 30,
+      "processPatterns": [
+        "curl.exe",
+        "curl",
+        "wget",
+        "git.exe",
+        "git",
+        "ssh.exe",
+        "ssh"
+      ],
+      "domainPatterns": [],
+      "ipCidrs": [],
+      "portRanges": [],
+      "protocol": "tcp",
+      "action": {
+        "type": "chain",
+        "targetId": "chain-multi-hop-stealth"
+      }
+    },
+    {
+      "id": "rule-telemetry-block",
+      "name": "Block Telemetry Endpoints",
+      "enabled": true,
+      "priority": 40,
+      "processPatterns": [],
+      "domainPatterns": [
+        "*.telemetry.*",
+        "*.analytics.*"
+      ],
+      "ipCidrs": [],
+      "portRanges": [],
+      "protocol": "any",
+      "action": {
+        "type": "block"
+      }
+    }
+  ]
+}

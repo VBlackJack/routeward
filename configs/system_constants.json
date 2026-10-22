@@ -1,0 +1,254 @@
+{
+  "network": {
+    "localBindHost": "127.0.0.1",
+    "defaultRelayTcpPort": 10808,
+    "defaultRelayHttpPort": 10809,
+    "defaultDnsListenPort": 10853,
+    "tcpConnectTimeoutMs": 5000,
+    "proxyHandshakeTimeoutMs": 6000,
+    "udpAssociationTimeoutMs": 30000,
+    "relayBufferSizeBytes": 65536,
+    "maxConcurrentConnections": 4096
+  },
+  "dns": {
+    "fakeIpCidr": "198.18.0.0/15",
+    "defaultTtlSeconds": 300,
+    "maxCacheEntries": 16384,
+    "upstreamDnsServer": "1.1.1.1:53",
+    "fallbackDnsServer": "8.8.8.8:53",
+    "dnsQueryPacketMaxBytes": 512
+  },
+  "checker": {
+    "probeTargetHost": "1.1.1.1",
+    "probeTargetPort": 443,
+    "httpIpEchoHost": "api.ipify.org",
+    "httpIpEchoPort": 80,
+    "httpIpEchoPath": "/?format=json",
+    "udpProbeDnsHost": "8.8.8.8",
+    "udpProbeDnsPort": 53,
+    "probeTimeoutMs": 4500
+  },
+  "telemetry": {
+    "maxLogRingBufferEntries": 1000,
+    "maxBandwidthHistorySamples": 60,
+    "samplingIntervalMs": 1000,
+    "processCacheTtlMs": 15000,
+    "logDirectory": "logs",
+    "logAppName": "RouteWard",
+    "logFlushIntervalMs": 500
+  },
+  "protocols": {
+    "socks5Version": 5,
+    "socks5AuthNone": 0,
+    "socks5AuthPassword": 2,
+    "socks5AuthNoAcceptable": 255,
+    "socks5PasswordAuthVersion": 1,
+    "socks5CmdConnect": 1,
+    "socks5CmdUdpAssociate": 3,
+    "socks5AtypIpv4": 1,
+    "socks5AtypDomain": 3,
+    "socks5AtypIpv6": 4,
+    "socks5ReplySucceeded": 0,
+    "httpSuccessStatusPrefix": "HTTP/1.1 200",
+    "httpAltSuccessStatusPrefix": "HTTP/1.0 200"
+  },
+  "rulePresets": [
+    {
+      "id": "preset-dev-toolchains",
+      "i18nKey": "rules.presets.dev_toolchains",
+      "priority": 15,
+      "processPatterns": [
+        "git.exe",
+        "git",
+        "cargo.exe",
+        "cargo",
+        "npm",
+        "node.exe",
+        "node",
+        "python.exe",
+        "python",
+        "docker.exe",
+        "docker"
+      ],
+      "domainPatterns": [
+        "*.github.com",
+        "*.crates.io",
+        "*.npmjs.org",
+        "*.pypi.org",
+        "*.docker.io"
+      ],
+      "ipCidrs": [],
+      "portRanges": [
+        { "start": 22, "end": 22 },
+        { "start": 80, "end": 80 },
+        { "start": 443, "end": 443 },
+        { "start": 9418, "end": 9418 }
+      ],
+      "protocol": "tcp",
+      "suggestedActionType": "proxy"
+    },
+    {
+      "id": "preset-privacy-browsers",
+      "i18nKey": "rules.presets.privacy_browsers",
+      "priority": 20,
+      "processPatterns": [
+        "firefox.exe",
+        "firefox",
+        "chrome.exe",
+        "chrome",
+        "brave.exe",
+        "brave",
+        "msedge.exe",
+        "vivaldi.exe"
+      ],
+      "domainPatterns": [],
+      "ipCidrs": [],
+      "portRanges": [
+        { "start": 80, "end": 80 },
+        { "start": 443, "end": 443 }
+      ],
+      "protocol": "any",
+      "suggestedActionType": "chain"
+    },
+    {
+      "id": "preset-block-os-telemetry",
+      "i18nKey": "rules.presets.block_telemetry",
+      "priority": 12,
+      "processPatterns": [
+        "CompatTelRunner.exe",
+        "DiagTrack",
+        "crashpad_handler.exe"
+      ],
+      "domainPatterns": [
+        "*.telemetry.*",
+        "*.events.data.microsoft.com",
+        "*.google-analytics.com",
+        "*.sentry.io"
+      ],
+      "ipCidrs": [],
+      "portRanges": [],
+      "protocol": "any",
+      "suggestedActionType": "block"
+    },
+    {
+      "id": "preset-rfc1918-direct",
+      "i18nKey": "rules.presets.rfc1918_direct",
+      "priority": 5,
+      "processPatterns": [],
+      "domainPatterns": [
+        "localhost",
+        "*.local",
+        "*.lan",
+        "*.home.arpa"
+      ],
+      "ipCidrs": [
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "::1/128",
+        "fe80::/10"
+      ],
+      "portRanges": [],
+      "protocol": "any",
+      "suggestedActionType": "direct"
+    }
+  ],
+  "visualAppCatalog": [
+    {
+      "id": "app-browsers",
+      "i18nKey": "rules.visual_apps.browsers",
+      "icon": "globe",
+      "priority": 18,
+      "processPatterns": [
+        "firefox.exe",
+        "firefox",
+        "chrome.exe",
+        "chrome",
+        "brave.exe",
+        "brave",
+        "msedge.exe",
+        "vivaldi.exe",
+        "opera.exe"
+      ],
+      "defaultAction": "proxy"
+    },
+    {
+      "id": "app-messaging",
+      "i18nKey": "rules.visual_apps.messaging",
+      "icon": "message",
+      "priority": 19,
+      "processPatterns": [
+        "Discord.exe",
+        "discord",
+        "Telegram.exe",
+        "telegram-desktop",
+        "Signal.exe",
+        "signal-desktop",
+        "Slack.exe"
+      ],
+      "defaultAction": "proxy"
+    },
+    {
+      "id": "app-gaming",
+      "i18nKey": "rules.visual_apps.gaming",
+      "icon": "gamepad",
+      "priority": 21,
+      "processPatterns": [
+        "steam.exe",
+        "steamwebhelper.exe",
+        "EpicGamesLauncher.exe",
+        "Battle.net.exe",
+        "javaw.exe"
+      ],
+      "defaultAction": "direct"
+    },
+    {
+      "id": "app-dev",
+      "i18nKey": "rules.visual_apps.dev",
+      "icon": "code",
+      "priority": 16,
+      "processPatterns": [
+        "Code.exe",
+        "code",
+        "git.exe",
+        "git",
+        "cargo.exe",
+        "cargo",
+        "node.exe",
+        "node",
+        "python.exe",
+        "docker.exe"
+      ],
+      "defaultAction": "proxy"
+    },
+    {
+      "id": "app-media",
+      "i18nKey": "rules.visual_apps.media",
+      "icon": "music",
+      "priority": 22,
+      "processPatterns": [
+        "Spotify.exe",
+        "spotify",
+        "vlc.exe",
+        "vlc",
+        "obs64.exe"
+      ],
+      "defaultAction": "direct"
+    },
+    {
+      "id": "app-telemetry",
+      "i18nKey": "rules.visual_apps.telemetry",
+      "icon": "shield_ban",
+      "priority": 11,
+      "processPatterns": [
+        "CompatTelRunner.exe",
+        "DiagTrack",
+        "crashpad_handler.exe",
+        "software_reporter_tool.exe"
+      ],
+      "defaultAction": "block"
+    }
+  ]
+}

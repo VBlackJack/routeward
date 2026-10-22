@@ -1,0 +1,17 @@
+RouteWard
+Copyright 2026 Julien Bombled
+
+This product includes software and ThemeForge color palettes developed by
+Julien Bombled and licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+ThemeForge Color Palettes / Theme Variants - Attribution
+================================================================================
+
+RouteWard integrates the 16 canonical ThemeForge palettes plus High Contrast:
+- Dracula: canonical MIT palette by Zeno Rocha (https://github.com/dracula/dracula-theme).
+- Drakul: WCAG AA-compliant Apache 2.0 sibling derived from Dracula by Julien Bombled
+  (Comment lifted from #6272A4 to #B3BBD6).
+- Striga, Cinder, Bracken, Tarn, Mortis, Slate, Voivode, Carmilla, Whitby, Vesper,
+  Parchment, Folio, Wormwood, and Sconce: original Apache 2.0 palettes engineered
+  from uniform Oklab targets by Julien Bombled.

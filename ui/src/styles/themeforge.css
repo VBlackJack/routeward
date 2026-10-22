@@ -1,0 +1,103 @@
+/*
+ * Copyright 2026 Julien Bombled
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --tf-Background: #282A36;
+  --tf-CurrentLine: #44475A;
+  --tf-Selection: #44475A;
+  --tf-Foreground: #F8F8F2;
+  --tf-Comment: #B3BBD6;
+  --tf-Cyan: #8BE9FD;
+  --tf-Green: #50FA7B;
+  --tf-Orange: #FFB86C;
+  --tf-Pink: #FF79C6;
+  --tf-Purple: #BD93F9;
+  --tf-Red: #FF5555;
+  --tf-Yellow: #F1FA8C;
+  --tf-Surface: #282A36;
+  --tf-SurfaceAlt: #44475A;
+  --tf-Accent: #BD93F9;
+  --tf-AccentHover: #D5BEFC;
+  --tf-AccentPressed: #A170E6;
+  --tf-TextPrimary: #F8F8F2;
+  --tf-TextSecondary: #B3BBD6;
+  --tf-Border: #44475A;
+  --tf-Success: #50FA7B;
+  --tf-Warning: #FFB86C;
+  --tf-Error: #FF5555;
+  --tf-Info: #8BE9FD;
+  --tf-Blue: #70AEFF;
+
+  --tf-radius-xs: 2px;
+  --tf-radius-sm: 3px;
+  --tf-radius-md: 4px;
+  --tf-radius-lg: 6px;
+  --tf-radius-xl: 10px;
+  --tf-border-width: 1px;
+}
+
+body {
+  background-color: var(--tf-Background);
+  color: var(--tf-TextPrimary);
+  font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+.tf-card {
+  background-color: var(--tf-Surface);
+  border: var(--tf-border-width) solid var(--tf-Border);
+  border-radius: var(--tf-radius-lg);
+}
+
+.tf-surface-alt {
+  background-color: var(--tf-SurfaceAlt);
+  border: var(--tf-border-width) solid var(--tf-Border);
+  border-radius: var(--tf-radius-md);
+}
+
+.tf-input {
+  background-color: var(--tf-Background);
+  color: var(--tf-TextPrimary);
+  border: var(--tf-border-width) solid var(--tf-Border);
+  border-radius: var(--tf-radius-md);
+}
+
+.tf-input:focus {
+  outline: 2px solid var(--tf-Accent);
+  outline-offset: 0px;
+}
+
+.tf-btn-accent {
+  background-color: var(--tf-Accent);
+  color: var(--tf-Background);
+  border-radius: var(--tf-radius-md);
+  font-weight: 600;
+  transition: background-color 120ms ease;
+}
+
+.tf-btn-accent:hover {
+  background-color: var(--tf-AccentHover);
+}
+
+.tf-btn-accent:active {
+  background-color: var(--tf-AccentPressed);
+}

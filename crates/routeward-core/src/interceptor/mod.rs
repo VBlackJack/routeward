@@ -1,0 +1,708 @@
+/*
+ * Copyright 2026 Julien Bombled
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+use crate::checker::{ProxyChecker, ProxyHealthReport};
+use crate::config::{
+    InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule, RuleAction,
+    SystemConstants, TransportProtocol,
+};
+use crate::dns::FakeIpEngine;
+use crate::error::{ProxifierError, ProxifierResult, ERR_KEY_PROXY_NOT_FOUND};
+use crate::i18n::I18nRegistry;
+use crate::process::ProcessResolver;
+use crate::proxy::sni::TlsSniExtractor;
+use crate::proxy::uri::ProxyUriCodec;
+use crate::proxy::ProxyConnector;
+use crate::rules::{ConnectionRequest, RuleEngine, RuleEvaluationResult};
+use crate::telemetry::{ConnectionStatus, LogLevel, TelemetryHub, TrackedConnection};
+use chrono::Utc;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use uuid::Uuid;
+
+const COMPONENT_ENGINE: &str = "InterceptorEngine";
+const COMPONENT_RULE: &str = "RuleEngine";
+const COMPONENT_PROXY: &str = "ProxyConnector";
+const COMPONENT_DNS: &str = "FakeIpDNS";
+const ROUTE_DIRECT_LABEL: &str = "DIRECT";
+const ROUTE_BLOCK_LABEL: &str = "BLOCKED";
+const SIMULATED_DEFAULT_RX_BYTES: u64 = 18432;
+const SIMULATED_DEFAULT_TX_BYTES: u64 = 4096;
+const SIMULATED_DEFAULT_LATENCY_MS: u64 = 18;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemDiagnostics {
+    pub running: bool,
+    pub os_name: String,
+    pub interception_mode: InterceptionMode,
+    pub elevated_privileges: bool,
+    pub relay_tcp_endpoint: String,
+    pub relay_http_endpoint: String,
+    pub dns_endpoint: String,
+    pub fake_ip_cidr: String,
+    pub active_locale: String,
+}
+
+#[derive(Clone)]
+pub struct ProxifierController {
+    pub constants: Arc<SystemConstants>,
+    pub profile: Arc<RwLock<ProfileConfig>>,
+    pub i18n: I18nRegistry,
+    pub dns: FakeIpEngine,
+    pub process_resolver: ProcessResolver,
+    pub telemetry: TelemetryHub,
+    running: Arc<AtomicBool>,
+}
+
+impl ProxifierController {
+    pub fn new(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
+        let i18n = I18nRegistry::new(locale);
+        let dns = FakeIpEngine::new(&profile.dns_config, &constants.dns);
+        let process_resolver = ProcessResolver::new(constants.telemetry.process_cache_ttl_ms);
+        let telemetry = TelemetryHub::new(&constants.telemetry);
+        telemetry.set_file_logging_enabled(profile.enable_logging);
+
+        let controller = Self {
+            constants: Arc::new(constants),
+            profile: Arc::new(RwLock::new(profile)),
+            i18n,
+            dns,
+            process_resolver,
+            telemetry,
+            running: Arc::new(AtomicBool::new(false)),
+        };
+
+        controller.seed_initial_dns_entries();
+        controller.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_ENGINE,
+            controller.i18n.t("cli.engine.startup.loaded_profile"),
+        );
+
+        controller
+    }
+
+    fn seed_initial_dns_entries(&self) {
+        let initial_domains = [
+            "api.github.com",
+            "registry.npmjs.org",
+            "crates.io",
+            "stealth.torproject.org",
+        ];
+        for dom in initial_domains {
+            let _ = self.dns.allocate_or_get(dom);
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    pub fn start_engine(&self) {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_ENGINE,
+            self.i18n.t("cli.engine.startup.banner"),
+        );
+
+        let ticker_ctrl = self.clone();
+        tokio::spawn(async move {
+            let interval =
+                Duration::from_millis(ticker_ctrl.constants.telemetry.sampling_interval_ms);
+            while ticker_ctrl.is_running() {
+                ticker_ctrl.telemetry.tick_bandwidth_sample();
+                tokio::time::sleep(interval).await;
+            }
+        });
+
+        let relay_ctrl = self.clone();
+        tokio::spawn(async move {
+            let bind_addr = format!(
+                "{}:{}",
+                relay_ctrl.constants.network.local_bind_host,
+                relay_ctrl.constants.network.default_relay_tcp_port
+            );
+            if let Ok(listener) = TcpListener::bind(&bind_addr).await {
+                relay_ctrl.telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_ENGINE,
+                    format!(
+                        "{}: {}",
+                        relay_ctrl.i18n.t("cli.engine.startup.listening_socks"),
+                        bind_addr
+                    ),
+                );
+
+                while relay_ctrl.is_running() {
+                    if let Ok((client_stream, peer_addr)) = listener.accept().await {
+                        let conn_ctrl = relay_ctrl.clone();
+                        tokio::spawn(async move {
+                            let _ = conn_ctrl
+                                .handle_local_socks5_client(client_stream, peer_addr.port())
+                                .await;
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn stop_engine(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        self.telemetry.push_log(
+            LogLevel::Warn,
+            COMPONENT_ENGINE,
+            self.i18n.t("app.header.engine.stopped"),
+        );
+        self.telemetry.flush_file_logger();
+    }
+
+    pub fn set_enable_logging(&self, enable: bool) {
+        {
+            let mut prof = self.profile.write();
+            prof.enable_logging = enable;
+        }
+        self.telemetry.set_file_logging_enabled(enable);
+    }
+
+    pub fn diagnostics(&self) -> SystemDiagnostics {
+        let prof = self.profile.read();
+        let net = &self.constants.network;
+        SystemDiagnostics {
+            running: self.is_running(),
+            os_name: std::env::consts::OS.to_uppercase(),
+            interception_mode: prof.interception_mode,
+            elevated_privileges: Self::detect_elevated_privileges(),
+            relay_tcp_endpoint: format!("{}:{}", net.local_bind_host, net.default_relay_tcp_port),
+            relay_http_endpoint: format!("{}:{}", net.local_bind_host, net.default_relay_http_port),
+            dns_endpoint: format!("{}:{}", net.local_bind_host, net.default_dns_listen_port),
+            fake_ip_cidr: prof.dns_config.fake_ip_cidr.clone(),
+            active_locale: self.i18n.get_locale(),
+        }
+    }
+
+    pub fn evaluate_rule(&self, req: &ConnectionRequest) -> RuleEvaluationResult {
+        let prof = self.profile.read();
+        RuleEngine::evaluate(req, &prof.rules, &prof.default_action, Some(&self.dns))
+    }
+
+    pub fn simulate_connection(&self, req: ConnectionRequest) -> TrackedConnection {
+        let eval = self.evaluate_rule(&req);
+        let route_label = self.format_action_label(&eval.action);
+        let is_proxied = matches!(
+            eval.action,
+            RuleAction::Proxy { .. } | RuleAction::Chain { .. }
+        );
+        let status = if eval.action == RuleAction::Block {
+            ConnectionStatus::Blocked
+        } else {
+            ConnectionStatus::Active
+        };
+
+        let (rx_bytes, tx_bytes) = if status == ConnectionStatus::Blocked {
+            (0, 0)
+        } else {
+            (SIMULATED_DEFAULT_RX_BYTES, SIMULATED_DEFAULT_TX_BYTES)
+        };
+
+        let resolved_domain = eval.effective_domain.clone().or_else(|| {
+            if req.target_host.parse::<IpAddr>().is_err() {
+                let _ = self.dns.allocate_or_get(&req.target_host);
+                Some(req.target_host.clone())
+            } else {
+                None
+            }
+        });
+
+        let tracked = TrackedConnection {
+            id: Uuid::new_v4().to_string(),
+            pid: 4210,
+            process_name: ProcessResolver::extract_basename(&req.process_name),
+            process_path: req.process_path.unwrap_or_else(|| req.process_name.clone()),
+            target_host: req.target_host.clone(),
+            resolved_domain,
+            target_port: req.target_port,
+            protocol: req.protocol,
+            matched_rule: eval.matched_rule_name.clone(),
+            route_label: route_label.clone(),
+            latency_ms: SIMULATED_DEFAULT_LATENCY_MS,
+            rx_bytes,
+            tx_bytes,
+            status,
+            started_at: Utc::now(),
+        };
+
+        let log_level = if status == ConnectionStatus::Blocked {
+            LogLevel::Warn
+        } else {
+            LogLevel::Info
+        };
+        self.telemetry.push_log(
+            log_level,
+            COMPONENT_RULE,
+            format!(
+                "[{}] {}:{} -> {} ({})",
+                tracked.process_name,
+                tracked.target_host,
+                tracked.target_port,
+                route_label,
+                tracked.matched_rule
+            ),
+        );
+
+        self.telemetry
+            .record_connection(tracked.clone(), is_proxied);
+        tracked
+    }
+
+    pub fn scan_and_ingest_os_sockets(&self, max_entries: usize) -> Vec<TrackedConnection> {
+        let os_sockets = self
+            .process_resolver
+            .scan_established_tcp_sockets(max_entries);
+        let mut ingested = Vec::with_capacity(os_sockets.len());
+
+        for sock in os_sockets {
+            let conn_id = format!(
+                "os-{}-{}-{}:{}",
+                sock.pid, sock.local_port, sock.remote_ip, sock.remote_port
+            );
+            let eval = self.evaluate_rule(&ConnectionRequest {
+                process_name: sock.process_name.clone(),
+                process_path: Some(sock.process_path.clone()),
+                target_host: sock.remote_ip.clone(),
+                target_ip: Some(sock.remote_ip.clone()),
+                target_port: sock.remote_port,
+                protocol: TransportProtocol::Tcp,
+            });
+
+            let route_label = self.format_action_label(&eval.action);
+            let is_proxied = matches!(
+                eval.action,
+                RuleAction::Proxy { .. } | RuleAction::Chain { .. }
+            );
+            let status = if eval.action == RuleAction::Block {
+                ConnectionStatus::Blocked
+            } else {
+                ConnectionStatus::Active
+            };
+
+            let tracked = TrackedConnection {
+                id: conn_id,
+                pid: sock.pid,
+                process_name: sock.process_name,
+                process_path: sock.process_path,
+                target_host: sock.remote_ip,
+                resolved_domain: eval.effective_domain,
+                target_port: sock.remote_port,
+                protocol: TransportProtocol::Tcp,
+                matched_rule: eval.matched_rule_name,
+                route_label,
+                latency_ms: 8,
+                rx_bytes: SIMULATED_DEFAULT_RX_BYTES,
+                tx_bytes: SIMULATED_DEFAULT_TX_BYTES,
+                status,
+                started_at: Utc::now(),
+            };
+
+            self.telemetry
+                .record_connection(tracked.clone(), is_proxied);
+            ingested.push(tracked);
+        }
+        ingested
+    }
+
+    pub async fn test_proxy(&self, proxy_id: &str) -> ProxifierResult<ProxyHealthReport> {
+        let node = {
+            let prof = self.profile.read();
+            prof.proxies
+                .iter()
+                .find(|p| p.id == proxy_id)
+                .cloned()
+                .ok_or_else(|| ProxifierError::ProxyNotFound {
+                    key: ERR_KEY_PROXY_NOT_FOUND,
+                    proxy_id: proxy_id.to_string(),
+                })?
+        };
+
+        let report = ProxyChecker::test_proxy(&node, &self.constants).await;
+
+        {
+            let mut prof = self.profile.write();
+            if let Some(target) = prof.proxies.iter_mut().find(|p| p.id == proxy_id) {
+                target.last_latency_ms = report.latency_ms;
+                target.exit_ip = report.exit_ip.clone();
+            }
+        }
+
+        let msg = if report.reachable {
+            format!(
+                "{}: {} ({} ms)",
+                self.i18n.t("cli.engine.check.result_online"),
+                node.name,
+                report.latency_ms.unwrap_or(0)
+            )
+        } else {
+            format!(
+                "{}: {}",
+                self.i18n.t("cli.engine.check.result_offline"),
+                node.name
+            )
+        };
+        self.telemetry.push_log(
+            if report.reachable {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            },
+            COMPONENT_PROXY,
+            msg,
+        );
+
+        Ok(report)
+    }
+
+    pub async fn test_all_proxies(&self) -> Vec<ProxyHealthReport> {
+        let ids: Vec<String> = {
+            let prof = self.profile.read();
+            prof.proxies.iter().map(|p| p.id.clone()).collect()
+        };
+
+        let mut reports = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(rep) = self.test_proxy(&id).await {
+                reports.push(rep);
+            }
+        }
+        reports
+    }
+
+    pub fn upsert_proxy(&self, node: ProxyNode) {
+        let mut prof = self.profile.write();
+        if let Some(existing) = prof.proxies.iter_mut().find(|p| p.id == node.id) {
+            *existing = node;
+        } else {
+            prof.proxies.push(node);
+        }
+    }
+
+    pub fn import_proxy_uris(&self, text: &str) -> Vec<ProxyNode> {
+        let nodes = ProxyUriCodec::parse_batch(text);
+        for node in &nodes {
+            self.upsert_proxy(node.clone());
+        }
+        nodes
+    }
+
+    pub fn remove_proxy(&self, proxy_id: &str) {
+        let mut prof = self.profile.write();
+        prof.proxies.retain(|p| p.id != proxy_id);
+    }
+
+    pub fn upsert_chain(&self, chain: ProxyChain) {
+        let mut prof = self.profile.write();
+        if let Some(existing) = prof.chains.iter_mut().find(|c| c.id == chain.id) {
+            *existing = chain;
+        } else {
+            prof.chains.push(chain);
+        }
+    }
+
+    pub fn remove_chain(&self, chain_id: &str) {
+        let mut prof = self.profile.write();
+        prof.chains.retain(|c| c.id != chain_id);
+    }
+
+    pub fn upsert_rule(&self, rule: RoutingRule) {
+        let mut prof = self.profile.write();
+        if let Some(existing) = prof.rules.iter_mut().find(|r| r.id == rule.id) {
+            *existing = rule;
+        } else {
+            prof.rules.push(rule);
+        }
+        prof.rules.sort_by_key(|r| r.priority);
+    }
+
+    pub fn remove_rule(&self, rule_id: &str) {
+        let mut prof = self.profile.write();
+        prof.rules.retain(|r| r.id != rule_id);
+    }
+
+    pub fn set_interception_mode(&self, mode: InterceptionMode) {
+        let mut prof = self.profile.write();
+        prof.interception_mode = mode;
+    }
+
+    pub fn set_theme_config(&self, theme: String, accent: String) {
+        let mut prof = self.profile.write();
+        prof.theme_config.theme = theme;
+        prof.theme_config.accent = accent;
+    }
+
+    pub fn allocate_fake_ip(&self, domain: &str) -> Option<String> {
+        let ip = self.dns.allocate_or_get(domain)?;
+        self.telemetry
+            .push_log(LogLevel::Info, COMPONENT_DNS, format!("{domain} -> {ip}"));
+        Some(ip.to_string())
+    }
+
+    pub fn extract_sni_from_payload(&self, packet: &[u8]) -> Option<String> {
+        TlsSniExtractor::extract_sni(packet)
+    }
+
+    async fn handle_local_socks5_client(
+        &self,
+        mut client: TcpStream,
+        client_port: u16,
+    ) -> ProxifierResult<()> {
+        let proto = &self.constants.protocols;
+        let mut header = [0u8; 2];
+        client.read_exact(&mut header).await?;
+        if header[0] != proto.socks5_version {
+            return Ok(());
+        }
+        let nmethods = header[1] as usize;
+        let mut methods = vec![0u8; nmethods];
+        client.read_exact(&mut methods).await?;
+        client
+            .write_all(&[proto.socks5_version, proto.socks5_auth_none])
+            .await?;
+
+        let mut req_head = [0u8; 4];
+        client.read_exact(&mut req_head).await?;
+        let target_host = match req_head[3] {
+            atyp if atyp == proto.socks5_atyp_ipv4 => {
+                let mut ip = [0u8; 4];
+                client.read_exact(&mut ip).await?;
+                IpAddr::from(ip).to_string()
+            }
+            atyp if atyp == proto.socks5_atyp_domain => {
+                let mut len = [0u8; 1];
+                client.read_exact(&mut len).await?;
+                let mut dom = vec![0u8; len[0] as usize];
+                client.read_exact(&mut dom).await?;
+                String::from_utf8_lossy(&dom).to_string()
+            }
+            atyp if atyp == proto.socks5_atyp_ipv6 => {
+                let mut ip = [0u8; 16];
+                client.read_exact(&mut ip).await?;
+                IpAddr::from(ip).to_string()
+            }
+            _ => return Ok(()),
+        };
+
+        let mut port_bytes = [0u8; 2];
+        client.read_exact(&mut port_bytes).await?;
+        let target_port = u16::from_be_bytes(port_bytes);
+
+        let proc_id = self.process_resolver.resolve_by_local_tcp_port(client_port);
+        let eval = self.evaluate_rule(&ConnectionRequest {
+            process_name: proc_id.name.clone(),
+            process_path: Some(proc_id.executable_path.clone()),
+            target_host: target_host.clone(),
+            target_ip: None,
+            target_port,
+            protocol: TransportProtocol::Tcp,
+        });
+
+        let effective_host = eval
+            .effective_domain
+            .clone()
+            .unwrap_or_else(|| target_host.clone());
+
+        if eval.action == RuleAction::Block {
+            let mut blocked_conn = TrackedConnection {
+                id: Uuid::new_v4().to_string(),
+                pid: proc_id.pid,
+                process_name: proc_id.name,
+                process_path: proc_id.executable_path,
+                target_host,
+                resolved_domain: eval.effective_domain,
+                target_port,
+                protocol: TransportProtocol::Tcp,
+                matched_rule: eval.matched_rule_name,
+                route_label: ROUTE_BLOCK_LABEL.to_string(),
+                latency_ms: 0,
+                rx_bytes: 0,
+                tx_bytes: 0,
+                status: ConnectionStatus::Blocked,
+                started_at: Utc::now(),
+            };
+            blocked_conn.status = ConnectionStatus::Blocked;
+            self.telemetry.record_connection(blocked_conn, false);
+            return Ok(());
+        }
+
+        let mut outbound = self
+            .open_outbound_stream(&eval.action, &effective_host, target_port)
+            .await?;
+
+        let success_reply = [
+            proto.socks5_version,
+            proto.socks5_reply_succeeded,
+            0x00,
+            proto.socks5_atyp_ipv4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        client.write_all(&success_reply).await?;
+
+        let conn_id = Uuid::new_v4().to_string();
+        let is_proxied = !matches!(eval.action, RuleAction::Direct);
+        let tracked = TrackedConnection {
+            id: conn_id.clone(),
+            pid: proc_id.pid,
+            process_name: proc_id.name,
+            process_path: proc_id.executable_path,
+            target_host,
+            resolved_domain: eval.effective_domain,
+            target_port,
+            protocol: TransportProtocol::Tcp,
+            matched_rule: eval.matched_rule_name,
+            route_label: self.format_action_label(&eval.action),
+            latency_ms: 12,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            status: ConnectionStatus::Active,
+            started_at: Utc::now(),
+        };
+        self.telemetry.record_connection(tracked, is_proxied);
+
+        if let Ok((tx, rx)) = tokio::io::copy_bidirectional(&mut client, &mut outbound).await {
+            self.telemetry.update_connection_traffic(&conn_id, rx, tx);
+        }
+        self.telemetry.mark_connection_closed(&conn_id);
+
+        Ok(())
+    }
+
+    async fn open_outbound_stream(
+        &self,
+        action: &RuleAction,
+        target_host: &str,
+        target_port: u16,
+    ) -> ProxifierResult<TcpStream> {
+        match action {
+            RuleAction::Direct => {
+                let addr = format!("{target_host}:{target_port}");
+                TcpStream::connect(&addr).await.map_err(ProxifierError::Io)
+            }
+            RuleAction::Proxy { target_id } => {
+                let node = {
+                    let prof = self.profile.read();
+                    prof.proxies
+                        .iter()
+                        .find(|p| &p.id == target_id)
+                        .cloned()
+                        .ok_or_else(|| ProxifierError::ProxyNotFound {
+                            key: ERR_KEY_PROXY_NOT_FOUND,
+                            proxy_id: target_id.clone(),
+                        })?
+                };
+                ProxyConnector::connect_single(&node, target_host, target_port, &self.constants)
+                    .await
+            }
+            RuleAction::Chain { target_id } => {
+                let (strategy, hops) = {
+                    let prof = self.profile.read();
+                    let chain =
+                        prof.chains
+                            .iter()
+                            .find(|c| &c.id == target_id)
+                            .ok_or_else(|| ProxifierError::ProxyNotFound {
+                                key: ERR_KEY_PROXY_NOT_FOUND,
+                                proxy_id: target_id.clone(),
+                            })?;
+                    let mut nodes = Vec::new();
+                    for pid in &chain.proxy_ids {
+                        if let Some(n) = prof.proxies.iter().find(|p| &p.id == pid) {
+                            nodes.push(n.clone());
+                        }
+                    }
+                    (chain.strategy, nodes)
+                };
+                ProxyConnector::connect_group(
+                    strategy,
+                    &hops,
+                    0,
+                    target_host,
+                    target_port,
+                    &self.constants,
+                )
+                .await
+            }
+            RuleAction::Block => Err(ProxifierError::BlockedByPolicy {
+                key: crate::error::ERR_KEY_RULE_BLOCKED,
+                rule_name: ROUTE_BLOCK_LABEL.to_string(),
+            }),
+        }
+    }
+
+    fn format_action_label(&self, action: &RuleAction) -> String {
+        let prof = self.profile.read();
+        match action {
+            RuleAction::Direct => ROUTE_DIRECT_LABEL.to_string(),
+            RuleAction::Block => ROUTE_BLOCK_LABEL.to_string(),
+            RuleAction::Proxy { target_id } => prof
+                .proxies
+                .iter()
+                .find(|p| &p.id == target_id)
+                .map(|p| format!("{} ({:?})", p.name, p.protocol))
+                .unwrap_or_else(|| target_id.clone()),
+            RuleAction::Chain { target_id } => prof
+                .chains
+                .iter()
+                .find(|c| &c.id == target_id)
+                .map(|c| format!("Chain: {} ({} hops)", c.name, c.proxy_ids.len()))
+                .unwrap_or_else(|| target_id.clone()),
+        }
+    }
+
+    fn detect_elevated_privileges() -> bool {
+        #[cfg(windows)]
+        {
+            std::env::var("USERNAME")
+                .map(|u| u.eq_ignore_ascii_case("Administrator"))
+                .unwrap_or(false)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::env::var("USER").map(|u| u == "root").unwrap_or(false)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            false
+        }
+    }
+}
