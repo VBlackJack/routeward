@@ -1,9 +1,44 @@
 # Troubleshooting
 
-## 1. `routeward-desktop` Fails to Compile Because `ui/dist` Is Missing
+## 1. Antivirus and EDR Detection of WinDivert (`HackTool` / PUA Alert)
 
 **Symptom**:
-Compiler error in `apps/desktop/src/main.rs` complaining that `../../../ui/dist/index.html` or `../../../ui/dist/assets/app.js` does not exist.
+Endpoint Detection and Response (EDR) agents or antivirus software quarantine `WinDivert64.sys` / `WinDivert.dll` or raise a security alert classifying WinDivert as a `HackTool` or Potentially Unwanted Application (PUA).
+
+**Cause**:
+Although WinDivert is a legitimate open-source packet interception library, some security tools flag its kernel driver because third-party utilities and offensive tools also use it to inspect or modify traffic.
+
+**Resolution**:
+- **Never load `WinDivert64.sys` directly on a corporate workstation monitored by an enterprise SOC/EDR** without prior authorization.
+- Perform all live packet interception testing inside an isolated virtual machine (for example Hyper-V).
+- RouteWard isolates packet capture behind the `Interceptor` trait (`crates/routeward-core/src/interceptor/backend.rs`) so that an alternative backend (such as a custom Windows Filtering Platform callout driver) can replace WinDivert in enterprise environments.
+
+## 2. `WinDivert.dll` Not Found When Running `routeward run`
+
+**Symptom**:
+`routeward run` exits with `errors.interceptor.driver_missing`.
+
+**Resolution**:
+WinDivert binaries are never committed to Git. Download and verify the official WinDivert 2.2.2-A binaries using the included PowerShell script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
+```
+
+This verifies the pinned SHA-256 (`63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15`) and extracts `WinDivert.dll` and `WinDivert64.sys` into `third_party/windivert/bin/`.
+
+## 3. `WinDivertOpen` Fails with Win32 Error 5 (`ERROR_ACCESS_DENIED`)
+
+**Symptom**:
+`routeward run` exits with `WinDivertOpen(SOCKET) failed with Win32 error 5`.
+
+**Resolution**:
+Loading and opening the WinDivert kernel filter requires **Administrator** privileges. Launch PowerShell as Administrator inside your test VM and run `routeward run --duration-secs 60`.
+
+## 4. `routeward-desktop` Fails to Compile Because `ui/dist` Is Missing
+
+**Symptom**:
+Compiler error in `apps/desktop/src/main.rs` complaining that `../../../ui/dist/index.html` does not exist.
 
 **Resolution**:
 Build the frontend bundle before compiling `routeward-desktop`:
@@ -15,32 +50,3 @@ npm run build
 Set-Location ..
 cargo build -p routeward-desktop
 ```
-
-## 2. Local Relay Port (`10808`, `10809`, or `10853`) Already in Use
-
-**Symptom**:
-The `Logs` view or `logs/RouteWard_<yyyyMMdd>.log` reports an `ADDRINUSE` error on `127.0.0.1:10808`, `127.0.0.1:10809`, or `127.0.0.1:10853`.
-
-**Resolution**:
-- Check if another instance of `routeward` or `routeward-desktop` is already running.
-- Or update `defaultRelayTcpPort`, `defaultRelayHttpPort`, and `defaultDnsListenPort` in `configs/system_constants.json`.
-
-## 3. Applications Ignore Routing Rules
-
-**Symptom**:
-A desktop application connects directly to the Internet without appearing in the local relay.
-
-**Cause**:
-Transparent OS-level packet interception (WinDivert / WFP on Windows, nftables / TUN on Linux) is not implemented yet (planned for Milestones 1 and 2).
-
-**Current Workaround**:
-- Use the **Run App via Proxy** launcher in the top bar to inject `ALL_PROXY`, `HTTP_PROXY`, and `HTTPS_PROXY` into the target process.
-- Or enable **System Proxy** for applications that honor the Windows WinINet proxy configuration.
-
-## 4. No Log Files Written Under `logs/`
-
-**Symptom**:
-The `logs/RouteWard_<yyyyMMdd>.log` file is not created or stops updating.
-
-**Resolution**:
-Verify that `enableLogging` is set to `true` in the active profile (`configs/default_profile.json`) and that the working directory is writable by the current user.

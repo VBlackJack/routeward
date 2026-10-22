@@ -562,6 +562,9 @@
         "loaded_profile": "Loaded profile configuration",
         "listening_socks": "Local SOCKS5 transparent relay listening",
         "listening_http": "Local HTTP CONNECT relay listening",
+        "listening_transparent": "Transparent TCP relay (WinDivert reflect) listening",
+        "interception_active": "Packet interception active via backend",
+        "duration_limit": "Automatic shutdown scheduled after (seconds)",
         "ready": "Interception engine active. Press Ctrl+C to stop."
       },
       "check": {
@@ -589,6 +592,10 @@
     },
     "rule": {
       "blocked_by_policy": "Connection blocked by routing policy rule"
+    },
+    "interceptor": {
+      "driver_missing": "WinDivert library or driver not found (run tools/fetch-windivert.ps1)",
+      "open_failed": "Failed to open WinDivert kernel filter (Administrator privileges required)"
     }
   },
   "themeforge": {

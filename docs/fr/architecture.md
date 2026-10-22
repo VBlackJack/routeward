@@ -4,60 +4,54 @@
 
 RouteWard est organise en workspace Rust comprenant trois crates (`routeward-core`, `routeward-cli` et `routeward-desktop` dans `apps/desktop`) ainsi qu'une interface React + TypeScript (`ui/`).
 
-**Limitation importante de l'etat actuel** :
-- **L'interception transparente de paquets au niveau du systeme d'exploitation n'est pas encore implementee.** Actuellement, `routeward-core` expose des ecouteurs locaux (SOCKS5 sur `127.0.0.1:10808`, HTTP CONNECT sur `127.0.0.1:10809` et DNS Fake-IP sur `127.0.0.1:10853`) et attribue les connexions locales aux processus via la table TCP du systeme. Les applications doivent donc etre lancees avec les variables d'environnement de proxy (`ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`), utiliser le Proxy Systeme Windows, ou pointer explicitement vers le relais local.
-- **Etat de l'IPC Frontend** : L'interface React (`ui/src/services/ipc.ts`) utilise encore un client d'etat local pour l'edition des profils et n'appelle le backend Rust que pour `/api/scan-os`, `/api/system-proxy`, `/api/launch-process` et les controles de fenetre. Le branchement IPC complet est prevu au Milestone 3.
+### Etat du Milestone 1 (Interception TCP IPv4 sous Windows)
+- **Trait `Interceptor` enfichable (`routeward-core::interceptor::backend`)** : Abstrait l'interception de paquets derriere le trait `Interceptor` afin de pouvoir brancher d'autres moteurs (comme un pilote WFP sous Windows ou `nftables`/TUN sous Linux au Milestone 2) sans toucher au moteur de regles.
+- **Backend WinDivert 2.2 (`routeward-core::interceptor::windivert`)** : Charge dynamiquement `WinDivert.dll` au runtime via `LoadLibraryExW` et `GetProcAddress` (conformite LGPLv3 par liaison dynamique; aucun binaire WinDivert n'est versionne dans le depot).
+- **Resolution de la course SOCKET / NETWORK (`routeward-core::interceptor::nat`)** : Ouvre simultanement `WINDIVERT_LAYER_SOCKET` (sniff lecture seule) et `WINDIVERT_LAYER_NETWORK`. Comme l'evenement `SOCKET` et le premier paquet `SYN` arrivent sur deux handles distincts, si le `SYN` arrive avant l'evenement `SOCKET`, RouteWard retient brievement le `SYN` et resout le PID via `GetExtendedTcpTable` (`tcp_table_fallback`), en journalisant la source de resolution (`resolvedVia=socket_layer` ou `resolvedVia=tcp_table_fallback`).
+- **Redirection locale par reflexion `streamdump`** : Les paquets TCP IPv4 rediriges utilisent la technique `reflect` de l'exemple officiel `streamdump` de WinDivert (`reflect_outbound_to_local_relay` et `reflect_relay_reply_to_client` dans `nat.rs`). Les paquets sortants du client (`client_ip:client_port -> orig_dst_ip:orig_dst_port`) voient leurs adresses IPv4 permutees (`orig_dst_ip:client_port -> client_ip:10810`), leur port de destination reecrit vers le relais TCP transparent (`0.0.0.0:10810`), leur direction basculee en entrant (`Outbound = 0`) et leurs sommes de controle RFC 1071 recalculees avant reinjection. Les paquets de reponse issus du port `10810` sont reflechis en sens inverse (`orig_dst_ip:orig_dst_port -> client_ip:client_port`, `Outbound = 0`).
+- **Exclusion anti-boucle** : Les connexions emises par le PID de RouteWard lui-meme, le trafic loopback et les connexions vers les serveurs proxies en amont sont automatiquement exclus.
+- **Non implemente a ce stade** : Interception IPv6 et UDP, capture DNS transparente, interception sous Linux (Milestone 2) et branchement IPC complet de l'interface graphique (Milestone 3).
 
 ## Diagramme des Composants
 
 ```mermaid
 flowchart TD
-    subgraph UI["Interface (ui/)"]
-        ReactApp["Interface React + ThemeForge"]
-        IpcService["ipc.ts (Pont HTTP partiel + Etat local)"]
+    subgraph ClientApp["Application Windows non modifiee (ex. curl.exe)"]
+        Curl["SYN TCP IPv4 sortant (client_ip:C -> dst_ip:D)"]
     end
 
-    subgraph Desktop["Hote Bureau (apps/desktop)"]
-        TaoWindow["Fenetre tao + wry WebView2"]
-        HttpLoopback["Serveur Loopback Embarque (127.0.0.1:0)"]
-        Bridge["DesktopCommandBridge"]
-    end
-
-    subgraph CLI["Binaire CLI (crates/routeward-cli)"]
-        RouteWardCli["CLI routeward (run, check, eval, fake-ip)"]
+    subgraph WinDivert["WinDivertBackend (Trait Interceptor)"]
+        SockLayer["WINDIVERT_LAYER_SOCKET (Cache PID)"]
+        NetLayer["WINDIVERT_LAYER_NETWORK (Reflexion streamdump)"]
+        PidFallback["Secours GetExtendedTcpTable (si SYN arrive en premier)"]
     end
 
     subgraph Core["Moteur Coeur (crates/routeward-core)"]
-        Controller["RouteWardController"]
-        RelayListeners["Ecouteurs locaux SOCKS5 (10808) & HTTP CONNECT (10809)"]
+        NatTable["TransparentNatTable (Session C -> orig_dst_ip:D, PID, Exe)"]
+        TransRelay["Ecouteur TCP Transparent (0.0.0.0:10810)"]
         RuleEngine["RuleEngine (Priorite, Processus, Domaine, CIDR, Port)"]
-        FakeIpDns["FakeIpDnsEngine (198.18.0.0/15)"]
-        ProcessResolver["ProcessResolver (GetExtendedTcpTable / procfs)"]
-        ProxyConnector["ProxyConnector (SOCKS5, HTTP, HTTPS)"]
+        ProxyConnector["ProxyConnector (SOCKS5 / HTTP CONNECT)"]
         Telemetry["TelemetryHub + FileLogger (logs/RouteWard_yyyyMMdd.log)"]
     end
 
-    ReactApp --> IpcService
-    IpcService --> HttpLoopback
-    TaoWindow --> HttpLoopback
-    HttpLoopback --> Bridge
-    Bridge --> Controller
-    RouteWardCli --> Controller
-    Controller --> RelayListeners
-    Controller --> RuleEngine
-    Controller --> FakeIpDns
-    Controller --> ProcessResolver
-    Controller --> ProxyConnector
-    Controller --> Telemetry
+    Curl --> SockLayer
+    Curl --> NetLayer
+    SockLayer --> NatTable
+    NetLayer --> PidFallback
+    PidFallback --> NatTable
+    NetLayer --> RuleEngine
+    NetLayer -->|"Reflechi en Entrant (dst_ip:C -> client_ip:10810)"| TransRelay
+    TransRelay --> NatTable
+    TransRelay --> ProxyConnector
+    TransRelay --> Telemetry
 ```
 
 ## Modules du Workspace
 
 | Chemin | Crate / Paquet | Responsabilite |
 | :--- | :--- | :--- |
-| `crates/routeward-core` | `routeward-core` | Chargement de configuration, moteur de regles par priorite, cache DNS Fake-IP, connecteur proxy SOCKS5/HTTP, attribution de sockets TCP OS, telemetrie et `FileLogger` quotidien. |
-| `crates/routeward-cli` | `routeward-cli` (`routeward`) | Interface en ligne de commande pour demarrer le relais local, tester les proxies, evaluer les regles et inspecter le DNS Fake-IP. |
+| `crates/routeward-core` | `routeward-core` | Trait `Interceptor`, `WinDivertInterceptor`, `TransparentNatTable` (reflexion `streamdump` + secours PID), `RuleEngine`, `ProxyConnector` et `FileLogger` quotidien. |
+| `crates/routeward-cli` | `routeward-cli` (`routeward`) | Interface en ligne de commande (`run --duration-secs`, `check`, `eval`, `fake-ip`). |
 | `apps/desktop` | `routeward-desktop` | Application bureau native basee sur `tao` et `wry` embarquant le bundle `ui/dist`. |
-| `ui` | `routeward-ui` | Interface React 18 + TypeScript + Tailwind CSS avec palettes ThemeForge et internationalisation `react-i18next`. |
-| `configs` | Configurations JSON | `system_constants.json`, `default_profile.json` et `themeforge_palettes.json`. |
-| `locales` | Dictionnaires i18n | Fichiers de traduction `fr.json` et `en.json`. |
+| `ui` | `routeward-ui` | Interface React 18 + TypeScript + Tailwind CSS avec palettes ThemeForge. |
+| `tools/fetch-windivert.ps1` | Script PowerShell | Telecharge WinDivert 2.2.2-A officiel, verifie le SHA-256 et extrait `WinDivert.dll` et `WinDivert64.sys` dans `third_party/windivert/bin/`. |

@@ -25,11 +25,16 @@ pub const ERR_KEY_CONNECTION_TIMEOUT: &str = "errors.proxy.connection_timeout";
 pub const ERR_KEY_AUTH_REJECTED: &str = "errors.proxy.auth_rejected";
 pub const ERR_KEY_INVALID_URI: &str = "errors.proxy.invalid_uri";
 pub const ERR_KEY_RULE_BLOCKED: &str = "errors.rule.blocked_by_policy";
+pub const ERR_KEY_INTERCEPTOR_DRIVER: &str = "errors.interceptor.driver_missing";
+pub const ERR_KEY_INTERCEPTOR_OPEN: &str = "errors.interceptor.open_failed";
 
 #[derive(Debug, Error)]
 pub enum RouteWardError {
     #[error("{key}: {detail}")]
     ConfigError { key: &'static str, detail: String },
+
+    #[error("{key}: {detail}")]
+    InterceptorError { key: &'static str, detail: String },
 
     #[error("{key}: {proxy_id}")]
     ProxyNotFound { key: &'static str, proxy_id: String },

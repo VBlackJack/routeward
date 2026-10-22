@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+pub mod backend;
+pub mod nat;
+pub mod windivert;
+
 use crate::checker::{ProxyChecker, ProxyHealthReport};
 use crate::config::{
     InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule, RuleAction,
@@ -22,6 +26,9 @@ use crate::config::{
 use crate::dns::FakeIpEngine;
 use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_PROXY_NOT_FOUND};
 use crate::i18n::I18nRegistry;
+use crate::interceptor::backend::Interceptor;
+use crate::interceptor::nat::TransparentNatTable;
+use crate::interceptor::windivert::WinDivertInterceptor;
 use crate::process::ProcessResolver;
 use crate::proxy::sni::TlsSniExtractor;
 use crate::proxy::uri::ProxyUriCodec;
@@ -31,7 +38,7 @@ use crate::telemetry::{ConnectionStatus, LogLevel, TelemetryHub, TrackedConnecti
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +47,7 @@ use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
 const COMPONENT_ENGINE: &str = "InterceptorEngine";
+const COMPONENT_TRANSPARENT: &str = "TransparentRelay";
 const COMPONENT_RULE: &str = "RuleEngine";
 const COMPONENT_PROXY: &str = "ProxyConnector";
 const COMPONENT_DNS: &str = "FakeIpDNS";
@@ -71,6 +79,8 @@ pub struct RouteWardController {
     pub dns: FakeIpEngine,
     pub process_resolver: ProcessResolver,
     pub telemetry: TelemetryHub,
+    pub nat_table: TransparentNatTable,
+    interceptor_backend: Arc<dyn Interceptor>,
     running: Arc<AtomicBool>,
 }
 
@@ -82,6 +92,19 @@ impl RouteWardController {
         let telemetry = TelemetryHub::new(&constants.telemetry);
         telemetry.set_file_logging_enabled(profile.enable_logging);
 
+        let nat_table = TransparentNatTable::new(
+            std::process::id(),
+            constants.network.default_transparent_tcp_port,
+            constants.network.default_relay_tcp_port,
+            constants.network.default_relay_http_port,
+        );
+        let upstream_endpoints: Vec<(Ipv4Addr, u16)> = profile
+            .proxies
+            .iter()
+            .filter_map(|p| p.host.parse::<Ipv4Addr>().ok().map(|ip| (ip, p.port)))
+            .collect();
+        nat_table.set_upstream_endpoints(upstream_endpoints);
+
         let controller = Self {
             constants: Arc::new(constants),
             profile: Arc::new(RwLock::new(profile)),
@@ -89,6 +112,8 @@ impl RouteWardController {
             dns,
             process_resolver,
             telemetry,
+            nat_table,
+            interceptor_backend: Arc::new(WinDivertInterceptor::new()),
             running: Arc::new(AtomicBool::new(false)),
         };
 
@@ -173,9 +198,58 @@ impl RouteWardController {
                 }
             }
         });
+
+        let trans_ctrl = self.clone();
+        tokio::spawn(async move {
+            let bind_addr = format!(
+                "{}:{}",
+                trans_ctrl.constants.network.transparent_bind_host,
+                trans_ctrl.constants.network.default_transparent_tcp_port
+            );
+            if let Ok(listener) = TcpListener::bind(&bind_addr).await {
+                trans_ctrl.telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_TRANSPARENT,
+                    format!(
+                        "{}: {}",
+                        trans_ctrl
+                            .i18n
+                            .t("cli.engine.startup.listening_transparent"),
+                        bind_addr
+                    ),
+                );
+
+                while trans_ctrl.is_running() {
+                    if let Ok((client_stream, peer_addr)) = listener.accept().await {
+                        let conn_ctrl = trans_ctrl.clone();
+                        tokio::spawn(async move {
+                            let _ = conn_ctrl
+                                .handle_transparent_tcp_client(client_stream, peer_addr.port())
+                                .await;
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    /// Starts the OS-level transparent packet interceptor (`Interceptor` trait backend).
+    pub fn start_transparent_interceptor(&self) -> RouteWardResult<&'static str> {
+        let backend_name = self.interceptor_backend.name();
+        self.interceptor_backend.start(self.clone())?;
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_ENGINE,
+            format!(
+                "{}: {backend_name}",
+                self.i18n.t("cli.engine.startup.interception_active")
+            ),
+        );
+        Ok(backend_name)
     }
 
     pub fn stop_engine(&self) {
+        self.interceptor_backend.stop();
         self.running.store(false, Ordering::SeqCst);
         self.telemetry.push_log(
             LogLevel::Warn,
@@ -603,6 +677,88 @@ impl RouteWardController {
             self.telemetry.update_connection_traffic(&conn_id, rx, tx);
         }
         self.telemetry.mark_connection_closed(&conn_id);
+
+        Ok(())
+    }
+
+    async fn handle_transparent_tcp_client(
+        &self,
+        mut client: TcpStream,
+        client_port: u16,
+    ) -> RouteWardResult<()> {
+        let Some(session) = self.nat_table.get_session(client_port) else {
+            return Ok(());
+        };
+
+        let target_host = session.orig_dst_ip.to_string();
+        let target_port = session.orig_dst_port;
+        let route_label = self.format_action_label(&session.action);
+
+        let mut outbound = match self
+            .open_outbound_stream(&session.action, &target_host, target_port)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                self.telemetry.push_log(
+                    LogLevel::Error,
+                    COMPONENT_TRANSPARENT,
+                    format!(
+                        "Failed upstream connect for PID={} process=\"{}\" exe=\"{}\" -> {}:{}: {}",
+                        session.pid,
+                        session.process_name,
+                        session.process_path,
+                        target_host,
+                        target_port,
+                        err
+                    ),
+                );
+                self.nat_table.remove_session(client_port);
+                return Err(err);
+            }
+        };
+
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_TRANSPARENT,
+            format!(
+                "Routed PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} via {} [rule=\"{}\"]",
+                session.pid,
+                session.process_name,
+                session.process_path,
+                session.resolution_source.as_str(),
+                target_host,
+                target_port,
+                route_label,
+                session.matched_rule_name
+            ),
+        );
+
+        let conn_id = Uuid::new_v4().to_string();
+        let tracked = TrackedConnection {
+            id: conn_id.clone(),
+            pid: session.pid,
+            process_name: session.process_name,
+            process_path: session.process_path,
+            target_host,
+            resolved_domain: None,
+            target_port,
+            protocol: TransportProtocol::Tcp,
+            matched_rule: session.matched_rule_name,
+            route_label,
+            latency_ms: 10,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            status: ConnectionStatus::Active,
+            started_at: Utc::now(),
+        };
+        self.telemetry.record_connection(tracked, true);
+
+        if let Ok((tx, rx)) = tokio::io::copy_bidirectional(&mut client, &mut outbound).await {
+            self.telemetry.update_connection_traffic(&conn_id, rx, tx);
+        }
+        self.telemetry.mark_connection_closed(&conn_id);
+        self.nat_table.remove_session(client_port);
 
         Ok(())
     }

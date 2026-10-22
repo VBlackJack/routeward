@@ -31,16 +31,12 @@ Generated binaries:
 - CLI binary: `target/release/routeward` (or `routeward.exe` on Windows)
 - Desktop binary: `target/release/routeward-desktop` (or `routeward-desktop.exe` on Windows)
 
-## Running in Development
+## Step 3: Fetch WinDivert Runtime Binaries (Windows VM Testing Only)
 
-Run the CLI rule evaluator:
-
-```powershell
-cargo run -p routeward-cli -- eval --process firefox.exe --host api.github.com --port 443
-```
-
-Run the native desktop window:
+WinDivert binaries are not committed to the repository. Inside your isolated Windows test VM, run:
 
 ```powershell
-cargo run -p routeward-desktop
+powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
 ```
+
+This downloads `WinDivert-2.2.2-A.zip`, verifies its SHA-256 (`63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15`), and extracts `WinDivert.dll` and `WinDivert64.sys` into `third_party/windivert/bin/`.

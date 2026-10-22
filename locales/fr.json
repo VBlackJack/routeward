@@ -562,6 +562,9 @@
         "loaded_profile": "Profil de configuration chargé",
         "listening_socks": "Relais transparent SOCKS5 en écoute",
         "listening_http": "Relais HTTP CONNECT en écoute",
+        "listening_transparent": "Relais TCP transparent (WinDivert reflect) en écoute",
+        "interception_active": "Interception de paquets active via le moteur",
+        "duration_limit": "Arrêt automatique programmé après (secondes)",
         "ready": "Moteur d'interception actif. Appuyez sur Ctrl+C pour arrêter."
       },
       "check": {
@@ -589,6 +592,10 @@
     },
     "rule": {
       "blocked_by_policy": "Connexion bloquée par une règle de routage"
+    },
+    "interceptor": {
+      "driver_missing": "Bibliothèque ou pilote WinDivert introuvable (exécutez tools/fetch-windivert.ps1)",
+      "open_failed": "Impossible d'ouvrir le filtre noyau WinDivert (droits Administrateur requis)"
     }
   },
   "themeforge": {

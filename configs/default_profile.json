@@ -137,7 +137,7 @@
     },
     {
       "id": "rule-cli-tools-chain",
-      "name": "CLI Tools via Multi-Hop Chain",
+      "name": "CLI Tools via SOCKS5 Proxy",
       "enabled": true,
       "priority": 30,
       "processPatterns": [
@@ -154,8 +154,8 @@
       "portRanges": [],
       "protocol": "tcp",
       "action": {
-        "type": "chain",
-        "targetId": "chain-multi-hop-stealth"
+        "type": "proxy",
+        "targetId": "proxy-socks5-primary"
       }
     },
     {

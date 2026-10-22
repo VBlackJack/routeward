@@ -1,14 +1,23 @@
 {
   "network": {
     "localBindHost": "127.0.0.1",
+    "transparentBindHost": "0.0.0.0",
     "defaultRelayTcpPort": 10808,
     "defaultRelayHttpPort": 10809,
+    "defaultTransparentTcpPort": 10810,
     "defaultDnsListenPort": 10853,
     "tcpConnectTimeoutMs": 5000,
     "proxyHandshakeTimeoutMs": 6000,
     "udpAssociationTimeoutMs": 30000,
     "relayBufferSizeBytes": 65536,
-    "maxConcurrentConnections": 4096
+    "maxConcurrentConnections": 4096,
+    "pidFallbackRetries": 4,
+    "pidFallbackDelayMs": 2,
+    "windivertPriority": 0,
+    "windivertDllPaths": [
+      "WinDivert.dll",
+      "third_party/windivert/bin/WinDivert.dll"
+    ]
   },
   "dns": {
     "fakeIpCidr": "198.18.0.0/15",

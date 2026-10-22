@@ -31,16 +31,12 @@ Binaires generes :
 - Binaire CLI : `target/release/routeward` (ou `routeward.exe` sous Windows)
 - Binaire Bureau : `target/release/routeward-desktop` (ou `routeward-desktop.exe` sous Windows)
 
-## Execution en Developpement
+## Etape 3 : Telecharger les Binaires WinDivert (Test en VM Windows uniquement)
 
-Tester l'evaluateur de regles en ligne de commande :
-
-```powershell
-cargo run -p routeward-cli -- eval --process firefox.exe --host api.github.com --port 443
-```
-
-Lancer la fenetre bureau native :
+Les binaires WinDivert ne sont pas versionnes dans Git. Dans la VM Windows de test, executer :
 
 ```powershell
-cargo run -p routeward-desktop
+powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
 ```
+
+Ce script telecharge `WinDivert-2.2.2-A.zip`, verifie son empreinte SHA-256 (`63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15`) et extrait `WinDivert.dll` et `WinDivert64.sys` dans `third_party/windivert/bin/`.

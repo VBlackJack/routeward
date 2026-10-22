@@ -15,3 +15,21 @@ RouteWard integrates the 16 canonical ThemeForge palettes plus High Contrast:
 - Striga, Cinder, Bracken, Tarn, Mortis, Slate, Voivode, Carmilla, Whitby, Vesper,
   Parchment, Folio, Wormwood, and Sconce: original Apache 2.0 palettes engineered
   from uniform Oklab targets by Julien Bombled.
+
+================================================================================
+WinDivert (Windows Packet Divert) - Dynamic Runtime Dependency (Windows)
+================================================================================
+
+On Windows, RouteWard supports transparent packet interception by dynamically
+loading WinDivert.dll at runtime (via LoadLibraryW / GetProcAddress).
+WinDivert is developed by Basil (https://github.com/basil00/WinDivert) and is
+dual-licensed under the GNU Lesser General Public License v3 (LGPLv3) or the
+GNU General Public License v2 (GPLv2).
+
+RouteWard uses WinDivert under the LGPLv3 dynamic linking terms:
+- No WinDivert source code or binary artifacts are statically linked into
+  RouteWard or committed to the repository.
+- Users may obtain the official WinDivert 2.2.2-A binaries via
+  tools/fetch-windivert.ps1 (with SHA-256 verification) or replace WinDivert.dll
+  on disk with any compatible version.
+- See third_party/windivert/LICENSE.md for the license text and source link.

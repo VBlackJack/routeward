@@ -12,3 +12,7 @@ logs/
 *.pdb
 *.log
 *.tsbuildinfo
+*.dll
+*.sys
+*.zip
+third_party/windivert/bin/

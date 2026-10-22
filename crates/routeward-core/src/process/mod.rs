@@ -144,7 +144,7 @@ impl ProcessResolver {
     }
 
     #[cfg(windows)]
-    fn find_pid_for_tcp_port(local_port: u16) -> Option<u32> {
+    pub fn find_pid_for_tcp_port(local_port: u16) -> Option<u32> {
         use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
@@ -300,7 +300,7 @@ impl ProcessResolver {
     }
 
     #[cfg(target_os = "linux")]
-    fn find_pid_for_tcp_port(local_port: u16) -> Option<u32> {
+    pub fn find_pid_for_tcp_port(local_port: u16) -> Option<u32> {
         use std::fs;
         let hex_port = format!("{:04X}", local_port);
         let content = fs::read_to_string("/proc/net/tcp").ok()?;
@@ -352,7 +352,7 @@ impl ProcessResolver {
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
-    fn find_pid_for_tcp_port(_local_port: u16) -> Option<u32> {
+    pub fn find_pid_for_tcp_port(_local_port: u16) -> Option<u32> {
         None
     }
 

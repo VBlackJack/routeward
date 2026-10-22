@@ -19,6 +19,7 @@ use routeward_core::config::{ProfileConfig, SystemConstants, TransportProtocol};
 use routeward_core::interceptor::RouteWardController;
 use routeward_core::rules::ConnectionRequest;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const DEFAULT_CLI_LOCALE: &str = "fr";
 const DEFAULT_EVAL_PORT: u16 = 443;
@@ -38,8 +39,12 @@ struct CliArgs {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the transparent relay and Fake-IP interceptor engine
-    Run,
+    /// Start the transparent relay and OS packet interceptor engine
+    Run {
+        /// Optional safety timeout in seconds before automatic fail-open shutdown
+        #[arg(long)]
+        duration_secs: Option<u64>,
+    },
     /// Probe all configured upstream proxies for latency, exit IP, and UDP support
     Check {
         #[arg(short, long)]
@@ -75,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let controller = RouteWardController::new(constants, profile, &args.locale);
 
     match args.command {
-        Commands::Run => {
+        Commands::Run { duration_secs } => {
             println!("=== {} ===", controller.i18n.t("cli.engine.startup.banner"));
             controller.start_engine();
             let diag = controller.diagnostics();
@@ -84,8 +89,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 controller.i18n.t("cli.engine.startup.listening_socks"),
                 diag.relay_tcp_endpoint
             );
+            println!(
+                "{}: {}:{}",
+                controller
+                    .i18n
+                    .t("cli.engine.startup.listening_transparent"),
+                controller.constants.network.transparent_bind_host,
+                controller.constants.network.default_transparent_tcp_port
+            );
+
+            match controller.start_transparent_interceptor() {
+                Ok(backend) => {
+                    println!(
+                        "{}: {backend}",
+                        controller.i18n.t("cli.engine.startup.interception_active")
+                    );
+                }
+                Err(err) => {
+                    controller.stop_engine();
+                    return Err(err.into());
+                }
+            }
+
+            if let Some(secs) = duration_secs {
+                println!(
+                    "{}: {secs}s",
+                    controller.i18n.t("cli.engine.startup.duration_limit")
+                );
+            }
             println!("{}", controller.i18n.t("cli.engine.startup.ready"));
-            tokio::signal::ctrl_c().await?;
+
+            if let Some(secs) = duration_secs {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(secs)) => {},
+                }
+            } else {
+                tokio::signal::ctrl_c().await?;
+            }
+
             controller.stop_engine();
         }
         Commands::Check { proxy_id } => {

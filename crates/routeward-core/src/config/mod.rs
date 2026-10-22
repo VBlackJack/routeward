@@ -78,14 +78,20 @@ pub struct SystemConstants {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkConstants {
     pub local_bind_host: String,
+    pub transparent_bind_host: String,
     pub default_relay_tcp_port: u16,
     pub default_relay_http_port: u16,
+    pub default_transparent_tcp_port: u16,
     pub default_dns_listen_port: u16,
     pub tcp_connect_timeout_ms: u64,
     pub proxy_handshake_timeout_ms: u64,
     pub udp_association_timeout_ms: u64,
     pub relay_buffer_size_bytes: usize,
     pub max_concurrent_connections: usize,
+    pub pid_fallback_retries: u32,
+    pub pid_fallback_delay_ms: u64,
+    pub windivert_priority: i16,
+    pub windivert_dll_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
