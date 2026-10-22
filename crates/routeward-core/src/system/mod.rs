@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::error::ProxifierResult;
+use crate::error::RouteWardResult;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
@@ -38,7 +38,7 @@ pub struct LaunchedProcessReport {
 pub struct SystemProxyManager;
 
 impl SystemProxyManager {
-    pub fn set_system_proxy(enable: bool, socks_endpoint: &str) -> ProxifierResult<bool> {
+    pub fn set_system_proxy(enable: bool, socks_endpoint: &str) -> RouteWardResult<bool> {
         #[cfg(windows)]
         {
             let enable_val = if enable { "1" } else { "0" };
@@ -85,7 +85,7 @@ impl SystemProxyManager {
         command_line: &str,
         socks_endpoint: &str,
         http_endpoint: &str,
-    ) -> ProxifierResult<LaunchedProcessReport> {
+    ) -> RouteWardResult<LaunchedProcessReport> {
         let parts: Vec<&str> = command_line.split_whitespace().collect();
         let program = parts.first().copied().unwrap_or(command_line);
         let args = if parts.len() > 1 { &parts[1..] } else { &[] };

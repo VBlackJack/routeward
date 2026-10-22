@@ -29,10 +29,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use wry::WebViewBuilder;
 
-const EMBEDDED_INDEX_HTML: &[u8] = include_bytes!("../../ui/dist/index.html");
-const EMBEDDED_APP_JS: &[u8] = include_bytes!("../../ui/dist/assets/app.js");
-const EMBEDDED_APP_CSS: &[u8] = include_bytes!("../../ui/dist/assets/app.css");
-const EMBEDDED_LOGO_JPG: &[u8] = include_bytes!("../../ui/public/logo.jpg");
+const EMBEDDED_INDEX_HTML: &[u8] = include_bytes!("../../../ui/dist/index.html");
+const EMBEDDED_APP_JS: &[u8] = include_bytes!("../../../ui/dist/assets/app.js");
+const EMBEDDED_APP_CSS: &[u8] = include_bytes!("../../../ui/dist/assets/app.css");
+const EMBEDDED_LOGO_JPG: &[u8] = include_bytes!("../../../ui/public/logo.jpg");
 
 const WINDOW_DEFAULT_WIDTH: f64 = 1400.0;
 const WINDOW_DEFAULT_HEIGHT: f64 = 900.0;

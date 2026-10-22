@@ -28,7 +28,7 @@ name = "routeward-desktop"
 path = "src/main.rs"
 
 [dependencies]
-routeward-core = { path = "../crates/routeward-core" }
+routeward-core = { path = "../../crates/routeward-core" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

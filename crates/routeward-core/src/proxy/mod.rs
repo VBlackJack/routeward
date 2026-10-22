@@ -19,7 +19,7 @@ pub mod uri;
 
 use crate::config::{ChainStrategy, ProtocolConstants, ProxyNode, ProxyProtocol, SystemConstants};
 use crate::error::{
-    ProxifierError, ProxifierResult, ERR_KEY_AUTH_REJECTED, ERR_KEY_CHAIN_EMPTY,
+    RouteWardError, RouteWardResult, ERR_KEY_AUTH_REJECTED, ERR_KEY_CHAIN_EMPTY,
     ERR_KEY_CONNECTION_TIMEOUT, ERR_KEY_HANDSHAKE_FAILED,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -45,17 +45,17 @@ impl ProxyConnector {
         target_host: &str,
         target_port: u16,
         constants: &SystemConstants,
-    ) -> ProxifierResult<TcpStream> {
+    ) -> RouteWardResult<TcpStream> {
         let connect_timeout = Duration::from_millis(constants.network.tcp_connect_timeout_ms);
         let handshake_timeout = Duration::from_millis(constants.network.proxy_handshake_timeout_ms);
 
         let proxy_addr = format!("{}:{}", node.host, node.port);
         let mut stream = timeout(connect_timeout, TcpStream::connect(&proxy_addr))
             .await
-            .map_err(|_| ProxifierError::ConnectionTimeout {
+            .map_err(|_| RouteWardError::ConnectionTimeout {
                 key: ERR_KEY_CONNECTION_TIMEOUT,
             })?
-            .map_err(ProxifierError::Io)?;
+            .map_err(RouteWardError::Io)?;
 
         timeout(
             handshake_timeout,
@@ -68,7 +68,7 @@ impl ProxyConnector {
             ),
         )
         .await
-        .map_err(|_| ProxifierError::ConnectionTimeout {
+        .map_err(|_| RouteWardError::ConnectionTimeout {
             key: ERR_KEY_CONNECTION_TIMEOUT,
         })??;
 
@@ -80,9 +80,9 @@ impl ProxyConnector {
         target_host: &str,
         target_port: u16,
         constants: &SystemConstants,
-    ) -> ProxifierResult<TcpStream> {
+    ) -> RouteWardResult<TcpStream> {
         if hops.is_empty() {
-            return Err(ProxifierError::EmptyProxyChain {
+            return Err(RouteWardError::EmptyProxyChain {
                 key: ERR_KEY_CHAIN_EMPTY,
             });
         }
@@ -94,10 +94,10 @@ impl ProxyConnector {
         let entry_addr = format!("{}:{}", first_hop.host, first_hop.port);
         let mut stream = timeout(connect_timeout, TcpStream::connect(&entry_addr))
             .await
-            .map_err(|_| ProxifierError::ConnectionTimeout {
+            .map_err(|_| RouteWardError::ConnectionTimeout {
                 key: ERR_KEY_CONNECTION_TIMEOUT,
             })?
-            .map_err(ProxifierError::Io)?;
+            .map_err(RouteWardError::Io)?;
 
         for idx in 0..hops.len() {
             let current_hop = &hops[idx];
@@ -118,7 +118,7 @@ impl ProxyConnector {
                 ),
             )
             .await
-            .map_err(|_| ProxifierError::ConnectionTimeout {
+            .map_err(|_| RouteWardError::ConnectionTimeout {
                 key: ERR_KEY_CONNECTION_TIMEOUT,
             })??;
         }
@@ -133,10 +133,10 @@ impl ProxyConnector {
         target_host: &str,
         target_port: u16,
         constants: &SystemConstants,
-    ) -> ProxifierResult<TcpStream> {
+    ) -> RouteWardResult<TcpStream> {
         let enabled_hops: Vec<ProxyNode> = hops.iter().filter(|n| n.enabled).cloned().collect();
         if enabled_hops.is_empty() {
-            return Err(ProxifierError::EmptyProxyChain {
+            return Err(RouteWardError::EmptyProxyChain {
                 key: ERR_KEY_CHAIN_EMPTY,
             });
         }
@@ -153,7 +153,7 @@ impl ProxyConnector {
                         Err(err) => last_err = Some(err),
                     }
                 }
-                Err(last_err.unwrap_or(ProxifierError::ConnectionTimeout {
+                Err(last_err.unwrap_or(RouteWardError::ConnectionTimeout {
                     key: ERR_KEY_CONNECTION_TIMEOUT,
                 }))
             }
@@ -167,7 +167,7 @@ impl ProxyConnector {
                         Err(err) => last_err = Some(err),
                     }
                 }
-                Err(last_err.unwrap_or(ProxifierError::ConnectionTimeout {
+                Err(last_err.unwrap_or(RouteWardError::ConnectionTimeout {
                     key: ERR_KEY_CONNECTION_TIMEOUT,
                 }))
             }
@@ -188,7 +188,7 @@ impl ProxyConnector {
                         Err(err) => last_err = Some(err),
                     }
                 }
-                Err(last_err.unwrap_or(ProxifierError::ConnectionTimeout {
+                Err(last_err.unwrap_or(RouteWardError::ConnectionTimeout {
                     key: ERR_KEY_CONNECTION_TIMEOUT,
                 }))
             }
@@ -201,7 +201,7 @@ impl ProxyConnector {
         target_host: &str,
         target_port: u16,
         proto: &ProtocolConstants,
-    ) -> ProxifierResult<()> {
+    ) -> RouteWardResult<()> {
         match node.protocol {
             ProxyProtocol::Socks5 => Self::negotiate_socks5(
                 stream,
@@ -226,7 +226,7 @@ impl ProxyConnector {
         target_port: u16,
         command: u8,
         proto: &ProtocolConstants,
-    ) -> ProxifierResult<Option<SocketAddr>> {
+    ) -> RouteWardResult<Option<SocketAddr>> {
         let has_auth = node
             .auth
             .as_ref()
@@ -250,7 +250,7 @@ impl ProxyConnector {
         stream.read_exact(&mut choice).await?;
 
         if choice[0] != proto.socks5_version {
-            return Err(ProxifierError::ProtocolHandshake {
+            return Err(RouteWardError::ProtocolHandshake {
                 key: ERR_KEY_HANDSHAKE_FAILED,
                 detail: format!("Invalid SOCKS5 version: {}", choice[0]),
             });
@@ -260,7 +260,7 @@ impl ProxyConnector {
             let creds = node
                 .auth
                 .as_ref()
-                .ok_or(ProxifierError::AuthenticationRejected {
+                .ok_or(RouteWardError::AuthenticationRejected {
                     key: ERR_KEY_AUTH_REJECTED,
                 })?;
             let user_bytes = creds.username.as_bytes();
@@ -278,12 +278,12 @@ impl ProxyConnector {
             let mut auth_resp = [0u8; 2];
             stream.read_exact(&mut auth_resp).await?;
             if auth_resp[1] != proto.socks5_reply_succeeded {
-                return Err(ProxifierError::AuthenticationRejected {
+                return Err(RouteWardError::AuthenticationRejected {
                     key: ERR_KEY_AUTH_REJECTED,
                 });
             }
         } else if choice[1] != proto.socks5_auth_none {
-            return Err(ProxifierError::AuthenticationRejected {
+            return Err(RouteWardError::AuthenticationRejected {
                 key: ERR_KEY_AUTH_REJECTED,
             });
         }
@@ -295,7 +295,7 @@ impl ProxyConnector {
         let mut reply_head = [0u8; 4];
         stream.read_exact(&mut reply_head).await?;
         if reply_head[1] != proto.socks5_reply_succeeded {
-            return Err(ProxifierError::ProtocolHandshake {
+            return Err(RouteWardError::ProtocolHandshake {
                 key: ERR_KEY_HANDSHAKE_FAILED,
                 detail: format!("SOCKS5 reply code: {}", reply_head[1]),
             });
@@ -341,7 +341,7 @@ impl ProxyConnector {
         target_host: &str,
         target_port: u16,
         proto: &ProtocolConstants,
-    ) -> ProxifierResult<()> {
+    ) -> RouteWardResult<()> {
         let auth_header = if let Some(creds) = &node.auth {
             if !creds.username.is_empty() || !creds.password.is_empty() {
                 let token =
@@ -376,7 +376,7 @@ impl ProxyConnector {
             Ok(())
         } else {
             let status_line = response_str.lines().next().unwrap_or("HTTP Error");
-            Err(ProxifierError::ProtocolHandshake {
+            Err(RouteWardError::ProtocolHandshake {
                 key: ERR_KEY_HANDSHAKE_FAILED,
                 detail: status_line.to_string(),
             })

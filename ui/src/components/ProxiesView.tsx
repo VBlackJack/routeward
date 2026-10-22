@@ -29,13 +29,13 @@ import {
   Zap
 } from 'lucide-react';
 import { UI_CONFIG } from '../config/constants';
-import { proxifierClient } from '../services/ipc';
+import { routewardClient } from '../services/ipc';
 import {
   ChainStrategy,
   ProxyChain,
   ProxyNode,
   ProxyProtocol
-} from '../types/proxifier';
+} from '../types/routeward';
 
 interface ProxiesViewProps {
   proxies: ProxyNode[];
@@ -150,7 +150,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   };
 
   const handleCopyNodeUri = (node: ProxyNode) => {
-    const uri = proxifierClient.formatProxyUri(node);
+    const uri = routewardClient.formatProxyUri(node);
     if (navigator.clipboard) {
       navigator.clipboard.writeText(uri).catch(() => {});
     }

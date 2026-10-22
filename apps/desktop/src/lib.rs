@@ -18,14 +18,14 @@ pub mod commands;
 
 use commands::DesktopCommandBridge;
 use routeward_core::config::{ProfileConfig, SystemConstants};
-use routeward_core::interceptor::ProxifierController;
+use routeward_core::interceptor::RouteWardController;
 
 const DEFAULT_DESKTOP_LOCALE: &str = "fr";
 
 pub fn create_desktop_bridge() -> Result<DesktopCommandBridge, String> {
     let constants = SystemConstants::load_embedded().map_err(|e| e.to_string())?;
     let profile = ProfileConfig::load_embedded_default().map_err(|e| e.to_string())?;
-    let controller = ProxifierController::new(constants, profile, DEFAULT_DESKTOP_LOCALE);
+    let controller = RouteWardController::new(constants, profile, DEFAULT_DESKTOP_LOCALE);
     controller.start_engine();
     let bridge = DesktopCommandBridge::new(controller);
     let _ = bridge.scan_os_sockets();

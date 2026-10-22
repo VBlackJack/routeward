@@ -15,7 +15,7 @@
  */
 
 use crate::config::{ProxyCredentials, ProxyNode, ProxyProtocol};
-use crate::error::{ProxifierError, ProxifierResult, ERR_KEY_INVALID_URI};
+use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_INVALID_URI};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use uuid::Uuid;
@@ -45,10 +45,10 @@ impl ProxyUriCodec {
             .collect()
     }
 
-    pub fn parse_uri(raw_uri: &str) -> ProxifierResult<ProxyNode> {
+    pub fn parse_uri(raw_uri: &str) -> RouteWardResult<ProxyNode> {
         let trimmed = raw_uri.trim();
         let (scheme_raw, remainder) = trimmed.split_once(SCHEME_SEPARATOR).ok_or_else(|| {
-            ProxifierError::InvalidProxyUri {
+            RouteWardError::InvalidProxyUri {
                 key: ERR_KEY_INVALID_URI,
                 uri: trimmed.to_string(),
             }
@@ -70,7 +70,7 @@ impl ProxyUriCodec {
             SCHEME_HTTP => ProxyProtocol::Http,
             SCHEME_HTTPS => ProxyProtocol::Https,
             _ => {
-                return Err(ProxifierError::InvalidProxyUri {
+                return Err(RouteWardError::InvalidProxyUri {
                     key: ERR_KEY_INVALID_URI,
                     uri: trimmed.to_string(),
                 })
@@ -160,19 +160,19 @@ impl ProxyUriCodec {
         )
     }
 
-    fn parse_host_port(host_port: &str, full_uri: &str) -> ProxifierResult<(String, u16)> {
+    fn parse_host_port(host_port: &str, full_uri: &str) -> RouteWardResult<(String, u16)> {
         let clean = host_port.trim_end_matches('/');
         let (host_str, port_str) =
             clean
                 .rsplit_once(':')
-                .ok_or_else(|| ProxifierError::InvalidProxyUri {
+                .ok_or_else(|| RouteWardError::InvalidProxyUri {
                     key: ERR_KEY_INVALID_URI,
                     uri: full_uri.to_string(),
                 })?;
 
         let port = port_str
             .parse::<u16>()
-            .map_err(|_| ProxifierError::InvalidProxyUri {
+            .map_err(|_| RouteWardError::InvalidProxyUri {
                 key: ERR_KEY_INVALID_URI,
                 uri: full_uri.to_string(),
             })?;
@@ -182,7 +182,7 @@ impl ProxyUriCodec {
             .trim_end_matches(']')
             .to_string();
         if host.is_empty() || port == 0 {
-            return Err(ProxifierError::InvalidProxyUri {
+            return Err(RouteWardError::InvalidProxyUri {
                 key: ERR_KEY_INVALID_URI,
                 uri: full_uri.to_string(),
             });

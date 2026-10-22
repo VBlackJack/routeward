@@ -18,7 +18,7 @@ import React, { useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Check, Palette, Upload, X } from 'lucide-react';
 import { useThemeForge } from '../theme/ThemeForgeContext';
-import { AccentTint, ThemeFamily } from '../types/proxifier';
+import { AccentTint, ThemeFamily } from '../types/routeward';
 
 interface ThemeForgeModalProps {
   onClose: () => void;
@@ -202,7 +202,7 @@ export const ThemeForgeModal: React.FC<ThemeForgeModalProps> = ({ onClose }) => 
           <div className="tf-surface-alt p-4">
             <div className="mb-2 flex items-center justify-between">
               <span className="text-xs font-semibold uppercase tracking-wider text-tf-secondary">
-                {t('themeforge.modal.preview_label')} — {activePalette.displayName}
+                {t('themeforge.modal.preview_label')} - {activePalette.displayName}
               </span>
               <span className="text-[11px] text-tf-secondary">
                 {activePalette.attribution}

@@ -26,13 +26,13 @@ export const UI_CONFIG = {
   DEFAULT_LOCALE: 'fr',
   SUPPORTED_LOCALES: ['fr', 'en'] as const,
   STORAGE_KEYS: {
-    THEME: 'proxifier_tf_theme',
-    ACCENT: 'proxifier_tf_accent',
-    CUSTOM_PALETTES: 'proxifier_tf_custom_palettes',
-    LOCALE: 'proxifier_locale',
-    PROFILE: 'proxifier_active_profile',
-    EXPERIENCE_MODE: 'proxifier_ux_mode',
-    WIZARD_COMPLETED: 'proxifier_wizard_done'
+    THEME: 'routeward_tf_theme',
+    ACCENT: 'routeward_tf_accent',
+    CUSTOM_PALETTES: 'routeward_tf_custom_palettes',
+    LOCALE: 'routeward_locale',
+    PROFILE: 'routeward_active_profile',
+    EXPERIENCE_MODE: 'routeward_ux_mode',
+    WIZARD_COMPLETED: 'routeward_wizard_done'
   },
   TELEMETRY_REFRESH_INTERVAL_MS: 1000,
   BYTE_UNITS: ['B', 'KB', 'MB', 'GB'] as const,

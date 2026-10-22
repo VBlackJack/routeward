@@ -20,7 +20,7 @@ import {
   AccentTint,
   ThemeForgeColors,
   ThemeForgePalette
-} from '../types/proxifier';
+} from '../types/routeward';
 
 interface ThemeForgeContextValue {
   palettes: ThemeForgePalette[];

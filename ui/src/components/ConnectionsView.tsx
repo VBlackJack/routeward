@@ -38,7 +38,7 @@ import {
   ProxyNode,
   RoutingRule,
   TrackedConnection
-} from '../types/proxifier';
+} from '../types/routeward';
 
 interface ConnectionsViewProps {
   connections: TrackedConnection[];
@@ -299,7 +299,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                           </span>
                         </td>
                         <td className="px-4 py-3 font-mono text-tf-secondary">
-                          {conn.latencyMs > 0 ? `${conn.latencyMs} ms` : '—'}
+                          {conn.latencyMs > 0 ? `${conn.latencyMs} ms` : '-'}
                         </td>
                         <td className="px-4 py-3 font-mono text-[11px]">
                           <span className="text-tf-cyan">

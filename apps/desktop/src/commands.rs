@@ -19,7 +19,7 @@ use routeward_core::config::{
     InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule, ThemeForgeCatalog,
 };
 use routeward_core::dns::FakeIpEntry;
-use routeward_core::interceptor::{ProxifierController, SystemDiagnostics};
+use routeward_core::interceptor::{RouteWardController, SystemDiagnostics};
 use routeward_core::rules::{ConnectionRequest, RuleEvaluationResult};
 use routeward_core::system::{LaunchedProcessReport, SystemProxyManager};
 use routeward_core::telemetry::{LogEntry, LogLevel, TelemetrySnapshot, TrackedConnection};
@@ -27,11 +27,11 @@ use routeward_core::telemetry::{LogEntry, LogLevel, TelemetrySnapshot, TrackedCo
 const DEFAULT_OS_SCAN_LIMIT: usize = 48;
 
 pub struct DesktopCommandBridge {
-    controller: ProxifierController,
+    controller: RouteWardController,
 }
 
 impl DesktopCommandBridge {
-    pub fn new(controller: ProxifierController) -> Self {
+    pub fn new(controller: RouteWardController) -> Self {
         Self { controller }
     }
 

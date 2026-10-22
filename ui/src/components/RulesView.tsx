@@ -42,7 +42,7 @@ import {
   RuleAction,
   RuleEvaluationResult,
   TransportProtocol
-} from '../types/proxifier';
+} from '../types/routeward';
 import { ExperienceMode } from './QuickSetupWizardModal';
 
 interface RulesViewProps {
@@ -278,7 +278,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
         </div>
       )}
 
-      {/* Visual App Routing Cards ("Mes Applications" — Always available, highlighted for beginners) */}
+      {/* Visual App Routing Cards ("Mes Applications" - Always available, highlighted for beginners) */}
       <div className="tf-card space-y-4 p-5">
         <div>
           <h3 className="text-sm font-bold text-tf-primary">

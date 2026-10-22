@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::error::{ProxifierError, ProxifierResult, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_LOAD};
+use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_LOAD};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -54,9 +54,9 @@ pub struct ThemeForgeCatalog {
 }
 
 impl ThemeForgeCatalog {
-    pub fn load_embedded() -> ProxifierResult<Self> {
+    pub fn load_embedded() -> RouteWardResult<Self> {
         serde_json::from_str(EMBEDDED_THEMEFORGE_PALETTES).map_err(|err| {
-            ProxifierError::ConfigError {
+            RouteWardError::ConfigError {
                 key: ERR_KEY_CONFIG_JSON,
                 detail: err.to_string(),
             }
@@ -143,19 +143,19 @@ pub struct ProtocolConstants {
 }
 
 impl SystemConstants {
-    pub fn load_embedded() -> ProxifierResult<Self> {
-        serde_json::from_str(EMBEDDED_SYSTEM_CONSTANTS).map_err(|err| ProxifierError::ConfigError {
+    pub fn load_embedded() -> RouteWardResult<Self> {
+        serde_json::from_str(EMBEDDED_SYSTEM_CONSTANTS).map_err(|err| RouteWardError::ConfigError {
             key: ERR_KEY_CONFIG_JSON,
             detail: err.to_string(),
         })
     }
 
-    pub fn load_from_path(path: impl AsRef<Path>) -> ProxifierResult<Self> {
-        let content = fs::read_to_string(path).map_err(|err| ProxifierError::ConfigError {
+    pub fn load_from_path(path: impl AsRef<Path>) -> RouteWardResult<Self> {
+        let content = fs::read_to_string(path).map_err(|err| RouteWardError::ConfigError {
             key: ERR_KEY_CONFIG_LOAD,
             detail: err.to_string(),
         })?;
-        serde_json::from_str(&content).map_err(|err| ProxifierError::ConfigError {
+        serde_json::from_str(&content).map_err(|err| RouteWardError::ConfigError {
             key: ERR_KEY_CONFIG_JSON,
             detail: err.to_string(),
         })
@@ -327,30 +327,30 @@ pub struct ProfileConfig {
 }
 
 impl ProfileConfig {
-    pub fn load_embedded_default() -> ProxifierResult<Self> {
-        serde_json::from_str(EMBEDDED_DEFAULT_PROFILE).map_err(|err| ProxifierError::ConfigError {
+    pub fn load_embedded_default() -> RouteWardResult<Self> {
+        serde_json::from_str(EMBEDDED_DEFAULT_PROFILE).map_err(|err| RouteWardError::ConfigError {
             key: ERR_KEY_CONFIG_JSON,
             detail: err.to_string(),
         })
     }
 
-    pub fn load_from_path(path: impl AsRef<Path>) -> ProxifierResult<Self> {
-        let content = fs::read_to_string(path).map_err(|err| ProxifierError::ConfigError {
+    pub fn load_from_path(path: impl AsRef<Path>) -> RouteWardResult<Self> {
+        let content = fs::read_to_string(path).map_err(|err| RouteWardError::ConfigError {
             key: ERR_KEY_CONFIG_LOAD,
             detail: err.to_string(),
         })?;
         Self::from_json_str(&content)
     }
 
-    pub fn from_json_str(json: &str) -> ProxifierResult<Self> {
-        serde_json::from_str(json).map_err(|err| ProxifierError::ConfigError {
+    pub fn from_json_str(json: &str) -> RouteWardResult<Self> {
+        serde_json::from_str(json).map_err(|err| RouteWardError::ConfigError {
             key: ERR_KEY_CONFIG_JSON,
             detail: err.to_string(),
         })
     }
 
-    pub fn to_json_pretty(&self) -> ProxifierResult<String> {
-        serde_json::to_string_pretty(self).map_err(|err| ProxifierError::ConfigError {
+    pub fn to_json_pretty(&self) -> RouteWardResult<String> {
+        serde_json::to_string_pretty(self).map_err(|err| RouteWardError::ConfigError {
             key: ERR_KEY_CONFIG_JSON,
             detail: err.to_string(),
         })

@@ -37,7 +37,7 @@ import {
   SystemDiagnostics,
   TelemetrySnapshot,
   TrackedConnection
-} from '../types/proxifier';
+} from '../types/routeward';
 
 const FAKE_IP_OCTET_A = 198;
 const FAKE_IP_OCTET_B = 18;
@@ -48,7 +48,7 @@ const SIMULATED_TX_BASE = 6144;
 const SIMULATED_LATENCY_BASE_MS = 14;
 const PRIORITY_STEP = 5;
 
-class ProxifierClientService {
+class RouteWardClientService {
   private profile: ProfileConfig;
   private running = true;
   private connections: TrackedConnection[] = [];
@@ -804,7 +804,7 @@ class ProxifierClientService {
   }
 }
 
-export const proxifierClient = new ProxifierClientService();
+export const routewardClient = new RouteWardClientService();
 
 export function formatBytes(bytes: number): string {
   if (bytes <= 0) return `0 ${UI_CONFIG.BYTE_UNITS[0]}`;

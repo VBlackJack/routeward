@@ -17,7 +17,7 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Globe, Plus, Trash2 } from 'lucide-react';
-import { FakeIpEntry } from '../types/proxifier';
+import { FakeIpEntry } from '../types/routeward';
 
 interface DnsViewProps {
   entries: FakeIpEntry[];

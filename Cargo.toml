@@ -17,7 +17,7 @@ resolver = "2"
 members = [
     "crates/routeward-core",
     "crates/routeward-cli",
-    "src-tauri",
+    "apps/desktop",
 ]
 
 [workspace.package]

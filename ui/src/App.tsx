@@ -39,9 +39,9 @@ import {
   Wand2
 } from 'lucide-react';
 import { UI_CONFIG } from './config/constants';
-import { proxifierClient } from './services/ipc';
+import { routewardClient } from './services/ipc';
 import { useThemeForge } from './theme/ThemeForgeContext';
-import { InterceptionMode, ToastNotification } from './types/proxifier';
+import { InterceptionMode, ToastNotification } from './types/routeward';
 import { DashboardView } from './components/DashboardView';
 import { ConnectionsView } from './components/ConnectionsView';
 import { ProxiesView } from './components/ProxiesView';
@@ -53,7 +53,7 @@ import {
   CommandPaletteModal,
   NavTabId
 } from './components/CommandPaletteModal';
-import { ProxifierLogo } from './components/ProxifierLogo';
+import { RouteWardLogo } from './components/RouteWardLogo';
 import { ProcessLauncherModal } from './components/ProcessLauncherModal';
 import {
   ExperienceMode,
@@ -90,18 +90,18 @@ export const App: React.FC = () => {
     }
   };
 
-  const [profile, setProfile] = useState(() => proxifierClient.getProfile());
+  const [profile, setProfile] = useState(() => routewardClient.getProfile());
   const [diagnostics, setDiagnostics] = useState(() =>
-    proxifierClient.getDiagnostics()
+    routewardClient.getDiagnostics()
   );
   const [telemetry, setTelemetry] = useState(() =>
-    proxifierClient.getTelemetry()
+    routewardClient.getTelemetry()
   );
   const [connections, setConnections] = useState(() =>
-    proxifierClient.listConnections()
+    routewardClient.listConnections()
   );
-  const [fakeIps, setFakeIps] = useState(() => proxifierClient.listFakeIps());
-  const [logs, setLogs] = useState(() => proxifierClient.listLogs());
+  const [fakeIps, setFakeIps] = useState(() => routewardClient.listFakeIps());
+  const [logs, setLogs] = useState(() => routewardClient.listLogs());
 
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -117,26 +117,26 @@ export const App: React.FC = () => {
   );
 
   const refreshAll = useCallback(() => {
-    setProfile(proxifierClient.getProfile());
-    setDiagnostics(proxifierClient.getDiagnostics());
-    setTelemetry(proxifierClient.getTelemetry());
-    setConnections(proxifierClient.listConnections());
-    setFakeIps(proxifierClient.listFakeIps());
-    setLogs(proxifierClient.listLogs());
+    setProfile(routewardClient.getProfile());
+    setDiagnostics(routewardClient.getDiagnostics());
+    setTelemetry(routewardClient.getTelemetry());
+    setConnections(routewardClient.listConnections());
+    setFakeIps(routewardClient.listFakeIps());
+    setLogs(routewardClient.listLogs());
   }, []);
 
   useEffect(() => {
-    void proxifierClient.scanRealOsSockets().then((updated) => {
+    void routewardClient.scanRealOsSockets().then((updated) => {
       setConnections(updated);
-      setLogs(proxifierClient.listLogs());
+      setLogs(routewardClient.listLogs());
     });
   }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      setTelemetry(proxifierClient.getTelemetry());
-      setConnections(proxifierClient.listConnections());
-      setLogs(proxifierClient.listLogs());
+      setTelemetry(routewardClient.getTelemetry());
+      setConnections(routewardClient.listConnections());
+      setLogs(routewardClient.listLogs());
     }, UI_CONFIG.TELEMETRY_REFRESH_INTERVAL_MS);
     return () => window.clearInterval(timer);
   }, []);
@@ -172,7 +172,7 @@ export const App: React.FC = () => {
   };
 
   const handleExportProfile = () => {
-    const json = proxifierClient.exportProfileJson();
+    const json = routewardClient.exportProfileJson();
     const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -189,7 +189,7 @@ export const App: React.FC = () => {
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') {
-        proxifierClient.importProfileJson(reader.result);
+        routewardClient.importProfileJson(reader.result);
         refreshAll();
         pushToast(t('app.toast.profile.imported'));
       }
@@ -226,7 +226,7 @@ export const App: React.FC = () => {
       <header className="border-b border-tf-border bg-tf-surface px-6 py-3">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <ProxifierLogo size="md" />
+            <RouteWardLogo size="md" />
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-base font-bold leading-tight text-tf-primary">
@@ -298,7 +298,7 @@ export const App: React.FC = () => {
               </span>
             </button>
 
-            {/* Process Launcher ("Run with Proxifier") */}
+            {/* Process Launcher ("Run with RouteWard") */}
             <button
               onClick={() => setShowLauncherModal(true)}
               className="tf-surface-alt flex items-center gap-1.5 border-tf-cyan/50 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan"
@@ -313,7 +313,7 @@ export const App: React.FC = () => {
             <button
               onClick={async () => {
                 const next = !systemProxyEnabled;
-                await proxifierClient.setSystemProxy(next);
+                await routewardClient.setSystemProxy(next);
                 setSystemProxyEnabled(next);
                 refreshAll();
                 pushToast(
@@ -357,7 +357,7 @@ export const App: React.FC = () => {
               <select
                 value={diagnostics.interceptionMode}
                 onChange={(e) => {
-                  proxifierClient.setInterceptionMode(
+                  routewardClient.setInterceptionMode(
                     e.target.value as InterceptionMode
                   );
                   refreshAll();
@@ -420,7 +420,7 @@ export const App: React.FC = () => {
             {/* Start / Stop Engine */}
             <button
               onClick={() => {
-                proxifierClient.toggleEngine(!diagnostics.running);
+                routewardClient.toggleEngine(!diagnostics.running);
                 refreshAll();
               }}
               className={`flex items-center gap-2 rounded-tf-md px-3.5 py-1.5 text-xs font-bold transition ${
@@ -471,7 +471,7 @@ export const App: React.FC = () => {
             securityPolicy={securityPolicy}
             experienceMode={experienceMode}
             onUpdateSecurityPolicy={(partial) => {
-              proxifierClient.updateSecurityPolicy(partial);
+              routewardClient.updateSecurityPolicy(partial);
               refreshAll();
             }}
             onOpenWizard={() => setShowWizardModal(true)}
@@ -485,25 +485,25 @@ export const App: React.FC = () => {
             connections={connections}
             proxies={profile.proxies}
             onSimulate={(req) => {
-              proxifierClient.simulateConnection(req);
+              routewardClient.simulateConnection(req);
               refreshAll();
             }}
             onScanOsSockets={async () => {
-              await proxifierClient.scanRealOsSockets();
+              await routewardClient.scanRealOsSockets();
               refreshAll();
               pushToast(t('app.toast.connection.os_scanned'), 'info');
             }}
             onClearClosed={() => {
-              proxifierClient.clearClosedConnections();
+              routewardClient.clearClosedConnections();
               refreshAll();
             }}
             onTerminateConnection={(connId) => {
-              proxifierClient.terminateConnection(connId);
+              routewardClient.terminateConnection(connId);
               refreshAll();
               pushToast(t('app.toast.connection.terminated'), 'warning');
             }}
             onQuickCreateRule={(rule) => {
-              proxifierClient.upsertRule(rule);
+              routewardClient.upsertRule(rule);
               refreshAll();
               pushToast(t('app.toast.rule.created'));
             }}
@@ -515,22 +515,22 @@ export const App: React.FC = () => {
             proxies={profile.proxies}
             chains={profile.chains}
             onTestProxy={async (id) => {
-              await proxifierClient.testProxy(id);
+              await routewardClient.testProxy(id);
               refreshAll();
               pushToast(t('app.toast.proxy.tested'));
             }}
             onTestAllProxies={async () => {
-              await proxifierClient.testAllProxies();
+              await routewardClient.testAllProxies();
               refreshAll();
               pushToast(t('app.toast.proxy.tested'));
             }}
             onAddProxy={(node) => {
-              proxifierClient.upsertProxy(node);
+              routewardClient.upsertProxy(node);
               refreshAll();
               pushToast(t('app.toast.proxy.added'));
             }}
             onImportUris={(text) => {
-              const count = proxifierClient.importProxyUris(text);
+              const count = routewardClient.importProxyUris(text);
               refreshAll();
               if (count > 0) {
                 pushToast(`${t('app.toast.proxy.imported_uris')} (${count})`);
@@ -540,15 +540,15 @@ export const App: React.FC = () => {
               pushToast(t('app.toast.proxy.copied_uri'), 'info');
             }}
             onRemoveProxy={(id) => {
-              proxifierClient.removeProxy(id);
+              routewardClient.removeProxy(id);
               refreshAll();
             }}
             onAddChain={(chain) => {
-              proxifierClient.upsertChain(chain);
+              routewardClient.upsertChain(chain);
               refreshAll();
             }}
             onRemoveChain={(id) => {
-              proxifierClient.removeChain(id);
+              routewardClient.removeChain(id);
               refreshAll();
             }}
           />
@@ -560,23 +560,23 @@ export const App: React.FC = () => {
             proxies={profile.proxies}
             chains={profile.chains}
             experienceMode={experienceMode}
-            onEvaluateRule={(req) => proxifierClient.evaluateRule(req)}
+            onEvaluateRule={(req) => routewardClient.evaluateRule(req)}
             onAddRule={(rule) => {
-              proxifierClient.upsertRule(rule);
+              routewardClient.upsertRule(rule);
               refreshAll();
               pushToast(t('app.toast.rule.created'));
             }}
             onToggleRule={(id) => {
-              proxifierClient.toggleRuleEnabled(id);
+              routewardClient.toggleRuleEnabled(id);
               refreshAll();
               pushToast(t('app.toast.rule.updated'), 'info');
             }}
             onReorderRule={(id, dir) => {
-              proxifierClient.reorderRulePriority(id, dir);
+              routewardClient.reorderRulePriority(id, dir);
               refreshAll();
             }}
             onRemoveRule={(id) => {
-              proxifierClient.removeRule(id);
+              routewardClient.removeRule(id);
               refreshAll();
               pushToast(t('app.toast.rule.deleted'), 'warning');
             }}
@@ -587,11 +587,11 @@ export const App: React.FC = () => {
           <DnsView
             entries={fakeIps}
             onAllocate={(dom) => {
-              proxifierClient.allocateFakeIp(dom);
+              routewardClient.allocateFakeIp(dom);
               refreshAll();
             }}
             onFlush={() => {
-              proxifierClient.flushFakeIps();
+              routewardClient.flushFakeIps();
               refreshAll();
               pushToast(t('app.toast.dns.flushed'), 'info');
             }}
@@ -602,7 +602,7 @@ export const App: React.FC = () => {
           <LogsView
             logs={logs}
             onClear={() => {
-              proxifierClient.clearLogs();
+              routewardClient.clearLogs();
               refreshAll();
             }}
           />
@@ -682,11 +682,11 @@ export const App: React.FC = () => {
           chains={profile.chains}
           currentMode={experienceMode}
           onImportUris={(text) => {
-            proxifierClient.importProxyUris(text);
+            routewardClient.importProxyUris(text);
             refreshAll();
           }}
           onAddRule={(rule) => {
-            proxifierClient.upsertRule(rule);
+            routewardClient.upsertRule(rule);
             refreshAll();
           }}
           onSelectMode={(mode) => handleSetExperienceMode(mode)}
@@ -702,7 +702,7 @@ export const App: React.FC = () => {
         <ProcessLauncherModal
           relayEndpoint={diagnostics.relayTcpEndpoint}
           onLaunch={async (exe, args) => {
-            await proxifierClient.launchProcessWithProxy(exe, args);
+            await routewardClient.launchProcessWithProxy(exe, args);
             refreshAll();
             pushToast(`${t('app.toast.system.process_launched')}: ${exe}`);
           }}
@@ -715,27 +715,27 @@ export const App: React.FC = () => {
           onClose={() => setShowCommandPalette(false)}
           onNavigate={(tab) => setActiveTab(tab)}
           onToggleEngine={() => {
-            proxifierClient.toggleEngine(!diagnostics.running);
+            routewardClient.toggleEngine(!diagnostics.running);
             refreshAll();
           }}
           onTestAllProxies={async () => {
-            await proxifierClient.testAllProxies();
+            await routewardClient.testAllProxies();
             refreshAll();
             pushToast(t('app.toast.proxy.tested'));
           }}
           onSimulateTraffic={() => {
-            proxifierClient.simulateConnection(
+            routewardClient.simulateConnection(
               UI_CONFIG.SIMULATION_PRESETS[0]
             );
             refreshAll();
           }}
           onFlushDns={() => {
-            proxifierClient.flushFakeIps();
+            routewardClient.flushFakeIps();
             refreshAll();
             pushToast(t('app.toast.dns.flushed'), 'info');
           }}
           onToggleKillSwitch={() => {
-            proxifierClient.updateSecurityPolicy({
+            routewardClient.updateSecurityPolicy({
               killSwitchEnabled: !securityPolicy.killSwitchEnabled
             });
             refreshAll();

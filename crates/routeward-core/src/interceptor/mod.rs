@@ -20,7 +20,7 @@ use crate::config::{
     SystemConstants, TransportProtocol,
 };
 use crate::dns::FakeIpEngine;
-use crate::error::{ProxifierError, ProxifierResult, ERR_KEY_PROXY_NOT_FOUND};
+use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_PROXY_NOT_FOUND};
 use crate::i18n::I18nRegistry;
 use crate::process::ProcessResolver;
 use crate::proxy::sni::TlsSniExtractor;
@@ -64,7 +64,7 @@ pub struct SystemDiagnostics {
 }
 
 #[derive(Clone)]
-pub struct ProxifierController {
+pub struct RouteWardController {
     pub constants: Arc<SystemConstants>,
     pub profile: Arc<RwLock<ProfileConfig>>,
     pub i18n: I18nRegistry,
@@ -74,7 +74,7 @@ pub struct ProxifierController {
     running: Arc<AtomicBool>,
 }
 
-impl ProxifierController {
+impl RouteWardController {
     pub fn new(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
         let i18n = I18nRegistry::new(locale);
         let dns = FakeIpEngine::new(&profile.dns_config, &constants.dns);
@@ -339,14 +339,14 @@ impl ProxifierController {
         ingested
     }
 
-    pub async fn test_proxy(&self, proxy_id: &str) -> ProxifierResult<ProxyHealthReport> {
+    pub async fn test_proxy(&self, proxy_id: &str) -> RouteWardResult<ProxyHealthReport> {
         let node = {
             let prof = self.profile.read();
             prof.proxies
                 .iter()
                 .find(|p| p.id == proxy_id)
                 .cloned()
-                .ok_or_else(|| ProxifierError::ProxyNotFound {
+                .ok_or_else(|| RouteWardError::ProxyNotFound {
                     key: ERR_KEY_PROXY_NOT_FOUND,
                     proxy_id: proxy_id.to_string(),
                 })?
@@ -481,7 +481,7 @@ impl ProxifierController {
         &self,
         mut client: TcpStream,
         client_port: u16,
-    ) -> ProxifierResult<()> {
+    ) -> RouteWardResult<()> {
         let proto = &self.constants.protocols;
         let mut header = [0u8; 2];
         client.read_exact(&mut header).await?;
@@ -612,11 +612,11 @@ impl ProxifierController {
         action: &RuleAction,
         target_host: &str,
         target_port: u16,
-    ) -> ProxifierResult<TcpStream> {
+    ) -> RouteWardResult<TcpStream> {
         match action {
             RuleAction::Direct => {
                 let addr = format!("{target_host}:{target_port}");
-                TcpStream::connect(&addr).await.map_err(ProxifierError::Io)
+                TcpStream::connect(&addr).await.map_err(RouteWardError::Io)
             }
             RuleAction::Proxy { target_id } => {
                 let node = {
@@ -625,7 +625,7 @@ impl ProxifierController {
                         .iter()
                         .find(|p| &p.id == target_id)
                         .cloned()
-                        .ok_or_else(|| ProxifierError::ProxyNotFound {
+                        .ok_or_else(|| RouteWardError::ProxyNotFound {
                             key: ERR_KEY_PROXY_NOT_FOUND,
                             proxy_id: target_id.clone(),
                         })?
@@ -640,7 +640,7 @@ impl ProxifierController {
                         prof.chains
                             .iter()
                             .find(|c| &c.id == target_id)
-                            .ok_or_else(|| ProxifierError::ProxyNotFound {
+                            .ok_or_else(|| RouteWardError::ProxyNotFound {
                                 key: ERR_KEY_PROXY_NOT_FOUND,
                                 proxy_id: target_id.clone(),
                             })?;
@@ -662,7 +662,7 @@ impl ProxifierController {
                 )
                 .await
             }
-            RuleAction::Block => Err(ProxifierError::BlockedByPolicy {
+            RuleAction::Block => Err(RouteWardError::BlockedByPolicy {
                 key: crate::error::ERR_KEY_RULE_BLOCKED,
                 rule_name: ROUTE_BLOCK_LABEL.to_string(),
             }),

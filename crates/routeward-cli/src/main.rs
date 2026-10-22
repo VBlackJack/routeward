@@ -16,7 +16,7 @@
 
 use clap::{Parser, Subcommand};
 use routeward_core::config::{ProfileConfig, SystemConstants, TransportProtocol};
-use routeward_core::interceptor::ProxifierController;
+use routeward_core::interceptor::RouteWardController;
 use routeward_core::rules::ConnectionRequest;
 use std::path::PathBuf;
 
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => ProfileConfig::load_embedded_default()?,
     };
 
-    let controller = ProxifierController::new(constants, profile, &args.locale);
+    let controller = RouteWardController::new(constants, profile, &args.locale);
 
     match args.command {
         Commands::Run => {

@@ -17,7 +17,7 @@
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Trash2 } from 'lucide-react';
-import { LogEntry, LogLevel } from '../types/proxifier';
+import { LogEntry, LogLevel } from '../types/routeward';
 
 interface LogsViewProps {
   logs: LogEntry[];

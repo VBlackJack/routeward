@@ -32,7 +32,7 @@ import {
   ProxyNode,
   RoutingRule,
   TransportProtocol
-} from '../types/proxifier';
+} from '../types/routeward';
 
 export type ExperienceMode = 'simple' | 'expert';
 type GoalProfile = 'privacy' | 'work' | 'gaming';

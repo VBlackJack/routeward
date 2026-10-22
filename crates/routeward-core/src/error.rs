@@ -27,7 +27,7 @@ pub const ERR_KEY_INVALID_URI: &str = "errors.proxy.invalid_uri";
 pub const ERR_KEY_RULE_BLOCKED: &str = "errors.rule.blocked_by_policy";
 
 #[derive(Debug, Error)]
-pub enum ProxifierError {
+pub enum RouteWardError {
     #[error("{key}: {detail}")]
     ConfigError { key: &'static str, detail: String },
 
@@ -59,4 +59,4 @@ pub enum ProxifierError {
     Io(#[from] std::io::Error),
 }
 
-pub type ProxifierResult<T> = Result<T, ProxifierError>;
+pub type RouteWardResult<T> = Result<T, RouteWardError>;

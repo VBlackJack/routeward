@@ -16,11 +16,11 @@
 
 import React, { useState } from 'react';
 
-interface ProxifierLogoProps {
+interface RouteWardLogoProps {
   size?: 'sm' | 'md';
 }
 
-export const ProxifierLogo: React.FC<ProxifierLogoProps> = ({
+export const RouteWardLogo: React.FC<RouteWardLogoProps> = ({
   size = 'md'
 }) => {
   const [imgError, setImgError] = useState(false);
@@ -33,7 +33,7 @@ export const ProxifierLogo: React.FC<ProxifierLogoProps> = ({
       {!imgError ? (
         <img
           src="/logo.jpg"
-          alt="Proxifier RS"
+          alt="RouteWard"
           onError={() => setImgError(true)}
           className="h-full w-full object-cover"
         />

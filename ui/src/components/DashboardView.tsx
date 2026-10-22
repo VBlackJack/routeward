@@ -35,7 +35,7 @@ import {
   SecurityPolicyConfig,
   SystemDiagnostics,
   TelemetrySnapshot
-} from '../types/proxifier';
+} from '../types/routeward';
 import { HelpTooltip } from './HelpTooltip';
 import { ExperienceMode } from './QuickSetupWizardModal';
 
@@ -254,7 +254,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <div
                     key={idx}
                     className="flex h-full flex-1 flex-col justify-end gap-0.5"
-                    title={`${sample.timestamp} — RX: ${formatBytes(
+                    title={`${sample.timestamp} - RX: ${formatBytes(
                       sample.rxBytesPerSec
                     )}/s | TX: ${formatBytes(sample.txBytesPerSec)}/s`}
                   >
