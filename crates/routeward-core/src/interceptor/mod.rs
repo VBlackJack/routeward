@@ -128,7 +128,6 @@ impl RouteWardController {
             running: Arc::new(AtomicBool::new(false)),
         };
 
-        controller.seed_initial_dns_entries();
         controller.telemetry.push_log(
             LogLevel::Info,
             COMPONENT_ENGINE,
@@ -136,18 +135,6 @@ impl RouteWardController {
         );
 
         controller
-    }
-
-    fn seed_initial_dns_entries(&self) {
-        let initial_domains = [
-            "api.github.com",
-            "registry.npmjs.org",
-            "crates.io",
-            "stealth.torproject.org",
-        ];
-        for dom in initial_domains {
-            let _ = self.dns.allocate_or_get(dom);
-        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -512,12 +499,15 @@ impl RouteWardController {
     }
 
     pub fn upsert_proxy(&self, node: ProxyNode) {
-        let mut prof = self.profile.write();
-        if let Some(existing) = prof.proxies.iter_mut().find(|p| p.id == node.id) {
-            *existing = node;
-        } else {
-            prof.proxies.push(node);
+        {
+            let mut prof = self.profile.write();
+            if let Some(existing) = prof.proxies.iter_mut().find(|p| p.id == node.id) {
+                *existing = node;
+            } else {
+                prof.proxies.push(node);
+            }
         }
+        self.sync_upstream_proxy_exclusions();
     }
 
     pub fn import_proxy_uris(&self, text: &str) -> Vec<ProxyNode> {
@@ -529,8 +519,61 @@ impl RouteWardController {
     }
 
     pub fn remove_proxy(&self, proxy_id: &str) {
-        let mut prof = self.profile.write();
-        prof.proxies.retain(|p| p.id != proxy_id);
+        {
+            let mut prof = self.profile.write();
+            prof.proxies.retain(|p| p.id != proxy_id);
+        }
+        self.sync_upstream_proxy_exclusions();
+    }
+
+    fn sync_upstream_proxy_exclusions(&self) {
+        let upstream_endpoints: Vec<(Ipv4Addr, u16)> = {
+            let prof = self.profile.read();
+            prof.proxies
+                .iter()
+                .filter_map(|p| p.host.parse::<Ipv4Addr>().ok().map(|ip| (ip, p.port)))
+                .collect()
+        };
+        self.nat_table.set_upstream_endpoints(upstream_endpoints);
+    }
+
+    /// Replaces the active in-memory profile and synchronizes logging and upstream loop exclusions.
+    pub fn replace_profile(&self, new_profile: ProfileConfig) {
+        self.telemetry
+            .set_file_logging_enabled(new_profile.enable_logging);
+        *self.profile.write() = new_profile;
+        self.sync_upstream_proxy_exclusions();
+    }
+
+    /// Atomically saves the active profile to `path`.
+    pub fn save_profile_to_path(&self, path: impl AsRef<std::path::Path>) -> RouteWardResult<()> {
+        let target = path.as_ref();
+        let prof = self.profile.read().clone();
+        prof.save_to_path(target)?;
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_ENGINE,
+            format!("Saved profile \"{}\" to {}", prof.name, target.display()),
+        );
+        Ok(())
+    }
+
+    /// Atomically saves the active profile to the configured `defaultProfilePath`.
+    pub fn save_profile_default(&self) -> RouteWardResult<()> {
+        self.save_profile_to_path(&self.constants.telemetry.default_profile_path)
+    }
+
+    /// Actively terminates an in-flight relayed connection by its identifier.
+    pub fn terminate_connection(&self, connection_id: &str) -> bool {
+        let terminated = self.telemetry.terminate_connection(connection_id);
+        if terminated {
+            self.telemetry.push_log(
+                LogLevel::Warn,
+                COMPONENT_TRANSPARENT,
+                format!("Terminated active connection id={connection_id}"),
+            );
+        }
+        terminated
     }
 
     pub fn upsert_chain(&self, chain: ProxyChain) {
@@ -705,11 +748,10 @@ impl RouteWardController {
             started_at: Utc::now(),
         };
         self.telemetry.record_connection(tracked, is_proxied);
-
-        if let Ok((tx, rx)) = tokio::io::copy_bidirectional(&mut client, &mut outbound).await {
-            self.telemetry.update_connection_traffic(&conn_id, rx, tx);
-        }
-        self.telemetry.mark_connection_closed(&conn_id);
+        let _ = self
+            .telemetry
+            .relay_bidirectional_with_telemetry(&conn_id, &mut client, &mut outbound)
+            .await;
 
         Ok(())
     }
@@ -785,10 +827,10 @@ impl RouteWardController {
             };
             self.telemetry.record_connection(tracked, true);
 
-            if let Ok((tx, rx)) = tokio::io::copy_bidirectional(&mut client, &mut outbound).await {
-                self.telemetry.update_connection_traffic(&conn_id, rx, tx);
-            }
-            self.telemetry.mark_connection_closed(&conn_id);
+            let _ = self
+                .telemetry
+                .relay_bidirectional_with_telemetry(&conn_id, &mut client, &mut outbound)
+                .await;
             self.nat_table
                 .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
 
@@ -980,13 +1022,10 @@ impl RouteWardController {
                     started_at: Utc::now(),
                 };
                 self.telemetry.record_connection(tracked, is_proxied);
-
-                if let Ok((tx, rx)) =
-                    tokio::io::copy_bidirectional(&mut client, &mut outbound).await
-                {
-                    self.telemetry.update_connection_traffic(&conn_id, rx, tx);
-                }
-                self.telemetry.mark_connection_closed(&conn_id);
+                let _ = self
+                    .telemetry
+                    .relay_bidirectional_with_telemetry(&conn_id, &mut client, &mut outbound)
+                    .await;
                 return Ok(());
             }
         }
@@ -1137,5 +1176,25 @@ mod tests {
         assert!(logs.iter().any(|l| l.level == LogLevel::Warn
             && l.component == COMPONENT_TRANSPARENT
             && l.message.contains("Rejected unauthorized connection")));
+    }
+
+    #[test]
+    fn controller_starts_with_empty_fake_ip_cache_and_saves_profile() {
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        let controller = RouteWardController::new(constants, profile, "en");
+
+        // No simulated Fake-IP entries or connections are seeded at startup
+        assert!(controller.dns.list_entries().is_empty());
+        assert!(controller.telemetry.list_connections().is_empty());
+
+        let temp_path =
+            std::env::temp_dir().join(format!("routeward_ctrl_prof_{}.json", Uuid::new_v4()));
+        controller
+            .save_profile_to_path(&temp_path)
+            .expect("controller atomic profile save");
+        assert!(temp_path.exists());
+        let _ = std::fs::remove_file(&temp_path);
     }
 }

@@ -49,7 +49,9 @@
     "processCacheTtlMs": 15000,
     "logDirectory": "logs",
     "logAppName": "RouteWard",
-    "logFlushIntervalMs": 500
+    "logFlushIntervalMs": 500,
+    "eventBroadcastCapacity": 256,
+    "defaultProfilePath": "configs/active_profile.json"
   },
   "protocols": {
     "socks5Version": 5,

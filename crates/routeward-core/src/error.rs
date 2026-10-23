@@ -17,6 +17,7 @@
 use thiserror::Error;
 
 pub const ERR_KEY_CONFIG_LOAD: &str = "errors.config.load_failed";
+pub const ERR_KEY_CONFIG_SAVE: &str = "errors.config.save_failed";
 pub const ERR_KEY_CONFIG_JSON: &str = "errors.config.invalid_json";
 pub const ERR_KEY_PROXY_NOT_FOUND: &str = "errors.proxy.not_found";
 pub const ERR_KEY_CHAIN_EMPTY: &str = "errors.proxy.chain_empty";

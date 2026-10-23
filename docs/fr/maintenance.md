@@ -4,7 +4,7 @@
 
 Toutes les constantes operationnelles, le profil par defaut et les palettes de couleurs se trouvent dans `configs/` :
 
-- `configs/system_constants.json` : Definit les ports locaux par defaut (`10808`, `10809`, `10810`, `10853`), les constantes `nftables` sous Linux (`linuxFwmark`: `21079` / `0x5257`, `linuxNftBinary`: `"nft"`, `linuxNftTableName`: `"routeward"`, `linuxNftChainName`: `"output"`), les delais d'attente, le sous-reseau Fake-IP (`198.18.0.0/15`), le dossier de journaux (`logs`), le prefixe de fichier (`RouteWard`) et les modeles de regles.
+- `configs/system_constants.json` : Definit les ports locaux par defaut (`10808`, `10809`, `10810`, `10853`), les constantes `nftables` sous Linux (`linuxFwmark`: `21079` / `0x5257`, `linuxNftBinary`: `"nft"`, `linuxNftTableName`: `"routeward"`, `linuxNftChainName`: `"output"`), les delais d'attente, le sous-reseau Fake-IP (`198.18.0.0/15`), le dossier de journaux (`logs`), le prefixe de fichier (`RouteWard`), la capacite du canal d'evenements (`eventBroadcastCapacity`: `256`), le chemin du profil actif par defaut (`defaultProfilePath`: `"configs/active_profile.json"`) et les modeles de regles.
 - `configs/default_profile.json` : Definit le profil de routage initial, les serveurs proxies, les chaines, les regles et la politique de securite (`enableLogging`, `blockUdpQuic`, `forceRemoteDns`, `unknownProcessAction`).
 - `configs/themeforge_palettes.json` : Contient les 16 palettes Oklab canoniques de ThemeForge (`Dracula`, `Drakul`, `Striga`, `Cinder`, `Bracken`, `Tarn`, `Mortis`, `Slate`, `Voivode`, `Carmilla`, `Whitby`, `Vesper`, `Parchment`, `Folio`, `Wormwood`, `Sconce`), `HighContrast` et les 9 teintes d'accent.
 

@@ -583,6 +583,7 @@
   "errors": {
     "config": {
       "load_failed": "Impossible de charger le fichier de configuration",
+      "save_failed": "Impossible de sauvegarder le profil de configuration sur le disque",
       "invalid_json": "Structure JSON invalide dans la configuration"
     },
     "proxy": {

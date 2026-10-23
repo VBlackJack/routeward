@@ -14,10 +14,14 @@
  * limitations under the License.
  */
 
-use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_LOAD};
+use crate::error::{
+    RouteWardError, RouteWardResult, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_LOAD, ERR_KEY_CONFIG_SAVE,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+use uuid::Uuid;
 
 const EMBEDDED_SYSTEM_CONSTANTS: &str = include_str!("../../../../configs/system_constants.json");
 const EMBEDDED_DEFAULT_PROFILE: &str = include_str!("../../../../configs/default_profile.json");
@@ -153,6 +157,18 @@ pub struct TelemetryConstants {
     pub log_directory: String,
     pub log_app_name: String,
     pub log_flush_interval_ms: u64,
+    #[serde(default = "default_event_broadcast_capacity")]
+    pub event_broadcast_capacity: usize,
+    #[serde(default = "default_profile_path")]
+    pub default_profile_path: String,
+}
+
+fn default_event_broadcast_capacity() -> usize {
+    256
+}
+
+fn default_profile_path() -> String {
+    "configs/active_profile.json".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +409,53 @@ impl ProfileConfig {
             detail: err.to_string(),
         })
     }
+
+    /// Atomically persists the profile configuration to `path` by writing to a temporary
+    /// sibling file, syncing to disk, and renaming over the destination path.
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> RouteWardResult<()> {
+        let target_path = path.as_ref();
+        let json = self.to_json_pretty()?;
+
+        if let Some(parent) = target_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|err| RouteWardError::ConfigError {
+                    key: ERR_KEY_CONFIG_SAVE,
+                    detail: err.to_string(),
+                })?;
+            }
+        }
+
+        let file_name = target_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("profile.json");
+        let tmp_path = target_path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(RouteWardError::ConfigError {
+                key: ERR_KEY_CONFIG_SAVE,
+                detail: err.to_string(),
+            });
+        }
+
+        if let Err(err) = fs::rename(&tmp_path, target_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(RouteWardError::ConfigError {
+                key: ERR_KEY_CONFIG_SAVE,
+                detail: err.to_string(),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -408,5 +471,38 @@ mod tests {
         let profile = ProfileConfig::load_embedded_default().expect("Default profile");
         assert_eq!(profile.theme_config.theme, "Drakul");
         assert!(profile.enable_logging);
+    }
+
+    #[test]
+    fn saves_and_reloads_profile_atomically() {
+        let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        profile.name = "Atomic Persistence Test Profile".to_string();
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("routeward_profile_test_{}", Uuid::new_v4()));
+        let profile_path = temp_dir.join("active_profile.json");
+
+        profile
+            .save_to_path(&profile_path)
+            .expect("atomic save #1 succeeded");
+        let loaded = ProfileConfig::load_from_path(&profile_path).expect("reload #1 succeeded");
+        assert_eq!(loaded.name, "Atomic Persistence Test Profile");
+
+        // Second overwrite verifies atomic replacement over an existing file
+        profile.name = "Atomic Overwrite Profile v2".to_string();
+        profile
+            .save_to_path(&profile_path)
+            .expect("atomic save #2 succeeded");
+        let loaded_v2 = ProfileConfig::load_from_path(&profile_path).expect("reload #2 succeeded");
+        assert_eq!(loaded_v2.name, "Atomic Overwrite Profile v2");
+
+        // Ensure no temporary .tmp sibling files remain
+        let entries: Vec<_> = fs::read_dir(&temp_dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
