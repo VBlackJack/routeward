@@ -307,16 +307,29 @@ impl WinDivertInterceptor {
                 );
             }
             Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                telemetry.push_log(
-                    LogLevel::Warn,
-                    COMPONENT_FIREWALL,
-                    format!(
-                        "Could not remove firewall rule \"{rule_name}\" (exit={:?}): {}",
-                        out.status.code(),
-                        stderr.trim()
-                    ),
-                );
+                let combined = format!("{} {}", stdout.trim(), stderr.trim());
+                if combined.contains("No rules match")
+                    || combined.contains("Aucune")
+                    || out.status.code() == Some(1)
+                {
+                    telemetry.push_log(
+                        LogLevel::Info,
+                        COMPONENT_FIREWALL,
+                        format!("Firewall rule \"{rule_name}\" was already absent during cleanup"),
+                    );
+                } else {
+                    telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_FIREWALL,
+                        format!(
+                            "Could not remove firewall rule \"{rule_name}\" (exit={:?}): {}",
+                            out.status.code(),
+                            combined.trim()
+                        ),
+                    );
+                }
             }
             Err(err) => {
                 telemetry.push_log(

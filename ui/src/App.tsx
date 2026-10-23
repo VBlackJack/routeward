@@ -18,6 +18,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Activity,
+  AlertTriangle,
   BookOpen,
   CheckCircle2,
   Command,
@@ -29,6 +30,7 @@ import {
   Network,
   Palette,
   Power,
+  RefreshCw,
   Rocket,
   Server,
   Shield,
@@ -39,7 +41,7 @@ import {
   Wand2
 } from 'lucide-react';
 import { UI_CONFIG } from './config/constants';
-import { routewardClient } from './services/ipc';
+import { generateClientId, routewardClient } from './services/ipc';
 import { useThemeForge } from './theme/ThemeForgeContext';
 import { InterceptionMode, ToastNotification } from './types/routeward';
 import { DashboardView } from './components/DashboardView';
@@ -107,7 +109,7 @@ export const App: React.FC = () => {
 
   const pushToast = useCallback(
     (message: string, severity: ToastNotification['severity'] = 'success') => {
-      const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const id = generateClientId('toast');
       setToasts((prev) => [...prev, { id, message, severity }]);
       window.setTimeout(() => {
         setToasts((prev) => prev.filter((item) => item.id !== id));
@@ -116,7 +118,7 @@ export const App: React.FC = () => {
     []
   );
 
-  const refreshAll = useCallback(() => {
+  const syncFromClient = useCallback(() => {
     setProfile(routewardClient.getProfile());
     setDiagnostics(routewardClient.getDiagnostics());
     setTelemetry(routewardClient.getTelemetry());
@@ -126,20 +128,14 @@ export const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    void routewardClient.scanRealOsSockets().then((updated) => {
-      setConnections(updated);
-      setLogs(routewardClient.listLogs());
-    });
-  }, []);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      setTelemetry(routewardClient.getTelemetry());
-      setConnections(routewardClient.listConnections());
-      setLogs(routewardClient.listLogs());
-    }, UI_CONFIG.TELEMETRY_REFRESH_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, []);
+    const unsubscribe = routewardClient.subscribe(syncFromClient);
+    const abortController = new AbortController();
+    routewardClient.startRealtimeStream(abortController.signal);
+    return () => {
+      abortController.abort();
+      unsubscribe();
+    };
+  }, [syncFromClient]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -189,9 +185,9 @@ export const App: React.FC = () => {
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') {
-        routewardClient.importProfileJson(reader.result);
-        refreshAll();
-        pushToast(t('app.toast.profile.imported'));
+        void routewardClient.importProfileJson(reader.result).then(() => {
+          pushToast(t('app.toast.profile.imported'));
+        });
       }
     };
     reader.readAsText(file);
@@ -202,6 +198,8 @@ export const App: React.FC = () => {
     blockUdpOnTcpOnlyProxy: true,
     strictDnsNoLocalFallback: true
   };
+
+  const isEngineRunning = diagnostics.daemonConnected && diagnostics.running;
 
   const allNavItems: Array<{
     id: NavTabId;
@@ -313,14 +311,13 @@ export const App: React.FC = () => {
             <button
               onClick={async () => {
                 const next = !systemProxyEnabled;
-                await routewardClient.setSystemProxy(next);
-                setSystemProxyEnabled(next);
-                refreshAll();
+                const applied = await routewardClient.setSystemProxy(next);
+                setSystemProxyEnabled(applied);
                 pushToast(
-                  next
+                  applied
                     ? t('app.toast.system.proxy_enabled')
                     : t('app.toast.system.proxy_disabled'),
-                  next ? 'success' : 'info'
+                  applied ? 'success' : 'info'
                 );
               }}
               title={t('app.system_proxy.tooltip')}
@@ -357,10 +354,9 @@ export const App: React.FC = () => {
               <select
                 value={diagnostics.interceptionMode}
                 onChange={(e) => {
-                  routewardClient.setInterceptionMode(
+                  void routewardClient.setInterceptionMode(
                     e.target.value as InterceptionMode
                   );
-                  refreshAll();
                 }}
                 className="tf-input px-2.5 py-1.5 text-xs font-medium"
               >
@@ -419,24 +415,74 @@ export const App: React.FC = () => {
 
             {/* Start / Stop Engine */}
             <button
+              disabled={!diagnostics.daemonConnected}
               onClick={() => {
-                routewardClient.toggleEngine(!diagnostics.running);
-                refreshAll();
+                void routewardClient.toggleEngine(!isEngineRunning);
               }}
-              className={`flex items-center gap-2 rounded-tf-md px-3.5 py-1.5 text-xs font-bold transition ${
-                diagnostics.running
+              className={`flex items-center gap-2 rounded-tf-md px-3.5 py-1.5 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                isEngineRunning
                   ? 'border border-tf-green bg-tf-green/20 text-tf-green'
                   : 'border border-tf-red bg-tf-red/20 text-tf-red'
               }`}
             >
               <Power className="h-3.5 w-3.5" />
-              {diagnostics.running
+              {isEngineRunning
                 ? t('app.header.engine.running')
                 : t('app.header.engine.stopped')}
             </button>
           </div>
         </div>
       </header>
+
+      {/* Persistent Daemon Disconnected / Non-Elevated Warning Banner */}
+      {!diagnostics.daemonConnected && (
+        <div className="border-b border-tf-red/40 bg-tf-red/15 px-6 py-2.5">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2.5">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-tf-red" />
+              <div>
+                <span className="font-bold text-tf-red">
+                  {t('app.daemon_banner.disconnected_title')}
+                </span>{' '}
+                <span className="text-tf-primary">
+                  — {t('app.daemon_banner.disconnected_desc')}
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="rounded bg-tf-red/20 px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-tf-red">
+                {t('app.daemon_banner.reconnecting_badge')}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  void routewardClient.fetchState();
+                }}
+                className="tf-surface-alt flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-tf-primary hover:border-tf-accent"
+              >
+                <RefreshCw className="h-3 w-3" />
+                {t('app.daemon_banner.retry_button')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {diagnostics.daemonConnected && !diagnostics.elevatedPrivileges && (
+        <div className="border-b border-tf-orange/40 bg-tf-orange/15 px-6 py-2.5">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-2.5 text-xs">
+            <ShieldAlert className="h-4 w-4 shrink-0 text-tf-orange" />
+            <div>
+              <span className="font-bold text-tf-orange">
+                {t('app.daemon_banner.not_elevated_title')}
+              </span>{' '}
+              <span className="text-tf-primary">
+                — {t('app.daemon_banner.not_elevated_desc')}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Navigation Tabs */}
       <nav className="border-b border-tf-border bg-tf-surface/60 px-6">
@@ -471,8 +517,7 @@ export const App: React.FC = () => {
             securityPolicy={securityPolicy}
             experienceMode={experienceMode}
             onUpdateSecurityPolicy={(partial) => {
-              routewardClient.updateSecurityPolicy(partial);
-              refreshAll();
+              void routewardClient.updateSecurityPolicy(partial);
             }}
             onOpenWizard={() => setShowWizardModal(true)}
             onNavigateRules={() => setActiveTab('rules')}
@@ -484,28 +529,22 @@ export const App: React.FC = () => {
           <ConnectionsView
             connections={connections}
             proxies={profile.proxies}
-            onSimulate={(req) => {
-              routewardClient.simulateConnection(req);
-              refreshAll();
-            }}
             onScanOsSockets={async () => {
               await routewardClient.scanRealOsSockets();
-              refreshAll();
               pushToast(t('app.toast.connection.os_scanned'), 'info');
             }}
             onClearClosed={() => {
-              routewardClient.clearClosedConnections();
-              refreshAll();
+              void routewardClient.clearClosedConnections();
             }}
             onTerminateConnection={(connId) => {
-              routewardClient.terminateConnection(connId);
-              refreshAll();
-              pushToast(t('app.toast.connection.terminated'), 'warning');
+              void routewardClient.terminateConnection(connId).then(() => {
+                pushToast(t('app.toast.connection.terminated'), 'warning');
+              });
             }}
             onQuickCreateRule={(rule) => {
-              routewardClient.upsertRule(rule);
-              refreshAll();
-              pushToast(t('app.toast.rule.created'));
+              void routewardClient.upsertRule(rule).then(() => {
+                pushToast(t('app.toast.rule.created'));
+              });
             }}
           />
         )}
@@ -516,40 +555,35 @@ export const App: React.FC = () => {
             chains={profile.chains}
             onTestProxy={async (id) => {
               await routewardClient.testProxy(id);
-              refreshAll();
               pushToast(t('app.toast.proxy.tested'));
             }}
             onTestAllProxies={async () => {
               await routewardClient.testAllProxies();
-              refreshAll();
               pushToast(t('app.toast.proxy.tested'));
             }}
             onAddProxy={(node) => {
-              routewardClient.upsertProxy(node);
-              refreshAll();
-              pushToast(t('app.toast.proxy.added'));
+              void routewardClient.upsertProxy(node).then(() => {
+                pushToast(t('app.toast.proxy.added'));
+              });
             }}
             onImportUris={(text) => {
-              const count = routewardClient.importProxyUris(text);
-              refreshAll();
-              if (count > 0) {
-                pushToast(`${t('app.toast.proxy.imported_uris')} (${count})`);
-              }
+              void routewardClient.importProxyUris(text).then((count) => {
+                if (count > 0) {
+                  pushToast(`${t('app.toast.proxy.imported_uris')} (${count})`);
+                }
+              });
             }}
             onCopyUri={() => {
               pushToast(t('app.toast.proxy.copied_uri'), 'info');
             }}
             onRemoveProxy={(id) => {
-              routewardClient.removeProxy(id);
-              refreshAll();
+              void routewardClient.removeProxy(id);
             }}
             onAddChain={(chain) => {
-              routewardClient.upsertChain(chain);
-              refreshAll();
+              void routewardClient.upsertChain(chain);
             }}
             onRemoveChain={(id) => {
-              routewardClient.removeChain(id);
-              refreshAll();
+              void routewardClient.removeChain(id);
             }}
           />
         )}
@@ -562,23 +596,22 @@ export const App: React.FC = () => {
             experienceMode={experienceMode}
             onEvaluateRule={(req) => routewardClient.evaluateRule(req)}
             onAddRule={(rule) => {
-              routewardClient.upsertRule(rule);
-              refreshAll();
-              pushToast(t('app.toast.rule.created'));
+              void routewardClient.upsertRule(rule).then(() => {
+                pushToast(t('app.toast.rule.created'));
+              });
             }}
             onToggleRule={(id) => {
-              routewardClient.toggleRuleEnabled(id);
-              refreshAll();
-              pushToast(t('app.toast.rule.updated'), 'info');
+              void routewardClient.toggleRuleEnabled(id).then(() => {
+                pushToast(t('app.toast.rule.updated'), 'info');
+              });
             }}
             onReorderRule={(id, dir) => {
-              routewardClient.reorderRulePriority(id, dir);
-              refreshAll();
+              void routewardClient.reorderRulePriority(id, dir);
             }}
             onRemoveRule={(id) => {
-              routewardClient.removeRule(id);
-              refreshAll();
-              pushToast(t('app.toast.rule.deleted'), 'warning');
+              void routewardClient.removeRule(id).then(() => {
+                pushToast(t('app.toast.rule.deleted'), 'warning');
+              });
             }}
           />
         )}
@@ -587,13 +620,12 @@ export const App: React.FC = () => {
           <DnsView
             entries={fakeIps}
             onAllocate={(dom) => {
-              routewardClient.allocateFakeIp(dom);
-              refreshAll();
+              void routewardClient.allocateFakeIp(dom);
             }}
             onFlush={() => {
-              routewardClient.flushFakeIps();
-              refreshAll();
-              pushToast(t('app.toast.dns.flushed'), 'info');
+              void routewardClient.flushFakeIps().then(() => {
+                pushToast(t('app.toast.dns.flushed'), 'info');
+              });
             }}
           />
         )}
@@ -602,8 +634,7 @@ export const App: React.FC = () => {
           <LogsView
             logs={logs}
             onClear={() => {
-              routewardClient.clearLogs();
-              refreshAll();
+              void routewardClient.clearLogs();
             }}
           />
         )}
@@ -616,7 +647,7 @@ export const App: React.FC = () => {
             <span className="flex items-center gap-1.5 font-mono">
               <span
                 className={`h-2 w-2 rounded-full ${
-                  diagnostics.running ? 'bg-tf-green' : 'bg-tf-red'
+                  isEngineRunning ? 'bg-tf-green' : 'bg-tf-red'
                 }`}
               />
               {t('app.statusbar.relay.label')}:{' '}
@@ -682,16 +713,13 @@ export const App: React.FC = () => {
           chains={profile.chains}
           currentMode={experienceMode}
           onImportUris={(text) => {
-            routewardClient.importProxyUris(text);
-            refreshAll();
+            void routewardClient.importProxyUris(text);
           }}
           onAddRule={(rule) => {
-            routewardClient.upsertRule(rule);
-            refreshAll();
+            void routewardClient.upsertRule(rule);
           }}
           onSelectMode={(mode) => handleSetExperienceMode(mode)}
           onComplete={() => {
-            refreshAll();
             pushToast(t('app.toast.wizard.completed'));
           }}
           onClose={() => setShowWizardModal(false)}
@@ -703,7 +731,6 @@ export const App: React.FC = () => {
           relayEndpoint={diagnostics.relayTcpEndpoint}
           onLaunch={async (exe, args) => {
             await routewardClient.launchProcessWithProxy(exe, args);
-            refreshAll();
             pushToast(`${t('app.toast.system.process_launched')}: ${exe}`);
           }}
           onClose={() => setShowLauncherModal(false)}
@@ -715,30 +742,21 @@ export const App: React.FC = () => {
           onClose={() => setShowCommandPalette(false)}
           onNavigate={(tab) => setActiveTab(tab)}
           onToggleEngine={() => {
-            routewardClient.toggleEngine(!diagnostics.running);
-            refreshAll();
+            void routewardClient.toggleEngine(!isEngineRunning);
           }}
           onTestAllProxies={async () => {
             await routewardClient.testAllProxies();
-            refreshAll();
             pushToast(t('app.toast.proxy.tested'));
           }}
-          onSimulateTraffic={() => {
-            routewardClient.simulateConnection(
-              UI_CONFIG.SIMULATION_PRESETS[0]
-            );
-            refreshAll();
-          }}
           onFlushDns={() => {
-            routewardClient.flushFakeIps();
-            refreshAll();
-            pushToast(t('app.toast.dns.flushed'), 'info');
+            void routewardClient.flushFakeIps().then(() => {
+              pushToast(t('app.toast.dns.flushed'), 'info');
+            });
           }}
           onToggleKillSwitch={() => {
-            routewardClient.updateSecurityPolicy({
+            void routewardClient.updateSecurityPolicy({
               killSwitchEnabled: !securityPolicy.killSwitchEnabled
             });
-            refreshAll();
           }}
           onOpenThemeForge={() => setShowThemeModal(true)}
           onSwitchLanguage={handleToggleLanguage}

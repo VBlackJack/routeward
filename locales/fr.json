@@ -34,6 +34,14 @@
       "glossary_button": "Lexique & Aide",
       "what_is_this": "À quoi ça sert ?"
     },
+    "daemon_banner": {
+      "disconnected_title": "Démon Privilégié RouteWard Déconnecté",
+      "disconnected_desc": "Le pont de l'interface ne parvient pas à joindre le démon (lancez 'routeward daemon' en Administrateur ou root). Reconnexion automatique active.",
+      "reconnecting_badge": "Reconnexion auto",
+      "retry_button": "Réessayer",
+      "not_elevated_title": "Démon Lancé Sans Privilèges Élevés",
+      "not_elevated_desc": "Le démon connecté tourne sans privilèges Administrateur ou root. L'interception transparente des paquets système requiert l'élévation."
+    },
     "header": {
       "brand": {
         "title": "RouteWard",
@@ -345,6 +353,7 @@
         "test": "Tester Latence & UDP",
         "testing": "Test en cours...",
         "copy_uri": "Copier l'URI",
+        "edit": "Modifier / Mot de passe",
         "delete": "Supprimer",
         "toggle": "Activer / Désactiver"
       },
@@ -352,6 +361,7 @@
         "udp_ready": "Support UDP",
         "tcp_only": "TCP Uniquement",
         "tls_enabled": "TLS",
+        "password_set": "Mot de passe défini",
         "untested": "Non testé",
         "online": "En ligne",
         "offline": "Injoignable",
@@ -361,12 +371,16 @@
     "modal": {
       "add_proxy": {
         "title": "Configurer un Serveur Proxy",
+        "edit_title": "Modifier le Serveur Proxy",
         "name_label": "Nom d'affichage",
         "protocol_label": "Protocole",
         "host_label": "Hôte / Adresse IP",
         "port_label": "Port",
         "username_label": "Identifiant (Optionnel)",
         "password_label": "Mot de passe (Optionnel)",
+        "password_unchanged_placeholder": "Inchangé (conservé par le démon)",
+        "replace_password_action": "Remplacer le mot de passe",
+        "cancel_replace_password": "Conserver le mot de passe actuel",
         "sni_label": "Nom d'hôte SNI TLS",
         "udp_label": "Activer UDP Associate",
         "tls_label": "Activer le transport TLS",

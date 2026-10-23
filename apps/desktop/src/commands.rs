@@ -42,6 +42,7 @@ use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
 
 const COMPONENT_DESKTOP_BRIDGE: &str = "DesktopBridge";
+const BRIDGE_EVENT_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 pub struct DesktopCommandBridge {
@@ -50,6 +51,7 @@ pub struct DesktopCommandBridge {
     ipc_client: IpcClient,
     state: Arc<RwLock<DaemonFullState>>,
     daemon_connected: Arc<AtomicBool>,
+    event_tx: tokio::sync::broadcast::Sender<IpcStreamEvent>,
 }
 
 impl DesktopCommandBridge {
@@ -57,6 +59,7 @@ impl DesktopCommandBridge {
         let i18n = I18nRegistry::new(locale);
         let ipc_client = IpcClient::new(constants.ipc.clone());
         let net = &constants.network;
+        let (event_tx, _) = tokio::sync::broadcast::channel(BRIDGE_EVENT_CHANNEL_CAPACITY);
 
         let initial_diagnostics = SystemDiagnostics {
             daemon_connected: false,
@@ -73,7 +76,7 @@ impl DesktopCommandBridge {
 
         let initial_state = DaemonFullState {
             diagnostics: initial_diagnostics,
-            profile: default_profile,
+            profile: default_profile.redacted_for_ipc(),
             telemetry: TelemetrySnapshot::default(),
             connections: Vec::new(),
             logs: Vec::new(),
@@ -86,10 +89,15 @@ impl DesktopCommandBridge {
             ipc_client,
             state: Arc::new(RwLock::new(initial_state)),
             daemon_connected: Arc::new(AtomicBool::new(false)),
+            event_tx,
         };
 
         bridge.mark_disconnected();
         bridge
+    }
+
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<IpcStreamEvent> {
+        self.event_tx.subscribe()
     }
 
     /// Spawns the background IPC subscription and automatic reconnection task.
@@ -152,7 +160,7 @@ impl DesktopCommandBridge {
                     if let Ok(stream_ev) = serde_json::from_str::<IpcStreamEvent>(&line) {
                         match stream_ev {
                             IpcStreamEvent::Event(ev) => self.apply_telemetry_event(ev),
-                            IpcStreamEvent::Resync { .. } => {
+                            IpcStreamEvent::Resync { skipped_events } => {
                                 if let Ok(fresh) = self
                                     .ipc_client
                                     .call_typed::<DaemonFullState>(IpcCommand::GetState)
@@ -160,6 +168,9 @@ impl DesktopCommandBridge {
                                 {
                                     self.apply_full_state(fresh);
                                 }
+                                let _ = self
+                                    .event_tx
+                                    .send(IpcStreamEvent::Resync { skipped_events });
                             }
                         }
                     }
@@ -189,50 +200,73 @@ impl DesktopCommandBridge {
 
     fn apply_full_state(&self, mut full_state: DaemonFullState) {
         full_state.diagnostics.daemon_connected = true;
-        self.daemon_connected.store(true, Ordering::SeqCst);
+        let was_connected = self.daemon_connected.swap(true, Ordering::SeqCst);
         *self.state.write() = full_state;
+        if !was_connected {
+            let _ = self
+                .event_tx
+                .send(IpcStreamEvent::Resync { skipped_events: 0 });
+        }
     }
 
     fn apply_telemetry_event(&self, event: TelemetryEvent) {
-        let mut st = self.state.write();
-        match event {
-            TelemetryEvent::Telemetry(snap) => {
-                st.telemetry = snap;
-            }
-            TelemetryEvent::ConnectionUpdated(conn) => {
-                if let Some(existing) = st.connections.iter_mut().find(|c| c.id == conn.id) {
-                    *existing = conn;
-                } else {
-                    st.connections.insert(0, conn);
+        {
+            let mut st = self.state.write();
+            match &event {
+                TelemetryEvent::Telemetry(snap) => {
+                    st.telemetry = snap.clone();
+                }
+                TelemetryEvent::ConnectionUpdated(conn) => {
+                    if let Some(existing) = st.connections.iter_mut().find(|c| c.id == conn.id) {
+                        *existing = conn.clone();
+                    } else {
+                        st.connections.insert(0, conn.clone());
+                    }
+                }
+                TelemetryEvent::ConnectionsCleared => {
+                    st.connections
+                        .retain(|c| c.status == ConnectionStatus::Active);
+                }
+                TelemetryEvent::Log(entry) => {
+                    st.logs.insert(0, entry.clone());
+                }
+                TelemetryEvent::LogsCleared => {
+                    st.logs.clear();
                 }
             }
-            TelemetryEvent::ConnectionsCleared => {
-                st.connections
-                    .retain(|c| c.status == ConnectionStatus::Active);
-            }
-            TelemetryEvent::Log(entry) => {
-                st.logs.insert(0, entry);
-            }
-            TelemetryEvent::LogsCleared => {
-                st.logs.clear();
-            }
         }
+        let _ = self.event_tx.send(IpcStreamEvent::Event(event));
     }
 
     fn mark_disconnected(&self) {
         let was_connected = self.daemon_connected.swap(false, Ordering::SeqCst);
-        let mut st = self.state.write();
-        st.diagnostics.daemon_connected = false;
-        st.diagnostics.running = false;
-        if was_connected || st.logs.is_empty() {
-            st.logs.insert(
-                0,
-                LogEntry::new(
-                    LogLevel::Warn,
-                    COMPONENT_DESKTOP_BRIDGE,
-                    self.i18n.t(ERR_KEY_DAEMON_DISCONNECTED),
-                ),
-            );
+        {
+            let mut st = self.state.write();
+            st.diagnostics.daemon_connected = false;
+            st.diagnostics.running = false;
+            st.telemetry.download_bytes_per_sec = 0;
+            st.telemetry.upload_bytes_per_sec = 0;
+            st.telemetry.active_connections = 0;
+            for conn in &mut st.connections {
+                if conn.status == ConnectionStatus::Active {
+                    conn.status = ConnectionStatus::Closed;
+                }
+            }
+            if was_connected || st.logs.is_empty() {
+                st.logs.insert(
+                    0,
+                    LogEntry::new(
+                        LogLevel::Warn,
+                        COMPONENT_DESKTOP_BRIDGE,
+                        self.i18n.t(ERR_KEY_DAEMON_DISCONNECTED),
+                    ),
+                );
+            }
+        }
+        if was_connected {
+            let _ = self
+                .event_tx
+                .send(IpcStreamEvent::Resync { skipped_events: 0 });
         }
     }
 
@@ -305,6 +339,14 @@ impl DesktopCommandBridge {
 
     pub fn get_profile(&self) -> ProfileConfig {
         self.state.read().profile.clone()
+    }
+
+    pub async fn replace_profile(&self, profile: ProfileConfig) -> Result<ProfileConfig, String> {
+        let updated = self
+            .call_daemon::<ProfileConfig>(IpcCommand::ReplaceProfile { profile })
+            .await?;
+        let _ = self.refresh_state().await;
+        Ok(updated)
     }
 
     pub fn get_themeforge_catalog(&self) -> Result<ThemeForgeCatalog, String> {
@@ -385,46 +427,46 @@ impl DesktopCommandBridge {
             .unwrap_or_default()
     }
 
-    pub async fn upsert_proxy(&self, node: ProxyNode) {
+    pub async fn upsert_proxy(&self, node: ProxyNode) -> ProfileConfig {
         let _ = self
             .call_daemon::<serde_json::Value>(IpcCommand::UpsertProxy { node })
             .await;
-        let _ = self.refresh_state().await;
+        self.refresh_state().await.profile
     }
 
-    pub async fn remove_proxy(&self, proxy_id: String) {
+    pub async fn remove_proxy(&self, proxy_id: String) -> ProfileConfig {
         let _ = self
             .call_daemon::<serde_json::Value>(IpcCommand::RemoveProxy { proxy_id })
             .await;
-        let _ = self.refresh_state().await;
+        self.refresh_state().await.profile
     }
 
-    pub async fn upsert_chain(&self, chain: ProxyChain) {
+    pub async fn upsert_chain(&self, chain: ProxyChain) -> ProfileConfig {
         let _ = self
             .call_daemon::<serde_json::Value>(IpcCommand::UpsertChain { chain })
             .await;
-        let _ = self.refresh_state().await;
+        self.refresh_state().await.profile
     }
 
-    pub async fn remove_chain(&self, chain_id: String) {
+    pub async fn remove_chain(&self, chain_id: String) -> ProfileConfig {
         let _ = self
             .call_daemon::<serde_json::Value>(IpcCommand::RemoveChain { chain_id })
             .await;
-        let _ = self.refresh_state().await;
+        self.refresh_state().await.profile
     }
 
-    pub async fn upsert_rule(&self, rule: RoutingRule) {
+    pub async fn upsert_rule(&self, rule: RoutingRule) -> ProfileConfig {
         let _ = self
             .call_daemon::<serde_json::Value>(IpcCommand::UpsertRule { rule })
             .await;
-        let _ = self.refresh_state().await;
+        self.refresh_state().await.profile
     }
 
-    pub async fn remove_rule(&self, rule_id: String) {
+    pub async fn remove_rule(&self, rule_id: String) -> ProfileConfig {
         let _ = self
             .call_daemon::<serde_json::Value>(IpcCommand::RemoveRule { rule_id })
             .await;
-        let _ = self.refresh_state().await;
+        self.refresh_state().await.profile
     }
 
     pub async fn toggle_engine(&self, start: bool) -> SystemDiagnostics {

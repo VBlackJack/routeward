@@ -43,9 +43,11 @@ powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
 
 Ce script telecharge `WinDivert-2.2.2-A.zip`, verifie son empreinte SHA-256 (`63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15`) et extrait `WinDivert.dll` et `WinDivert64.sys` dans `third_party/windivert/bin/`.
 
-## Etape 4 : Execution du Daemon Privilegie et des Clients Non Privilegies (`routeward daemon` & `routeward ctl`)
+## Etape 4 : Lancement en Deux Etapes (Daemon Privilegie + Interface Bureau / CLI Standard)
 
-### Configuration du groupe Linux (`routeward`)
+RouteWard separe le moteur d'interception privilegie (`routeward daemon`) de l'interface bureau non privilegiee (`routeward-desktop`) et du client CLI (`routeward ctl`). Au demarrage de `routeward daemon`, toute regle de pare-feu Windows (`RouteWard_TransparentRelay_*`) ou table `nftables` Linux (`table ip routeward`) orpheline laissee par un arret brutal precedent est nettoyee automatiquement et journalisee au niveau `INFO`.
+
+### Lancement en deux etapes sous Linux (groupe `routeward`)
 Sous Linux, le daemon cree `/run/routeward/routeward.sock` avec pour proprietaire `root:routeward` (socket en `0660` dans un dossier en `0750`). Creez le groupe systeme `routeward` et ajoutez-y votre utilisateur courant avant de lancer le daemon :
 
 ```bash
@@ -54,20 +56,32 @@ sudo usermod -aG routeward "$USER"
 # Reconnectez votre session (ou executez `newgrp routeward`) pour activer le groupe
 ```
 
-Lancez ensuite le daemon en `root`, puis pilotez-le depuis votre compte non privilegie :
+Lancez le daemon en `root` (etape 1), puis demarrez l'interface bureau ou pilotez le daemon depuis votre compte utilisateur non privilegie (etape 2) :
 
 ```bash
-# Terminal 1 (root) :
+# Etape 1 - Terminal 1 (root) :
 sudo ./target/release/routeward daemon
 
-# Terminal 2 (utilisateur membre du groupe 'routeward') :
+# Etape 2 - Terminal 2 (utilisateur standard membre du groupe 'routeward') :
+./target/release/routeward-desktop
+# Ou via la CLI :
 ./target/release/routeward ctl status
 ./target/release/routeward ctl start
 ./target/release/routeward ctl connections
 ./target/release/routeward ctl stop
 ```
 
-### Fonctionnement sous Windows (Named Pipe)
-Sous Windows, lancez `routeward.exe daemon` dans une console PowerShell en Administrateur. Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lance le daemon. Vous pouvez ensuite executer `routeward.exe ctl status` ou `routeward-desktop.exe` depuis une session non privilegiee du meme utilisateur.
+### Lancement en deux etapes sous Windows (Named Pipe)
+Sous Windows, lancez `routeward.exe daemon` dans une console PowerShell en Administrateur (etape 1), puis lancez `routeward-desktop.exe` ou `routeward.exe ctl` dans une session standard non elevee du meme compte utilisateur (etape 2) :
+
+```powershell
+# Etape 1 - PowerShell en Administrateur :
+.\target\release\routeward.exe daemon
+
+# Etape 2 - PowerShell standard (meme compte utilisateur, non eleve) :
+.\target\release\routeward-desktop.exe
+```
+
+Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lance le daemon. Si le daemon est arrete ou non demarre, `routeward-desktop` affiche une banniere persistante de deconnexion et se reconnecte automatiquement des que le daemon demarre.
 
 > **Important (Elevation du compte Windows UAC) :** Le daemon doit etre lance par l'utilisateur de l'interface (par elevation UAC de son propre compte). Si l'elevation se fait avec un autre compte administrateur (par exemple via « Executer en tant qu'autre utilisateur » ou un compte admin distinct), la DACL du Named Pipe autorisera le SID de cet autre compte, et l'interface ou la CLI de l'utilisateur courant ne pourra pas se connecter au pipe `\\.\pipe\routeward-daemon`.

@@ -44,27 +44,31 @@ export const UI_CONFIG = {
   DEFAULT_PROXY_PORT: 1080,
   DEFAULT_RULE_PRIORITY: 50,
   DEFAULT_TEST_PORT: 443,
-  SIMULATION_PRESETS: [
-    {
-      processName: 'firefox.exe',
-      processPath: 'C:\\Program Files\\Mozilla Firefox\\firefox.exe',
-      targetHost: 'api.github.com',
-      targetPort: 443,
-      protocol: 'tcp' as const
-    },
-    {
-      processName: 'curl',
-      processPath: '/usr/bin/curl',
-      targetHost: 'stealth.torproject.org',
-      targetPort: 443,
-      protocol: 'tcp' as const
-    },
-    {
-      processName: 'updater.exe',
-      processPath: 'C:\\ProgramData\\App\\updater.exe',
-      targetHost: 'events.telemetry.example.com',
-      targetPort: 443,
-      protocol: 'tcp' as const
-    }
-  ]
+  TOKEN_HEADER: 'X-RouteWard-Token',
+  SSE_RECONNECT_DELAY_MS: 1500,
+  API_ENDPOINTS: {
+    STATE: '/api/state',
+    EVENTS: '/api/events',
+    ENGINE_TOGGLE: '/api/engine/toggle',
+    ENGINE_MODE: '/api/engine/mode',
+    PROFILE_REPLACE: '/api/profile/replace',
+    THEME: '/api/theme',
+    RULES_UPSERT: '/api/rules/upsert',
+    RULES_REMOVE: '/api/rules/remove',
+    RULES_EVALUATE: '/api/rules/evaluate',
+    PROXIES_UPSERT: '/api/proxies/upsert',
+    PROXIES_REMOVE: '/api/proxies/remove',
+    PROXIES_TEST: '/api/proxies/test',
+    PROXIES_TEST_ALL: '/api/proxies/test-all',
+    CHAINS_UPSERT: '/api/chains/upsert',
+    CHAINS_REMOVE: '/api/chains/remove',
+    CONNECTIONS_TERMINATE: '/api/connections/terminate',
+    CONNECTIONS_CLEAR: '/api/connections/clear',
+    SCAN_OS: '/api/scan-os',
+    DNS_ALLOCATE: '/api/dns/allocate',
+    DNS_FLUSH: '/api/dns/flush',
+    LOGS_CLEAR: '/api/logs/clear',
+    SYSTEM_PROXY: '/api/system-proxy',
+    LAUNCH_PROCESS: '/api/launch-process'
+  }
 } as const;

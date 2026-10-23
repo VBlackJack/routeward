@@ -17,9 +17,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use routeward_core::ipc::generate_ephemeral_token;
-use routeward_desktop_lib::commands::DesktopCommandBridge;
-use routeward_desktop_lib::{create_desktop_bridge, validate_loopback_http_request};
-use serde::Deserialize;
+use routeward_desktop_lib::{
+    create_desktop_bridge, extract_json_body, handle_api_route, http_status_line,
+    stream_sse_events, validate_loopback_http_request, DesktopWindowCommand, HTTP_REQ_BUFFER_BYTES,
+};
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
 use tao::dpi::LogicalSize;
@@ -40,39 +41,7 @@ const WINDOW_DEFAULT_HEIGHT: f64 = 900.0;
 const WINDOW_MIN_WIDTH: f64 = 980.0;
 const WINDOW_MIN_HEIGHT: f64 = 660.0;
 const LOOPBACK_EPHEMERAL_ADDR: &str = "127.0.0.1:0";
-const HTTP_REQ_BUFFER_BYTES: usize = 65536;
 const ICON_DIMENSION: u32 = 32;
-
-#[derive(Debug, Clone)]
-enum DesktopWindowCommand {
-    Minimize,
-    ToggleMaximize,
-    Close,
-    DragWindow,
-}
-
-#[derive(Debug, Deserialize)]
-struct LaunchProcessRequest {
-    executable: String,
-    #[serde(default)]
-    args: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SystemProxyRequest {
-    enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToggleEngineRequest {
-    start: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct TerminateConnectionRequest {
-    #[serde(rename = "connectionId")]
-    connection_id: String,
-}
 
 fn build_drakul_window_icon() -> Option<Icon> {
     let mut rgba = Vec::with_capacity((ICON_DIMENSION * ICON_DIMENSION * 4) as usize);
@@ -115,156 +84,6 @@ fn build_drakul_window_icon() -> Option<Icon> {
     }
 
     Icon::from_rgba(rgba, ICON_DIMENSION, ICON_DIMENSION).ok()
-}
-
-fn extract_json_body(raw_request: &str) -> &str {
-    if let Some(idx) = raw_request.find("\r\n\r\n") {
-        &raw_request[idx + 4..]
-    } else if let Some(idx) = raw_request.find("\n\n") {
-        &raw_request[idx + 2..]
-    } else {
-        ""
-    }
-}
-
-async fn handle_api_route(
-    path: &str,
-    body_str: &str,
-    bridge: &DesktopCommandBridge,
-    proxy: &EventLoopProxy<DesktopWindowCommand>,
-) -> Option<(String, Vec<u8>)> {
-    if path.starts_with("/api/state") {
-        let state = bridge.refresh_state().await;
-        let json = serde_json::to_vec(&state).unwrap_or_default();
-        return Some(("application/json; charset=utf-8".to_string(), json));
-    }
-
-    if path.starts_with("/api/diagnostics") {
-        let diag = bridge.get_diagnostics();
-        let json = serde_json::to_vec(&diag).unwrap_or_default();
-        return Some(("application/json; charset=utf-8".to_string(), json));
-    }
-
-    if path.starts_with("/api/telemetry") {
-        let snap = bridge.get_telemetry();
-        let json = serde_json::to_vec(&snap).unwrap_or_default();
-        return Some(("application/json; charset=utf-8".to_string(), json));
-    }
-
-    if path.starts_with("/api/connections/terminate") {
-        let parsed: Result<TerminateConnectionRequest, _> = serde_json::from_str(body_str);
-        let terminated = match parsed {
-            Ok(req) => bridge.terminate_connection(req.connection_id).await,
-            Err(_) => false,
-        };
-        let json = serde_json::to_vec(&serde_json::json!({ "terminated": terminated }))
-            .unwrap_or_default();
-        return Some(("application/json; charset=utf-8".to_string(), json));
-    }
-
-    if path.starts_with("/api/connections/clear") {
-        bridge.clear_closed_connections().await;
-        return Some((
-            "application/json; charset=utf-8".to_string(),
-            b"{\"ok\":true}".to_vec(),
-        ));
-    }
-
-    if path.starts_with("/api/connections") {
-        let conns = bridge.list_connections();
-        let json = serde_json::to_vec(&conns).unwrap_or_default();
-        return Some(("application/json; charset=utf-8".to_string(), json));
-    }
-
-    if path.starts_with("/api/logs/clear") {
-        bridge.clear_logs().await;
-        return Some((
-            "application/json; charset=utf-8".to_string(),
-            b"{\"ok\":true}".to_vec(),
-        ));
-    }
-
-    if path.starts_with("/api/logs") {
-        let logs = bridge.list_logs();
-        let json = serde_json::to_vec(&logs).unwrap_or_default();
-        return Some(("application/json; charset=utf-8".to_string(), json));
-    }
-
-    if path.starts_with("/api/engine/toggle") {
-        let parsed: ToggleEngineRequest =
-            serde_json::from_str(body_str).unwrap_or(ToggleEngineRequest { start: false });
-        let diag = bridge.toggle_engine(parsed.start).await;
-        let json = serde_json::to_vec(&diag).unwrap_or_default();
-        return Some(("application/json; charset=utf-8".to_string(), json));
-    }
-
-    if path.starts_with("/api/scan-os") {
-        let sockets = bridge.scan_os_sockets().await;
-        let json = serde_json::to_vec(&sockets).unwrap_or_default();
-        return Some(("application/json; charset=utf-8".to_string(), json));
-    }
-
-    if path.starts_with("/api/system-proxy") {
-        let parsed: SystemProxyRequest =
-            serde_json::from_str(body_str).unwrap_or(SystemProxyRequest { enabled: false });
-        let result = bridge.set_system_proxy(parsed.enabled);
-        let json = match result {
-            Ok(status) => serde_json::to_vec(&status).unwrap_or_default(),
-            Err(err) => {
-                serde_json::to_vec(&serde_json::json!({ "error": err })).unwrap_or_default()
-            }
-        };
-        return Some(("application/json; charset=utf-8".to_string(), json));
-    }
-
-    if path.starts_with("/api/launch-process") {
-        let parsed: Result<LaunchProcessRequest, _> = serde_json::from_str(body_str);
-        let json = match parsed {
-            Ok(req) => match bridge.launch_process_with_proxy(&req.executable, &req.args) {
-                Ok(res) => serde_json::to_vec(&res).unwrap_or_default(),
-                Err(err) => {
-                    serde_json::to_vec(&serde_json::json!({ "error": err })).unwrap_or_default()
-                }
-            },
-            Err(err) => serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
-                .unwrap_or_default(),
-        };
-        return Some(("application/json; charset=utf-8".to_string(), json));
-    }
-
-    if path.starts_with("/api/window/minimize") {
-        let _ = proxy.send_event(DesktopWindowCommand::Minimize);
-        return Some((
-            "application/json; charset=utf-8".to_string(),
-            b"{\"ok\":true}".to_vec(),
-        ));
-    }
-
-    if path.starts_with("/api/window/maximize") {
-        let _ = proxy.send_event(DesktopWindowCommand::ToggleMaximize);
-        return Some((
-            "application/json; charset=utf-8".to_string(),
-            b"{\"ok\":true}".to_vec(),
-        ));
-    }
-
-    if path.starts_with("/api/window/close") {
-        let _ = proxy.send_event(DesktopWindowCommand::Close);
-        return Some((
-            "application/json; charset=utf-8".to_string(),
-            b"{\"ok\":true}".to_vec(),
-        ));
-    }
-
-    if path.starts_with("/api/window/drag") {
-        let _ = proxy.send_event(DesktopWindowCommand::DragWindow);
-        return Some((
-            "application/json; charset=utf-8".to_string(),
-            b"{\"ok\":true}".to_vec(),
-        ));
-    }
-
-    None
 }
 
 fn spawn_embedded_ui_server(
@@ -312,14 +131,23 @@ fn spawn_embedded_ui_server(
                         }
                     };
 
+                    if path.starts_with("/api/events") {
+                        stream_sse_events(stream, bound_port, &bridge_ref).await;
+                        return;
+                    }
+
                     let body_str = extract_json_body(&req);
                     let allowed_origin = format!("http://127.0.0.1:{bound_port}");
+                    let win_cb = |cmd: DesktopWindowCommand| {
+                        let _ = proxy_ref.send_event(cmd);
+                    };
 
-                    if let Some((content_type, payload)) =
-                        handle_api_route(&path, body_str, &bridge_ref, &proxy_ref).await
+                    if let Some((status_code, content_type, payload)) =
+                        handle_api_route(&path, body_str, &bridge_ref, Some(&win_cb)).await
                     {
+                        let status = http_status_line(status_code);
                         let header = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: {allowed_origin}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: {allowed_origin}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
                             payload.len()
                         );
                         let _ = stream.write_all(header.as_bytes()).await;

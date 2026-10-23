@@ -78,7 +78,8 @@ export interface ThemeForgePalette {
 
 export interface ProxyCredentials {
   username: string;
-  password: string;
+  password?: string;
+  hasPassword?: boolean;
 }
 
 export interface ProxyNode {
@@ -205,6 +206,7 @@ export interface TelemetrySnapshot {
 }
 
 export interface SystemDiagnostics {
+  daemonConnected: boolean;
   running: boolean;
   osName: string;
   interceptionMode: InterceptionMode;
@@ -262,4 +264,30 @@ export interface ToastNotification {
   id: string;
   message: string;
   severity: 'success' | 'info' | 'warning';
+}
+
+export interface DaemonFullState {
+  diagnostics: SystemDiagnostics;
+  profile: ProfileConfig;
+  telemetry: TelemetrySnapshot;
+  connections: TrackedConnection[];
+  logs: LogEntry[];
+  fakeIps: FakeIpEntry[];
+}
+
+export type TelemetryEventPayload =
+  | { type: 'telemetry'; data: TelemetrySnapshot }
+  | { type: 'connection_updated'; data: TrackedConnection }
+  | { type: 'connections_cleared' }
+  | { type: 'log'; data: LogEntry }
+  | { type: 'logs_cleared' };
+
+export type IpcStreamEvent =
+  | { kind: 'event'; payload: TelemetryEventPayload }
+  | { kind: 'resync'; skipped: number };
+
+declare global {
+  interface Window {
+    __ROUTEWARD_TOKEN__?: string;
+  }
 }

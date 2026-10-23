@@ -124,6 +124,41 @@ impl IpcServer {
         }
     }
 
+    pub fn bind_for_test(ipc_config: &IpcConstants) -> RouteWardResult<Self> {
+        #[cfg(unix)]
+        {
+            use std::fs;
+            use std::path::PathBuf;
+
+            let socket_path = PathBuf::from(&ipc_config.unix_socket_path);
+            if socket_path.exists() {
+                let _ = fs::remove_file(&socket_path);
+            }
+            if let Some(parent) = socket_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = fs::create_dir_all(parent);
+                }
+            }
+            let listener = tokio::net::UnixListener::bind(&socket_path).map_err(|err| {
+                RouteWardError::DaemonError {
+                    key: ERR_KEY_DAEMON_IPC_ERROR,
+                    detail: format!(
+                        "Failed to bind test Unix socket {}: {err}",
+                        socket_path.display()
+                    ),
+                }
+            })?;
+            Ok(Self {
+                listener,
+                socket_path,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Self::bind_windows(&ipc_config.windows_pipe_name)
+        }
+    }
+
     #[cfg(windows)]
     pub fn bind_windows(pipe_name: &str) -> RouteWardResult<Self> {
         let user_sid = query_current_user_sid_string()?;

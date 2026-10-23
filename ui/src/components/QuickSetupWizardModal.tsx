@@ -27,6 +27,7 @@ import {
   X
 } from 'lucide-react';
 import { SYSTEM_CONSTANTS } from '../config/constants';
+import { generateClientId } from '../services/ipc';
 import {
   ProxyChain,
   ProxyNode,
@@ -104,7 +105,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
             : undefined;
 
       onAddRule({
-        id: `rule-wiz-${Date.now()}-${preset.id}`,
+        id: `${generateClientId('rule-wiz')}-${preset.id}`,
         name: t(`${preset.i18nKey}.name`),
         enabled: true,
         priority: preset.priority,

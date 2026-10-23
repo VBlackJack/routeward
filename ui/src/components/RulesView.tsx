@@ -33,6 +33,7 @@ import {
   Trash2
 } from 'lucide-react';
 import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
+import { generateClientId } from '../services/ipc';
 import {
   ConnectionRequest,
   PortRange,
@@ -50,7 +51,9 @@ interface RulesViewProps {
   proxies: ProxyNode[];
   chains: ProxyChain[];
   experienceMode: ExperienceMode;
-  onEvaluateRule: (req: ConnectionRequest) => RuleEvaluationResult;
+  onEvaluateRule: (
+    req: ConnectionRequest
+  ) => Promise<RuleEvaluationResult | null>;
   onAddRule: (rule: RoutingRule) => void;
   onToggleRule: (ruleId: string) => void;
   onReorderRule: (ruleId: string, direction: 'up' | 'down') => void;
@@ -111,9 +114,9 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const [actionType, setActionType] = useState<RuleAction['type']>('proxy');
   const [actionTargetId, setActionTargetId] = useState(proxies[0]?.id || '');
 
-  const handleRunSimulator = (e: React.FormEvent) => {
+  const handleRunSimulator = async (e: React.FormEvent) => {
     e.preventDefault();
-    const res = onEvaluateRule({
+    const res = await onEvaluateRule({
       processName: simProc,
       targetHost: simHost,
       targetPort: simPort,
@@ -134,7 +137,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
           : undefined;
 
     onAddRule({
-      id: `rule-${Date.now()}-${preset.id}`,
+      id: `${generateClientId('rule')}-${preset.id}`,
       name: t(`${preset.i18nKey}.name`),
       enabled: true,
       priority: preset.priority,
@@ -200,7 +203,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
         .filter(Boolean);
 
     onAddRule({
-      id: `rule-${Date.now()}`,
+      id: generateClientId('rule'),
       name: ruleName.trim(),
       enabled: true,
       priority,

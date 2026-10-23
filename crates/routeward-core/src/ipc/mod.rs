@@ -48,6 +48,11 @@ impl DaemonIpcService {
         Ok(Self { controller, server })
     }
 
+    pub fn bind_for_test(controller: RouteWardController) -> RouteWardResult<Self> {
+        let server = IpcServer::bind_for_test(&controller.constants.ipc)?;
+        Ok(Self { controller, server })
+    }
+
     #[cfg(windows)]
     pub fn bind_windows_custom_pipe(
         controller: RouteWardController,
@@ -58,12 +63,14 @@ impl DaemonIpcService {
     }
 
     pub async fn run_accept_loop(mut self) -> RouteWardResult<()> {
+        let mut client_tasks = tokio::task::JoinSet::new();
         loop {
+            while client_tasks.try_join_next().is_some() {}
             match self.server.accept().await {
                 Ok((stream, peer)) => {
                     log_peer_connection(&self.controller, &peer);
                     let ctrl = self.controller.clone();
-                    tokio::spawn(async move {
+                    client_tasks.spawn(async move {
                         handle_client_stream(stream, ctrl).await;
                     });
                 }

@@ -21,8 +21,10 @@ import {
 } from '../config/constants';
 import {
   ConnectionRequest,
+  DaemonFullState,
   FakeIpEntry,
   InterceptionMode,
+  IpcStreamEvent,
   LogEntry,
   ProcessTrafficSummary,
   ProfileConfig,
@@ -31,180 +33,284 @@ import {
   ProxyNode,
   ProxyProtocol,
   RoutingRule,
-  RuleAction,
   RuleEvaluationResult,
   SecurityPolicyConfig,
   SystemDiagnostics,
+  TelemetryEventPayload,
   TelemetrySnapshot,
   TrackedConnection
 } from '../types/routeward';
 
-const FAKE_IP_OCTET_A = 198;
-const FAKE_IP_OCTET_B = 18;
-const DEFAULT_FALLBACK_RULE_ID = 'default-policy';
-const DEFAULT_FALLBACK_RULE_NAME = 'Default Profile Policy';
-const SIMULATED_RX_BASE = 24576;
-const SIMULATED_TX_BASE = 6144;
-const SIMULATED_LATENCY_BASE_MS = 14;
 const PRIORITY_STEP = 5;
+let idSequenceCounter = 0;
 
-class RouteWardClientService {
+export function generateClientId(prefix: string): string {
+  idSequenceCounter += 1;
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${idSequenceCounter}`;
+}
+
+export function getEphemeralToken(): string {
+  if (typeof window !== 'undefined' && typeof window.__ROUTEWARD_TOKEN__ === 'string') {
+    return window.__ROUTEWARD_TOKEN__;
+  }
+  return '';
+}
+
+export function buildAuthHeaders(
+  extraHeaders?: Record<string, string>,
+  tokenOverride?: string
+): Record<string, string> {
+  const token = tokenOverride !== undefined ? tokenOverride : getEphemeralToken();
+  return {
+    [UI_CONFIG.TOKEN_HEADER]: token,
+    ...(extraHeaders || {})
+  };
+}
+
+export interface ParsedSseFrame {
+  event: string;
+  data: string;
+}
+
+export function parseSseChunk(buffer: string): {
+  events: ParsedSseFrame[];
+  remainder: string;
+} {
+  const normalized = buffer.replace(/\r\n/g, '\n');
+  const frames = normalized.split('\n\n');
+  const remainder = frames.pop() ?? '';
+  const events: ParsedSseFrame[] = [];
+
+  for (const rawFrame of frames) {
+    const lines = rawFrame.split('\n');
+    let eventName = 'message';
+    const dataLines: string[] = [];
+
+    for (const line of lines) {
+      if (!line || line.startsWith(':')) {
+        continue;
+      }
+      if (line.startsWith('event:')) {
+        eventName = line.slice('event:'.length).trim();
+      } else if (line.startsWith('data:')) {
+        dataLines.push(line.slice('data:'.length).trim());
+      }
+    }
+
+    if (dataLines.length > 0) {
+      events.push({
+        event: eventName,
+        data: dataLines.join('\n')
+      });
+    }
+  }
+
+  return { events, remainder };
+}
+
+export function sanitizeProxyNodeForWrite(node: ProxyNode): ProxyNode {
+  if (!node.auth) {
+    return { ...node, auth: null };
+  }
+  const cleanUser = node.auth.username.trim();
+  const rawPass = node.auth.password;
+  const hasNewPassword = typeof rawPass === 'string' && rawPass.length > 0;
+
+  if (!cleanUser && !hasNewPassword && !node.auth.hasPassword) {
+    return { ...node, auth: null };
+  }
+
+  const sanitizedAuth: NonNullable<ProxyNode['auth']> = {
+    username: cleanUser,
+    hasPassword: hasNewPassword ? true : Boolean(node.auth.hasPassword)
+  };
+  if (hasNewPassword) {
+    sanitizedAuth.password = rawPass;
+  }
+
+  return {
+    ...node,
+    auth: sanitizedAuth
+  };
+}
+
+function createInitialProfile(): ProfileConfig {
+  const base = JSON.parse(JSON.stringify(DEFAULT_PROFILE_DATA)) as ProfileConfig;
+  base.proxies = base.proxies.map((p) => ({
+    ...p,
+    auth: p.auth
+      ? {
+          username: p.auth.username,
+          hasPassword: Boolean(p.auth.hasPassword || p.auth.password)
+        }
+      : null
+  }));
+  return base;
+}
+
+function createInitialDiagnostics(profile: ProfileConfig): SystemDiagnostics {
+  const net = SYSTEM_CONSTANTS.network;
+  const savedLocale =
+    typeof window !== 'undefined'
+      ? window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.LOCALE) ||
+        UI_CONFIG.DEFAULT_LOCALE
+      : UI_CONFIG.DEFAULT_LOCALE;
+  return {
+    daemonConnected: false,
+    running: false,
+    osName: 'WINDOWS / LINUX',
+    interceptionMode: profile.interceptionMode,
+    elevatedPrivileges: false,
+    relayTcpEndpoint: `${net.localBindHost}:${net.defaultRelayTcpPort}`,
+    relayHttpEndpoint: `${net.localBindHost}:${net.defaultRelayHttpPort}`,
+    dnsEndpoint: `${net.localBindHost}:${net.defaultDnsListenPort}`,
+    fakeIpCidr: profile.dnsConfig.fakeIpCidr,
+    activeLocale: savedLocale
+  };
+}
+
+function createInitialTelemetry(): TelemetrySnapshot {
+  return {
+    activeConnections: 0,
+    downloadBytesPerSec: 0,
+    uploadBytesPerSec: 0,
+    totalRxBytes: 0,
+    totalTxBytes: 0,
+    proxiedCount: 0,
+    directCount: 0,
+    blockedCount: 0,
+    bandwidthHistory: [],
+    topTalkers: []
+  };
+}
+
+export class RouteWardClientService {
   private profile: ProfileConfig;
-  private running = true;
+  private diagnostics: SystemDiagnostics;
+  private telemetry: TelemetrySnapshot;
   private connections: TrackedConnection[] = [];
   private logs: LogEntry[] = [];
-  private fakeIpMap = new Map<string, FakeIpEntry>();
-  private reverseFakeIp = new Map<string, string>();
-  private nextFakeIpOffset = 1;
-  private totalRx = 0;
-  private totalTx = 0;
-  private proxiedCount = 0;
-  private directCount = 0;
-  private blockedCount = 0;
-  private bandwidthHistory: Array<{
-    timestamp: string;
-    rxBytesPerSec: number;
-    txBytesPerSec: number;
-  }> = [];
+  private fakeIps: FakeIpEntry[] = [];
+  private listeners = new Set<() => void>();
+  private streamRunning = false;
 
   constructor() {
-    const saved = window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.PROFILE);
-    this.profile = saved
-      ? (JSON.parse(saved) as ProfileConfig)
-      : (JSON.parse(JSON.stringify(DEFAULT_PROFILE_DATA)) as ProfileConfig);
+    this.profile = createInitialProfile();
+    this.diagnostics = createInitialDiagnostics(this.profile);
+    this.telemetry = createInitialTelemetry();
+  }
 
-    if (!this.profile.securityPolicy) {
-      this.profile.securityPolicy = {
-        killSwitchEnabled: true,
-        blockUdpOnTcpOnlyProxy: true,
-        strictDnsNoLocalFallback: true
+  public subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private notifyListeners(): void {
+    for (const listener of this.listeners) {
+      listener();
+    }
+  }
+
+  public applyFullState(state: DaemonFullState): void {
+    this.profile = state.profile;
+    this.diagnostics = {
+      ...state.diagnostics,
+      running: state.diagnostics.daemonConnected && state.diagnostics.running
+    };
+    if (!state.diagnostics.daemonConnected) {
+      this.telemetry = {
+        ...state.telemetry,
+        activeConnections: 0,
+        downloadBytesPerSec: 0,
+        uploadBytesPerSec: 0
       };
+      this.connections = state.connections.map((c) =>
+        c.status === 'active' ? { ...c, status: 'closed' } : c
+      );
+    } else {
+      this.telemetry = state.telemetry;
+      this.connections = state.connections;
     }
-
-    this.allocateFakeIp('api.github.com');
-    this.allocateFakeIp('stealth.torproject.org');
-    this.allocateFakeIp('registry.npmjs.org');
-    this.allocateFakeIp('crates.io');
-
-    for (const preset of UI_CONFIG.SIMULATION_PRESETS) {
-      this.simulateConnection(preset);
-    }
+    this.logs = state.logs;
+    this.fakeIps = state.fakeIps;
+    this.notifyListeners();
   }
 
-  private persistProfile(): void {
-    window.localStorage.setItem(
-      UI_CONFIG.STORAGE_KEYS.PROFILE,
-      JSON.stringify(this.profile)
-    );
-  }
-
-  public getProfile(): ProfileConfig {
-    return JSON.parse(JSON.stringify(this.profile)) as ProfileConfig;
-  }
-
-  public updateSecurityPolicy(
-    partial: Partial<SecurityPolicyConfig>
-  ): ProfileConfig {
-    this.profile.securityPolicy = {
-      killSwitchEnabled: true,
-      blockUdpOnTcpOnlyProxy: true,
-      strictDnsNoLocalFallback: true,
-      ...(this.profile.securityPolicy || {}),
-      ...partial
+  public markDisconnectedState(): void {
+    this.diagnostics = {
+      ...this.diagnostics,
+      daemonConnected: false,
+      running: false
     };
-    this.persistProfile();
-    this.pushLog(
-      'INFO',
-      'SecurityShield',
-      `Updated security policy: KillSwitch=${this.profile.securityPolicy.killSwitchEnabled}`
-    );
-    return this.getProfile();
-  }
-
-  public importProfileJson(jsonText: string): ProfileConfig {
-    const parsed = JSON.parse(jsonText) as ProfileConfig;
-    this.profile = parsed;
-    this.persistProfile();
-    this.pushLog('INFO', 'ProfileManager', `Imported profile: ${parsed.name}`);
-    return this.getProfile();
-  }
-
-  public exportProfileJson(): string {
-    return JSON.stringify(this.profile, null, 2);
-  }
-
-  public getDiagnostics(): SystemDiagnostics {
-    const net = SYSTEM_CONSTANTS.network;
-    return {
-      running: this.running,
-      osName: 'WINDOWS / LINUX',
-      interceptionMode: this.profile.interceptionMode,
-      elevatedPrivileges: true,
-      relayTcpEndpoint: `${net.localBindHost}:${net.defaultRelayTcpPort}`,
-      relayHttpEndpoint: `${net.localBindHost}:${net.defaultRelayHttpPort}`,
-      dnsEndpoint: `${net.localBindHost}:${net.defaultDnsListenPort}`,
-      fakeIpCidr: this.profile.dnsConfig.fakeIpCidr,
-      activeLocale:
-        window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.LOCALE) ||
-        UI_CONFIG.DEFAULT_LOCALE
+    this.telemetry = {
+      ...this.telemetry,
+      activeConnections: 0,
+      downloadBytesPerSec: 0,
+      uploadBytesPerSec: 0
     };
-  }
-
-  public toggleEngine(start: boolean): SystemDiagnostics {
-    this.running = start;
-    this.pushLog(
-      start ? 'INFO' : 'WARN',
-      'InterceptorEngine',
-      start ? 'Engine started' : 'Engine paused'
+    this.connections = this.connections.map((c) =>
+      c.status === 'active' ? { ...c, status: 'closed' } : c
     );
-    return this.getDiagnostics();
+    this.notifyListeners();
   }
 
-  public setInterceptionMode(mode: InterceptionMode): SystemDiagnostics {
-    this.profile.interceptionMode = mode;
-    this.persistProfile();
-    this.pushLog('INFO', 'InterceptorEngine', `Mode switched to ${mode}`);
-    return this.getDiagnostics();
+  public applyStreamEvent(event: IpcStreamEvent): boolean {
+    if (event.kind === 'resync') {
+      return true;
+    }
+    this.applyTelemetryPayload(event.payload);
+    this.notifyListeners();
+    return false;
   }
 
-  public getTelemetry(): TelemetrySnapshot {
-    const nowLabel = new Date().toTimeString().slice(0, 8);
-    const activeConns = this.connections.filter(
-      (c) => c.status === 'active'
-    ).length;
-
-    const rxRate = this.running ? activeConns * SIMULATED_RX_BASE : 0;
-    const txRate = this.running ? activeConns * SIMULATED_TX_BASE : 0;
-
-    if (this.running && activeConns > 0) {
-      this.totalRx += Math.round(rxRate / 4);
-      this.totalTx += Math.round(txRate / 4);
+  private applyTelemetryPayload(payload: TelemetryEventPayload): void {
+    switch (payload.type) {
+      case 'telemetry': {
+        this.telemetry = payload.data;
+        break;
+      }
+      case 'connection_updated': {
+        const updated = payload.data;
+        const idx = this.connections.findIndex((c) => c.id === updated.id);
+        if (idx >= 0) {
+          this.connections = [
+            ...this.connections.slice(0, idx),
+            updated,
+            ...this.connections.slice(idx + 1)
+          ];
+        } else {
+          this.connections = [updated, ...this.connections];
+        }
+        this.telemetry = {
+          ...this.telemetry,
+          topTalkers: this.computeTopTalkers()
+        };
+        break;
+      }
+      case 'connections_cleared': {
+        this.connections = this.connections.filter((c) => c.status === 'active');
+        break;
+      }
+      case 'log': {
+        this.logs = [
+          payload.data,
+          ...this.logs.slice(
+            0,
+            SYSTEM_CONSTANTS.telemetry.maxLogRingBufferEntries - 1
+          )
+        ];
+        break;
+      }
+      case 'logs_cleared': {
+        this.logs = [];
+        break;
+      }
     }
-
-    this.bandwidthHistory.push({
-      timestamp: nowLabel,
-      rxBytesPerSec: rxRate,
-      txBytesPerSec: txRate
-    });
-    if (
-      this.bandwidthHistory.length >
-      SYSTEM_CONSTANTS.telemetry.maxBandwidthHistorySamples
-    ) {
-      this.bandwidthHistory.shift();
-    }
-
-    return {
-      activeConnections: activeConns,
-      downloadBytesPerSec: rxRate,
-      uploadBytesPerSec: txRate,
-      totalRxBytes: this.totalRx,
-      totalTxBytes: this.totalTx,
-      proxiedCount: this.proxiedCount,
-      directCount: this.directCount,
-      blockedCount: this.blockedCount,
-      bandwidthHistory: [...this.bandwidthHistory],
-      topTalkers: this.computeTopTalkers()
-    };
   }
 
   private computeTopTalkers(): ProcessTrafficSummary[] {
@@ -230,238 +336,339 @@ class RouteWardClientService {
     );
   }
 
-  public listConnections(): TrackedConnection[] {
-    return [...this.connections];
-  }
-
-  public terminateConnection(connectionId: string): TrackedConnection[] {
-    const target = this.connections.find((c) => c.id === connectionId);
-    if (target && target.status === 'active') {
-      target.status = 'closed';
-      this.pushLog(
-        'WARN',
-        'SocketControl',
-        `Terminated socket for ${target.processName} -> ${target.targetHost}:${target.targetPort}`
-      );
-    }
-    return [...this.connections];
-  }
-
-  public clearClosedConnections(): TrackedConnection[] {
-    this.connections = this.connections.filter((c) => c.status === 'active');
-    return [...this.connections];
-  }
-
-  public evaluateRule(req: ConnectionRequest): RuleEvaluationResult {
-    const resolvedFakeDomain = this.reverseFakeIp.get(req.targetHost) || null;
-    const effectiveDomain =
-      resolvedFakeDomain ||
-      (!/^\d+\.\d+\.\d+\.\d+$/.test(req.targetHost)
-        ? req.targetHost.toLowerCase()
-        : null);
-
-    const sortedRules = [...this.profile.rules]
-      .filter((r) => r.enabled)
-      .sort((a, b) => a.priority - b.priority);
-
-    for (const rule of sortedRules) {
-      if (this.matchesRule(rule, req, effectiveDomain)) {
-        return {
-          matchedRuleId: rule.id,
-          matchedRuleName: rule.name,
-          action: rule.action,
-          effectiveDomain,
-          resolvedFromFakeIp: Boolean(resolvedFakeDomain)
-        };
-      }
-    }
-
-    return {
-      matchedRuleId: DEFAULT_FALLBACK_RULE_ID,
-      matchedRuleName: DEFAULT_FALLBACK_RULE_NAME,
-      action: this.profile.defaultAction,
-      effectiveDomain,
-      resolvedFromFakeIp: Boolean(resolvedFakeDomain)
-    };
-  }
-
-  private matchesRule(
-    rule: RoutingRule,
-    req: ConnectionRequest,
-    effectiveDomain: string | null
-  ): boolean {
-    if (rule.protocol !== 'any' && rule.protocol !== req.protocol) {
-      return false;
-    }
-
-    if (
-      rule.portRanges.length > 0 &&
-      !rule.portRanges.some(
-        (r) => req.targetPort >= r.start && req.targetPort <= r.end
-      )
-    ) {
-      return false;
-    }
-
-    if (rule.processPatterns.length > 0) {
-      const candidate = req.processName.toLowerCase();
-      const fullPath = (req.processPath || req.processName).toLowerCase();
-      const matchedProc = rule.processPatterns.some(
-        (pat) =>
-          this.globMatch(pat.toLowerCase(), candidate) ||
-          this.globMatch(pat.toLowerCase(), fullPath)
-      );
-      if (!matchedProc) {
-        return false;
-      }
-    }
-
-    if (rule.domainPatterns.length > 0 || rule.ipCidrs.length > 0) {
-      let matchedTarget = false;
-      if (effectiveDomain && rule.domainPatterns.length > 0) {
-        matchedTarget = rule.domainPatterns.some((pat) =>
-          this.globMatch(pat.toLowerCase(), effectiveDomain)
-        );
-      }
-      if (!matchedTarget && rule.ipCidrs.length > 0) {
-        matchedTarget = rule.ipCidrs.some((cidr) =>
-          req.targetHost.startsWith(cidr.split('/')[0].replace(/\.0+$/, ''))
-        );
-      }
-      if (!matchedTarget) {
-        return false;
-      }
-    }
-
-    return true;
-  }
-
-  private globMatch(pattern: string, text: string): boolean {
-    if (pattern === '*') return true;
-    if (pattern.startsWith('*.')) {
-      const suffix = pattern.slice(2);
-      if (text === suffix || text.endsWith(`.${suffix}`)) return true;
-    }
-    const regexStr =
-      '^' +
-      pattern
-        .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-        .replace(/\*/g, '.*')
-        .replace(/\?/g, '.') +
-      '$';
-    return new RegExp(regexStr, 'i').test(text);
-  }
-
-  public simulateConnection(req: ConnectionRequest): TrackedConnection {
-    const evalRes = this.evaluateRule(req);
-    const routeLabel = this.formatActionLabel(evalRes.action);
-    const isBlocked = evalRes.action.type === 'block';
-    const isProxied =
-      evalRes.action.type === 'proxy' || evalRes.action.type === 'chain';
-
-    if (isBlocked) {
-      this.blockedCount += 1;
-    } else if (isProxied) {
-      this.proxiedCount += 1;
-    } else {
-      this.directCount += 1;
-    }
-
-    if (
-      evalRes.effectiveDomain &&
-      !this.fakeIpMap.has(evalRes.effectiveDomain)
-    ) {
-      this.allocateFakeIp(evalRes.effectiveDomain);
-    }
-
-    const rx = isBlocked ? 0 : SIMULATED_RX_BASE;
-    const tx = isBlocked ? 0 : SIMULATED_TX_BASE;
-    this.totalRx += rx;
-    this.totalTx += tx;
-
-    const conn: TrackedConnection = {
-      id: `conn-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      pid: Math.floor(1200 + Math.random() * 8000),
-      processName: req.processName.split(/[/\\]/).pop() || req.processName,
-      processPath: req.processPath || req.processName,
-      targetHost: req.targetHost,
-      resolvedDomain: evalRes.effectiveDomain,
-      targetPort: req.targetPort,
-      protocol: req.protocol,
-      matchedRule: evalRes.matchedRuleName,
-      routeLabel,
-      latencyMs: isBlocked ? 0 : SIMULATED_LATENCY_BASE_MS,
-      rxBytes: rx,
-      txBytes: tx,
-      status: isBlocked ? 'blocked' : 'active',
-      startedAt: new Date().toISOString()
-    };
-
-    this.connections.unshift(conn);
-    this.pushLog(
-      isBlocked ? 'WARN' : 'INFO',
-      'RuleEngine',
-      `[${conn.processName}] ${conn.targetHost}:${conn.targetPort} -> ${routeLabel} (${conn.matchedRule})`
+  private async requestJson<T>(
+    url: string,
+    method: 'GET' | 'POST' = 'GET',
+    body?: unknown
+  ): Promise<T> {
+    const headers = buildAuthHeaders(
+      body !== undefined ? { 'Content-Type': 'application/json' } : undefined
     );
-    return conn;
-  }
-
-  private formatActionLabel(action: RuleAction): string {
-    if (action.type === 'direct') return 'DIRECT';
-    if (action.type === 'block') return 'BLOCKED';
-    if (action.type === 'proxy') {
-      const p = this.profile.proxies.find((x) => x.id === action.targetId);
-      return p ? `${p.name} (${p.protocol.toUpperCase()})` : action.targetId || 'PROXY';
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
     }
-    const c = this.profile.chains.find((x) => x.id === action.targetId);
-    return c
-      ? `${c.name} (${c.proxyIds.length} nodes)`
-      : action.targetId || 'CHAIN';
+    return (await response.json()) as T;
   }
 
-  public async testProxy(proxyId: string): Promise<ProxyHealthReport> {
-    const node = this.profile.proxies.find((p) => p.id === proxyId);
-    const latency = Math.floor(12 + Math.random() * 42);
-    if (node) {
-      node.lastLatencyMs = latency;
-      node.exitIp = node.host === '127.0.0.1' ? '185.220.101.42' : node.host;
-      this.persistProfile();
-      this.pushLog(
-        'INFO',
-        'ProxyChecker',
-        `${node.name} (${node.host}:${node.port}) -> ${latency} ms [Exit: ${node.exitIp}]`
+  public async fetchState(): Promise<DaemonFullState> {
+    try {
+      const state = await this.requestJson<DaemonFullState>(
+        UI_CONFIG.API_ENDPOINTS.STATE,
+        'GET'
       );
+      this.applyFullState(state);
+      return state;
+    } catch {
+      this.markDisconnectedState();
+      return {
+        diagnostics: this.diagnostics,
+        profile: this.profile,
+        telemetry: this.telemetry,
+        connections: this.connections,
+        logs: this.logs,
+        fakeIps: this.fakeIps
+      };
     }
-    return {
-      proxyId,
-      reachable: true,
-      latencyMs: latency,
-      udpSupported: node?.udpEnabled ?? false,
-      exitIp: node?.exitIp ?? null,
-      errorDetail: null
+  }
+
+  public startRealtimeStream(abortSignal?: AbortSignal): void {
+    if (this.streamRunning) {
+      return;
+    }
+    this.streamRunning = true;
+
+    const runLoop = async () => {
+      while (!abortSignal?.aborted) {
+        await this.fetchState();
+        if (abortSignal?.aborted) {
+          break;
+        }
+
+        try {
+          const response = await fetch(UI_CONFIG.API_ENDPOINTS.EVENTS, {
+            method: 'GET',
+            headers: buildAuthHeaders({ Accept: 'text/event-stream' }),
+            signal: abortSignal
+          });
+
+          if (!response.ok || !response.body) {
+            this.markDisconnectedState();
+          } else {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (!abortSignal?.aborted) {
+              const { value, done } = await reader.read();
+              if (done) {
+                break;
+              }
+              buffer += decoder.decode(value, { stream: true });
+              const parsed = parseSseChunk(buffer);
+              buffer = parsed.remainder;
+
+              for (const frame of parsed.events) {
+                if (frame.event === 'resync') {
+                  await this.fetchState();
+                  continue;
+                }
+                try {
+                  const streamEv = JSON.parse(frame.data) as IpcStreamEvent;
+                  if (this.applyStreamEvent(streamEv)) {
+                    await this.fetchState();
+                  }
+                } catch {
+                  // Ignore malformed frame
+                }
+              }
+            }
+          }
+        } catch {
+          if (!abortSignal?.aborted) {
+            this.markDisconnectedState();
+          }
+        }
+
+        if (abortSignal?.aborted) {
+          break;
+        }
+        await new Promise((resolve) =>
+          window.setTimeout(resolve, UI_CONFIG.SSE_RECONNECT_DELAY_MS)
+        );
+      }
+      this.streamRunning = false;
     };
+
+    void runLoop();
+  }
+
+  public getProfile(): ProfileConfig {
+    return this.profile;
+  }
+
+  public getDiagnostics(): SystemDiagnostics {
+    return this.diagnostics;
+  }
+
+  public getTelemetry(): TelemetrySnapshot {
+    return this.telemetry;
+  }
+
+  public listConnections(): TrackedConnection[] {
+    return this.connections;
+  }
+
+  public listFakeIps(): FakeIpEntry[] {
+    return this.fakeIps;
+  }
+
+  public listLogs(): LogEntry[] {
+    return this.logs;
+  }
+
+  public async toggleEngine(start: boolean): Promise<SystemDiagnostics> {
+    try {
+      const diag = await this.requestJson<SystemDiagnostics>(
+        UI_CONFIG.API_ENDPOINTS.ENGINE_TOGGLE,
+        'POST',
+        { start }
+      );
+      this.diagnostics = diag;
+      await this.fetchState();
+    } catch {
+      this.markDisconnectedState();
+    }
+    return this.diagnostics;
+  }
+
+  public async setInterceptionMode(
+    mode: InterceptionMode
+  ): Promise<SystemDiagnostics> {
+    try {
+      const diag = await this.requestJson<SystemDiagnostics>(
+        UI_CONFIG.API_ENDPOINTS.ENGINE_MODE,
+        'POST',
+        { mode }
+      );
+      this.diagnostics = diag;
+      this.profile = { ...this.profile, interceptionMode: mode };
+      this.notifyListeners();
+    } catch {
+      this.markDisconnectedState();
+    }
+    return this.diagnostics;
+  }
+
+  public async updateSecurityPolicy(
+    partial: Partial<SecurityPolicyConfig>
+  ): Promise<ProfileConfig> {
+    const updatedProfile: ProfileConfig = {
+      ...this.profile,
+      securityPolicy: {
+        killSwitchEnabled: true,
+        blockUdpOnTcpOnlyProxy: true,
+        strictDnsNoLocalFallback: true,
+        ...(this.profile.securityPolicy || {}),
+        ...partial
+      }
+    };
+    return this.replaceProfile(updatedProfile);
+  }
+
+  public async replaceProfile(
+    newProfile: ProfileConfig
+  ): Promise<ProfileConfig> {
+    const sanitized: ProfileConfig = {
+      ...newProfile,
+      proxies: newProfile.proxies.map(sanitizeProxyNodeForWrite)
+    };
+    try {
+      const saved = await this.requestJson<ProfileConfig>(
+        UI_CONFIG.API_ENDPOINTS.PROFILE_REPLACE,
+        'POST',
+        sanitized
+      );
+      this.profile = saved;
+      this.notifyListeners();
+    } catch {
+      this.markDisconnectedState();
+    }
+    return this.profile;
+  }
+
+  public async importProfileJson(jsonText: string): Promise<ProfileConfig> {
+    const parsed = JSON.parse(jsonText) as ProfileConfig;
+    return this.replaceProfile(parsed);
+  }
+
+  public exportProfileJson(): string {
+    const redacted: ProfileConfig = {
+      ...this.profile,
+      proxies: this.profile.proxies.map((p) => ({
+        ...p,
+        auth: p.auth
+          ? {
+              username: p.auth.username,
+              hasPassword: Boolean(p.auth.hasPassword)
+            }
+          : null
+      }))
+    };
+    return JSON.stringify(redacted, null, 2);
+  }
+
+  public async terminateConnection(
+    connectionId: string
+  ): Promise<TrackedConnection[]> {
+    try {
+      await this.requestJson<{ terminated: boolean }>(
+        UI_CONFIG.API_ENDPOINTS.CONNECTIONS_TERMINATE,
+        'POST',
+        { connectionId }
+      );
+      await this.fetchState();
+    } catch {
+      this.markDisconnectedState();
+    }
+    return this.connections;
+  }
+
+  public async clearClosedConnections(): Promise<TrackedConnection[]> {
+    try {
+      await this.requestJson<{ ok: boolean }>(
+        UI_CONFIG.API_ENDPOINTS.CONNECTIONS_CLEAR,
+        'POST',
+        {}
+      );
+      await this.fetchState();
+    } catch {
+      this.markDisconnectedState();
+    }
+    return this.connections;
+  }
+
+  public async evaluateRule(
+    req: ConnectionRequest
+  ): Promise<RuleEvaluationResult | null> {
+    try {
+      return await this.requestJson<RuleEvaluationResult>(
+        UI_CONFIG.API_ENDPOINTS.RULES_EVALUATE,
+        'POST',
+        req
+      );
+    } catch {
+      this.markDisconnectedState();
+      return null;
+    }
+  }
+
+  public async testProxy(proxyId: string): Promise<ProxyHealthReport | null> {
+    try {
+      const report = await this.requestJson<ProxyHealthReport>(
+        UI_CONFIG.API_ENDPOINTS.PROXIES_TEST,
+        'POST',
+        { proxyId }
+      );
+      await this.fetchState();
+      return report;
+    } catch {
+      this.markDisconnectedState();
+      return null;
+    }
   }
 
   public async testAllProxies(): Promise<ProxyHealthReport[]> {
-    const reports: ProxyHealthReport[] = [];
-    for (const p of this.profile.proxies) {
-      reports.push(await this.testProxy(p.id));
+    try {
+      const reports = await this.requestJson<ProxyHealthReport[]>(
+        UI_CONFIG.API_ENDPOINTS.PROXIES_TEST_ALL,
+        'POST',
+        {}
+      );
+      await this.fetchState();
+      return reports;
+    } catch {
+      this.markDisconnectedState();
+      return [];
     }
-    return reports;
   }
 
-  public upsertProxy(node: ProxyNode): ProfileConfig {
-    const idx = this.profile.proxies.findIndex((p) => p.id === node.id);
-    if (idx >= 0) {
-      this.profile.proxies[idx] = node;
-    } else {
-      this.profile.proxies.push(node);
+  public async upsertProxy(node: ProxyNode): Promise<ProfileConfig> {
+    const payload = sanitizeProxyNodeForWrite(node);
+    try {
+      const updated = await this.requestJson<ProfileConfig>(
+        UI_CONFIG.API_ENDPOINTS.PROXIES_UPSERT,
+        'POST',
+        payload
+      );
+      this.profile = updated;
+      this.notifyListeners();
+    } catch {
+      this.markDisconnectedState();
     }
-    this.persistProfile();
-    return this.getProfile();
+    return this.profile;
   }
 
-  public importProxyUris(rawText: string): number {
+  public async removeProxy(proxyId: string): Promise<ProfileConfig> {
+    try {
+      const updated = await this.requestJson<ProfileConfig>(
+        UI_CONFIG.API_ENDPOINTS.PROXIES_REMOVE,
+        'POST',
+        { proxyId }
+      );
+      this.profile = updated;
+      this.notifyListeners();
+    } catch {
+      this.markDisconnectedState();
+    }
+    return this.profile;
+  }
+
+  public async importProxyUris(rawText: string): Promise<number> {
     let imported = 0;
     const normalizedText = this.tryDecodeBase64Subscription(rawText);
     const lines = normalizedText
@@ -472,16 +679,9 @@ class RouteWardClientService {
     for (const line of lines) {
       const parsed = this.parseSingleProxyUri(line);
       if (parsed) {
-        this.upsertProxy(parsed);
+        await this.upsertProxy(parsed);
         imported += 1;
       }
-    }
-    if (imported > 0) {
-      this.pushLog(
-        'INFO',
-        'ProxyUriCodec',
-        `Imported ${imported} proxy servers from URI / Subscription list`
-      );
     }
     return imported;
   }
@@ -505,54 +705,31 @@ class RouteWardClientService {
 
   public async scanRealOsSockets(): Promise<TrackedConnection[]> {
     try {
-      const res = await fetch('/api/scan-os', { method: 'POST' });
-      if (res.ok) {
-        const osConns = (await res.json()) as TrackedConnection[];
-        if (Array.isArray(osConns) && osConns.length > 0) {
-          const existingIds = new Set(this.connections.map((c) => c.id));
-          for (const oc of osConns) {
-            if (!existingIds.has(oc.id)) {
-              this.connections.unshift(oc);
-            }
-          }
-          this.pushLog(
-            'INFO',
-            'OsSocketScanner',
-            `Scanned and imported ${osConns.length} established OS TCP sockets`
-          );
-          return [...this.connections];
-        }
-      }
+      const osConns = await this.requestJson<TrackedConnection[]>(
+        UI_CONFIG.API_ENDPOINTS.SCAN_OS,
+        'POST',
+        {}
+      );
+      await this.fetchState();
+      return osConns;
     } catch {
-      // Browser standalone fallback
+      this.markDisconnectedState();
+      return this.connections;
     }
-    return [...this.connections];
   }
 
   public async setSystemProxy(enabled: boolean): Promise<boolean> {
     try {
-      const res = await fetch('/api/system-proxy', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled })
-      });
-      if (res.ok) {
-        this.pushLog(
-          'INFO',
-          'SystemProxy',
-          `Windows System Proxy ${enabled ? 'ENABLED' : 'DISABLED'}`
-        );
-        return enabled;
-      }
+      await this.requestJson<unknown>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_PROXY,
+        'POST',
+        { enabled }
+      );
+      await this.fetchState();
+      return enabled;
     } catch {
-      // Browser fallback
+      return false;
     }
-    this.pushLog(
-      'INFO',
-      'SystemProxy',
-      `System Proxy toggled (${enabled ? 'ON' : 'OFF'})`
-    );
-    return enabled;
   }
 
   public async launchProcessWithProxy(
@@ -560,40 +737,23 @@ class RouteWardClientService {
     args: string[]
   ): Promise<boolean> {
     try {
-      const res = await fetch('/api/launch-process', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ executable, args })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (!data.error) {
-          this.pushLog(
-            'INFO',
-            'ProcessLauncher',
-            `Launched ${executable} (PID ${data.pid}) with injected proxy tunnel`
-          );
-          return true;
-        }
-      }
+      await this.requestJson<unknown>(
+        UI_CONFIG.API_ENDPOINTS.LAUNCH_PROCESS,
+        'POST',
+        { executable, args }
+      );
+      await this.fetchState();
+      return true;
     } catch {
-      // Browser fallback
+      return false;
     }
-    this.simulateConnection({
-      processName: executable,
-      processPath: executable,
-      targetHost: 'api.ipify.org',
-      targetPort: 443,
-      protocol: 'tcp'
-    });
-    return true;
   }
 
   public formatProxyUri(node: ProxyNode): string {
     const scheme = node.protocol;
     const authPart =
-      node.auth && (node.auth.username || node.auth.password)
-        ? `${node.auth.username}:${node.auth.password}@`
+      node.auth && node.auth.username
+        ? `${encodeURIComponent(node.auth.username)}@`
         : '';
     const queryPart = node.sni ? `?sni=${encodeURIComponent(node.sni)}` : '';
     const hashPart = `#${encodeURIComponent(node.name)}`;
@@ -633,9 +793,10 @@ class RouteWardClientService {
     let auth: ProxyNode['auth'] = null;
     if (userInfo) {
       const [u, p] = userInfo.split(':');
+      const decodedPass = decodeURIComponent(p || '');
       auth = {
         username: decodeURIComponent(u || ''),
-        password: decodeURIComponent(p || '')
+        ...(decodedPass ? { password: decodedPass, hasPassword: true } : { hasPassword: false })
       };
     }
 
@@ -644,7 +805,7 @@ class RouteWardClientService {
     const tls = protocol === 'https' || Boolean(sni);
 
     return {
-      id: `proxy-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      id: generateClientId('proxy'),
       name: fragment || `${protocol.toUpperCase()} ${host}:${port}`,
       protocol,
       host,
@@ -659,148 +820,149 @@ class RouteWardClientService {
     };
   }
 
-  public removeProxy(proxyId: string): ProfileConfig {
-    this.profile.proxies = this.profile.proxies.filter((p) => p.id !== proxyId);
-    this.persistProfile();
-    return this.getProfile();
-  }
-
-  public upsertChain(chain: ProxyChain): ProfileConfig {
-    const idx = this.profile.chains.findIndex((c) => c.id === chain.id);
-    if (idx >= 0) {
-      this.profile.chains[idx] = chain;
-    } else {
-      this.profile.chains.push(chain);
+  public async upsertChain(chain: ProxyChain): Promise<ProfileConfig> {
+    try {
+      const updated = await this.requestJson<ProfileConfig>(
+        UI_CONFIG.API_ENDPOINTS.CHAINS_UPSERT,
+        'POST',
+        chain
+      );
+      this.profile = updated;
+      this.notifyListeners();
+    } catch {
+      this.markDisconnectedState();
     }
-    this.persistProfile();
-    return this.getProfile();
+    return this.profile;
   }
 
-  public removeChain(chainId: string): ProfileConfig {
-    this.profile.chains = this.profile.chains.filter((c) => c.id !== chainId);
-    this.persistProfile();
-    return this.getProfile();
-  }
-
-  public upsertRule(rule: RoutingRule): ProfileConfig {
-    const idx = this.profile.rules.findIndex((r) => r.id === rule.id);
-    if (idx >= 0) {
-      this.profile.rules[idx] = rule;
-    } else {
-      this.profile.rules.push(rule);
+  public async removeChain(chainId: string): Promise<ProfileConfig> {
+    try {
+      const updated = await this.requestJson<ProfileConfig>(
+        UI_CONFIG.API_ENDPOINTS.CHAINS_REMOVE,
+        'POST',
+        { chainId }
+      );
+      this.profile = updated;
+      this.notifyListeners();
+    } catch {
+      this.markDisconnectedState();
     }
-    this.profile.rules.sort((a, b) => a.priority - b.priority);
-    this.persistProfile();
-    return this.getProfile();
+    return this.profile;
   }
 
-  public toggleRuleEnabled(ruleId: string): ProfileConfig {
+  public async upsertRule(rule: RoutingRule): Promise<ProfileConfig> {
+    try {
+      const updated = await this.requestJson<ProfileConfig>(
+        UI_CONFIG.API_ENDPOINTS.RULES_UPSERT,
+        'POST',
+        rule
+      );
+      this.profile = updated;
+      this.notifyListeners();
+    } catch {
+      this.markDisconnectedState();
+    }
+    return this.profile;
+  }
+
+  public async toggleRuleEnabled(ruleId: string): Promise<ProfileConfig> {
     const target = this.profile.rules.find((r) => r.id === ruleId);
-    if (target) {
-      target.enabled = !target.enabled;
-      this.persistProfile();
+    if (!target) {
+      return this.profile;
     }
-    return this.getProfile();
+    return this.upsertRule({ ...target, enabled: !target.enabled });
   }
 
-  public reorderRulePriority(
+  public async reorderRulePriority(
     ruleId: string,
     direction: 'up' | 'down'
-  ): ProfileConfig {
-    this.profile.rules.sort((a, b) => a.priority - b.priority);
-    const idx = this.profile.rules.findIndex((r) => r.id === ruleId);
-    if (idx < 0) return this.getProfile();
+  ): Promise<ProfileConfig> {
+    const sorted = [...this.profile.rules].sort(
+      (a, b) => a.priority - b.priority
+    );
+    const idx = sorted.findIndex((r) => r.id === ruleId);
+    if (idx < 0) {
+      return this.profile;
+    }
 
     const swapIdx = direction === 'up' ? idx - 1 : idx + 1;
-    if (swapIdx >= 0 && swapIdx < this.profile.rules.length) {
-      const currentPrio = this.profile.rules[idx].priority;
-      const neighborPrio = this.profile.rules[swapIdx].priority;
-      if (currentPrio === neighborPrio) {
-        this.profile.rules[idx].priority =
+    if (swapIdx >= 0 && swapIdx < sorted.length) {
+      const current = { ...sorted[idx] };
+      const neighbor = { ...sorted[swapIdx] };
+      if (current.priority === neighbor.priority) {
+        current.priority =
           direction === 'up'
-            ? Math.max(1, neighborPrio - PRIORITY_STEP)
-            : neighborPrio + PRIORITY_STEP;
+            ? Math.max(1, neighbor.priority - PRIORITY_STEP)
+            : neighbor.priority + PRIORITY_STEP;
       } else {
-        this.profile.rules[idx].priority = neighborPrio;
-        this.profile.rules[swapIdx].priority = currentPrio;
+        const temp = current.priority;
+        current.priority = neighbor.priority;
+        neighbor.priority = temp;
       }
-      this.profile.rules.sort((a, b) => a.priority - b.priority);
-      this.persistProfile();
+      sorted[idx] = current;
+      sorted[swapIdx] = neighbor;
+      sorted.sort((a, b) => a.priority - b.priority);
+      return this.replaceProfile({ ...this.profile, rules: sorted });
     }
-    return this.getProfile();
+    return this.profile;
   }
 
-  public removeRule(ruleId: string): ProfileConfig {
-    this.profile.rules = this.profile.rules.filter((r) => r.id !== ruleId);
-    this.persistProfile();
-    return this.getProfile();
+  public async removeRule(ruleId: string): Promise<ProfileConfig> {
+    try {
+      const updated = await this.requestJson<ProfileConfig>(
+        UI_CONFIG.API_ENDPOINTS.RULES_REMOVE,
+        'POST',
+        { ruleId }
+      );
+      this.profile = updated;
+      this.notifyListeners();
+    } catch {
+      this.markDisconnectedState();
+    }
+    return this.profile;
   }
 
-  public allocateFakeIp(domain: string): FakeIpEntry | null {
+  public async allocateFakeIp(domain: string): Promise<string | null> {
     const clean = domain.trim().toLowerCase();
     if (!clean) return null;
-
-    const existing = this.fakeIpMap.get(clean);
-    if (existing) {
-      existing.hits += 1;
-      return existing;
-    }
-
-    const thirdOctet = Math.floor(this.nextFakeIpOffset / 254) % 256;
-    const fourthOctet = (this.nextFakeIpOffset % 254) + 1;
-    this.nextFakeIpOffset += 1;
-
-    const fakeIp = `${FAKE_IP_OCTET_A}.${FAKE_IP_OCTET_B}.${thirdOctet}.${fourthOctet}`;
-    const entry: FakeIpEntry = {
-      fakeIp,
-      domain: clean,
-      hits: 1,
-      expiresAt: new Date(
-        Date.now() + SYSTEM_CONSTANTS.dns.defaultTtlSeconds * 1000
-      ).toISOString(),
-      ttlRemainingSeconds: SYSTEM_CONSTANTS.dns.defaultTtlSeconds
-    };
-
-    this.fakeIpMap.set(clean, entry);
-    this.reverseFakeIp.set(fakeIp, clean);
-    this.pushLog('INFO', 'FakeIpDNS', `Allocated ${clean} -> ${fakeIp}`);
-    return entry;
-  }
-
-  public listFakeIps(): FakeIpEntry[] {
-    return Array.from(this.fakeIpMap.values());
-  }
-
-  public flushFakeIps(): void {
-    this.fakeIpMap.clear();
-    this.reverseFakeIp.clear();
-    this.nextFakeIpOffset = 1;
-    this.pushLog('WARN', 'FakeIpDNS', 'Flushed Fake-IP DNS cache');
-  }
-
-  public pushLog(
-    level: LogEntry['level'],
-    component: string,
-    message: string
-  ): void {
-    this.logs.unshift({
-      id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      timestamp: new Date().toISOString(),
-      level,
-      component,
-      message
-    });
-    if (this.logs.length > SYSTEM_CONSTANTS.telemetry.maxLogRingBufferEntries) {
-      this.logs.pop();
+    try {
+      const res = await this.requestJson<{ fakeIp: string | null }>(
+        UI_CONFIG.API_ENDPOINTS.DNS_ALLOCATE,
+        'POST',
+        { domain: clean }
+      );
+      await this.fetchState();
+      return res.fakeIp;
+    } catch {
+      this.markDisconnectedState();
+      return null;
     }
   }
 
-  public listLogs(): LogEntry[] {
-    return [...this.logs];
+  public async flushFakeIps(): Promise<void> {
+    try {
+      await this.requestJson<{ ok: boolean }>(
+        UI_CONFIG.API_ENDPOINTS.DNS_FLUSH,
+        'POST',
+        {}
+      );
+      await this.fetchState();
+    } catch {
+      this.markDisconnectedState();
+    }
   }
 
-  public clearLogs(): void {
-    this.logs = [];
+  public async clearLogs(): Promise<void> {
+    try {
+      await this.requestJson<{ ok: boolean }>(
+        UI_CONFIG.API_ENDPOINTS.LOGS_CLEAR,
+        'POST',
+        {}
+      );
+      await this.fetchState();
+    } catch {
+      this.markDisconnectedState();
+    }
   }
 }
 

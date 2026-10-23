@@ -369,5 +369,33 @@ else
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Scenario (j): Orphaned 'table ip routeward' is automatically cleaned up
+#               at 'routeward daemon' startup and logged at INFO
+# ---------------------------------------------------------------------------
+nft add table ip routeward
+if ! nft list table ip routeward >/dev/null 2>&1; then
+    echo "[FAIL] Scenario (j): could not create synthetic orphaned table ip routeward"
+    exit 1
+fi
+
+rm -f /workspace/logs/RouteWard_*.log /run/routeward/routeward.sock
+"${BIN}" daemon --duration-secs 2 >/tmp/rw_daemon_j.out 2>&1
+
+if ! nft list table ip routeward >/dev/null 2>&1; then
+    LOG_FILE_J=$(ls -1 /workspace/logs/RouteWard_*.log | head -n 1)
+    if grep -q 'Removed nftables table "ip routeward"' "${LOG_FILE_J}"; then
+        echo "[PASS] Scenario (j): orphaned table ip routeward automatically removed at daemon startup and logged at INFO"
+        grep 'Removed nftables table "ip routeward"' "${LOG_FILE_J}" | tail -n 1
+    else
+        echo "[FAIL] Scenario (j): table removed at startup, but INFO log entry was not found"
+        cat "${LOG_FILE_J}" || true
+        exit 1
+    fi
+else
+    echo "[FAIL] Scenario (j): orphaned table ip routeward was NOT removed at daemon startup"
+    exit 1
+fi
+
 kill "${MOCK_PID}" 2>/dev/null || true
-echo "=== ALL 9 LINUX CONTAINER SCENARIOS PASSED ==="
+echo "=== ALL 10 LINUX CONTAINER SCENARIOS PASSED ==="

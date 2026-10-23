@@ -20,7 +20,6 @@ import {
   Ban,
   CheckCircle,
   Globe,
-  Play,
   PowerOff,
   Radar,
   Search,
@@ -30,10 +29,8 @@ import {
   Trash2,
   X
 } from 'lucide-react';
-import { UI_CONFIG } from '../config/constants';
-import { formatBytes } from '../services/ipc';
+import { formatBytes, generateClientId } from '../services/ipc';
 import {
-  ConnectionRequest,
   ConnectionStatus,
   ProxyNode,
   RoutingRule,
@@ -43,7 +40,6 @@ import {
 interface ConnectionsViewProps {
   connections: TrackedConnection[];
   proxies: ProxyNode[];
-  onSimulate: (req: ConnectionRequest) => void;
   onScanOsSockets: () => void;
   onClearClosed: () => void;
   onTerminateConnection: (connectionId: string) => void;
@@ -55,7 +51,6 @@ const QUICK_RULE_HIGH_PRIORITY = 8;
 export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
   connections,
   proxies,
-  onSimulate,
   onScanOsSockets,
   onClearClosed,
   onTerminateConnection,
@@ -66,7 +61,6 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
   const [statusFilter, setStatusFilter] = useState<'all' | ConnectionStatus>(
     'all'
   );
-  const [presetIdx, setPresetIdx] = useState(0);
   const [selectedConnId, setSelectedConnId] = useState<string | null>(null);
 
   const selectedConnection = useMemo(
@@ -91,22 +85,13 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
     });
   }, [connections, filterText, statusFilter]);
 
-  const handleSimulateClick = () => {
-    const preset =
-      UI_CONFIG.SIMULATION_PRESETS[
-        presetIdx % UI_CONFIG.SIMULATION_PRESETS.length
-      ];
-    setPresetIdx((prev) => prev + 1);
-    onSimulate(preset);
-  };
-
   const buildQuickProcessRule = (
     conn: TrackedConnection,
     actionType: 'proxy' | 'direct' | 'block'
   ) => {
     const primaryProxyId = proxies[0]?.id || 'proxy-socks5-primary';
     onQuickCreateRule({
-      id: `rule-quick-${Date.now()}`,
+      id: generateClientId('rule-quick'),
       name: `${conn.processName} (${actionType.toUpperCase()})`,
       enabled: true,
       priority: QUICK_RULE_HIGH_PRIORITY,
@@ -125,7 +110,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
   const buildQuickDomainBlockRule = (conn: TrackedConnection) => {
     const domain = conn.resolvedDomain || conn.targetHost;
     onQuickCreateRule({
-      id: `rule-domain-${Date.now()}`,
+      id: generateClientId('rule-domain'),
       name: `Block ${domain}`,
       enabled: true,
       priority: QUICK_RULE_HIGH_PRIORITY,
@@ -175,13 +160,6 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
           >
             <Radar className="h-3.5 w-3.5" />
             {t('connections.toolbar.scan_os.button')}
-          </button>
-          <button
-            onClick={handleSimulateClick}
-            className="tf-btn-accent flex items-center gap-2 px-4 py-2 text-xs"
-          >
-            <Play className="h-3.5 w-3.5" />
-            {t('connections.toolbar.simulate.button')}
           </button>
           <button
             onClick={onClearClosed}

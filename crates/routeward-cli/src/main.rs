@@ -194,7 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        let _ = controller.cleanup_orphaned_rules();
         println!("=== {} ===", controller.i18n.t("cli.engine.daemon.banner"));
+        println!("{}", controller.i18n.t("cli.engine.cleanup.completed"));
         #[cfg(unix)]
         let ipc_endpoint = controller.constants.ipc.unix_socket_path.clone();
         #[cfg(windows)]

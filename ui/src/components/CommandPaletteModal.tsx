@@ -23,7 +23,6 @@ import {
   Globe,
   LayoutDashboard,
   Palette,
-  Play,
   Power,
   Search,
   Server,
@@ -45,7 +44,6 @@ interface CommandPaletteModalProps {
   onNavigate: (tab: NavTabId) => void;
   onToggleEngine: () => void;
   onTestAllProxies: () => void;
-  onSimulateTraffic: () => void;
   onFlushDns: () => void;
   onToggleKillSwitch: () => void;
   onOpenThemeForge: () => void;
@@ -67,7 +65,6 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
   onNavigate,
   onToggleEngine,
   onTestAllProxies,
-  onSimulateTraffic,
   onFlushDns,
   onToggleKillSwitch,
   onOpenThemeForge,
@@ -155,13 +152,6 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
         onSelect: onTestAllProxies
       },
       {
-        id: 'act-simulate',
-        group: actGroup,
-        label: t('command_palette.actions.simulate_traffic'),
-        icon: Play,
-        onSelect: onSimulateTraffic
-      },
-      {
         id: 'act-killswitch',
         group: actGroup,
         label: t('command_palette.actions.toggle_killswitch'),
@@ -208,7 +198,6 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
     onNavigate,
     onToggleEngine,
     onTestAllProxies,
-    onSimulateTraffic,
     onFlushDns,
     onToggleKillSwitch,
     onOpenThemeForge,

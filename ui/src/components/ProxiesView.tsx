@@ -20,7 +20,9 @@ import {
   Activity,
   ArrowRight,
   Copy,
+  Edit3,
   FileCode2,
+  KeyRound,
   Link2,
   Lock,
   Plus,
@@ -29,7 +31,7 @@ import {
   Zap
 } from 'lucide-react';
 import { UI_CONFIG } from '../config/constants';
-import { routewardClient } from '../services/ipc';
+import { generateClientId, routewardClient } from '../services/ipc';
 import {
   ChainStrategy,
   ProxyChain,
@@ -77,7 +79,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [showImportUri, setShowImportUri] = useState(false);
   const [showAddChain, setShowAddChain] = useState(false);
 
-  // Add Proxy state
+  // Add / Edit Proxy state
+  const [editingProxyId, setEditingProxyId] = useState<string | null>(null);
+  const [existingHasPassword, setExistingHasPassword] = useState(false);
+  const [replacingPassword, setReplacingPassword] = useState(true);
   const [name, setName] = useState('');
   const [protocol, setProtocol] = useState<ProxyProtocol>('socks5');
   const [host, setHost] = useState('127.0.0.1');
@@ -102,19 +107,58 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setTestingId(null);
   };
 
+  const openNewProxyModal = () => {
+    setEditingProxyId(null);
+    setExistingHasPassword(false);
+    setReplacingPassword(true);
+    setName('');
+    setProtocol('socks5');
+    setHost('127.0.0.1');
+    setPort(UI_CONFIG.DEFAULT_PROXY_PORT);
+    setUsername('');
+    setPassword('');
+    setUdpEnabled(true);
+    setTls(false);
+    setShowAddProxy(true);
+  };
+
+  const openEditProxyModal = (proxy: ProxyNode) => {
+    const hasPw = Boolean(proxy.auth?.hasPassword);
+    setEditingProxyId(proxy.id);
+    setExistingHasPassword(hasPw);
+    setReplacingPassword(!hasPw);
+    setName(proxy.name);
+    setProtocol(proxy.protocol);
+    setHost(proxy.host);
+    setPort(proxy.port);
+    setUsername(proxy.auth?.username || '');
+    setPassword('');
+    setUdpEnabled(proxy.udpEnabled);
+    setTls(proxy.tls);
+    setShowAddProxy(true);
+  };
+
   const handleCreateProxy = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim() || !host.trim()) return;
+    const cleanUser = username.trim();
+    const shouldSendNewPassword = replacingPassword && password.length > 0;
+    const authPayload =
+      cleanUser || shouldSendNewPassword || existingHasPassword
+        ? {
+            username: cleanUser,
+            ...(shouldSendNewPassword ? { password } : {}),
+            hasPassword: shouldSendNewPassword ? true : existingHasPassword
+          }
+        : null;
+
     onAddProxy({
-      id: `proxy-${Date.now()}`,
+      id: editingProxyId || generateClientId('proxy'),
       name: name.trim(),
       protocol,
       host: host.trim(),
       port,
-      auth:
-        username || password
-          ? { username: username.trim(), password }
-          : null,
+      auth: authPayload,
       udpEnabled,
       tls,
       sni: tls ? host.trim() : null,
@@ -123,6 +167,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       exitIp: null
     });
     setName('');
+    setPassword('');
+    setEditingProxyId(null);
     setShowAddProxy(false);
   };
 
@@ -138,7 +184,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     e.preventDefault();
     if (!chainName.trim() || selectedHops.length === 0) return;
     onAddChain({
-      id: `chain-${Date.now()}`,
+      id: generateClientId('chain'),
       name: chainName.trim(),
       strategy: chainStrategy,
       proxyIds: selectedHops,
@@ -181,7 +227,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               {t('proxies.section.servers.import_uri')}
             </button>
             <button
-              onClick={() => setShowAddProxy(true)}
+              onClick={openNewProxyModal}
               className="tf-btn-accent flex items-center gap-1.5 px-3.5 py-1.5 text-xs"
             >
               <Plus className="h-3.5 w-3.5" />
@@ -231,6 +277,12 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       {t('proxies.card.badge.tls_enabled')}
                     </span>
                   )}
+                  {proxy.auth?.hasPassword && (
+                    <span className="flex items-center gap-1 rounded bg-tf-accent/20 px-2 py-0.5 font-semibold text-tf-accent">
+                      <KeyRound className="h-2.5 w-2.5" />
+                      {t('proxies.card.badge.password_set')}
+                    </span>
+                  )}
                   {proxy.lastLatencyMs !== null ? (
                     <span className="rounded bg-tf-green/20 px-2 py-0.5 font-mono font-bold text-tf-green">
                       {proxy.lastLatencyMs} ms
@@ -262,6 +314,13 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     : t('proxies.card.action.test')}
                 </button>
                 <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => openEditProxyModal(proxy)}
+                    className="flex items-center gap-1 text-xs text-tf-secondary hover:text-tf-primary"
+                    title={t('proxies.card.action.edit')}
+                  >
+                    <Edit3 className="h-3.5 w-3.5" />
+                  </button>
                   <button
                     onClick={() => handleCopyNodeUri(proxy)}
                     className="flex items-center gap-1 text-xs text-tf-secondary hover:text-tf-primary"
@@ -408,7 +467,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             className="tf-card w-full max-w-md space-y-4 p-6"
           >
             <h3 className="text-base font-bold text-tf-primary">
-              {t('proxies.modal.add_proxy.title')}
+              {editingProxyId
+                ? t('proxies.modal.add_proxy.edit_title')
+                : t('proxies.modal.add_proxy.title')}
             </h3>
             <div>
               <label className="block text-xs text-tf-secondary">
@@ -477,15 +538,43 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 />
               </div>
               <div>
-                <label className="block text-xs text-tf-secondary">
-                  {t('proxies.modal.add_proxy.password_label')}
-                </label>
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs text-tf-secondary">
+                    {t('proxies.modal.add_proxy.password_label')}
+                  </label>
+                  {existingHasPassword && (
+                    <span className="flex items-center gap-1 text-[10px] font-bold text-tf-accent">
+                      <KeyRound className="h-2.5 w-2.5" />
+                      {t('proxies.card.badge.password_set')}
+                    </span>
+                  )}
+                </div>
                 <input
                   type="password"
                   value={password}
+                  disabled={!replacingPassword}
+                  placeholder={
+                    existingHasPassword && !replacingPassword
+                      ? t('proxies.modal.add_proxy.password_unchanged_placeholder')
+                      : ''
+                  }
                   onChange={(e) => setPassword(e.target.value)}
-                  className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
+                  className="tf-input mt-1 w-full px-3 py-1.5 text-sm disabled:opacity-60"
                 />
+                {existingHasPassword && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReplacingPassword((prev) => !prev);
+                      setPassword('');
+                    }}
+                    className="mt-1 text-[11px] font-semibold text-tf-accent hover:underline"
+                  >
+                    {replacingPassword
+                      ? t('proxies.modal.add_proxy.cancel_replace_password')
+                      : t('proxies.modal.add_proxy.replace_password_action')}
+                  </button>
+                )}
               </div>
             </div>
             <div className="flex items-center gap-6 pt-1 text-xs text-tf-primary">
