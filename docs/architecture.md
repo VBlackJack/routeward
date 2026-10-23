@@ -95,3 +95,4 @@ flowchart TD
 | `ui` | `routeward-ui` | React 18 + TypeScript + Tailwind CSS interface with ThemeForge palettes. |
 | `tools/fetch-windivert.ps1` | PowerShell Script | Downloads official WinDivert 2.2.2-A, verifies SHA-256, and extracts `WinDivert.dll` and `WinDivert64.sys` into `third_party/windivert/bin/`. |
 | `tests/linux/` | Container Test Suite | Automated Debian 12 + `nftables` Docker integration scenarios (`run-scenarios.sh`). |
+| `tests/windows/` | Windows Test Suite | Automated Windows PowerShell 5.1 non-regression suite (`Invoke-RouteWardTests.ps1`, `Run-RouteWardTests.bat`). |

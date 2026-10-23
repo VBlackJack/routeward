@@ -16,3 +16,4 @@ logs/
 *.sys
 *.zip
 third_party/windivert/bin/
+tests/windows/RouteWard_TestReport_*.txt
