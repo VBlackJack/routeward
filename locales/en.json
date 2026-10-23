@@ -244,7 +244,8 @@
         "relay_http_label": "Local HTTP Relay",
         "dns_server_label": "Fake-IP DNS Listener",
         "admin_elevated": "Elevated (Kernel Hooks Ready)",
-        "admin_standard": "Standard User (Local Relay Fallback)"
+        "admin_standard": "Standard User (Local Relay Fallback)",
+        "admin_unknown": "Privilege State: Unknown (Daemon Unreachable)"
       }
     }
   },

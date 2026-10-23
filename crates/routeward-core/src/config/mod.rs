@@ -191,10 +191,124 @@ pub struct TelemetryConstants {
     pub sampling_interval_ms: u64,
     pub process_cache_ttl_ms: u64,
     pub log_directory: String,
+    #[serde(default = "default_windows_daemon_log_dir")]
+    pub windows_daemon_log_dir: String,
+    #[serde(default = "default_linux_daemon_log_dir")]
+    pub linux_daemon_log_dir: String,
+    #[serde(default = "default_windows_user_log_dir")]
+    pub windows_user_log_dir: String,
+    #[serde(default = "default_linux_user_log_dir")]
+    pub linux_user_log_dir: String,
+    #[serde(default = "default_linux_user_fallback_log_dir")]
+    pub linux_user_fallback_log_dir: String,
     pub log_app_name: String,
     pub log_flush_interval_ms: u64,
     #[serde(default = "default_event_broadcast_capacity")]
     pub event_broadcast_capacity: usize,
+}
+
+fn default_windows_daemon_log_dir() -> String {
+    r"%ProgramData%\RouteWard\logs".to_string()
+}
+
+fn default_linux_daemon_log_dir() -> String {
+    "/var/log/routeward".to_string()
+}
+
+fn default_windows_user_log_dir() -> String {
+    r"%LOCALAPPDATA%\RouteWard\logs".to_string()
+}
+
+fn default_linux_user_log_dir() -> String {
+    "$XDG_STATE_HOME/routeward/logs".to_string()
+}
+
+fn default_linux_user_fallback_log_dir() -> String {
+    ".local/state/routeward/logs".to_string()
+}
+
+impl TelemetryConstants {
+    /// Resolves the absolute log directory for the privileged daemon (`%ProgramData%\RouteWard\logs`
+    /// on Windows via `SHGetKnownFolderPath(FOLDERID_ProgramData)`, `/var/log/routeward` on Linux).
+    pub fn resolve_daemon_log_dir(&self) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            if let Ok(program_data) = security::resolve_windows_program_data_dir() {
+                let program_data_str = program_data.to_string_lossy();
+                return std::path::PathBuf::from(
+                    self.windows_daemon_log_dir
+                        .replace("%ProgramData%", &program_data_str),
+                );
+            }
+            std::path::PathBuf::from(&self.windows_daemon_log_dir)
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from(&self.linux_daemon_log_dir)
+        }
+    }
+
+    /// Resolves the absolute log directory for the desktop UI and unprivileged CLI
+    /// (`%LOCALAPPDATA%\RouteWard\logs` on Windows via `SHGetKnownFolderPath(FOLDERID_LocalAppData)`,
+    /// `$XDG_STATE_HOME/routeward/logs` or `~/.local/state/routeward/logs` on Linux).
+    pub fn resolve_user_log_dir(&self) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            if let Ok(local_app_data) = security::resolve_windows_local_app_data_dir() {
+                let local_str = local_app_data.to_string_lossy();
+                return std::path::PathBuf::from(
+                    self.windows_user_log_dir
+                        .replace("%LOCALAPPDATA%", &local_str),
+                );
+            }
+            std::path::PathBuf::from(&self.windows_user_log_dir)
+        }
+        #[cfg(not(windows))]
+        {
+            if let Ok(xdg_state) = std::env::var("XDG_STATE_HOME") {
+                let trimmed = xdg_state.trim();
+                if !trimmed.is_empty() {
+                    return std::path::PathBuf::from(
+                        self.linux_user_log_dir.replace("$XDG_STATE_HOME", trimmed),
+                    );
+                }
+            }
+            let home_dir = std::env::var("HOME")
+                .ok()
+                .filter(|h| !h.trim().is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(resolve_unix_passwd_home)
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+            home_dir.join(&self.linux_user_fallback_log_dir)
+        }
+    }
+
+    /// Resolves the appropriate log directory for the current process privilege level.
+    pub fn resolve_process_log_dir(&self) -> std::path::PathBuf {
+        if crate::interceptor::RouteWardController::detect_elevated_privileges() {
+            self.resolve_daemon_log_dir()
+        } else {
+            self.resolve_user_log_dir()
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_unix_passwd_home() -> Option<std::path::PathBuf> {
+    use std::ffi::CStr;
+    // SAFETY: `geteuid` and `getpwuid` are standard POSIX calls; the returned pointer is checked for null.
+    unsafe {
+        let pwd = libc::getpwuid(libc::geteuid());
+        if pwd.is_null() || (*pwd).pw_dir.is_null() {
+            return None;
+        }
+        let dir_str = CStr::from_ptr((*pwd).pw_dir).to_str().ok()?;
+        if dir_str.trim().is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(dir_str))
+        }
+    }
 }
 
 fn default_event_broadcast_capacity() -> usize {
@@ -635,6 +749,41 @@ mod tests {
         assert!(dbg_str.contains("alice"));
         assert!(dbg_str.contains("[REDACTED]"));
         assert!(!dbg_str.contains("SuperSecretPass!99"));
+    }
+
+    #[test]
+    fn resolves_absolute_daemon_and_user_log_directories_from_constants() {
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let daemon_log_dir = constants.telemetry.resolve_daemon_log_dir();
+        let user_log_dir = constants.telemetry.resolve_user_log_dir();
+
+        assert!(
+            daemon_log_dir.is_absolute(),
+            "Daemon log dir must be absolute: {}",
+            daemon_log_dir.display()
+        );
+        assert!(
+            user_log_dir.is_absolute(),
+            "User log dir must be absolute: {}",
+            user_log_dir.display()
+        );
+
+        #[cfg(windows)]
+        {
+            assert!(daemon_log_dir
+                .to_string_lossy()
+                .ends_with(r"RouteWard\logs"));
+            assert!(user_log_dir.to_string_lossy().ends_with(r"RouteWard\logs"));
+            assert_ne!(daemon_log_dir, user_log_dir);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                daemon_log_dir,
+                std::path::PathBuf::from("/var/log/routeward")
+            );
+            assert!(user_log_dir.to_string_lossy().ends_with("routeward/logs"));
+        }
     }
 
     #[cfg(windows)]

@@ -372,17 +372,37 @@ pub async fn connect_ipc_stream(ipc_config: &IpcConstants) -> RouteWardResult<Ip
 
 #[cfg(windows)]
 pub async fn connect_windows_named_pipe(pipe_name: &str) -> RouteWardResult<IpcStream> {
+    use std::time::Duration;
     use tokio::net::windows::named_pipe::ClientOptions;
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
-    let client =
-        ClientOptions::new()
-            .open(pipe_name)
-            .map_err(|err| RouteWardError::DaemonError {
-                key: ERR_KEY_DAEMON_DISCONNECTED,
-                detail: format!("Cannot open named pipe {pipe_name}: {err}"),
-            })?;
-    Ok(IpcStream {
-        inner: IpcStreamInner::NamedPipeClient(client),
+    const MAX_BUSY_RETRIES: usize = 30;
+    const BUSY_RETRY_DELAY_MS: u64 = 10;
+
+    for attempt in 0..=MAX_BUSY_RETRIES {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(client) => {
+                return Ok(IpcStream {
+                    inner: IpcStreamInner::NamedPipeClient(client),
+                });
+            }
+            Err(err) => {
+                let raw = err.raw_os_error().unwrap_or(0) as u32;
+                if raw == ERROR_PIPE_BUSY && attempt < MAX_BUSY_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(BUSY_RETRY_DELAY_MS)).await;
+                    continue;
+                }
+                return Err(RouteWardError::DaemonError {
+                    key: ERR_KEY_DAEMON_DISCONNECTED,
+                    detail: format!("Cannot open named pipe {pipe_name}: {err}"),
+                });
+            }
+        }
+    }
+
+    Err(RouteWardError::DaemonError {
+        key: ERR_KEY_DAEMON_DISCONNECTED,
+        detail: format!("Cannot open named pipe {pipe_name}: pipe busy after retries"),
     })
 }
 

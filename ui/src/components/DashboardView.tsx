@@ -333,11 +333,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <div className="tf-surface-alt mt-4 p-3 text-xs text-tf-secondary">
             <div className="flex items-center gap-2 font-semibold text-tf-primary">
-              <ShieldCheck className="h-4 w-4 text-tf-green" />
+              {!diagnostics.daemonConnected ? (
+                <ShieldAlert className="h-4 w-4 text-tf-orange" />
+              ) : (
+                <ShieldCheck className="h-4 w-4 text-tf-green" />
+              )}
               <span>
-                {diagnostics.elevatedPrivileges
-                  ? t('dashboard.system.status.admin_elevated')
-                  : t('dashboard.system.status.admin_standard')}
+                {!diagnostics.daemonConnected
+                  ? t('dashboard.system.status.admin_unknown')
+                  : diagnostics.elevatedPrivileges
+                    ? t('dashboard.system.status.admin_elevated')
+                    : t('dashboard.system.status.admin_standard')}
               </span>
             </div>
           </div>

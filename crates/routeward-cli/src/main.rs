@@ -22,12 +22,15 @@ use routeward_core::i18n::I18nRegistry;
 use routeward_core::interceptor::RouteWardController;
 use routeward_core::ipc::protocol::IpcCommand;
 use routeward_core::ipc::{DaemonIpcService, IpcClient};
+use routeward_core::logger::FileLogger;
 use routeward_core::rules::ConnectionRequest;
+use routeward_core::telemetry::LogLevel;
 use std::path::PathBuf;
 use std::time::Duration;
 
 const DEFAULT_CLI_LOCALE: &str = "fr";
 const DEFAULT_EVAL_PORT: u16 = 443;
+const COMPONENT_CLI_CTL: &str = "CliCtl";
 
 #[derive(Parser)]
 #[command(name = "routeward", version, about)]
@@ -133,6 +136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let constants = SystemConstants::load_embedded()?;
 
     if let Commands::Ctl { action } = args.command {
+        let user_logger = FileLogger::new(
+            constants.telemetry.resolve_user_log_dir(),
+            &constants.telemetry.log_app_name,
+            true,
+        );
         let client = IpcClient::new(constants.ipc);
         let ipc_cmd = match action {
             CtlCommands::Status => IpcCommand::GetDiagnostics,
@@ -150,13 +158,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let response = client.call_raw(ipc_cmd).await?;
+        let response = match client.call_raw(ipc_cmd).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                user_logger.log(
+                    LogLevel::Error,
+                    COMPONENT_CLI_CTL,
+                    &format!("Failed to execute ctl command against daemon: {err}"),
+                );
+                return Err(err.into());
+            }
+        };
         println!("{}", serde_json::to_string_pretty(&response)?);
         if !response.ok {
-            return Err(response
+            let err_msg = response
                 .error
-                .unwrap_or_else(|| "Daemon returned error".to_string())
-                .into());
+                .unwrap_or_else(|| "Daemon returned error".to_string());
+            user_logger.log(
+                LogLevel::Warn,
+                COMPONENT_CLI_CTL,
+                &format!("Daemon returned error for ctl command: {err_msg}"),
+            );
+            return Err(err_msg.into());
         }
         return Ok(());
     }
@@ -231,7 +254,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => ProfileConfig::load_embedded_default()?,
     };
 
-    let controller = RouteWardController::new(constants, profile, &args.locale);
+    let controller = match args.command {
+        Commands::Run { .. } | Commands::Cleanup => {
+            RouteWardController::new(constants, profile, &args.locale)
+        }
+        _ => RouteWardController::new_user_cli(constants, profile, &args.locale),
+    };
 
     match args.command {
         Commands::Run { duration_secs } => {

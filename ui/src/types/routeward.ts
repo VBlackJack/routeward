@@ -276,15 +276,15 @@ export interface DaemonFullState {
 }
 
 export type TelemetryEventPayload =
-  | { type: 'telemetry'; data: TelemetrySnapshot }
-  | { type: 'connection_updated'; data: TrackedConnection }
-  | { type: 'connections_cleared' }
-  | { type: 'log'; data: LogEntry }
-  | { type: 'logs_cleared' };
+  | { event: 'telemetry'; data: TelemetrySnapshot }
+  | { event: 'connectionUpdated'; data: TrackedConnection }
+  | { event: 'connectionsCleared' }
+  | { event: 'log'; data: LogEntry }
+  | { event: 'logsCleared' };
 
 export type IpcStreamEvent =
-  | { kind: 'event'; payload: TelemetryEventPayload }
-  | { kind: 'resync'; skipped: number };
+  | { streamType: 'event'; payload: TelemetryEventPayload }
+  | { streamType: 'resync'; payload: { skippedEvents: number } };
 
 declare global {
   interface Window {

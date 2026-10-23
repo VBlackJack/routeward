@@ -85,3 +85,12 @@ Sous Windows, lancez `routeward.exe daemon` dans une console PowerShell en Admin
 Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lance le daemon. Si le daemon est arrete ou non demarre, `routeward-desktop` affiche une banniere persistante de deconnexion et se reconnecte automatiquement des que le daemon demarre.
 
 > **Important (Elevation du compte Windows UAC) :** Le daemon doit etre lance par l'utilisateur de l'interface (par elevation UAC de son propre compte). Si l'elevation se fait avec un autre compte administrateur (par exemple via « Executer en tant qu'autre utilisateur » ou un compte admin distinct), la DACL du Named Pipe autorisera le SID de cet autre compte, et l'interface ou la CLI de l'utilisateur courant ne pourra pas se connecter au pipe `\\.\pipe\routeward-daemon`.
+
+### Emplacement des Journaux (Daemon vs Bureau / CLI)
+Les fichiers journaux (`RouteWard_yyyyMMdd.log`) sont ecrits dans des dossiers systeme ou utilisateur fixes, independamment du repertoire courant (`CWD`) :
+- **Daemon privilegie (`routeward daemon`, `routeward run`, `routeward cleanup`)** :
+  - **Windows** : `%ProgramData%\RouteWard\logs` (resolu via `SHGetKnownFolderPath(FOLDERID_ProgramData)`)
+  - **Linux** : `/var/log/routeward`
+- **Pont Bureau et CLI non privilegies (`routeward-desktop`, `routeward ctl`)** :
+  - **Windows** : `%LOCALAPPDATA%\RouteWard\logs` (resolu via `SHGetKnownFolderPath(FOLDERID_LocalAppData)`)
+  - **Linux** : `$XDG_STATE_HOME/routeward/logs` (ou `~/.local/state/routeward/logs` par defaut)

@@ -110,7 +110,7 @@ wait_for_nft_table() {
 # ---------------------------------------------------------------------------
 # Scenario (a): Unmodified curl (no proxy setting) routed via SOCKS5 by rule
 # ---------------------------------------------------------------------------
-rm -f "${SOCKS_LOG}" /workspace/logs/RouteWard_*.log
+rm -f "${SOCKS_LOG}" /var/log/routeward/RouteWard_*.log
 "${BIN}" -p /tmp/profile_proxy.json run >/tmp/rw_a.out 2>&1 &
 RW_PID=$!
 wait_for_nft_table
@@ -120,7 +120,7 @@ RESP_A=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PR
 kill -INT "${RW_PID}" || true
 wait "${RW_PID}" || true
 
-LOG_FILE=$(ls -1 /workspace/logs/RouteWard_*.log | head -n 1)
+LOG_FILE=$(ls -1 /var/log/routeward/RouteWard_*.log | head -n 1)
 if [[ "${RESP_A}" == "ROUTEWARD_OK" ]] \
     && grep -q "CONNECT ${TARGET_IP}:${TARGET_PORT}" "${SOCKS_LOG}" \
     && grep -q 'process="curl"' "${LOG_FILE}" \
@@ -137,7 +137,7 @@ fi
 # ---------------------------------------------------------------------------
 # Scenario (b): Direct rule pass-through
 # ---------------------------------------------------------------------------
-rm -f "${SOCKS_LOG}" /workspace/logs/RouteWard_*.log
+rm -f "${SOCKS_LOG}" /var/log/routeward/RouteWard_*.log
 "${BIN}" -p /tmp/profile_direct.json run >/tmp/rw_b.out 2>&1 &
 RW_PID=$!
 wait_for_nft_table
@@ -147,7 +147,7 @@ RESP_B=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PR
 kill -INT "${RW_PID}" || true
 wait "${RW_PID}" || true
 
-LOG_FILE=$(ls -1 /workspace/logs/RouteWard_*.log | head -n 1)
+LOG_FILE=$(ls -1 /var/log/routeward/RouteWard_*.log | head -n 1)
 if [[ "${RESP_B}" == "ROUTEWARD_OK" ]] \
     && [[ ! -s "${SOCKS_LOG}" ]] \
     && grep -q 'process="curl"' "${LOG_FILE}" \
@@ -163,7 +163,7 @@ fi
 # ---------------------------------------------------------------------------
 # Scenario (c): Block rule resets connection (TCP RST)
 # ---------------------------------------------------------------------------
-rm -f "${SOCKS_LOG}" /workspace/logs/RouteWard_*.log
+rm -f "${SOCKS_LOG}" /var/log/routeward/RouteWard_*.log
 "${BIN}" -p /tmp/profile_block.json run >/tmp/rw_c.out 2>&1 &
 RW_PID=$!
 wait_for_nft_table
@@ -177,7 +177,7 @@ set -e
 kill -INT "${RW_PID}" || true
 wait "${RW_PID}" || true
 
-LOG_FILE=$(ls -1 /workspace/logs/RouteWard_*.log | head -n 1)
+LOG_FILE=$(ls -1 /var/log/routeward/RouteWard_*.log | head -n 1)
 if [[ "${CURL_EXIT_C}" -ne 0 ]] \
     && grep -q "Blocked connection PID=" "${LOG_FILE}" \
     && grep -q "(TCP RST)" "${LOG_FILE}"; then
@@ -260,7 +260,7 @@ id -u rwoutsider >/dev/null 2>&1 || useradd -M -s /bin/bash rwoutsider
 mkdir -p /etc/routeward
 chmod 0700 /etc/routeward
 cp /tmp/profile_proxy.json /etc/routeward/active_profile.json
-rm -f "${SOCKS_LOG}" /workspace/logs/RouteWard_*.log /run/routeward/routeward.sock
+rm -f "${SOCKS_LOG}" /var/log/routeward/RouteWard_*.log /run/routeward/routeward.sock
 
 # Verify daemon refuses to start if /etc/routeward/active_profile.json is group-readable (0640) or world-readable (0644)
 chmod 0640 /etc/routeward/active_profile.json
@@ -379,11 +379,11 @@ if ! nft list table ip routeward >/dev/null 2>&1; then
     exit 1
 fi
 
-rm -f /workspace/logs/RouteWard_*.log /run/routeward/routeward.sock
+rm -f /var/log/routeward/RouteWard_*.log /run/routeward/routeward.sock
 "${BIN}" daemon --duration-secs 2 >/tmp/rw_daemon_j.out 2>&1
 
 if ! nft list table ip routeward >/dev/null 2>&1; then
-    LOG_FILE_J=$(ls -1 /workspace/logs/RouteWard_*.log | head -n 1)
+    LOG_FILE_J=$(ls -1 /var/log/routeward/RouteWard_*.log | head -n 1)
     if grep -q 'Removed nftables table "ip routeward"' "${LOG_FILE_J}"; then
         echo "[PASS] Scenario (j): orphaned table ip routeward automatically removed at daemon startup and logged at INFO"
         grep 'Removed nftables table "ip routeward"' "${LOG_FILE_J}" | tail -n 1

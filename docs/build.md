@@ -85,3 +85,12 @@ On Windows, start `routeward.exe daemon` in an elevated Administrator PowerShell
 The daemon binds `\\.\pipe\routeward-daemon` with an explicit DACL restricting access to `SYSTEM`, `Administrators`, and the launching user's SID. If the daemon is stopped or not running yet, `routeward-desktop` displays a persistent disconnected banner and reconnects automatically as soon as the daemon starts.
 
 > **Important (Windows UAC Account Elevation):** The daemon must be launched by the same user account that runs the desktop UI or `routeward ctl` (by elevating your own account via UAC). If you elevate using a different Administrator account (for example via "Run as different user" or a separate local admin credential), the Named Pipe DACL will grant read/write access to that other account's SID, and your standard user session will not be allowed to connect to `\\.\pipe\routeward-daemon`.
+
+### Log File Locations (Daemon vs Desktop / CLI)
+Log files (`RouteWard_yyyyMMdd.log`) are resolved from fixed OS system paths rather than the process working directory (`CWD`):
+- **Privileged Daemon (`routeward daemon`, `routeward run`, `routeward cleanup`)**:
+  - **Windows**: `%ProgramData%\RouteWard\logs` (resolved via `SHGetKnownFolderPath(FOLDERID_ProgramData)`)
+  - **Linux**: `/var/log/routeward`
+- **Unprivileged Desktop Bridge & CLI (`routeward-desktop`, `routeward ctl`)**:
+  - **Windows**: `%LOCALAPPDATA%\RouteWard\logs` (resolved via `SHGetKnownFolderPath(FOLDERID_LocalAppData)`)
+  - **Linux**: `$XDG_STATE_HOME/routeward/logs` (or `~/.local/state/routeward/logs` when `XDG_STATE_HOME` is unset)

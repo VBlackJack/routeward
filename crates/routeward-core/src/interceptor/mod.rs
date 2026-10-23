@@ -98,11 +98,26 @@ pub struct RouteWardController {
 
 impl RouteWardController {
     pub fn new(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
+        let log_dir = constants.telemetry.resolve_daemon_log_dir();
+        Self::new_with_log_dir(constants, profile, locale, log_dir)
+    }
+
+    pub fn new_user_cli(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
+        let log_dir = constants.telemetry.resolve_user_log_dir();
+        Self::new_with_log_dir(constants, profile, locale, log_dir)
+    }
+
+    pub fn new_with_log_dir(
+        constants: SystemConstants,
+        profile: ProfileConfig,
+        locale: &str,
+        log_dir: std::path::PathBuf,
+    ) -> Self {
         let i18n = I18nRegistry::new(locale);
         let dns = FakeIpEngine::new(&profile.dns_config, &constants.dns);
         let process_resolver = ProcessResolver::new(constants.telemetry.process_cache_ttl_ms);
-        let telemetry = TelemetryHub::new(&constants.telemetry);
-        telemetry.set_file_logging_enabled(profile.enable_logging);
+        let telemetry =
+            TelemetryHub::new_with_log_dir(&constants.telemetry, log_dir, profile.enable_logging);
 
         let nat_table = TransparentNatTable::new(
             std::process::id(),

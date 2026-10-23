@@ -328,7 +328,7 @@ mod tests {
     async fn emits_resync_event_and_logs_warn_when_broadcast_subscriber_lags() {
         let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
         constants.telemetry.event_broadcast_capacity = 2;
-        let hub = TelemetryHub::new(&constants.telemetry);
+        let hub = TelemetryHub::new_with_logging(&constants.telemetry, false);
 
         let mut rx = hub.subscribe();
         // Overflow the broadcast ring buffer (clamped to MIN_BROADCAST_CAPACITY = 16) by pushing 24 events

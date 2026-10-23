@@ -244,7 +244,8 @@
         "relay_http_label": "Relais Local HTTP",
         "dns_server_label": "Écouteur DNS Fake-IP",
         "admin_elevated": "Privilèges Élevés (Hooks Noyau Prêts)",
-        "admin_standard": "Utilisateur Standard (Relais Local Actif)"
+        "admin_standard": "Utilisateur Standard (Relais Local Actif)",
+        "admin_unknown": "État inconnu (daemon non joint)"
       }
     }
   },

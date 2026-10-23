@@ -216,7 +216,23 @@ pub struct TelemetryHub {
 
 impl TelemetryHub {
     pub fn new(constants: &TelemetryConstants) -> Self {
-        let file_logger = FileLogger::new(&constants.log_directory, &constants.log_app_name, true);
+        Self::new_with_logging(constants, true)
+    }
+
+    pub fn new_with_logging(constants: &TelemetryConstants, enable_logging: bool) -> Self {
+        Self::new_with_log_dir(
+            constants,
+            constants.resolve_daemon_log_dir(),
+            enable_logging,
+        )
+    }
+
+    pub fn new_with_log_dir(
+        constants: &TelemetryConstants,
+        log_dir: impl Into<std::path::PathBuf>,
+        enable_logging: bool,
+    ) -> Self {
+        let file_logger = FileLogger::new(log_dir, &constants.log_app_name, enable_logging);
         let broadcast_cap = constants
             .event_broadcast_capacity
             .max(MIN_BROADCAST_CAPACITY);

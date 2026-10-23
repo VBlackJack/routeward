@@ -55,19 +55,33 @@ const ALLOWED_ACE_TYPE: u8 = 0;
 /// rather than trusting any caller-controlled environment variable.
 #[cfg(windows)]
 pub fn resolve_windows_program_data_dir() -> RouteWardResult<PathBuf> {
+    use windows_sys::Win32::UI::Shell::FOLDERID_ProgramData;
+    resolve_windows_known_folder(&FOLDERID_ProgramData, "FOLDERID_ProgramData")
+}
+
+/// Resolves the Windows user `LocalAppData` directory via `SHGetKnownFolderPath(FOLDERID_LocalAppData)`.
+#[cfg(windows)]
+pub fn resolve_windows_local_app_data_dir() -> RouteWardResult<PathBuf> {
+    use windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData;
+    resolve_windows_known_folder(&FOLDERID_LocalAppData, "FOLDERID_LocalAppData")
+}
+
+#[cfg(windows)]
+fn resolve_windows_known_folder(
+    folder_id: *const windows_sys::core::GUID,
+    folder_label: &str,
+) -> RouteWardResult<PathBuf> {
     use std::ptr::null_mut;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
 
     unsafe {
         let mut raw_path: *mut u16 = null_mut();
-        let hr = SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, null_mut(), &mut raw_path);
+        let hr = SHGetKnownFolderPath(folder_id, 0, null_mut(), &mut raw_path);
         if hr != 0 || raw_path.is_null() {
             return Err(RouteWardError::ConfigError {
                 key: ERR_KEY_CONFIG_LOAD,
-                detail: format!(
-                    "SHGetKnownFolderPath(FOLDERID_ProgramData) failed: HRESULT 0x{hr:08x}"
-                ),
+                detail: format!("SHGetKnownFolderPath({folder_label}) failed: HRESULT 0x{hr:08x}"),
             });
         }
 

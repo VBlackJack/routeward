@@ -260,23 +260,28 @@ export class RouteWardClientService {
   }
 
   public applyStreamEvent(event: IpcStreamEvent): boolean {
-    if (event.kind === 'resync') {
+    if (event.streamType === 'resync') {
       return true;
     }
-    this.applyTelemetryPayload(event.payload);
-    this.notifyListeners();
+    if (event.streamType === 'event' && event.payload) {
+      const wasDisconnected = !this.diagnostics.daemonConnected;
+      this.applyTelemetryPayload(event.payload);
+      this.notifyListeners();
+      return wasDisconnected;
+    }
     return false;
   }
 
   private applyTelemetryPayload(payload: TelemetryEventPayload): void {
-    switch (payload.type) {
+    switch (payload.event) {
       case 'telemetry': {
         this.telemetry = payload.data;
         break;
       }
-      case 'connection_updated': {
+      case 'connectionUpdated': {
         const updated = payload.data;
         const idx = this.connections.findIndex((c) => c.id === updated.id);
+        const isNew = idx < 0;
         if (idx >= 0) {
           this.connections = [
             ...this.connections.slice(0, idx),
@@ -286,14 +291,38 @@ export class RouteWardClientService {
         } else {
           this.connections = [updated, ...this.connections];
         }
+        const activeCount = this.connections.filter(
+          (c) => c.status === 'active'
+        ).length;
+        let proxiedCount = this.telemetry.proxiedCount;
+        let directCount = this.telemetry.directCount;
+        let blockedCount = this.telemetry.blockedCount;
+        if (isNew) {
+          if (updated.status === 'blocked') {
+            blockedCount += 1;
+          } else if (updated.routeLabel === 'DIRECT') {
+            directCount += 1;
+          } else {
+            proxiedCount += 1;
+          }
+        }
         this.telemetry = {
           ...this.telemetry,
+          activeConnections: activeCount,
+          proxiedCount,
+          directCount,
+          blockedCount,
           topTalkers: this.computeTopTalkers()
         };
         break;
       }
-      case 'connections_cleared': {
+      case 'connectionsCleared': {
         this.connections = this.connections.filter((c) => c.status === 'active');
+        this.telemetry = {
+          ...this.telemetry,
+          activeConnections: this.connections.length,
+          topTalkers: this.computeTopTalkers()
+        };
         break;
       }
       case 'log': {
@@ -306,7 +335,7 @@ export class RouteWardClientService {
         ];
         break;
       }
-      case 'logs_cleared': {
+      case 'logsCleared': {
         this.logs = [];
         break;
       }
@@ -347,6 +376,7 @@ export class RouteWardClientService {
     const response = await fetch(url, {
       method,
       headers,
+      cache: 'no-store',
       body: body !== undefined ? JSON.stringify(body) : undefined
     });
     if (!response.ok) {
@@ -382,66 +412,81 @@ export class RouteWardClientService {
     }
     this.streamRunning = true;
 
+    const reconnectPollTimer = window.setInterval(() => {
+      if (abortSignal?.aborted) {
+        window.clearInterval(reconnectPollTimer);
+        return;
+      }
+      if (!this.diagnostics.daemonConnected) {
+        void this.fetchState();
+      }
+    }, UI_CONFIG.SSE_RECONNECT_DELAY_MS);
+
     const runLoop = async () => {
-      while (!abortSignal?.aborted) {
-        await this.fetchState();
-        if (abortSignal?.aborted) {
-          break;
-        }
+      try {
+        while (!abortSignal?.aborted) {
+          await this.fetchState();
+          if (abortSignal?.aborted) {
+            break;
+          }
 
-        try {
-          const response = await fetch(UI_CONFIG.API_ENDPOINTS.EVENTS, {
-            method: 'GET',
-            headers: buildAuthHeaders({ Accept: 'text/event-stream' }),
-            signal: abortSignal
-          });
+          try {
+            const response = await fetch(UI_CONFIG.API_ENDPOINTS.EVENTS, {
+              method: 'GET',
+              headers: buildAuthHeaders({ Accept: 'text/event-stream' }),
+              cache: 'no-store',
+              signal: abortSignal
+            });
 
-          if (!response.ok || !response.body) {
-            this.markDisconnectedState();
-          } else {
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
+            if (!response.ok || !response.body) {
+              this.markDisconnectedState();
+            } else {
+              const reader = response.body.getReader();
+              const decoder = new TextDecoder();
+              let buffer = '';
 
-            while (!abortSignal?.aborted) {
-              const { value, done } = await reader.read();
-              if (done) {
-                break;
-              }
-              buffer += decoder.decode(value, { stream: true });
-              const parsed = parseSseChunk(buffer);
-              buffer = parsed.remainder;
-
-              for (const frame of parsed.events) {
-                if (frame.event === 'resync') {
-                  await this.fetchState();
-                  continue;
+              while (!abortSignal?.aborted) {
+                const { value, done } = await reader.read();
+                if (done) {
+                  break;
                 }
-                try {
-                  const streamEv = JSON.parse(frame.data) as IpcStreamEvent;
-                  if (this.applyStreamEvent(streamEv)) {
+                buffer += decoder.decode(value, { stream: true });
+                const parsed = parseSseChunk(buffer);
+                buffer = parsed.remainder;
+
+                for (const frame of parsed.events) {
+                  if (frame.event === 'resync') {
                     await this.fetchState();
+                    continue;
                   }
-                } catch {
-                  // Ignore malformed frame
+                  try {
+                    const streamEv = JSON.parse(frame.data) as IpcStreamEvent;
+                    if (this.applyStreamEvent(streamEv)) {
+                      await this.fetchState();
+                    }
+                  } catch {
+                    // Ignore malformed frame
+                  }
                 }
               }
             }
+          } catch {
+            if (!abortSignal?.aborted) {
+              this.markDisconnectedState();
+            }
           }
-        } catch {
-          if (!abortSignal?.aborted) {
-            this.markDisconnectedState();
-          }
-        }
 
-        if (abortSignal?.aborted) {
-          break;
+          if (abortSignal?.aborted) {
+            break;
+          }
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, UI_CONFIG.SSE_RECONNECT_DELAY_MS)
+          );
         }
-        await new Promise((resolve) =>
-          window.setTimeout(resolve, UI_CONFIG.SSE_RECONNECT_DELAY_MS)
-        );
+      } finally {
+        window.clearInterval(reconnectPollTimer);
+        this.streamRunning = false;
       }
-      this.streamRunning = false;
     };
 
     void runLoop();

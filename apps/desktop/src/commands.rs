@@ -30,6 +30,7 @@ use routeward_core::ipc::protocol::{
 };
 use routeward_core::ipc::transport::connect_ipc_stream;
 use routeward_core::ipc::{generate_ephemeral_token, IpcClient};
+use routeward_core::logger::FileLogger;
 use routeward_core::rules::{ConnectionRequest, RuleEvaluationResult};
 use routeward_core::system::{LaunchedProcessReport, SystemProxyManager};
 use routeward_core::telemetry::{
@@ -49,6 +50,7 @@ pub struct DesktopCommandBridge {
     constants: Arc<SystemConstants>,
     i18n: I18nRegistry,
     ipc_client: IpcClient,
+    file_logger: FileLogger,
     state: Arc<RwLock<DaemonFullState>>,
     daemon_connected: Arc<AtomicBool>,
     event_tx: tokio::sync::broadcast::Sender<IpcStreamEvent>,
@@ -56,8 +58,23 @@ pub struct DesktopCommandBridge {
 
 impl DesktopCommandBridge {
     pub fn new(constants: SystemConstants, default_profile: ProfileConfig, locale: &str) -> Self {
+        let user_log_dir = constants.telemetry.resolve_user_log_dir();
+        Self::new_with_log_dir(constants, default_profile, locale, user_log_dir)
+    }
+
+    pub fn new_with_log_dir(
+        constants: SystemConstants,
+        default_profile: ProfileConfig,
+        locale: &str,
+        log_dir: std::path::PathBuf,
+    ) -> Self {
         let i18n = I18nRegistry::new(locale);
         let ipc_client = IpcClient::new(constants.ipc.clone());
+        let file_logger = FileLogger::new(
+            &log_dir,
+            &constants.telemetry.log_app_name,
+            default_profile.enable_logging,
+        );
         let net = &constants.network;
         let (event_tx, _) = tokio::sync::broadcast::channel(BRIDGE_EVENT_CHANNEL_CAPACITY);
 
@@ -87,13 +104,45 @@ impl DesktopCommandBridge {
             constants: Arc::new(constants),
             i18n,
             ipc_client,
+            file_logger,
             state: Arc::new(RwLock::new(initial_state)),
             daemon_connected: Arc::new(AtomicBool::new(false)),
             event_tx,
         };
 
+        bridge.log_info(format!(
+            "Initialized routeward-desktop bridge (ipc_endpoint={}, log_dir={})",
+            bridge.ipc_endpoint_label(),
+            log_dir.display()
+        ));
         bridge.mark_disconnected();
         bridge
+    }
+
+    pub fn ipc_endpoint_label(&self) -> &str {
+        #[cfg(windows)]
+        {
+            &self.constants.ipc.windows_pipe_name
+        }
+        #[cfg(not(windows))]
+        {
+            &self.constants.ipc.unix_socket_path
+        }
+    }
+
+    pub fn log_info(&self, message: impl AsRef<str>) {
+        self.file_logger
+            .log(LogLevel::Info, COMPONENT_DESKTOP_BRIDGE, message.as_ref());
+    }
+
+    pub fn log_warn(&self, message: impl AsRef<str>) {
+        self.file_logger
+            .log(LogLevel::Warn, COMPONENT_DESKTOP_BRIDGE, message.as_ref());
+    }
+
+    pub fn log_error(&self, message: impl AsRef<str>) {
+        self.file_logger
+            .log(LogLevel::Error, COMPONENT_DESKTOP_BRIDGE, message.as_ref());
     }
 
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<IpcStreamEvent> {
@@ -106,7 +155,11 @@ impl DesktopCommandBridge {
         tokio::spawn(async move {
             let reconnect_delay = Duration::from_millis(bridge.constants.ipc.reconnect_interval_ms);
             loop {
-                if bridge.run_subscription_session().await.is_err() {
+                if let Err(err) = bridge.run_subscription_session().await {
+                    bridge.log_warn(format!(
+                        "Daemon IPC subscription session failed ({}): {err}",
+                        bridge.ipc_endpoint_label()
+                    ));
                     bridge.mark_disconnected();
                 }
                 tokio::time::sleep(reconnect_delay).await;
@@ -115,18 +168,51 @@ impl DesktopCommandBridge {
     }
 
     async fn run_subscription_session(&self) -> Result<(), String> {
-        let full_state: DaemonFullState = self
-            .ipc_client
-            .call_typed(IpcCommand::GetState)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.apply_full_state(full_state);
+        self.log_info(format!(
+            "Attempting IPC connection to daemon ({})",
+            self.ipc_endpoint_label()
+        ));
 
         let stream = connect_ipc_stream(&self.constants.ipc)
             .await
             .map_err(|e| e.to_string())?;
         let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        let max_line = self.constants.ipc.max_line_bytes;
+        let idle_timeout_ms = self.constants.ipc.idle_timeout_ms;
 
+        // 1. Fetch full initial state over the same stream before entering Subscribe mode
+        let state_req = IpcRequest {
+            id: generate_ephemeral_token(),
+            command: IpcCommand::GetState,
+        };
+        let mut state_req_bytes = serde_json::to_vec(&state_req).map_err(|e| e.to_string())?;
+        state_req_bytes.push(b'\n');
+        write_half
+            .write_all(&state_req_bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        write_half.flush().await.map_err(|e| e.to_string())?;
+
+        match read_bounded_line(&mut reader, max_line, idle_timeout_ms).await {
+            ReadLineOutcome::Line(line) => {
+                let resp: IpcResponse = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+                if !resp.ok {
+                    return Err(resp
+                        .error
+                        .unwrap_or_else(|| "GetState handshake failed".to_string()));
+                }
+                let val = resp
+                    .result
+                    .ok_or_else(|| "GetState returned empty result".to_string())?;
+                let full_state: DaemonFullState =
+                    serde_json::from_value(val).map_err(|e| e.to_string())?;
+                self.apply_full_state(full_state);
+            }
+            other => return Err(format!("GetState handshake failed: {other:?}")),
+        }
+
+        // 2. Subscribe to real-time events on the same stream
         let sub_req = IpcRequest {
             id: generate_ephemeral_token(),
             command: IpcCommand::Subscribe,
@@ -139,10 +225,8 @@ impl DesktopCommandBridge {
             .map_err(|e| e.to_string())?;
         write_half.flush().await.map_err(|e| e.to_string())?;
 
-        let mut reader = BufReader::new(read_half);
-        let max_line = self.constants.ipc.max_line_bytes;
         // Subscription stream stays open indefinitely while events arrive or until EOF
-        let sub_timeout_ms = self.constants.ipc.idle_timeout_ms.max(60_000);
+        let sub_timeout_ms = idle_timeout_ms.max(60_000);
 
         match read_bounded_line(&mut reader, max_line, sub_timeout_ms).await {
             ReadLineOutcome::Line(line) => {
@@ -153,6 +237,11 @@ impl DesktopCommandBridge {
             }
             other => return Err(format!("subscribe handshake failed: {other:?}")),
         }
+
+        self.log_info(format!(
+            "Connected and subscribed to daemon IPC event stream ({})",
+            self.ipc_endpoint_label()
+        ));
 
         loop {
             match read_bounded_line(&mut reader, max_line, sub_timeout_ms).await {
@@ -203,6 +292,10 @@ impl DesktopCommandBridge {
         let was_connected = self.daemon_connected.swap(true, Ordering::SeqCst);
         *self.state.write() = full_state;
         if !was_connected {
+            self.log_info(format!(
+                "Daemon connection established ({})",
+                self.ipc_endpoint_label()
+            ));
             let _ = self
                 .event_tx
                 .send(IpcStreamEvent::Resync { skipped_events: 0 });
@@ -264,6 +357,10 @@ impl DesktopCommandBridge {
             }
         }
         if was_connected {
+            self.log_warn(format!(
+                "Daemon connection lost ({})",
+                self.ipc_endpoint_label()
+            ));
             let _ = self
                 .event_tx
                 .send(IpcStreamEvent::Resync { skipped_events: 0 });
@@ -271,15 +368,35 @@ impl DesktopCommandBridge {
     }
 
     async fn call_daemon<T: DeserializeOwned>(&self, command: IpcCommand) -> Result<T, String> {
+        if !self.is_daemon_connected() {
+            self.log_info(format!(
+                "Attempting IPC command to daemon ({})",
+                self.ipc_endpoint_label()
+            ));
+        }
         match self.ipc_client.call_typed::<T>(command).await {
             Ok(res) => {
-                self.daemon_connected.store(true, Ordering::SeqCst);
+                let was_connected = self.daemon_connected.swap(true, Ordering::SeqCst);
                 self.state.write().diagnostics.daemon_connected = true;
+                if !was_connected {
+                    self.log_info(format!(
+                        "Connected to daemon via IPC command ({})",
+                        self.ipc_endpoint_label()
+                    ));
+                    let _ = self
+                        .event_tx
+                        .send(IpcStreamEvent::Resync { skipped_events: 0 });
+                }
                 Ok(res)
             }
             Err(err) => {
+                let err_msg = err.to_string();
+                self.log_warn(format!(
+                    "Daemon IPC command failed ({}): {err_msg}",
+                    self.ipc_endpoint_label()
+                ));
                 self.mark_disconnected();
-                Err(err.to_string())
+                Err(err_msg)
             }
         }
     }
@@ -293,8 +410,8 @@ impl DesktopCommandBridge {
             .call_daemon::<DaemonFullState>(IpcCommand::GetState)
             .await
         {
-            self.apply_full_state(fresh.clone());
-            return fresh;
+            self.apply_full_state(fresh);
+            return self.state.read().clone();
         }
         self.state.read().clone()
     }

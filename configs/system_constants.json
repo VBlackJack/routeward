@@ -48,6 +48,11 @@
     "samplingIntervalMs": 1000,
     "processCacheTtlMs": 15000,
     "logDirectory": "logs",
+    "windowsDaemonLogDir": "%ProgramData%\\RouteWard\\logs",
+    "linuxDaemonLogDir": "/var/log/routeward",
+    "windowsUserLogDir": "%LOCALAPPDATA%\\RouteWard\\logs",
+    "linuxUserLogDir": "$XDG_STATE_HOME/routeward/logs",
+    "linuxUserFallbackLogDir": ".local/state/routeward/logs",
     "logAppName": "RouteWard",
     "logFlushIntervalMs": 500,
     "eventBroadcastCapacity": 256

@@ -100,6 +100,9 @@ fn spawn_embedded_ui_server(
 
         rt.block_on(async move {
             let bridge = Arc::new(create_desktop_bridge().expect("DesktopCommandBridge"));
+            bridge.log_info(format!(
+                "Loopback UI server listening on http://127.0.0.1:{bound_port}"
+            ));
             let listener = TcpListener::from_std(std_listener).expect("Async listener");
             let token_arc = Arc::new(ephemeral_token);
 
@@ -109,6 +112,7 @@ fn spawn_embedded_ui_server(
                 let token_ref = Arc::clone(&token_arc);
 
                 tokio::spawn(async move {
+                    let _ = stream.set_nodelay(true);
                     let mut buf = vec![0u8; HTTP_REQ_BUFFER_BYTES];
                     let n = stream.read(&mut buf).await.unwrap_or(0);
                     if n == 0 {
@@ -122,11 +126,13 @@ fn spawn_embedded_ui_server(
                             let status = rejection.status_line();
                             let body = b"{\"error\":\"forbidden\"}";
                             let resp = format!(
-                                "{status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                "{status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
                                 body.len()
                             );
                             let _ = stream.write_all(resp.as_bytes()).await;
                             let _ = stream.write_all(body).await;
+                            let _ = stream.flush().await;
+                            let _ = stream.shutdown().await;
                             return;
                         }
                     };
@@ -147,11 +153,13 @@ fn spawn_embedded_ui_server(
                     {
                         let status = http_status_line(status_code);
                         let header = format!(
-                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: {allowed_origin}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: {allowed_origin}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
                             payload.len()
                         );
                         let _ = stream.write_all(header.as_bytes()).await;
                         let _ = stream.write_all(&payload).await;
+                        let _ = stream.flush().await;
+                        let _ = stream.shutdown().await;
                         return;
                     }
 
@@ -166,11 +174,13 @@ fn spawn_embedded_ui_server(
                     };
 
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
                     let _ = stream.write_all(header.as_bytes()).await;
                     let _ = stream.write_all(body).await;
+                    let _ = stream.flush().await;
+                    let _ = stream.shutdown().await;
                 });
             }
         });

@@ -27,7 +27,7 @@ use crate::ipc::protocol::{
 use crate::ipc::transport::{connect_ipc_stream, IpcServer, IpcStream, PeerIdentity};
 use crate::telemetry::LogLevel;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 const COMPONENT_DAEMON_IPC: &str = "DaemonIpc";
@@ -130,12 +130,28 @@ pub async fn handle_client_stream(stream: IpcStream, controller: RouteWardContro
                         break;
                     }
 
-                    // Stream events until client disconnects or channel closes
-                    while let Some(stream_ev) =
-                        recv_next_stream_event(&mut rx, &controller.telemetry).await
-                    {
-                        if write_json_line(&mut write_half, &stream_ev).await.is_err() {
-                            break;
+                    // Stream events until client disconnects (EOF) or channel closes
+                    loop {
+                        tokio::select! {
+                            maybe_ev = recv_next_stream_event(&mut rx, &controller.telemetry) => {
+                                match maybe_ev {
+                                    Some(stream_ev) => {
+                                        if write_json_line(&mut write_half, &stream_ev).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
+                            buf_res = reader.fill_buf() => {
+                                match buf_res {
+                                    Ok([]) | Err(_) => break,
+                                    Ok(buf) => {
+                                        let len = buf.len();
+                                        reader.consume(len);
+                                    }
+                                }
+                            }
                         }
                     }
                     break;
