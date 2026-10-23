@@ -33,17 +33,17 @@ const SID_BUILTIN_ADMINISTRATORS: &str = "S-1-5-32-544";
 /// - `D:P`: Protected DACL (disables inheritance from `%ProgramData%`)
 /// - `(A;OICI;FA;;;SY)`: SYSTEM Full Control (Object + Container Inherit)
 /// - `(A;OICI;FA;;;BA)`: Administrators Full Control (Object + Container Inherit)
-/// - `(A;OICI;FR;;;BU)`: Users Read-Only (Object + Container Inherit)
+/// - No access is granted to `Users` (`BU`) or any other principal.
 #[cfg(windows)]
-pub const WINDOWS_PROTECTED_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)";
+pub const WINDOWS_PROTECTED_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
 /// Protected DACL for the active_profile.json file:
 /// - `D:P`: Protected DACL
 /// - `(A;;FA;;;SY)`: SYSTEM Full Control
 /// - `(A;;FA;;;BA)`: Administrators Full Control
-/// - `(A;;FR;;;BU)`: Users Read-Only
+/// - No access is granted to `Users` (`BU`) or any other principal.
 #[cfg(windows)]
-pub const WINDOWS_PROTECTED_FILE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)";
+pub const WINDOWS_PROTECTED_FILE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
 
 #[cfg(windows)]
 const WINDOWS_ADMIN_OWNER_SDDL: &str = "O:BA";
@@ -109,8 +109,8 @@ pub fn load_or_init_secure_daemon_profile(profile_path: &Path) -> RouteWardResul
     }
 }
 
-/// Creates `dir_path` with a protected DACL (Windows) or mode `0750` (Linux) and sets owner
-/// to `Administrators` (Windows) or `root` (Linux).
+/// Creates `dir_path` with a protected DACL restricting access to `SYSTEM` and `Administrators`
+/// (Windows) or mode `0700` (Linux) and sets owner to `Administrators` (Windows) or `root` (Linux).
 pub fn create_secure_profile_dir(
     dir_path: &Path,
     require_privileged_owner: bool,
@@ -136,11 +136,12 @@ pub fn create_secure_profile_dir(
 
     #[cfg(not(windows))]
     {
-        apply_unix_secure_permissions(dir_path, 0o750, require_privileged_owner)
+        apply_unix_secure_permissions(dir_path, 0o700, require_privileged_owner)
     }
 }
 
-/// Applies the protected file DACL (Windows) or mode `0640` (Linux) to `file_path`.
+/// Applies the protected file DACL restricting access to `SYSTEM` and `Administrators` (Windows)
+/// or mode `0600` (Linux) to `file_path`.
 pub fn apply_secure_profile_file_permissions(
     file_path: &Path,
     require_privileged_owner: bool,
@@ -158,12 +159,12 @@ pub fn apply_secure_profile_file_permissions(
 
     #[cfg(not(windows))]
     {
-        apply_unix_secure_permissions(file_path, 0o640, require_privileged_owner)
+        apply_unix_secure_permissions(file_path, 0o600, require_privileged_owner)
     }
 }
 
 /// Verifies that `path` (directory or profile file) is owned by `SYSTEM`/`Administrators` (Windows)
-/// or `root` (Linux) and that no DACL entry / mode bit grants write access to any other principal.
+/// or `root` (Linux) and that no DACL entry / mode bit grants read or write access to any other principal.
 pub fn verify_profile_path_security(path: &Path) -> RouteWardResult<()> {
     #[cfg(windows)]
     {
@@ -247,11 +248,11 @@ pub fn verify_unix_path_security(path: &Path) -> RouteWardResult<()> {
     }
 
     let mode = meta.mode();
-    if (mode & 0o022) != 0 {
+    if (mode & 0o077) != 0 {
         return Err(RouteWardError::DaemonError {
             key: ERR_KEY_DAEMON_INSECURE_PROFILE,
             detail: format!(
-                "Insecure permissions {:04o} on {} (group or others have write access)",
+                "Insecure permissions {:04o} on {} (group or others have read/write/execute access)",
                 mode & 0o777,
                 path.display()
             ),
@@ -478,30 +479,18 @@ pub fn verify_windows_owner_security(path: &Path) -> RouteWardResult<()> {
     Ok(())
 }
 
+/// Verifies that the DACL on `path` is protected (`SE_DACL_PROTECTED`) and that NO entry grants
+/// read, write, or any other access right to any principal other than `SYSTEM` or `Administrators`.
 #[cfg(windows)]
 pub fn verify_windows_dacl_security(path: &Path) -> RouteWardResult<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, GENERIC_ALL, GENERIC_WRITE};
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
         DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED,
     };
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_APPEND_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, WRITE_DAC,
-        WRITE_OWNER,
-    };
-
-    const WRITE_MASK: u32 = FILE_WRITE_DATA
-        | FILE_APPEND_DATA
-        | FILE_WRITE_EA
-        | FILE_WRITE_ATTRIBUTES
-        | DELETE
-        | WRITE_DAC
-        | WRITE_OWNER
-        | GENERIC_WRITE
-        | GENERIC_ALL;
 
     let wide_path: Vec<u16> = path
         .as_os_str()
@@ -576,7 +565,7 @@ pub fn verify_windows_dacl_security(path: &Path) -> RouteWardResult<()> {
             if header.AceType == ALLOWED_ACE_TYPE {
                 let allowed = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
                 let mask = allowed.Mask;
-                if (mask & WRITE_MASK) != 0 {
+                if mask != 0 {
                     let sid_ptr = &allowed.SidStart as *const u32 as PSID;
                     let trustee = sid_to_string(sid_ptr).unwrap_or_else(|| "unknown".to_string());
                     if trustee != SID_LOCAL_SYSTEM && trustee != SID_BUILTIN_ADMINISTRATORS {
@@ -584,7 +573,7 @@ pub fn verify_windows_dacl_security(path: &Path) -> RouteWardResult<()> {
                         return Err(RouteWardError::DaemonError {
                             key: ERR_KEY_DAEMON_INSECURE_PROFILE,
                             detail: format!(
-                                "Insecure DACL entry on {}: principal {} has write access mask 0x{:08x}",
+                                "Insecure DACL entry on {}: principal {} has access mask 0x{:08x} (only SYSTEM and Administrators are allowed)",
                                 path.display(),
                                 trustee,
                                 mask

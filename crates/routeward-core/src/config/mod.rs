@@ -263,11 +263,53 @@ pub enum TransportProtocol {
     Any,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProxyCredentials {
     pub username: String,
-    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub has_password: bool,
+}
+
+impl ProxyCredentials {
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        let username = username.into();
+        let password = password.into();
+        let has_password = !password.is_empty();
+        Self {
+            username,
+            password: Some(password),
+            has_password,
+        }
+    }
+
+    pub fn password_str(&self) -> &str {
+        self.password.as_deref().unwrap_or("")
+    }
+
+    pub fn has_password(&self) -> bool {
+        self.has_password || self.password.as_ref().is_some_and(|p| !p.is_empty())
+    }
+
+    pub fn redacted_for_ipc(&self) -> Self {
+        Self {
+            username: self.username.clone(),
+            password: None,
+            has_password: self.has_password(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ProxyCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("has_password", &self.has_password())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +327,14 @@ pub struct ProxyNode {
     pub enabled: bool,
     pub last_latency_ms: Option<u64>,
     pub exit_ip: Option<String>,
+}
+
+impl ProxyNode {
+    pub fn redacted_for_ipc(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.auth = self.auth.as_ref().map(ProxyCredentials::redacted_for_ipc);
+        cloned
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,6 +461,16 @@ pub struct ProfileConfig {
 }
 
 impl ProfileConfig {
+    pub fn redacted_for_ipc(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.proxies = self
+            .proxies
+            .iter()
+            .map(ProxyNode::redacted_for_ipc)
+            .collect();
+        cloned
+    }
+
     pub fn load_embedded_default() -> RouteWardResult<Self> {
         serde_json::from_str(EMBEDDED_DEFAULT_PROFILE).map_err(|err| RouteWardError::ConfigError {
             key: ERR_KEY_CONFIG_JSON,
@@ -476,11 +536,19 @@ impl ProfileConfig {
             });
         }
 
+        #[cfg(not(windows))]
         if let Err(err) = security::apply_secure_profile_file_permissions(&tmp_path, false) {
-            #[cfg(windows)]
-            let _ = security::apply_windows_sddl_dacl(&tmp_path, "D:(A;;FA;;;WD)");
             let _ = fs::remove_file(&tmp_path);
             return Err(err);
+        }
+
+        #[cfg(windows)]
+        if crate::interceptor::RouteWardController::detect_elevated_privileges() {
+            if let Err(err) = security::apply_secure_profile_file_permissions(&tmp_path, false) {
+                let _ = security::apply_windows_sddl_dacl(&tmp_path, "D:(A;;FA;;;WD)");
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err);
+            }
         }
 
         if let Err(err) = fs::rename(&tmp_path, target_path) {
@@ -527,14 +595,14 @@ mod tests {
             .save_to_path(&profile_path)
             .expect("atomic save #1 succeeded");
         #[cfg(windows)]
-        security::verify_windows_dacl_security(&profile_path)
-            .expect("saved profile retains protected DACL after rename");
+        {
+            security::verify_windows_dacl_security(&profile_path)
+                .expect("saved profile retains protected DACL after rename");
+            // In non-elevated test runs on Windows, grant access back on the temp file so it can be read/overwritten
+            let _ = security::apply_windows_sddl_dacl(&profile_path, "D:(A;;FA;;;WD)");
+        }
         let loaded = ProfileConfig::load_from_path(&profile_path).expect("reload #1 succeeded");
         assert_eq!(loaded.name, "Atomic Persistence Test Profile");
-
-        // In non-elevated test runs on Windows, grant write back on the temp file before overwrite
-        #[cfg(windows)]
-        let _ = security::apply_windows_sddl_dacl(&profile_path, "D:(A;;FA;;;WD)");
 
         // Second overwrite verifies atomic replacement over an existing file
         profile.name = "Atomic Overwrite Profile v2".to_string();
@@ -542,8 +610,11 @@ mod tests {
             .save_to_path(&profile_path)
             .expect("atomic save #2 succeeded");
         #[cfg(windows)]
-        security::verify_windows_dacl_security(&profile_path)
-            .expect("overwritten profile retains protected DACL after rename");
+        {
+            security::verify_windows_dacl_security(&profile_path)
+                .expect("overwritten profile retains protected DACL after rename");
+            let _ = security::apply_windows_sddl_dacl(&profile_path, "D:(A;;FA;;;WD)");
+        }
         let loaded_v2 = ProfileConfig::load_from_path(&profile_path).expect("reload #2 succeeded");
         assert_eq!(loaded_v2.name, "Atomic Overwrite Profile v2");
 
@@ -554,16 +625,26 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
 
-        #[cfg(windows)]
-        let _ = security::apply_windows_sddl_dacl(&profile_path, "D:(A;;FA;;;WD)");
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn proxy_credentials_debug_redacts_password() {
+        let creds = ProxyCredentials::new("alice".to_string(), "SuperSecretPass!99".to_string());
+        let dbg_str = format!("{creds:?}");
+        assert!(dbg_str.contains("alice"));
+        assert!(dbg_str.contains("[REDACTED]"));
+        assert!(!dbg_str.contains("SuperSecretPass!99"));
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_profile_dir_created_with_expected_dacl_and_rejects_unprivileged_owner_or_users_write(
+    fn windows_profile_dir_created_with_expected_dacl_and_rejects_unprivileged_owner_or_users_access(
     ) {
         use crate::error::ERR_KEY_DAEMON_INSECURE_PROFILE;
+
+        assert!(!security::WINDOWS_PROTECTED_DIR_SDDL.contains("BU"));
+        assert!(!security::WINDOWS_PROTECTED_FILE_SDDL.contains("BU"));
 
         // 1. Verify ProgramData is resolved via SHGetKnownFolderPath(FOLDERID_ProgramData)
         let constants = SystemConstants::load_embedded().expect("SystemConstants");
@@ -582,14 +663,13 @@ mod tests {
         security::create_secure_profile_dir(&secure_dir, false)
             .expect("create_secure_profile_dir in temp");
 
-        // Verify the created directory has a protected DACL granting write only to SYSTEM and Administrators
+        // Verify the created directory has a protected DACL granting access only to SYSTEM and Administrators
         security::verify_windows_dacl_security(&secure_dir)
             .expect("Protected DACL on created directory should be valid");
 
         // 3. A pre-existing directory owned by a standard user must be rejected by owner check
         let standard_user_dir = temp_root.join("PreExistingUserOwned");
         fs::create_dir_all(&standard_user_dir).expect("create standard_user_dir");
-        // Apply valid protected DACL so only ownership differs when running as a standard user
         security::apply_windows_sddl_dacl(&standard_user_dir, security::WINDOWS_PROTECTED_DIR_SDDL)
             .expect("apply protected DACL");
         if !crate::interceptor::RouteWardController::detect_elevated_privileges() {
@@ -604,7 +684,26 @@ mod tests {
             }
         }
 
-        // 4. A directory with a DACL granting write access to Users (BU) must be rejected
+        // 4. A profile file readable by Users (BU) must be rejected
+        let readable_users_file = temp_root.join("readable_by_users_profile.json");
+        fs::write(&readable_users_file, b"{}").expect("write readable_users_file");
+        security::apply_windows_sddl_dacl(
+            &readable_users_file,
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)",
+        )
+        .expect("apply DACL with Users read access");
+
+        let read_check = security::verify_windows_dacl_security(&readable_users_file);
+        match read_check {
+            Err(RouteWardError::DaemonError { key, .. }) => {
+                assert_eq!(key, ERR_KEY_DAEMON_INSECURE_PROFILE);
+            }
+            other => panic!(
+                "Expected ERR_KEY_DAEMON_INSECURE_PROFILE for Users-readable file DACL, got {other:?}"
+            ),
+        }
+
+        // 5. A directory with a DACL granting write access to Users (BU) must be rejected
         let writable_users_dir = temp_root.join("UsersWritableDir");
         fs::create_dir_all(&writable_users_dir).expect("create writable_users_dir");
         security::apply_windows_sddl_dacl(
@@ -623,22 +722,23 @@ mod tests {
             ),
         }
 
-        // 5. A directory with an unprotected (inheriting) DACL must be rejected
+        // 6. A directory with an unprotected (inheriting) DACL must be rejected
         let unprotected_dir = temp_root.join("UnprotectedInheritingDir");
         fs::create_dir_all(&unprotected_dir).expect("create unprotected_dir");
         let inherit_check = security::verify_windows_dacl_security(&unprotected_dir);
         assert!(inherit_check.is_err());
 
-        // Cleanup temporary directories by restoring full access to current user before removal
+        // Cleanup temporary directories/files by restoring full access to current user before removal
         let _ = security::apply_windows_sddl_dacl(&secure_dir, "D:(A;OICI;FA;;;WD)");
         let _ = security::apply_windows_sddl_dacl(&standard_user_dir, "D:(A;OICI;FA;;;WD)");
+        let _ = security::apply_windows_sddl_dacl(&readable_users_file, "D:(A;;FA;;;WD)");
         let _ = security::apply_windows_sddl_dacl(&writable_users_dir, "D:(A;OICI;FA;;;WD)");
         let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn unix_profile_dir_and_file_reject_group_or_other_writable_permissions() {
+    fn unix_profile_dir_and_file_reject_group_or_other_permissions() {
         use crate::error::ERR_KEY_DAEMON_INSECURE_PROFILE;
         use std::os::unix::fs::PermissionsExt;
 
@@ -654,39 +754,39 @@ mod tests {
 
         if is_root {
             security::verify_profile_path_security(&etc_dir)
-                .expect("0750 root-owned dir should pass");
+                .expect("0700 root-owned dir should pass");
             security::verify_profile_path_security(&profile_path)
-                .expect("0640 root-owned profile should pass");
+                .expect("0600 root-owned profile should pass");
         }
 
-        // Group-writable directory (0770) must be rejected
-        fs::set_permissions(&etc_dir, fs::Permissions::from_mode(0o770)).expect("chmod 0770");
+        // Group-readable directory (0750) or group-writable directory (0770) must be rejected
+        fs::set_permissions(&etc_dir, fs::Permissions::from_mode(0o750)).expect("chmod 0750");
         match security::verify_profile_path_security(&etc_dir) {
             Err(RouteWardError::DaemonError { key, .. }) => {
                 assert_eq!(key, ERR_KEY_DAEMON_INSECURE_PROFILE);
             }
-            other => panic!("Expected ERR_KEY_DAEMON_INSECURE_PROFILE for 0770 dir, got {other:?}"),
+            other => panic!("Expected ERR_KEY_DAEMON_INSECURE_PROFILE for 0750 dir, got {other:?}"),
         }
-
-        // World-writable directory (0752) must be rejected
-        fs::set_permissions(&etc_dir, fs::Permissions::from_mode(0o752)).expect("chmod 0752");
+        fs::set_permissions(&etc_dir, fs::Permissions::from_mode(0o770)).expect("chmod 0770");
         assert!(security::verify_profile_path_security(&etc_dir).is_err());
 
-        // Restore directory to 0750 and test group-writable profile file (0660)
-        fs::set_permissions(&etc_dir, fs::Permissions::from_mode(0o750)).expect("chmod 0750");
-        fs::set_permissions(&profile_path, fs::Permissions::from_mode(0o660)).expect("chmod 0660");
-        match security::verify_profile_path_security(&profile_path) {
-            Err(RouteWardError::DaemonError { key, .. }) => {
-                assert_eq!(key, ERR_KEY_DAEMON_INSECURE_PROFILE);
-            }
-            other => {
-                panic!("Expected ERR_KEY_DAEMON_INSECURE_PROFILE for 0660 file, got {other:?}")
+        // Restore directory to 0700 and verify profile files in 0640 and 0644 are rejected
+        fs::set_permissions(&etc_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+
+        for bad_mode in [0o640, 0o644, 0o660, 0o642] {
+            fs::set_permissions(&profile_path, fs::Permissions::from_mode(bad_mode))
+                .expect("chmod bad_mode");
+            match security::verify_profile_path_security(&profile_path) {
+                Err(RouteWardError::DaemonError { key, .. }) => {
+                    assert_eq!(key, ERR_KEY_DAEMON_INSECURE_PROFILE);
+                }
+                other => {
+                    panic!(
+                        "Expected ERR_KEY_DAEMON_INSECURE_PROFILE for {bad_mode:04o} file, got {other:?}"
+                    )
+                }
             }
         }
-
-        // World-writable profile file (0642) must be rejected
-        fs::set_permissions(&profile_path, fs::Permissions::from_mode(0o642)).expect("chmod 0642");
-        assert!(security::verify_profile_path_security(&profile_path).is_err());
 
         let _ = fs::remove_dir_all(&temp_root);
     }

@@ -258,21 +258,21 @@ id -u rwmember >/dev/null 2>&1 || useradd -M -s /bin/bash -G routeward rwmember
 id -u rwoutsider >/dev/null 2>&1 || useradd -M -s /bin/bash rwoutsider
 
 mkdir -p /etc/routeward
-chmod 0750 /etc/routeward
+chmod 0700 /etc/routeward
 cp /tmp/profile_proxy.json /etc/routeward/active_profile.json
 rm -f "${SOCKS_LOG}" /workspace/logs/RouteWard_*.log /run/routeward/routeward.sock
 
-# Verify daemon refuses to start if /etc/routeward/active_profile.json is group/world-writable
-chmod 0660 /etc/routeward/active_profile.json
+# Verify daemon refuses to start if /etc/routeward/active_profile.json is group-readable (0640) or world-readable (0644)
+chmod 0640 /etc/routeward/active_profile.json
 set +e
 "${BIN}" daemon >/tmp/rw_daemon_insecure.out 2>&1
 INSECURE_EXIT=$?
 set -e
 if [[ "${INSECURE_EXIT}" -eq 0 ]]; then
-    echo "[FAIL] Scenario (g): daemon started despite group-writable /etc/routeward/active_profile.json"
+    echo "[FAIL] Scenario (g): daemon started despite group-readable (0640) /etc/routeward/active_profile.json"
     exit 1
 fi
-chmod 0640 /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
 
 "${BIN}" daemon >/tmp/rw_daemon.out 2>&1 &
 DAEMON_PID=$!

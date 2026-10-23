@@ -174,7 +174,7 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
         IpcCommand::GetState => {
             let state = DaemonFullState {
                 diagnostics: controller.diagnostics(),
-                profile: controller.profile.read().clone(),
+                profile: controller.profile.read().redacted_for_ipc(),
                 telemetry: controller.telemetry.snapshot(),
                 connections: controller.telemetry.list_connections(),
                 logs: controller.telemetry.list_logs(),
@@ -210,7 +210,7 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::GetProfile => {
-            let prof = controller.profile.read().clone();
+            let prof = controller.profile.read().redacted_for_ipc();
             IpcResponse::success(id, &prof)
         }
         IpcCommand::ReplaceProfile { profile } => {
@@ -218,7 +218,7 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
             if let Err(err) = controller.save_profile_default() {
                 return IpcResponse::error(Some(id), err.to_string());
             }
-            let prof = controller.profile.read().clone();
+            let prof = controller.profile.read().redacted_for_ipc();
             IpcResponse::success(id, &prof)
         }
         IpcCommand::UpsertRule { rule } => {
@@ -456,5 +456,142 @@ mod windows_tests {
                 .expect("deserialize SystemDiagnostics");
         assert!(diag.daemon_connected);
         assert!(!diag.running);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        ProfileConfig, ProxyCredentials, ProxyNode, ProxyProtocol, SystemConstants,
+    };
+
+    #[tokio::test]
+    async fn ipc_redacts_proxy_password_and_preserves_password_when_omitted_on_write() {
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let temp_file = std::env::temp_dir().join(format!(
+            "routeward_ipc_test_{}\\active_profile.json",
+            Uuid::new_v4()
+        ));
+        constants.ipc.windows_profile_path = temp_file.to_string_lossy().into_owned();
+        constants.ipc.linux_profile_path = temp_file.to_string_lossy().into_owned();
+
+        let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        profile.enable_logging = false;
+
+        let controller = RouteWardController::new(constants, profile, "en");
+
+        let initial_node = ProxyNode {
+            id: "proxy-auth-test".to_string(),
+            name: "Auth Proxy".to_string(),
+            protocol: ProxyProtocol::Socks5,
+            host: "10.0.0.10".to_string(),
+            port: 1080,
+            auth: Some(ProxyCredentials::new("alice", "top_secret_pw_99")),
+            udp_enabled: true,
+            tls: false,
+            sni: None,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        };
+        controller.upsert_proxy(initial_node);
+
+        // 1. GetProfile and GetState over IPC must never include the cleartext password
+        let get_prof_resp = dispatch_command(
+            &controller,
+            IpcRequest {
+                id: "req-1".to_string(),
+                command: IpcCommand::GetProfile,
+            },
+        )
+        .await;
+        assert!(get_prof_resp.ok);
+        let serialized_prof = serde_json::to_string(&get_prof_resp).expect("serialize GetProfile");
+        assert!(
+            !serialized_prof.contains("top_secret_pw_99"),
+            "IPC GetProfile response must never leak cleartext password"
+        );
+        let returned_prof: ProfileConfig =
+            serde_json::from_value(get_prof_resp.result.expect("profile result"))
+                .expect("deserialize ProfileConfig");
+        let returned_proxy = returned_prof
+            .proxies
+            .iter()
+            .find(|p| p.id == "proxy-auth-test")
+            .expect("proxy present");
+        let returned_auth = returned_proxy.auth.as_ref().expect("auth present");
+        assert_eq!(returned_auth.username, "alice");
+        assert!(returned_auth.password.is_none());
+        assert!(returned_auth.has_password);
+
+        let get_state_resp = dispatch_command(
+            &controller,
+            IpcRequest {
+                id: "req-2".to_string(),
+                command: IpcCommand::GetState,
+            },
+        )
+        .await;
+        let serialized_state = serde_json::to_string(&get_state_resp).expect("serialize GetState");
+        assert!(
+            !serialized_state.contains("top_secret_pw_99"),
+            "IPC GetState response must never leak cleartext password"
+        );
+
+        // 2. Updating the proxy with an absent password (None, as returned by IPC) preserves existing password
+        let mut updated_node = returned_proxy.clone();
+        updated_node.name = "Renamed Auth Proxy".to_string();
+        assert!(updated_node.auth.as_ref().unwrap().password.is_none());
+        controller.upsert_proxy(updated_node);
+
+        {
+            let prof_guard = controller.profile.read();
+            let stored = prof_guard
+                .proxies
+                .iter()
+                .find(|p| p.id == "proxy-auth-test")
+                .expect("stored proxy");
+            assert_eq!(stored.name, "Renamed Auth Proxy");
+            assert_eq!(
+                stored.auth.as_ref().unwrap().password_str(),
+                "top_secret_pw_99"
+            );
+            assert!(stored.auth.as_ref().unwrap().has_password);
+        }
+
+        // 3. Replacing the profile with a proxy whose password is None also preserves the existing password
+        let mut replaced_prof = controller.profile.read().redacted_for_ipc();
+        replaced_prof.name = "Updated Profile".to_string();
+        controller.replace_profile(replaced_prof);
+        {
+            let prof_guard = controller.profile.read();
+            let stored = prof_guard
+                .proxies
+                .iter()
+                .find(|p| p.id == "proxy-auth-test")
+                .expect("stored proxy after replace_profile");
+            assert_eq!(
+                stored.auth.as_ref().unwrap().password_str(),
+                "top_secret_pw_99"
+            );
+        }
+
+        // 4. Providing a new password replaces the existing password
+        let mut new_pw_node = returned_proxy.clone();
+        new_pw_node.auth = Some(ProxyCredentials::new("alice", "rotated_pw_2026"));
+        controller.upsert_proxy(new_pw_node);
+        {
+            let prof_guard = controller.profile.read();
+            let stored = prof_guard
+                .proxies
+                .iter()
+                .find(|p| p.id == "proxy-auth-test")
+                .expect("stored proxy after password rotation");
+            assert_eq!(
+                stored.auth.as_ref().unwrap().password_str(),
+                "rotated_pw_2026"
+            );
+        }
     }
 }

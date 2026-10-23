@@ -284,7 +284,7 @@ impl ProxyConnector {
         let has_auth = node
             .auth
             .as_ref()
-            .map(|a| !a.username.is_empty() || !a.password.is_empty())
+            .map(|a| !a.username.is_empty() || !a.password_str().is_empty())
             .unwrap_or(false);
 
         let greeting = if has_auth {
@@ -318,7 +318,7 @@ impl ProxyConnector {
                     key: ERR_KEY_AUTH_REJECTED,
                 })?;
             let user_bytes = creds.username.as_bytes();
-            let pass_bytes = creds.password.as_bytes();
+            let pass_bytes = creds.password_str().as_bytes();
 
             let mut auth_pkt = Vec::with_capacity(3 + user_bytes.len() + pass_bytes.len());
             auth_pkt.push(proto.socks5_password_auth_version);
@@ -397,9 +397,9 @@ impl ProxyConnector {
         proto: &ProtocolConstants,
     ) -> RouteWardResult<()> {
         let auth_header = if let Some(creds) = &node.auth {
-            if !creds.username.is_empty() || !creds.password.is_empty() {
-                let token =
-                    BASE64_STANDARD.encode(format!("{}:{}", creds.username, creds.password));
+            let pass = creds.password_str();
+            if !creds.username.is_empty() || !pass.is_empty() {
+                let token = BASE64_STANDARD.encode(format!("{}:{pass}", creds.username));
                 format!("Proxy-Authorization: Basic {token}\r\n")
             } else {
                 String::new()

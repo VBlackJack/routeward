@@ -50,7 +50,7 @@ impl ProxyUriCodec {
         let (scheme_raw, remainder) = trimmed.split_once(SCHEME_SEPARATOR).ok_or_else(|| {
             RouteWardError::InvalidProxyUri {
                 key: ERR_KEY_INVALID_URI,
-                uri: trimmed.to_string(),
+                uri: Self::redact_uri_userinfo(trimmed),
             }
         })?;
 
@@ -72,7 +72,7 @@ impl ProxyUriCodec {
             _ => {
                 return Err(RouteWardError::InvalidProxyUri {
                     key: ERR_KEY_INVALID_URI,
-                    uri: trimmed.to_string(),
+                    uri: Self::redact_uri_userinfo(trimmed),
                 })
             }
         };
@@ -82,19 +82,14 @@ impl ProxyUriCodec {
             None => (None, authority_part),
         };
 
-        let (host, port) = Self::parse_host_port(host_port_str, trimmed)?;
+        let redacted_uri = Self::redact_uri_userinfo(trimmed);
+        let (host, port) = Self::parse_host_port(host_port_str, &redacted_uri)?;
 
         let auth = userinfo_opt.map(|raw_user_info| {
             if let Some((u, p)) = raw_user_info.split_once(':') {
-                ProxyCredentials {
-                    username: Self::percent_decode(u),
-                    password: Self::percent_decode(p),
-                }
+                ProxyCredentials::new(Self::percent_decode(u), Self::percent_decode(p))
             } else {
-                ProxyCredentials {
-                    username: Self::percent_decode(raw_user_info),
-                    password: String::new(),
-                }
+                ProxyCredentials::new(Self::percent_decode(raw_user_info), String::new())
             }
         });
 
@@ -140,8 +135,8 @@ impl ProxyUriCodec {
         };
 
         let auth_prefix = match &node.auth {
-            Some(creds) if !creds.username.is_empty() || !creds.password.is_empty() => {
-                format!("{}:{}@", creds.username, creds.password)
+            Some(creds) if !creds.username.is_empty() || !creds.password_str().is_empty() => {
+                format!("{}:{}@", creds.username, creds.password_str())
             }
             _ => String::new(),
         };
@@ -200,6 +195,18 @@ impl ProxyUriCodec {
 
     fn percent_decode(input: &str) -> String {
         input.replace("%20", " ").replace('+', " ")
+    }
+
+    fn redact_uri_userinfo(uri: &str) -> String {
+        if let Some((scheme, rest)) = uri.split_once(SCHEME_SEPARATOR) {
+            if let Some((_, after_at)) = rest.rsplit_once('@') {
+                return format!("{scheme}{SCHEME_SEPARATOR}[REDACTED]@{after_at}");
+            }
+        }
+        if let Some((_, after_at)) = uri.rsplit_once('@') {
+            return format!("[REDACTED]@{after_at}");
+        }
+        uri.to_string()
     }
 }
 

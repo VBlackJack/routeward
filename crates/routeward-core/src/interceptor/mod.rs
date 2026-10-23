@@ -505,12 +505,23 @@ impl RouteWardController {
         reports
     }
 
-    pub fn upsert_proxy(&self, node: ProxyNode) {
+    pub fn upsert_proxy(&self, mut node: ProxyNode) {
         {
             let mut prof = self.profile.write();
             if let Some(existing) = prof.proxies.iter_mut().find(|p| p.id == node.id) {
+                if let Some(ref mut incoming_creds) = node.auth {
+                    if incoming_creds.password.is_none() {
+                        if let Some(ref existing_creds) = existing.auth {
+                            incoming_creds.password = existing_creds.password.clone();
+                        }
+                    }
+                    incoming_creds.has_password = incoming_creds.has_password();
+                }
                 *existing = node;
             } else {
+                if let Some(ref mut incoming_creds) = node.auth {
+                    incoming_creds.has_password = incoming_creds.has_password();
+                }
                 prof.proxies.push(node);
             }
         }
@@ -545,10 +556,27 @@ impl RouteWardController {
     }
 
     /// Replaces the active in-memory profile and synchronizes logging and upstream loop exclusions.
-    pub fn replace_profile(&self, new_profile: ProfileConfig) {
+    pub fn replace_profile(&self, mut new_profile: ProfileConfig) {
         self.telemetry
             .set_file_logging_enabled(new_profile.enable_logging);
-        *self.profile.write() = new_profile;
+        {
+            let mut prof = self.profile.write();
+            for incoming_node in &mut new_profile.proxies {
+                if let Some(ref mut incoming_creds) = incoming_node.auth {
+                    if incoming_creds.password.is_none() {
+                        if let Some(existing_node) =
+                            prof.proxies.iter().find(|p| p.id == incoming_node.id)
+                        {
+                            if let Some(ref existing_creds) = existing_node.auth {
+                                incoming_creds.password = existing_creds.password.clone();
+                            }
+                        }
+                    }
+                    incoming_creds.has_password = incoming_creds.has_password();
+                }
+            }
+            *prof = new_profile;
+        }
         self.sync_upstream_proxy_exclusions();
     }
 
