@@ -69,6 +69,8 @@ sudo ./target/release/routeward daemon
 ./target/release/routeward ctl start
 ./target/release/routeward ctl connections
 ./target/release/routeward ctl upsert-rule --json '{"id":"rule-1","name":"Custom","enabled":true,"priority":5,"processPatterns":["curl"],"domainPatterns":[],"ipCidrs":[],"portRanges":[],"protocol":"tcp","action":{"type":"block"}}'
+# Ou depuis un fichier JSON UTF-8 (recommande sous Windows PowerShell 5.1, qui retire les guillemets doubles internes des arguments passes aux executables natifs) :
+./target/release/routeward ctl upsert-rule --json-file ./rule.json
 ./target/release/routeward ctl remove-rule --id rule-1
 ./target/release/routeward ctl stop
 

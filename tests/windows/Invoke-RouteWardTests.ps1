@@ -393,9 +393,78 @@ function Remove-SensitiveText {
     return $redacted
 }
 
+function Build-CurlArguments {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+
+        [Parameter(Mandatory = $true)]
+        [int]$TimeoutSec
+    )
+    # Note: Never pass an empty string "" to --noproxy in Windows PowerShell 5.1,
+    # as PowerShell 5.1 strips "" when invoking native binaries, causing --noproxy to consume -s.
+    return @(
+        "-s",
+        "-o",
+        "NUL",
+        "-w",
+        "%{http_code}",
+        "--noproxy",
+        "*",
+        "--max-time",
+        "$TimeoutSec",
+        $Url
+    )
+}
+
+function Invoke-UnproxiedCurl {
+    param(
+        [string]$CurlBin,
+        [string]$Url,
+        [int]$TimeoutSec
+    )
+    $proxyVars = @("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
+    $savedVars = @{}
+    foreach ($v in $proxyVars) {
+        $savedVars[$v] = [Environment]::GetEnvironmentVariable($v, "Process")
+        [Environment]::SetEnvironmentVariable($v, $null, "Process")
+    }
+    $curlArgs = Build-CurlArguments -Url $Url -TimeoutSec $TimeoutSec
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        # Capture standard output only; discard standard error so progress/diagnostics never mix with %{http_code}
+        $stdoutLines = & $CurlBin @curlArgs 2>$null
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+        foreach ($v in $proxyVars) {
+            [Environment]::SetEnvironmentVariable($v, $savedVars[$v], "Process")
+        }
+    }
+    $httpCodeOnly = (($stdoutLines | ForEach-Object { $_.ToString() }) -join "").Trim()
+    return [PSCustomObject]@{
+        ExitCode = $code
+        HttpCode = $httpCodeOnly
+    }
+}
+
+function Write-Utf8NoBomJsonTempFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$JsonText
+    )
+    $tempDir = [System.IO.Path]::GetTempPath()
+    $tempFileName = "routeward_rule_$([guid]::NewGuid().ToString('N')).json"
+    $tempFilePath = Join-Path $tempDir $tempFileName
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tempFilePath, $JsonText, $utf8NoBom)
+    return $tempFilePath
+}
+
 # ---------------------------------------------------------------------------
-# DryRun Mode: Validate out-of-repo path resolution and IPC response parser
-#              against recorded sample responses without starting WinDivert/daemon
+# DryRun Mode: Validate out-of-repo path resolution, curl command construction,
+#              --json-file UTF-8 no-BOM temp file flow, and IPC response parser
 # ---------------------------------------------------------------------------
 if ($DryRun.IsPresent) {
     Write-Host "=== RouteWard Windows Test Suite - DRY RUN MODE (No daemon / No WinDivert) ===" -ForegroundColor Cyan
@@ -407,7 +476,66 @@ if ($DryRun.IsPresent) {
     }
     Write-Host "[DRYRUN-PASS] Out-of-repo path resolution ('C:\RouteWard') succeeded without Join-Path error." -ForegroundColor Green
 
-    # 2. Load sample ctl responses fixture and verify strict parser
+    # 2. Verify curl argument construction and stdout-only HTTP code capture
+    $sampleCurlArgs = Build-CurlArguments -Url $TestUrl -TimeoutSec $CurlTimeoutSec
+    if ($sampleCurlArgs[0] -ne "-s" -or $sampleCurlArgs[1] -ne "-o" -or $sampleCurlArgs[2] -ne "NUL" -or $sampleCurlArgs[3] -ne "-w" -or $sampleCurlArgs[4] -ne "%{http_code}") {
+        throw "DryRun failed: unexpected curl argument order: $($sampleCurlArgs -join ' ')"
+    }
+    foreach ($argItem in $sampleCurlArgs) {
+        if ([string]::IsNullOrEmpty($argItem)) {
+            throw "DryRun failed: curl arguments must not contain empty strings in PowerShell 5.1."
+        }
+    }
+    if (Test-Path -LiteralPath $CurlExePath) {
+        $closedPortCurl = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url "http://127.0.0.1:1" -TimeoutSec 1
+        if ($closedPortCurl.ExitCode -eq 0 -or $closedPortCurl.HttpCode -notmatch '^\d{3}$') {
+            throw "DryRun failed: expected clean 3-digit HTTP code and non-zero exit from closed port curl, got HttpCode='$($closedPortCurl.HttpCode)' ExitCode=$($closedPortCurl.ExitCode)"
+        }
+    }
+    Write-Host "[DRYRUN-PASS] Verified curl command construction (-s -o NUL -w '%{http_code}') and stdout-only HTTP code capture." -ForegroundColor Green
+
+    # 3. Verify --json-file temporary UTF-8 no-BOM file creation and cleanup in %TEMP%
+    $dryRunRuleObj = @{
+        id              = $TempBlockRuleId
+        name            = $TempBlockRuleName
+        enabled         = $true
+        priority        = 1
+        processPatterns = @("curl.exe")
+        domainPatterns  = @()
+        ipCidrs         = @()
+        portRanges      = @()
+        protocol        = "tcp"
+        action          = @{ type = "block" }
+    }
+    $dryRunRuleJson = $dryRunRuleObj | ConvertTo-Json -Compress -Depth 5
+    $dryRunTempFile = Write-Utf8NoBomJsonTempFile -JsonText $dryRunRuleJson
+    try {
+        if (-not (Test-Path -LiteralPath $dryRunTempFile)) {
+            throw "DryRun failed: temporary JSON file was not created at '$dryRunTempFile'."
+        }
+        $rawBytes = [System.IO.File]::ReadAllBytes($dryRunTempFile)
+        if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
+            throw "DryRun failed: temporary JSON file '$dryRunTempFile' contains a UTF-8 BOM."
+        }
+        $reloadedRule = Get-Content -LiteralPath $dryRunTempFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($reloadedRule.id -ne $TempBlockRuleId -or $reloadedRule.protocol -ne "tcp" -or $reloadedRule.action.type -ne "block") {
+            throw "DryRun failed: reloaded JSON from '$dryRunTempFile' did not preserve rule fields."
+        }
+        $ctlUpsertArgs = @("upsert-rule", "--json-file", $dryRunTempFile)
+        if ($ctlUpsertArgs[1] -ne "--json-file" -or $ctlUpsertArgs[2] -ne $dryRunTempFile) {
+            throw "DryRun failed: unexpected --json-file argument list."
+        }
+    } finally {
+        if (Test-Path -LiteralPath $dryRunTempFile) {
+            Remove-Item -LiteralPath $dryRunTempFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (Test-Path -LiteralPath $dryRunTempFile) {
+        throw "DryRun failed: temporary JSON file '$dryRunTempFile' was not removed in finally block."
+    }
+    Write-Host "[DRYRUN-PASS] Verified --json-file UTF-8 (no BOM) temporary file creation, JSON integrity, and cleanup under %TEMP%." -ForegroundColor Green
+
+    # 4. Load sample ctl responses fixture and verify strict parser
     if ([string]::IsNullOrWhiteSpace($SampleResponsesJsonPath)) {
         $SampleResponsesJsonPath = Join-Path $PSScriptRoot "fixtures\sample_ctl_responses.json"
     }
@@ -589,36 +717,6 @@ function Invoke-RouteWardCtl {
     return [PSCustomObject]@{
         ExitCode = $exitCode
         RawText  = $rawText
-    }
-}
-
-function Invoke-UnproxiedCurl {
-    param(
-        [string]$CurlBin,
-        [string]$Url,
-        [int]$TimeoutSec
-    )
-    $proxyVars = @("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
-    $savedVars = @{}
-    foreach ($v in $proxyVars) {
-        $savedVars[$v] = [Environment]::GetEnvironmentVariable($v, "Process")
-        [Environment]::SetEnvironmentVariable($v, $null, "Process")
-    }
-    $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $out = & $CurlBin --noproxy "" -s -S -o NUL -w "%{http_code}" --max-time $TimeoutSec $Url 2>&1
-        $code = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $prevEap
-        foreach ($v in $proxyVars) {
-            [Environment]::SetEnvironmentVariable($v, $savedVars[$v], "Process")
-        }
-    }
-    $raw = ($out | ForEach-Object { $_.ToString() }) -join ""
-    return [PSCustomObject]@{
-        ExitCode = $code
-        HttpCode = $raw.Trim()
     }
 }
 
@@ -944,8 +1042,15 @@ try {
         $blockRuleJson = $blockRuleObj | ConvertTo-Json -Compress -Depth 5
         $profileModifiedByScript = $true
 
-        $upsertRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("upsert-rule", "--json", $blockRuleJson) -Label "Scenario-e-upsert-block"
-        $null = ConvertFrom-CtlResponseJson -RawJson $upsertRes.RawText -Context "Scenario-e-upsert-block" -RequiredResultProperties @("ok")
+        $tempRuleFile = Write-Utf8NoBomJsonTempFile -JsonText $blockRuleJson
+        try {
+            $upsertRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("upsert-rule", "--json-file", $tempRuleFile) -Label "Scenario-e-upsert-block"
+            $null = ConvertFrom-CtlResponseJson -RawJson $upsertRes.RawText -Context "Scenario-e-upsert-block" -RequiredResultProperties @("ok")
+        } finally {
+            if (Test-Path -LiteralPath $tempRuleFile) {
+                Remove-Item -LiteralPath $tempRuleFile -Force -ErrorAction SilentlyContinue
+            }
+        }
 
         try {
             $curlBlocked = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec 5

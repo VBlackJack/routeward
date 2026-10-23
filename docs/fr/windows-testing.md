@@ -25,7 +25,7 @@ Depuis une console PowerShell ou Invite de commandes en Administrateur, dans le 
 # Ou via le fichier .bat :
 .\Run-RouteWardTests.bat -ConfirmTestMachine
 
-# Mode DryRun (valide la resolution de chemins hors depot et le parseur JSON des reponses ctl sur fichier d'exemple sans lancer le daemon ni WinDivert) :
+# Mode DryRun (valide la resolution de chemins hors depot, le parseur JSON des reponses ctl, la capture stdout seule du code HTTP curl et la creation/suppression du fichier temporaire UTF-8 sans BOM pour --json-file, sans lancer le daemon ni WinDivert) :
 .\Invoke-RouteWardTests.ps1 -DryRun
 ```
 
@@ -39,7 +39,7 @@ Chaque scenario etablit lui-meme son etat de depart de maniere independante :
 - **`(b)`** : Verifie les DACL protegees (`D:P`) limitees a `SYSTEM` et `Administrators` sur `%ProgramData%\RouteWard` et `active_profile.json`, ainsi que la SDDL du Named Pipe via `[System.IO.Directory]::GetAccessControl` (absence de `WD`, `BU` et `AU`).
 - **`(c)`** : Verifie `routeward.exe ctl status` (`result.daemonConnected=true`, `result.elevatedPrivileges=true`, `result.running=false`).
 - **`(d)`** : Execute `routeward.exe ctl start` puis `curl.exe`, verifie le code HTTP `200` et la presence de `curl.exe` dans `result` de `ctl connections` avec `matchedRule="CLI Tools via SOCKS5 Proxy"` et `rxBytes > 0`.
-- **`(e)`** : Ajoute une regle `Block` temporaire de priorite 1 pour `curl.exe` via `routeward.exe ctl upsert-rule`, verifie l'echec de `curl.exe` et l'etat `blocked` dans `ctl connections`, retire la regle via `routeward.exe ctl remove-rule --id <ID>`, et verifie via `ctl state` que le profil est revenu exactement a l'identique.
+- **`(e)`** : Ecrit une regle `Block` temporaire de priorite 1 pour `curl.exe` en UTF-8 sans BOM dans `%TEMP%`, l'applique via `routeward.exe ctl upsert-rule --json-file <chemin>` (contournant la suppression des guillemets doubles par Windows PowerShell 5.1 lors de l'appel d'un executable natif), verifie l'echec de `curl.exe` et l'etat `blocked` dans `ctl connections`, retire la regle via `routeward.exe ctl remove-rule --id <ID>`, supprime le fichier temporaire dans un bloc `finally`, et verifie via `ctl state` que le profil est revenu exactement a l'identique.
 - **`(f)`** : Execute `routeward.exe ctl stop`, verifie la suppression de la regle de pare-feu `RouteWard_TransparentRelay_10810` et le retour HTTP `200` de `curl.exe` en direct.
 - **`(g)`** : Demarre l'interception, tue brutalement le daemon (`Stop-Process -Force`), verifie que `curl.exe` repond `200` (fail-open) et que la regle de pare-feu orpheline est toujours presente.
 - **`(h)`** : S'assure que le daemon est arrete et que la regle de pare-feu orpheline est presente, redemarre `routeward.exe daemon`, et verifie que la regle orpheline est supprimee automatiquement au demarrage et mentionnee dans le journal du daemon.

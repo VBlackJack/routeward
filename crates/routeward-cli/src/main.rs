@@ -17,7 +17,10 @@
 use clap::{Parser, Subcommand};
 use routeward_core::config::security::load_or_init_secure_daemon_profile;
 use routeward_core::config::{ProfileConfig, RoutingRule, SystemConstants, TransportProtocol};
-use routeward_core::error::{RouteWardError, ERR_KEY_DAEMON_NOT_ELEVATED};
+use routeward_core::error::{
+    RouteWardError, RouteWardResult, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_LOAD,
+    ERR_KEY_DAEMON_NOT_ELEVATED,
+};
 use routeward_core::i18n::I18nRegistry;
 use routeward_core::interceptor::RouteWardController;
 use routeward_core::ipc::protocol::IpcCommand;
@@ -105,10 +108,23 @@ enum CtlCommands {
     Connections,
     /// List recent log entries from the daemon
     Logs,
-    /// Insert or update a routing rule (JSON string) on the daemon
+    /// Insert or update a routing rule (via inline JSON string or UTF-8 JSON file) on the daemon
     UpsertRule {
-        #[arg(long)]
-        json: String,
+        /// Inline JSON string describing the routing rule
+        #[arg(
+            long,
+            required_unless_present = "json_file",
+            conflicts_with = "json_file"
+        )]
+        json: Option<String>,
+        /// Path to a UTF-8 JSON file describing the routing rule (recommended on Windows PowerShell 5.1)
+        #[arg(
+            long = "json-file",
+            value_name = "PATH",
+            required_unless_present = "json",
+            conflicts_with = "json"
+        )]
+        json_file: Option<PathBuf>,
     },
     /// Remove a routing rule by its identifier on the daemon
     RemoveRule {
@@ -122,9 +138,40 @@ enum CtlCommands {
     },
 }
 
-fn ctl_action_into_ipc(
-    action: CtlCommands,
-) -> Result<(&'static str, IpcCommand), serde_json::Error> {
+fn parse_routing_rule_payload(
+    json: Option<String>,
+    json_file: Option<PathBuf>,
+) -> RouteWardResult<RoutingRule> {
+    if let Some(path) = json_file {
+        let raw_content =
+            std::fs::read_to_string(&path).map_err(|err| RouteWardError::ConfigError {
+                key: ERR_KEY_CONFIG_LOAD,
+                detail: format!("Cannot read rule JSON file '{}': {err}", path.display()),
+            })?;
+        let without_bom = raw_content.strip_prefix('\u{feff}').unwrap_or(&raw_content);
+        serde_json::from_str::<RoutingRule>(without_bom).map_err(|err| {
+            RouteWardError::ConfigError {
+                key: ERR_KEY_CONFIG_JSON,
+                detail: format!("Invalid rule JSON in file '{}': {err}", path.display()),
+            }
+        })
+    } else if let Some(raw_inline) = json {
+        let without_bom = raw_inline.strip_prefix('\u{feff}').unwrap_or(&raw_inline);
+        serde_json::from_str::<RoutingRule>(without_bom).map_err(|err| {
+            RouteWardError::ConfigError {
+                key: ERR_KEY_CONFIG_JSON,
+                detail: format!("Invalid inline rule JSON: {err}"),
+            }
+        })
+    } else {
+        Err(RouteWardError::ConfigError {
+            key: ERR_KEY_CONFIG_JSON,
+            detail: "Either --json or --json-file must be provided".to_string(),
+        })
+    }
+}
+
+fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, IpcCommand)> {
     match action {
         CtlCommands::Status => Ok(("status", IpcCommand::GetDiagnostics)),
         CtlCommands::State => Ok(("state", IpcCommand::GetState)),
@@ -132,8 +179,8 @@ fn ctl_action_into_ipc(
         CtlCommands::Stop => Ok(("stop", IpcCommand::ToggleEngine { start: false })),
         CtlCommands::Connections => Ok(("connections", IpcCommand::ListConnections)),
         CtlCommands::Logs => Ok(("logs", IpcCommand::ListLogs)),
-        CtlCommands::UpsertRule { json } => {
-            let rule: RoutingRule = serde_json::from_str(&json)?;
+        CtlCommands::UpsertRule { json, json_file } => {
+            let rule = parse_routing_rule_payload(json, json_file)?;
             Ok(("upsert-rule", IpcCommand::UpsertRule { rule }))
         }
         CtlCommands::RemoveRule { id } => {
@@ -157,7 +204,7 @@ async fn execute_ctl_action(
             user_logger.log(
                 LogLevel::Info,
                 COMPONENT_CLI_CTL,
-                &format!("Executed ctl command 'upsert-rule': outcome=invalid_json ({err})"),
+                &format!("Executed ctl command 'upsert-rule': outcome=invalid_input ({err})"),
             );
             return Err(err.into());
         }
@@ -515,7 +562,8 @@ mod tests {
             &client,
             &user_logger,
             CtlCommands::UpsertRule {
-                json: temp_rule_json,
+                json: Some(temp_rule_json),
+                json_file: None,
             },
         )
         .await
@@ -573,6 +621,138 @@ mod tests {
         assert!(log_text.contains("[INFO] [CliCtl] Executed ctl command 'state': outcome=success"));
 
         daemon_task.abort();
+        let _ = std::fs::remove_file(&temp_prof_path);
+        let _ = std::fs::remove_dir_all(&temp_user_log_dir);
+    }
+
+    #[tokio::test]
+    async fn ctl_upsert_rule_json_file_handles_valid_bom_missing_and_invalid_json() {
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let unique_id = routeward_core::ipc::generate_ephemeral_token();
+        constants.ipc.windows_pipe_name = format!(r"\\.\pipe\routeward-ctl-file-test-{unique_id}");
+        let temp_sock = std::env::temp_dir().join(format!("routeward-ctl-file-{unique_id}.sock"));
+        constants.ipc.unix_socket_path = temp_sock.to_string_lossy().into_owned();
+
+        let temp_prof_path =
+            std::env::temp_dir().join(format!("routeward_ctl_file_prof_{unique_id}.json"));
+        constants.ipc.windows_profile_path = temp_prof_path.to_string_lossy().into_owned();
+        constants.ipc.linux_profile_path = temp_prof_path.to_string_lossy().into_owned();
+
+        let temp_user_log_dir =
+            std::env::temp_dir().join(format!("routeward_ctl_file_logs_{unique_id}"));
+        let _ = std::fs::remove_dir_all(&temp_user_log_dir);
+
+        let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        profile.enable_logging = false;
+
+        let daemon_ctrl = RouteWardController::new(constants.clone(), profile, "en");
+        let service =
+            DaemonIpcService::bind_for_test(daemon_ctrl.clone()).expect("bind test daemon");
+        let daemon_task = tokio::spawn(async move {
+            let _ = service.run_accept_loop().await;
+        });
+
+        let client = IpcClient::new(constants.ipc.clone());
+        let user_logger =
+            FileLogger::new(&temp_user_log_dir, &constants.telemetry.log_app_name, true);
+
+        let valid_json_body = r#"{
+            "id": "rule-from-json-file",
+            "name": "Rule From JSON File",
+            "enabled": true,
+            "priority": 2,
+            "processPatterns": ["curl.exe"],
+            "domainPatterns": [],
+            "ipCidrs": [],
+            "portRanges": [],
+            "protocol": "tcp",
+            "action": { "type": "block" }
+        }"#;
+
+        // 1. Valid UTF-8 file without BOM
+        let valid_file_path =
+            std::env::temp_dir().join(format!("routeward_valid_rule_{unique_id}.json"));
+        std::fs::write(&valid_file_path, valid_json_body.as_bytes()).expect("write valid json");
+
+        let resp_valid = execute_ctl_action(
+            &client,
+            &user_logger,
+            CtlCommands::UpsertRule {
+                json: None,
+                json_file: Some(valid_file_path.clone()),
+            },
+        )
+        .await
+        .expect("upsert-rule via valid --json-file");
+        assert!(resp_valid.ok);
+
+        // 2. Valid UTF-8 file WITH UTF-8 BOM (\u{feff} / 0xEF,0xBB,0xBF)
+        let bom_file_path =
+            std::env::temp_dir().join(format!("routeward_bom_rule_{unique_id}.json"));
+        let mut bom_bytes = vec![0xEF, 0xBB, 0xBF];
+        bom_bytes.extend_from_slice(
+            valid_json_body
+                .replace("Rule From JSON File", "Rule From BOM File")
+                .as_bytes(),
+        );
+        std::fs::write(&bom_file_path, &bom_bytes).expect("write BOM json");
+
+        let resp_bom = execute_ctl_action(
+            &client,
+            &user_logger,
+            CtlCommands::UpsertRule {
+                json: None,
+                json_file: Some(bom_file_path.clone()),
+            },
+        )
+        .await
+        .expect("upsert-rule via UTF-8 BOM --json-file");
+        assert!(resp_bom.ok);
+
+        let state_resp = execute_ctl_action(&client, &user_logger, CtlCommands::State)
+            .await
+            .expect("query state");
+        let parsed_state: DaemonFullState =
+            serde_json::from_value(state_resp.result.expect("state result")).expect("decode state");
+        let stored_rule = parsed_state
+            .profile
+            .rules
+            .iter()
+            .find(|r| r.id == "rule-from-json-file")
+            .expect("rule present");
+        assert_eq!(stored_rule.name, "Rule From BOM File");
+
+        // 3. Missing file -> clear error with ERR_KEY_CONFIG_LOAD
+        let missing_path =
+            std::env::temp_dir().join(format!("routeward_nonexistent_{unique_id}.json"));
+        let missing_err = parse_routing_rule_payload(None, Some(missing_path.clone()))
+            .expect_err("missing --json-file must fail");
+        match missing_err {
+            RouteWardError::ConfigError { key, detail } => {
+                assert_eq!(key, ERR_KEY_CONFIG_LOAD);
+                assert!(detail.contains("Cannot read rule JSON file"));
+            }
+            other => panic!("Expected ConfigError(ERR_KEY_CONFIG_LOAD), got {other:?}"),
+        }
+
+        // 4. Invalid JSON file -> clear error with ERR_KEY_CONFIG_JSON
+        let invalid_file_path =
+            std::env::temp_dir().join(format!("routeward_invalid_rule_{unique_id}.json"));
+        std::fs::write(&invalid_file_path, b"{protocol:tcp}").expect("write invalid json");
+        let invalid_err = parse_routing_rule_payload(None, Some(invalid_file_path.clone()))
+            .expect_err("invalid --json-file must fail");
+        match invalid_err {
+            RouteWardError::ConfigError { key, detail } => {
+                assert_eq!(key, ERR_KEY_CONFIG_JSON);
+                assert!(detail.contains("Invalid rule JSON in file"));
+            }
+            other => panic!("Expected ConfigError(ERR_KEY_CONFIG_JSON), got {other:?}"),
+        }
+
+        daemon_task.abort();
+        let _ = std::fs::remove_file(&valid_file_path);
+        let _ = std::fs::remove_file(&bom_file_path);
+        let _ = std::fs::remove_file(&invalid_file_path);
         let _ = std::fs::remove_file(&temp_prof_path);
         let _ = std::fs::remove_dir_all(&temp_user_log_dir);
     }

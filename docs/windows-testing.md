@@ -25,7 +25,7 @@ From an elevated Administrator PowerShell or Command Prompt session inside the f
 # Or via the batch launcher:
 .\Run-RouteWardTests.bat -ConfirmTestMachine
 
-# Dry-run mode (validates path resolution and IPC JSON response parsing against recorded fixtures without starting the daemon or WinDivert):
+# Dry-run mode (validates path resolution, IPC JSON response parsing, curl stdout-only HTTP code capture, and --json-file temp UTF-8 file creation/cleanup without starting the daemon or WinDivert):
 .\Invoke-RouteWardTests.ps1 -DryRun
 ```
 
@@ -39,7 +39,7 @@ Each scenario establishes its own starting state independently:
 - **`(b)`**: Verifies protected DACLs (`D:P`) restricted to `SYSTEM` and `Administrators` on `%ProgramData%\RouteWard` and `active_profile.json`, and checks the Named Pipe SDDL via `[System.IO.Directory]::GetAccessControl` to ensure `WD`, `BU`, and `AU` are absent.
 - **`(c)`**: Verifies `routeward.exe ctl status` (`result.daemonConnected=true`, `result.elevatedPrivileges=true`, `result.running=false`).
 - **`(d)`**: Runs `routeward.exe ctl start`, executes `curl.exe`, and verifies HTTP `200` and a tracked `curl.exe` connection in `result` with `matchedRule="CLI Tools via SOCKS5 Proxy"` and `rxBytes > 0`.
-- **`(e)`**: Adds a temporary priority-1 `Block` rule for `curl.exe` via `routeward.exe ctl upsert-rule`, verifies `curl.exe` fails and is recorded as `blocked` in `ctl connections`, removes the rule via `routeward.exe ctl remove-rule --id <ID>`, and verifies via `ctl state` that the profile rules returned to their exact initial state.
+- **`(e)`**: Writes a temporary priority-1 `Block` rule for `curl.exe` as UTF-8 without BOM under `%TEMP%`, applies it via `routeward.exe ctl upsert-rule --json-file <path>` (avoiding Windows PowerShell 5.1 native command-line double-quote stripping), verifies `curl.exe` fails and is recorded as `blocked` in `ctl connections`, removes the rule via `routeward.exe ctl remove-rule --id <ID>`, deletes the temporary file in `finally`, and verifies via `ctl state` that the profile rules returned to their exact initial state.
 - **`(f)`**: Runs `routeward.exe ctl stop`, verifies removal of the `RouteWard_TransparentRelay_10810` firewall rule, and checks direct `curl.exe` HTTP `200`.
 - **`(g)`**: Starts interception, force-kills the daemon (`Stop-Process -Force`), verifies fail-open `curl.exe` HTTP `200`, and confirms the orphaned firewall rule remains present.
 - **`(h)`**: Ensures the orphaned firewall rule is present with the daemon stopped, restarts `routeward.exe daemon`, and verifies automatic removal of the orphaned firewall rule at startup along with its daemon log entry.
