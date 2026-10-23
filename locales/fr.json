@@ -613,7 +613,8 @@
       "group_missing": "Le groupe Unix configuré pour le socket du démon n'existe pas sur le système",
       "not_elevated": "Les privilèges Administrateur ou root sont requis pour lancer routeward daemon",
       "ipc_error": "Erreur de communication IPC avec le démon",
-      "disconnected": "Le démon privilégié RouteWard n'est pas connecté"
+      "disconnected": "Le démon privilégié RouteWard n'est pas connecté",
+      "insecure_profile": "Refus de démarrer : le dossier ou le fichier de profil a un propriétaire ou des droits d'écriture non sécurisés"
     }
   },
   "themeforge": {

@@ -69,3 +69,5 @@ sudo ./target/release/routeward daemon
 
 ### Fonctionnement sous Windows (Named Pipe)
 Sous Windows, lancez `routeward.exe daemon` dans une console PowerShell en Administrateur. Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lance le daemon. Vous pouvez ensuite executer `routeward.exe ctl status` ou `routeward-desktop.exe` depuis une session non privilegiee du meme utilisateur.
+
+> **Important (Elevation du compte Windows UAC) :** Le daemon doit etre lance par l'utilisateur de l'interface (par elevation UAC de son propre compte). Si l'elevation se fait avec un autre compte administrateur (par exemple via « Executer en tant qu'autre utilisateur » ou un compte admin distinct), la DACL du Named Pipe autorisera le SID de cet autre compte, et l'interface ou la CLI de l'utilisateur courant ne pourra pas se connecter au pipe `\\.\pipe\routeward-daemon`.

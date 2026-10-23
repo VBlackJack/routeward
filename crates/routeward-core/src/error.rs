@@ -36,6 +36,7 @@ pub const ERR_KEY_DAEMON_GROUP_MISSING: &str = "errors.daemon.group_missing";
 pub const ERR_KEY_DAEMON_NOT_ELEVATED: &str = "errors.daemon.not_elevated";
 pub const ERR_KEY_DAEMON_IPC_ERROR: &str = "errors.daemon.ipc_error";
 pub const ERR_KEY_DAEMON_DISCONNECTED: &str = "errors.daemon.disconnected";
+pub const ERR_KEY_DAEMON_INSECURE_PROFILE: &str = "errors.daemon.insecure_profile";
 
 #[derive(Debug, Error)]
 pub enum RouteWardError {

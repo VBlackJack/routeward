@@ -567,7 +567,7 @@ impl RouteWardController {
 
     /// Atomically saves the active profile to the daemon's fixed system profile path.
     pub fn save_profile_default(&self) -> RouteWardResult<()> {
-        let profile_path = self.constants.ipc.resolve_daemon_profile_path();
+        let profile_path = self.constants.ipc.resolve_daemon_profile_path()?;
         self.save_profile_to_path(&profile_path)
     }
 
@@ -1133,12 +1133,33 @@ impl RouteWardController {
         }
     }
 
-    fn detect_elevated_privileges() -> bool {
+    pub fn detect_elevated_privileges() -> bool {
         #[cfg(windows)]
         {
-            std::env::var("USERNAME")
-                .map(|u| u.eq_ignore_ascii_case("Administrator"))
-                .unwrap_or(false)
+            use std::ptr::null_mut;
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+            use windows_sys::Win32::Security::{
+                GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+            };
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+            unsafe {
+                let mut token: HANDLE = null_mut();
+                if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                    return false;
+                }
+                let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+                let mut ret_len: u32 = 0;
+                let ok = GetTokenInformation(
+                    token,
+                    TokenElevation,
+                    &mut elevation as *mut _ as *mut _,
+                    std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                    &mut ret_len,
+                );
+                let _ = CloseHandle(token);
+                ok != 0 && elevation.TokenIsElevated != 0
+            }
         }
         #[cfg(target_os = "linux")]
         {
@@ -1203,6 +1224,8 @@ mod tests {
             .save_profile_to_path(&temp_path)
             .expect("controller atomic profile save");
         assert!(temp_path.exists());
+        #[cfg(windows)]
+        let _ = crate::config::security::apply_windows_sddl_dacl(&temp_path, "D:(A;;FA;;;WD)");
         let _ = std::fs::remove_file(&temp_path);
     }
 }

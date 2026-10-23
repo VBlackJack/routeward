@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+pub mod security;
+
 use crate::error::{
     RouteWardError, RouteWardResult, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_LOAD, ERR_KEY_CONFIG_SAVE,
 };
@@ -95,19 +97,19 @@ pub struct IpcConstants {
 }
 
 impl IpcConstants {
-    pub fn resolve_daemon_profile_path(&self) -> std::path::PathBuf {
+    pub fn resolve_daemon_profile_path(&self) -> RouteWardResult<std::path::PathBuf> {
         #[cfg(windows)]
         {
-            let program_data =
-                std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
+            let program_data = security::resolve_windows_program_data_dir()?;
+            let program_data_str = program_data.to_string_lossy();
             let expanded = self
                 .windows_profile_path
-                .replace("%ProgramData%", &program_data);
-            std::path::PathBuf::from(expanded)
+                .replace("%ProgramData%", &program_data_str);
+            Ok(std::path::PathBuf::from(expanded))
         }
         #[cfg(not(windows))]
         {
-            std::path::PathBuf::from(&self.linux_profile_path)
+            Ok(std::path::PathBuf::from(&self.linux_profile_path))
         }
     }
 }
@@ -474,13 +476,24 @@ impl ProfileConfig {
             });
         }
 
+        if let Err(err) = security::apply_secure_profile_file_permissions(&tmp_path, false) {
+            #[cfg(windows)]
+            let _ = security::apply_windows_sddl_dacl(&tmp_path, "D:(A;;FA;;;WD)");
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+
         if let Err(err) = fs::rename(&tmp_path, target_path) {
+            #[cfg(windows)]
+            let _ = security::apply_windows_sddl_dacl(&tmp_path, "D:(A;;FA;;;WD)");
             let _ = fs::remove_file(&tmp_path);
             return Err(RouteWardError::ConfigError {
                 key: ERR_KEY_CONFIG_SAVE,
                 detail: err.to_string(),
             });
         }
+
+        security::apply_secure_profile_file_permissions(target_path, false)?;
 
         Ok(())
     }
@@ -513,14 +526,24 @@ mod tests {
         profile
             .save_to_path(&profile_path)
             .expect("atomic save #1 succeeded");
+        #[cfg(windows)]
+        security::verify_windows_dacl_security(&profile_path)
+            .expect("saved profile retains protected DACL after rename");
         let loaded = ProfileConfig::load_from_path(&profile_path).expect("reload #1 succeeded");
         assert_eq!(loaded.name, "Atomic Persistence Test Profile");
+
+        // In non-elevated test runs on Windows, grant write back on the temp file before overwrite
+        #[cfg(windows)]
+        let _ = security::apply_windows_sddl_dacl(&profile_path, "D:(A;;FA;;;WD)");
 
         // Second overwrite verifies atomic replacement over an existing file
         profile.name = "Atomic Overwrite Profile v2".to_string();
         profile
             .save_to_path(&profile_path)
             .expect("atomic save #2 succeeded");
+        #[cfg(windows)]
+        security::verify_windows_dacl_security(&profile_path)
+            .expect("overwritten profile retains protected DACL after rename");
         let loaded_v2 = ProfileConfig::load_from_path(&profile_path).expect("reload #2 succeeded");
         assert_eq!(loaded_v2.name, "Atomic Overwrite Profile v2");
 
@@ -531,6 +554,140 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
 
+        #[cfg(windows)]
+        let _ = security::apply_windows_sddl_dacl(&profile_path, "D:(A;;FA;;;WD)");
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_profile_dir_created_with_expected_dacl_and_rejects_unprivileged_owner_or_users_write(
+    ) {
+        use crate::error::ERR_KEY_DAEMON_INSECURE_PROFILE;
+
+        // 1. Verify ProgramData is resolved via SHGetKnownFolderPath(FOLDERID_ProgramData)
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let resolved_path = constants
+            .ipc
+            .resolve_daemon_profile_path()
+            .expect("SHGetKnownFolderPath resolution");
+        assert!(resolved_path.is_absolute());
+        assert!(resolved_path
+            .to_string_lossy()
+            .ends_with(r"RouteWard\active_profile.json"));
+
+        // 2. Create a temporary directory with the protected DACL (never touching C:\ProgramData\RouteWard)
+        let temp_root = std::env::temp_dir().join(format!("routeward_acl_test_{}", Uuid::new_v4()));
+        let secure_dir = temp_root.join("RouteWardSecure");
+        security::create_secure_profile_dir(&secure_dir, false)
+            .expect("create_secure_profile_dir in temp");
+
+        // Verify the created directory has a protected DACL granting write only to SYSTEM and Administrators
+        security::verify_windows_dacl_security(&secure_dir)
+            .expect("Protected DACL on created directory should be valid");
+
+        // 3. A pre-existing directory owned by a standard user must be rejected by owner check
+        let standard_user_dir = temp_root.join("PreExistingUserOwned");
+        fs::create_dir_all(&standard_user_dir).expect("create standard_user_dir");
+        // Apply valid protected DACL so only ownership differs when running as a standard user
+        security::apply_windows_sddl_dacl(&standard_user_dir, security::WINDOWS_PROTECTED_DIR_SDDL)
+            .expect("apply protected DACL");
+        if !crate::interceptor::RouteWardController::detect_elevated_privileges() {
+            let owner_check = security::verify_profile_path_security(&standard_user_dir);
+            match owner_check {
+                Err(RouteWardError::DaemonError { key, .. }) => {
+                    assert_eq!(key, ERR_KEY_DAEMON_INSECURE_PROFILE);
+                }
+                other => panic!(
+                    "Expected ERR_KEY_DAEMON_INSECURE_PROFILE for standard-user-owned dir, got {other:?}"
+                ),
+            }
+        }
+
+        // 4. A directory with a DACL granting write access to Users (BU) must be rejected
+        let writable_users_dir = temp_root.join("UsersWritableDir");
+        fs::create_dir_all(&writable_users_dir).expect("create writable_users_dir");
+        security::apply_windows_sddl_dacl(
+            &writable_users_dir,
+            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BU)",
+        )
+        .expect("apply insecure DACL with Users full access");
+
+        let dacl_check = security::verify_windows_dacl_security(&writable_users_dir);
+        match dacl_check {
+            Err(RouteWardError::DaemonError { key, .. }) => {
+                assert_eq!(key, ERR_KEY_DAEMON_INSECURE_PROFILE);
+            }
+            other => panic!(
+                "Expected ERR_KEY_DAEMON_INSECURE_PROFILE for Users-writable DACL, got {other:?}"
+            ),
+        }
+
+        // 5. A directory with an unprotected (inheriting) DACL must be rejected
+        let unprotected_dir = temp_root.join("UnprotectedInheritingDir");
+        fs::create_dir_all(&unprotected_dir).expect("create unprotected_dir");
+        let inherit_check = security::verify_windows_dacl_security(&unprotected_dir);
+        assert!(inherit_check.is_err());
+
+        // Cleanup temporary directories by restoring full access to current user before removal
+        let _ = security::apply_windows_sddl_dacl(&secure_dir, "D:(A;OICI;FA;;;WD)");
+        let _ = security::apply_windows_sddl_dacl(&standard_user_dir, "D:(A;OICI;FA;;;WD)");
+        let _ = security::apply_windows_sddl_dacl(&writable_users_dir, "D:(A;OICI;FA;;;WD)");
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_profile_dir_and_file_reject_group_or_other_writable_permissions() {
+        use crate::error::ERR_KEY_DAEMON_INSECURE_PROFILE;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_root =
+            std::env::temp_dir().join(format!("routeward_unix_acl_test_{}", Uuid::new_v4()));
+        let etc_dir = temp_root.join("routeward");
+        let profile_path = etc_dir.join("active_profile.json");
+
+        let is_root = unsafe { libc::geteuid() == 0 };
+        security::create_secure_profile_dir(&etc_dir, is_root).expect("create_secure_profile_dir");
+        let prof = ProfileConfig::load_embedded_default().expect("Default profile");
+        prof.save_to_path(&profile_path).expect("save_to_path");
+
+        if is_root {
+            security::verify_profile_path_security(&etc_dir)
+                .expect("0750 root-owned dir should pass");
+            security::verify_profile_path_security(&profile_path)
+                .expect("0640 root-owned profile should pass");
+        }
+
+        // Group-writable directory (0770) must be rejected
+        fs::set_permissions(&etc_dir, fs::Permissions::from_mode(0o770)).expect("chmod 0770");
+        match security::verify_profile_path_security(&etc_dir) {
+            Err(RouteWardError::DaemonError { key, .. }) => {
+                assert_eq!(key, ERR_KEY_DAEMON_INSECURE_PROFILE);
+            }
+            other => panic!("Expected ERR_KEY_DAEMON_INSECURE_PROFILE for 0770 dir, got {other:?}"),
+        }
+
+        // World-writable directory (0752) must be rejected
+        fs::set_permissions(&etc_dir, fs::Permissions::from_mode(0o752)).expect("chmod 0752");
+        assert!(security::verify_profile_path_security(&etc_dir).is_err());
+
+        // Restore directory to 0750 and test group-writable profile file (0660)
+        fs::set_permissions(&etc_dir, fs::Permissions::from_mode(0o750)).expect("chmod 0750");
+        fs::set_permissions(&profile_path, fs::Permissions::from_mode(0o660)).expect("chmod 0660");
+        match security::verify_profile_path_security(&profile_path) {
+            Err(RouteWardError::DaemonError { key, .. }) => {
+                assert_eq!(key, ERR_KEY_DAEMON_INSECURE_PROFILE);
+            }
+            other => {
+                panic!("Expected ERR_KEY_DAEMON_INSECURE_PROFILE for 0660 file, got {other:?}")
+            }
+        }
+
+        // World-writable profile file (0642) must be rejected
+        fs::set_permissions(&profile_path, fs::Permissions::from_mode(0o642)).expect("chmod 0642");
+        assert!(security::verify_profile_path_security(&profile_path).is_err());
+
+        let _ = fs::remove_dir_all(&temp_root);
     }
 }

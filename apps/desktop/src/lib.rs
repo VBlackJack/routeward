@@ -48,6 +48,20 @@ pub fn create_desktop_bridge() -> Result<DesktopCommandBridge, String> {
     Ok(bridge)
 }
 
+/// Constant-time byte comparison to prevent timing side-channels when verifying the desktop loopback token.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut diff = a_bytes.len() ^ b_bytes.len();
+    let max_len = a_bytes.len().max(b_bytes.len());
+    for i in 0..max_len {
+        let byte_a = a_bytes.get(i).copied().unwrap_or(0);
+        let byte_b = b_bytes.get(i).copied().unwrap_or(0);
+        diff |= (byte_a ^ byte_b) as usize;
+    }
+    diff == 0
+}
+
 /// Strictly validates the `Host`, `Origin`, and ephemeral token headers on incoming loopback HTTP requests.
 /// Returns the request path if valid.
 pub fn validate_loopback_http_request(
@@ -104,8 +118,9 @@ pub fn validate_loopback_http_request(
         if origin_header.as_deref() != Some(expected_origin.as_str()) {
             return Err(HttpSecurityRejection::InvalidOrigin);
         }
-        if token_header.as_deref() != Some(expected_token) {
-            return Err(HttpSecurityRejection::InvalidToken);
+        match token_header {
+            Some(ref provided) if constant_time_eq(provided, expected_token) => {}
+            _ => return Err(HttpSecurityRejection::InvalidToken),
         }
     } else if let Some(ref origin) = origin_header {
         if origin != &expected_origin {
@@ -167,5 +182,22 @@ mod tests {
             validate_loopback_http_request(&bad_token_req, port, token),
             Err(HttpSecurityRejection::InvalidToken)
         );
+    }
+
+    #[test]
+    fn constant_time_token_comparison_is_exact() {
+        let token = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(constant_time_eq(token, token));
+        assert!(!constant_time_eq(
+            token,
+            "550e8400-e29b-41d4-a716-446655440001"
+        ));
+        assert!(!constant_time_eq(
+            token,
+            "450e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(!constant_time_eq(token, "550e8400-e29b-41d4-a716"));
+        assert!(!constant_time_eq(token, ""));
+        assert!(constant_time_eq("", ""));
     }
 }

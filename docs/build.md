@@ -69,3 +69,5 @@ sudo ./target/release/routeward daemon
 
 ### Windows Setup (Named Pipe)
 On Windows, launch `routeward.exe daemon` from an elevated Administrator PowerShell session. The daemon binds `\\.\pipe\routeward-daemon` with an explicit DACL restricting access to `SYSTEM`, `Administrators`, and the launching user's SID. You can then run `routeward.exe ctl status` or `routeward-desktop.exe` from an unprivileged session under the same user account.
+
+> **Important (Windows UAC Account Elevation):** The daemon must be launched by the same user account that runs the desktop UI or `routeward ctl` (by elevating your own account via UAC). If you elevate using a different Administrator account (for example via "Run as different user" or a separate local admin credential), the Named Pipe DACL will grant read/write access to that other account's SID, and your standard user session will not be allowed to connect to `\\.\pipe\routeward-daemon`.

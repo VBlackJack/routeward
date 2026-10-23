@@ -15,8 +15,10 @@
  */
 
 use clap::{Parser, Subcommand};
+use routeward_core::config::security::load_or_init_secure_daemon_profile;
 use routeward_core::config::{ProfileConfig, RoutingRule, SystemConstants, TransportProtocol};
 use routeward_core::error::{RouteWardError, ERR_KEY_DAEMON_NOT_ELEVATED};
+use routeward_core::i18n::I18nRegistry;
 use routeward_core::interceptor::RouteWardController;
 use routeward_core::ipc::protocol::IpcCommand;
 use routeward_core::ipc::{DaemonIpcService, IpcClient};
@@ -160,18 +162,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Commands::Daemon { duration_secs } = args.command {
-        let fixed_profile_path = constants.ipc.resolve_daemon_profile_path();
-        let profile = if fixed_profile_path.exists() {
-            ProfileConfig::load_from_path(&fixed_profile_path)?
-        } else {
-            let default_prof = ProfileConfig::load_embedded_default()?;
-            let _ = default_prof.save_to_path(&fixed_profile_path);
-            default_prof
-        };
-
-        let controller = RouteWardController::new(constants, profile, &args.locale);
-        if !controller.diagnostics().elevated_privileges {
-            let msg = controller.i18n.t(ERR_KEY_DAEMON_NOT_ELEVATED);
+        let i18n = I18nRegistry::new(&args.locale);
+        if !RouteWardController::detect_elevated_privileges() {
+            let msg = i18n.t(ERR_KEY_DAEMON_NOT_ELEVATED);
             eprintln!("{msg}");
             return Err(RouteWardError::DaemonError {
                 key: ERR_KEY_DAEMON_NOT_ELEVATED,
@@ -179,6 +172,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             .into());
         }
+
+        let fixed_profile_path = constants.ipc.resolve_daemon_profile_path()?;
+        let profile = match load_or_init_secure_daemon_profile(&fixed_profile_path) {
+            Ok(prof) => prof,
+            Err(err) => {
+                let localized = i18n.t(err.i18n_key());
+                eprintln!("{localized}: {err}");
+                return Err(err.into());
+            }
+        };
+
+        let controller = RouteWardController::new(constants, profile, &args.locale);
 
         let service = match DaemonIpcService::bind(controller.clone()) {
             Ok(svc) => svc,
