@@ -66,6 +66,8 @@ const SIMULATED_DEFAULT_LATENCY_MS: u64 = 18;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemDiagnostics {
+    #[serde(default = "default_daemon_connected")]
+    pub daemon_connected: bool,
     pub running: bool,
     pub os_name: String,
     pub interception_mode: InterceptionMode,
@@ -75,6 +77,10 @@ pub struct SystemDiagnostics {
     pub dns_endpoint: String,
     pub fake_ip_cidr: String,
     pub active_locale: String,
+}
+
+fn default_daemon_connected() -> bool {
+    true
 }
 
 #[derive(Clone)]
@@ -250,7 +256,7 @@ impl RouteWardController {
         self.interceptor_backend.stop();
         self.running.store(false, Ordering::SeqCst);
         self.telemetry.push_log(
-            LogLevel::Warn,
+            LogLevel::Info,
             COMPONENT_ENGINE,
             self.i18n.t("app.header.engine.stopped"),
         );
@@ -291,6 +297,7 @@ impl RouteWardController {
         let prof = self.profile.read();
         let net = &self.constants.network;
         SystemDiagnostics {
+            daemon_connected: true,
             running: self.is_running(),
             os_name: std::env::consts::OS.to_uppercase(),
             interception_mode: prof.interception_mode,
@@ -558,9 +565,10 @@ impl RouteWardController {
         Ok(())
     }
 
-    /// Atomically saves the active profile to the configured `defaultProfilePath`.
+    /// Atomically saves the active profile to the daemon's fixed system profile path.
     pub fn save_profile_default(&self) -> RouteWardResult<()> {
-        self.save_profile_to_path(&self.constants.telemetry.default_profile_path)
+        let profile_path = self.constants.ipc.resolve_daemon_profile_path();
+        self.save_profile_to_path(&profile_path)
     }
 
     /// Actively terminates an in-flight relayed connection by its identifier.

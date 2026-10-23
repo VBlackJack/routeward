@@ -28,7 +28,7 @@ const DEFAULT_FALLBACK_RULE_NAME: &str = "Default Profile Policy";
 const REGEX_PREFIX: &str = "regex:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConnectionRequest {
     pub process_name: String,
     pub process_path: Option<String>,

@@ -20,6 +20,7 @@ pub mod dns;
 pub mod error;
 pub mod i18n;
 pub mod interceptor;
+pub mod ipc;
 pub mod logger;
 pub mod process;
 pub mod proxy;

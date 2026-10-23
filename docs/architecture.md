@@ -28,7 +28,19 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
 - **Active Connection Termination (`terminate_connection`)**: Each active relayed connection registers a `tokio::sync::watch` cancellation channel in `TelemetryHub`; calling `RouteWardController::terminate_connection(id)` immediately aborts the in-flight `copy_bidirectional` select loop, shuts down both client and upstream sockets, and marks the connection `Closed`.
 - **Real-Time Event Broadcast (`tokio::sync::broadcast`)**: `TelemetryHub::subscribe()` exposes a typed broadcast stream of `TelemetryEvent` (`Telemetry`, `ConnectionUpdated`, `ConnectionsCleared`, `Log`, `LogsCleared`) with configurable capacity (`telemetry.eventBroadcastCapacity`).
 - **Atomic Profile Persistence (`ProfileConfig::save_to_path`)**: Writes serialized JSON to a temporary sibling file, flushes via `sync_all()`, and atomically renames over the target path.
-- **Not Implemented Yet**: Privileged IPC daemon and desktop bridge (Batch 3.2), frontend `ui/` IPC wiring (Batch 3.3), IPv6 and UDP interception, and transparent DNS capture.
+
+### Milestone 3 - Batch 3.2 Status (Privileged Daemon, Restricted OS IPC Channel, and Hardened Desktop Bridge)
+- **Privilege Separation (`routeward daemon`)**: The privileged packet interception engine runs as a single-instance daemon (`routeward daemon`, launched manually as Administrator on Windows or `root` on Linux), decoupled from the unprivileged desktop UI (`apps/desktop`) and CLI controller (`routeward ctl`).
+- **Restricted Local Control Channel (`routeward-core::ipc::transport`)**:
+  - **Linux**: Unix domain socket (`/run/routeward/routeward.sock` by default from `configs/system_constants.json`), owned by `root:<unixSocketGroup>` (`routeward`), parent directory mode `0750`, socket mode `0660`. Verifies connecting clients via `SO_PEERCRED` and logs `pid`, `uid`, and `gid`. Fails fast at startup with a clear error if the configured group does not exist or if another daemon instance is already listening.
+  - **Windows**: Named Pipe (`\\.\pipe\routeward-daemon`), created with `first_pipe_instance(true)` on the initial instance to prevent pipe squatting, `reject_remote_clients(true)`, and an explicit SDDL security descriptor (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{user_sid})`) granting access exclusively to `SYSTEM`, `Administrators`, and the user SID that launched the daemon.
+- **Bounded Line-Delimited JSON Protocol (`routeward-core::ipc::protocol`)**:
+  - Uses strict deserialization (`#[serde(deny_unknown_fields)]`) on all requests and command payloads; malformed JSON, unknown fields, or unknown commands return a structured `IpcResponse` error and never panic.
+  - Enforces a configurable line length cap (`ipc.maxLineBytes`, default `65536`) and idle timeout (`ipc.idleTimeoutMs`, default `30000` ms) prior to allocation.
+  - Converts `broadcast::error::RecvError::Lagged(skipped)` on subscribed event streams into an `IpcStreamEvent::Resync` notification and logs a `WARN` event so clients reload full state.
+- **Fixed System Profile Path**: The daemon reads and atomically saves the active profile at a fixed OS-specific system path (`/etc/routeward/active_profile.json` on Linux, `%ProgramData%\RouteWard\active_profile.json` on Windows). No IPC command accepts a client-supplied file path.
+- **Hardened Desktop Loopback Bridge (`apps/desktop`)**: Connects to the daemon via `IpcClient` (reporting `daemonConnected: false, running: false` and auto-reconnecting in the background if the daemon stops), injects an ephemeral startup token into the WebView (`window.__ROUTEWARD_TOKEN__`), and enforces token verification plus strict `Host` (`127.0.0.1:<port>`) and `Origin` (`http://127.0.0.1:<port>`) header validation on `/api/*`.
+- **Not Implemented Yet**: Frontend `ui/` IPC wiring (Batch 3.3), IPv6 and UDP interception, and transparent DNS capture.
 
 ## Component Diagram
 

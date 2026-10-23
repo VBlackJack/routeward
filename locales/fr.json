@@ -577,6 +577,10 @@
       },
       "cleanup": {
         "completed": "Nettoyage des règles d'interception terminé"
+      },
+      "daemon": {
+        "banner": "Démarrage du démon privilégié RouteWard",
+        "listening_ipc": "Canal de contrôle IPC du démon en écoute"
       }
     }
   },
@@ -603,6 +607,13 @@
       "not_root": "Privilèges root requis sous Linux pour l'interception nftables (EUID != 0)",
       "nft_missing": "Binaire nftables (nft) introuvable sur le système",
       "nft_failed": "Échec de l'exécution de la commande nftables"
+    },
+    "daemon": {
+      "already_running": "Une autre instance du démon RouteWard est déjà en cours d'exécution",
+      "group_missing": "Le groupe Unix configuré pour le socket du démon n'existe pas sur le système",
+      "not_elevated": "Les privilèges Administrateur ou root sont requis pour lancer routeward daemon",
+      "ipc_error": "Erreur de communication IPC avec le démon",
+      "disconnected": "Le démon privilégié RouteWard n'est pas connecté"
     }
   },
   "themeforge": {

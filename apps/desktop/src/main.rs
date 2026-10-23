@@ -16,8 +16,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use routeward_core::ipc::generate_ephemeral_token;
 use routeward_desktop_lib::commands::DesktopCommandBridge;
-use routeward_desktop_lib::create_desktop_bridge;
+use routeward_desktop_lib::{create_desktop_bridge, validate_loopback_http_request};
 use serde::Deserialize;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
@@ -39,7 +40,7 @@ const WINDOW_DEFAULT_HEIGHT: f64 = 900.0;
 const WINDOW_MIN_WIDTH: f64 = 980.0;
 const WINDOW_MIN_HEIGHT: f64 = 660.0;
 const LOOPBACK_EPHEMERAL_ADDR: &str = "127.0.0.1:0";
-const HTTP_REQ_BUFFER_BYTES: usize = 8192;
+const HTTP_REQ_BUFFER_BYTES: usize = 65536;
 const ICON_DIMENSION: u32 = 32;
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,17 @@ struct LaunchProcessRequest {
 #[derive(Debug, Deserialize)]
 struct SystemProxyRequest {
     enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToggleEngineRequest {
+    start: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminateConnectionRequest {
+    #[serde(rename = "connectionId")]
+    connection_id: String,
 }
 
 fn build_drakul_window_icon() -> Option<Icon> {
@@ -115,14 +127,79 @@ fn extract_json_body(raw_request: &str) -> &str {
     }
 }
 
-fn handle_api_route(
+async fn handle_api_route(
     path: &str,
     body_str: &str,
     bridge: &DesktopCommandBridge,
     proxy: &EventLoopProxy<DesktopWindowCommand>,
 ) -> Option<(String, Vec<u8>)> {
+    if path.starts_with("/api/state") {
+        let state = bridge.refresh_state().await;
+        let json = serde_json::to_vec(&state).unwrap_or_default();
+        return Some(("application/json; charset=utf-8".to_string(), json));
+    }
+
+    if path.starts_with("/api/diagnostics") {
+        let diag = bridge.get_diagnostics();
+        let json = serde_json::to_vec(&diag).unwrap_or_default();
+        return Some(("application/json; charset=utf-8".to_string(), json));
+    }
+
+    if path.starts_with("/api/telemetry") {
+        let snap = bridge.get_telemetry();
+        let json = serde_json::to_vec(&snap).unwrap_or_default();
+        return Some(("application/json; charset=utf-8".to_string(), json));
+    }
+
+    if path.starts_with("/api/connections/terminate") {
+        let parsed: Result<TerminateConnectionRequest, _> = serde_json::from_str(body_str);
+        let terminated = match parsed {
+            Ok(req) => bridge.terminate_connection(req.connection_id).await,
+            Err(_) => false,
+        };
+        let json = serde_json::to_vec(&serde_json::json!({ "terminated": terminated }))
+            .unwrap_or_default();
+        return Some(("application/json; charset=utf-8".to_string(), json));
+    }
+
+    if path.starts_with("/api/connections/clear") {
+        bridge.clear_closed_connections().await;
+        return Some((
+            "application/json; charset=utf-8".to_string(),
+            b"{\"ok\":true}".to_vec(),
+        ));
+    }
+
+    if path.starts_with("/api/connections") {
+        let conns = bridge.list_connections();
+        let json = serde_json::to_vec(&conns).unwrap_or_default();
+        return Some(("application/json; charset=utf-8".to_string(), json));
+    }
+
+    if path.starts_with("/api/logs/clear") {
+        bridge.clear_logs().await;
+        return Some((
+            "application/json; charset=utf-8".to_string(),
+            b"{\"ok\":true}".to_vec(),
+        ));
+    }
+
+    if path.starts_with("/api/logs") {
+        let logs = bridge.list_logs();
+        let json = serde_json::to_vec(&logs).unwrap_or_default();
+        return Some(("application/json; charset=utf-8".to_string(), json));
+    }
+
+    if path.starts_with("/api/engine/toggle") {
+        let parsed: ToggleEngineRequest =
+            serde_json::from_str(body_str).unwrap_or(ToggleEngineRequest { start: false });
+        let diag = bridge.toggle_engine(parsed.start).await;
+        let json = serde_json::to_vec(&diag).unwrap_or_default();
+        return Some(("application/json; charset=utf-8".to_string(), json));
+    }
+
     if path.starts_with("/api/scan-os") {
-        let sockets = bridge.scan_os_sockets();
+        let sockets = bridge.scan_os_sockets().await;
         let json = serde_json::to_vec(&sockets).unwrap_or_default();
         return Some(("application/json; charset=utf-8".to_string(), json));
     }
@@ -192,6 +269,8 @@ fn handle_api_route(
 
 fn spawn_embedded_ui_server(
     std_listener: StdTcpListener,
+    bound_port: u16,
+    ephemeral_token: String,
     event_proxy: EventLoopProxy<DesktopWindowCommand>,
 ) {
     std::thread::spawn(move || {
@@ -203,27 +282,44 @@ fn spawn_embedded_ui_server(
         rt.block_on(async move {
             let bridge = Arc::new(create_desktop_bridge().expect("DesktopCommandBridge"));
             let listener = TcpListener::from_std(std_listener).expect("Async listener");
+            let token_arc = Arc::new(ephemeral_token);
 
             while let Ok((mut stream, _)) = listener.accept().await {
                 let bridge_ref = Arc::clone(&bridge);
                 let proxy_ref = event_proxy.clone();
+                let token_ref = Arc::clone(&token_arc);
 
                 tokio::spawn(async move {
-                    let mut buf = [0u8; HTTP_REQ_BUFFER_BYTES];
+                    let mut buf = vec![0u8; HTTP_REQ_BUFFER_BYTES];
                     let n = stream.read(&mut buf).await.unwrap_or(0);
                     if n == 0 {
                         return;
                     }
                     let req = String::from_utf8_lossy(&buf[..n]);
-                    let first_line = req.lines().next().unwrap_or("");
-                    let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+                    let path = match validate_loopback_http_request(&req, bound_port, &token_ref) {
+                        Ok(valid_path) => valid_path,
+                        Err(rejection) => {
+                            let status = rejection.status_line();
+                            let body = b"{\"error\":\"forbidden\"}";
+                            let resp = format!(
+                                "{status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.write_all(body).await;
+                            return;
+                        }
+                    };
+
                     let body_str = extract_json_body(&req);
+                    let allowed_origin = format!("http://127.0.0.1:{bound_port}");
 
                     if let Some((content_type, payload)) =
-                        handle_api_route(path, body_str, &bridge_ref, &proxy_ref)
+                        handle_api_route(&path, body_str, &bridge_ref, &proxy_ref).await
                     {
                         let header = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: {allowed_origin}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
                             payload.len()
                         );
                         let _ = stream.write_all(header.as_bytes()).await;
@@ -259,12 +355,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let std_listener = StdTcpListener::bind(LOOPBACK_EPHEMERAL_ADDR)?;
     std_listener.set_nonblocking(true)?;
     let local_addr = std_listener.local_addr()?;
+    let bound_port = local_addr.port();
+    let ephemeral_token = generate_ephemeral_token();
     let ui_url = format!("http://{local_addr}/");
 
     let event_loop = EventLoopBuilder::<DesktopWindowCommand>::with_user_event().build();
     let event_proxy = event_loop.create_proxy();
 
-    spawn_embedded_ui_server(std_listener, event_proxy);
+    spawn_embedded_ui_server(
+        std_listener,
+        bound_port,
+        ephemeral_token.clone(),
+        event_proxy,
+    );
 
     let window = WindowBuilder::new()
         .with_title("RouteWard")
@@ -277,7 +380,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_theme(Some(Theme::Dark))
         .build(&event_loop)?;
 
-    let _webview = WebViewBuilder::new().with_url(&ui_url).build(&window)?;
+    let init_script = format!("window.__ROUTEWARD_TOKEN__ = {ephemeral_token:?};");
+    let _webview = WebViewBuilder::new()
+        .with_initialization_script(&init_script)
+        .with_url(&ui_url)
+        .build(&window)?;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;

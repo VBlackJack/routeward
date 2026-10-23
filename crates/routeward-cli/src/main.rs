@@ -15,8 +15,11 @@
  */
 
 use clap::{Parser, Subcommand};
-use routeward_core::config::{ProfileConfig, SystemConstants, TransportProtocol};
+use routeward_core::config::{ProfileConfig, RoutingRule, SystemConstants, TransportProtocol};
+use routeward_core::error::{RouteWardError, ERR_KEY_DAEMON_NOT_ELEVATED};
 use routeward_core::interceptor::RouteWardController;
+use routeward_core::ipc::protocol::IpcCommand;
+use routeward_core::ipc::{DaemonIpcService, IpcClient};
 use routeward_core::rules::ConnectionRequest;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -39,11 +42,22 @@ struct CliArgs {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the transparent relay and OS packet interceptor engine
+    /// Start the transparent relay and OS packet interceptor engine in standalone foreground mode
     Run {
         /// Optional safety timeout in seconds before automatic fail-open shutdown
         #[arg(long)]
         duration_secs: Option<u64>,
+    },
+    /// Run the privileged RouteWard daemon listening on the restricted local OS IPC channel
+    Daemon {
+        /// Optional safety timeout in seconds before automatic fail-open shutdown
+        #[arg(long)]
+        duration_secs: Option<u64>,
+    },
+    /// Control and query the running RouteWard daemon over the local OS IPC channel
+    Ctl {
+        #[command(subcommand)]
+        action: CtlCommands,
     },
     /// Probe all configured upstream proxies for latency, exit IP, and UDP support
     Check {
@@ -68,6 +82,32 @@ enum Commands {
     Cleanup,
 }
 
+#[derive(Subcommand)]
+enum CtlCommands {
+    /// Query daemon diagnostics and interception engine status
+    Status,
+    /// Query full daemon state (diagnostics, profile, telemetry, connections, logs)
+    State,
+    /// Start the relay and transparent OS packet interceptor on the daemon
+    Start,
+    /// Stop the relay and transparent OS packet interceptor on the daemon
+    Stop,
+    /// List tracked connections from the daemon
+    Connections,
+    /// List recent log entries from the daemon
+    Logs,
+    /// Insert or update a routing rule (JSON string) on the daemon
+    UpsertRule {
+        #[arg(long)]
+        json: String,
+    },
+    /// Actively terminate an open connection by its identifier
+    TerminateConnection {
+        #[arg(long)]
+        id: String,
+    },
+}
+
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -89,6 +129,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
 
     let constants = SystemConstants::load_embedded()?;
+
+    if let Commands::Ctl { action } = args.command {
+        let client = IpcClient::new(constants.ipc);
+        let ipc_cmd = match action {
+            CtlCommands::Status => IpcCommand::GetDiagnostics,
+            CtlCommands::State => IpcCommand::GetState,
+            CtlCommands::Start => IpcCommand::ToggleEngine { start: true },
+            CtlCommands::Stop => IpcCommand::ToggleEngine { start: false },
+            CtlCommands::Connections => IpcCommand::ListConnections,
+            CtlCommands::Logs => IpcCommand::ListLogs,
+            CtlCommands::UpsertRule { json } => {
+                let rule: RoutingRule = serde_json::from_str(&json)?;
+                IpcCommand::UpsertRule { rule }
+            }
+            CtlCommands::TerminateConnection { id } => {
+                IpcCommand::TerminateConnection { connection_id: id }
+            }
+        };
+
+        let response = client.call_raw(ipc_cmd).await?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "Daemon returned error".to_string())
+                .into());
+        }
+        return Ok(());
+    }
+
+    if let Commands::Daemon { duration_secs } = args.command {
+        let fixed_profile_path = constants.ipc.resolve_daemon_profile_path();
+        let profile = if fixed_profile_path.exists() {
+            ProfileConfig::load_from_path(&fixed_profile_path)?
+        } else {
+            let default_prof = ProfileConfig::load_embedded_default()?;
+            let _ = default_prof.save_to_path(&fixed_profile_path);
+            default_prof
+        };
+
+        let controller = RouteWardController::new(constants, profile, &args.locale);
+        if !controller.diagnostics().elevated_privileges {
+            let msg = controller.i18n.t(ERR_KEY_DAEMON_NOT_ELEVATED);
+            eprintln!("{msg}");
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_NOT_ELEVATED,
+                detail: msg,
+            }
+            .into());
+        }
+
+        let service = match DaemonIpcService::bind(controller.clone()) {
+            Ok(svc) => svc,
+            Err(err) => {
+                let localized = controller.i18n.t(err.i18n_key());
+                eprintln!("{localized}: {err}");
+                return Err(err.into());
+            }
+        };
+
+        println!("=== {} ===", controller.i18n.t("cli.engine.daemon.banner"));
+        #[cfg(unix)]
+        let ipc_endpoint = controller.constants.ipc.unix_socket_path.clone();
+        #[cfg(windows)]
+        let ipc_endpoint = controller.constants.ipc.windows_pipe_name.clone();
+        println!(
+            "{}: {ipc_endpoint}",
+            controller.i18n.t("cli.engine.daemon.listening_ipc")
+        );
+
+        let accept_handle = tokio::spawn(async move {
+            let _ = service.run_accept_loop().await;
+        });
+
+        if let Some(secs) = duration_secs {
+            tokio::select! {
+                _ = wait_for_shutdown_signal() => {},
+                _ = tokio::time::sleep(Duration::from_secs(secs)) => {},
+            }
+        } else {
+            wait_for_shutdown_signal().await;
+        }
+
+        accept_handle.abort();
+        if controller.is_running() {
+            controller.stop_engine();
+        }
+        return Ok(());
+    }
+
     let profile = match &args.profile {
         Some(path) => ProfileConfig::load_from_path(path)?,
         None => ProfileConfig::load_embedded_default()?,
@@ -191,6 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             controller.cleanup_orphaned_rules()?;
             println!("{}", controller.i18n.t("cli.engine.cleanup.completed"));
         }
+        Commands::Daemon { .. } | Commands::Ctl { .. } => unreachable!(),
     }
 
     Ok(())

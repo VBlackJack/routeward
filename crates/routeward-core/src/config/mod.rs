@@ -31,7 +31,7 @@ const DEFAULT_THEME_NAME: &str = "Drakul";
 const DEFAULT_ACCENT_NAME: &str = "Default";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThemeConfig {
     pub theme: String,
     pub accent: String,
@@ -75,7 +75,41 @@ pub struct SystemConstants {
     pub dns: DnsConstants,
     pub checker: CheckerConstants,
     pub telemetry: TelemetryConstants,
+    pub ipc: IpcConstants,
     pub protocols: ProtocolConstants,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpcConstants {
+    pub unix_socket_path: String,
+    pub unix_socket_group: String,
+    pub unix_socket_mode: u32,
+    pub unix_socket_dir_mode: u32,
+    pub windows_pipe_name: String,
+    pub windows_profile_path: String,
+    pub linux_profile_path: String,
+    pub max_line_bytes: usize,
+    pub idle_timeout_ms: u64,
+    pub reconnect_interval_ms: u64,
+}
+
+impl IpcConstants {
+    pub fn resolve_daemon_profile_path(&self) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let program_data =
+                std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
+            let expanded = self
+                .windows_profile_path
+                .replace("%ProgramData%", &program_data);
+            std::path::PathBuf::from(expanded)
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from(&self.linux_profile_path)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,16 +193,10 @@ pub struct TelemetryConstants {
     pub log_flush_interval_ms: u64,
     #[serde(default = "default_event_broadcast_capacity")]
     pub event_broadcast_capacity: usize,
-    #[serde(default = "default_profile_path")]
-    pub default_profile_path: String,
 }
 
 fn default_event_broadcast_capacity() -> usize {
     256
-}
-
-fn default_profile_path() -> String {
-    "configs/active_profile.json".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,14 +262,14 @@ pub enum TransportProtocol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProxyCredentials {
     pub username: String,
     pub password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProxyNode {
     pub id: String,
     pub name: String,
@@ -268,7 +296,7 @@ pub enum ChainStrategy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SecurityPolicyConfig {
     pub kill_switch_enabled: bool,
     pub block_udp_on_tcp_only_proxy: bool,
@@ -293,7 +321,7 @@ impl Default for SecurityPolicyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProxyChain {
     pub id: String,
     pub name: String,
@@ -304,7 +332,7 @@ pub struct ProxyChain {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PortRange {
     pub start: u16,
     pub end: u16,
@@ -332,7 +360,7 @@ pub enum RuleAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RoutingRule {
     pub id: String,
     pub name: String,
@@ -347,7 +375,7 @@ pub struct RoutingRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DnsConfig {
     pub enable_fake_ip: bool,
     pub remote_dns_resolution: bool,
@@ -361,7 +389,7 @@ fn default_enable_logging() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileConfig {
     pub profile_id: String,
     pub name: String,

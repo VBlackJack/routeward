@@ -31,6 +31,11 @@ pub const ERR_KEY_INTERCEPTOR_OPEN: &str = "errors.interceptor.open_failed";
 pub const ERR_KEY_INTERCEPTOR_NOT_ROOT: &str = "errors.interceptor.not_root";
 pub const ERR_KEY_INTERCEPTOR_NFT_MISSING: &str = "errors.interceptor.nft_missing";
 pub const ERR_KEY_INTERCEPTOR_NFT_FAILED: &str = "errors.interceptor.nft_failed";
+pub const ERR_KEY_DAEMON_ALREADY_RUNNING: &str = "errors.daemon.already_running";
+pub const ERR_KEY_DAEMON_GROUP_MISSING: &str = "errors.daemon.group_missing";
+pub const ERR_KEY_DAEMON_NOT_ELEVATED: &str = "errors.daemon.not_elevated";
+pub const ERR_KEY_DAEMON_IPC_ERROR: &str = "errors.daemon.ipc_error";
+pub const ERR_KEY_DAEMON_DISCONNECTED: &str = "errors.daemon.disconnected";
 
 #[derive(Debug, Error)]
 pub enum RouteWardError {
@@ -39,6 +44,9 @@ pub enum RouteWardError {
 
     #[error("{key}: {detail}")]
     InterceptorError { key: &'static str, detail: String },
+
+    #[error("{key}: {detail}")]
+    DaemonError { key: &'static str, detail: String },
 
     #[error("{key}: {proxy_id}")]
     ProxyNotFound { key: &'static str, proxy_id: String },
@@ -66,6 +74,24 @@ pub enum RouteWardError {
 
     #[error("IO: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl RouteWardError {
+    pub fn i18n_key(&self) -> &'static str {
+        match self {
+            Self::ConfigError { key, .. }
+            | Self::InterceptorError { key, .. }
+            | Self::DaemonError { key, .. }
+            | Self::ProxyNotFound { key, .. }
+            | Self::EmptyProxyChain { key }
+            | Self::ProtocolHandshake { key, .. }
+            | Self::ConnectionTimeout { key }
+            | Self::AuthenticationRejected { key }
+            | Self::InvalidProxyUri { key, .. }
+            | Self::BlockedByPolicy { key, .. } => key,
+            Self::Io(_) => ERR_KEY_DAEMON_IPC_ERROR,
+        }
+    }
 }
 
 pub type RouteWardResult<T> = Result<T, RouteWardError>;

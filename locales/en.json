@@ -577,6 +577,10 @@
       },
       "cleanup": {
         "completed": "Interception rules cleanup completed"
+      },
+      "daemon": {
+        "banner": "Starting RouteWard Privileged Daemon",
+        "listening_ipc": "Daemon IPC control channel listening"
       }
     }
   },
@@ -603,6 +607,13 @@
       "not_root": "Root privileges required on Linux for nftables interception (EUID != 0)",
       "nft_missing": "nftables binary (nft) was not found on the system",
       "nft_failed": "Failed to execute nftables command"
+    },
+    "daemon": {
+      "already_running": "Another RouteWard daemon instance is already running",
+      "group_missing": "Configured Unix socket group does not exist on the system",
+      "not_elevated": "Administrator or root privileges are required to run routeward daemon",
+      "ipc_error": "Daemon IPC communication error",
+      "disconnected": "Privileged RouteWard daemon is not connected"
     }
   },
   "themeforge": {

@@ -50,8 +50,19 @@
     "logDirectory": "logs",
     "logAppName": "RouteWard",
     "logFlushIntervalMs": 500,
-    "eventBroadcastCapacity": 256,
-    "defaultProfilePath": "configs/active_profile.json"
+    "eventBroadcastCapacity": 256
+  },
+  "ipc": {
+    "unixSocketPath": "/run/routeward/routeward.sock",
+    "unixSocketGroup": "routeward",
+    "unixSocketMode": 432,
+    "unixSocketDirMode": 488,
+    "windowsPipeName": "\\\\.\\pipe\\routeward-daemon",
+    "windowsProfilePath": "%ProgramData%\\RouteWard\\active_profile.json",
+    "linuxProfilePath": "/etc/routeward/active_profile.json",
+    "maxLineBytes": 65536,
+    "idleTimeoutMs": 30000,
+    "reconnectIntervalMs": 2000
   },
   "protocols": {
     "socks5Version": 5,

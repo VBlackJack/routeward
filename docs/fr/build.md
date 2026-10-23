@@ -42,3 +42,30 @@ powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
 ```
 
 Ce script telecharge `WinDivert-2.2.2-A.zip`, verifie son empreinte SHA-256 (`63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15`) et extrait `WinDivert.dll` et `WinDivert64.sys` dans `third_party/windivert/bin/`.
+
+## Etape 4 : Execution du Daemon Privilegie et des Clients Non Privilegies (`routeward daemon` & `routeward ctl`)
+
+### Configuration du groupe Linux (`routeward`)
+Sous Linux, le daemon cree `/run/routeward/routeward.sock` avec pour proprietaire `root:routeward` (socket en `0660` dans un dossier en `0750`). Creez le groupe systeme `routeward` et ajoutez-y votre utilisateur courant avant de lancer le daemon :
+
+```bash
+sudo groupadd -r routeward
+sudo usermod -aG routeward "$USER"
+# Reconnectez votre session (ou executez `newgrp routeward`) pour activer le groupe
+```
+
+Lancez ensuite le daemon en `root`, puis pilotez-le depuis votre compte non privilegie :
+
+```bash
+# Terminal 1 (root) :
+sudo ./target/release/routeward daemon
+
+# Terminal 2 (utilisateur membre du groupe 'routeward') :
+./target/release/routeward ctl status
+./target/release/routeward ctl start
+./target/release/routeward ctl connections
+./target/release/routeward ctl stop
+```
+
+### Fonctionnement sous Windows (Named Pipe)
+Sous Windows, lancez `routeward.exe daemon` dans une console PowerShell en Administrateur. Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lance le daemon. Vous pouvez ensuite executer `routeward.exe ctl status` ou `routeward-desktop.exe` depuis une session non privilegiee du meme utilisateur.

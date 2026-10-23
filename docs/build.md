@@ -42,3 +42,30 @@ powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
 ```
 
 This downloads `WinDivert-2.2.2-A.zip`, verifies its SHA-256 (`63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15`), and extracts `WinDivert.dll` and `WinDivert64.sys` into `third_party/windivert/bin/`.
+
+## Step 4: Running the Privileged Daemon and Unprivileged Clients (`routeward daemon` & `routeward ctl`)
+
+### Linux Group Setup (`routeward`)
+On Linux, the daemon creates `/run/routeward/routeward.sock` owned by `root:routeward` (`0660` socket inside a `0750` directory). Create the `routeward` system group and add your unprivileged user account before starting the daemon:
+
+```bash
+sudo groupadd -r routeward
+sudo usermod -aG routeward "$USER"
+# Log out and back in (or run `newgrp routeward`) so group membership takes effect
+```
+
+Start the daemon as `root`, then query or control it as your unprivileged user:
+
+```bash
+# Terminal 1 (root):
+sudo ./target/release/routeward daemon
+
+# Terminal 2 (member of group 'routeward'):
+./target/release/routeward ctl status
+./target/release/routeward ctl start
+./target/release/routeward ctl connections
+./target/release/routeward ctl stop
+```
+
+### Windows Setup (Named Pipe)
+On Windows, launch `routeward.exe daemon` from an elevated Administrator PowerShell session. The daemon binds `\\.\pipe\routeward-daemon` with an explicit DACL restricting access to `SYSTEM`, `Administrators`, and the launching user's SID. You can then run `routeward.exe ctl status` or `routeward-desktop.exe` from an unprivileged session under the same user account.

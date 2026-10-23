@@ -85,6 +85,18 @@ pub struct LogEntry {
     pub message: String,
 }
 
+impl LogEntry {
+    pub fn new(level: LogLevel, component: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            timestamp: Utc::now(),
+            level,
+            component: component.into(),
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessTrafficSummary {
@@ -95,7 +107,7 @@ pub struct ProcessTrafficSummary {
     pub tx_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TelemetrySnapshot {
     pub active_connections: usize,

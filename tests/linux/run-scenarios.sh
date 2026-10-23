@@ -248,5 +248,113 @@ else
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Scenario (g): Daemon started as root; non-root user in 'routeward' group
+#               queries status via 'routeward ctl', starts interception, and
+#               curl connection is reported (PID, exe, rxBytes > 0)
+# ---------------------------------------------------------------------------
+groupadd -f routeward
+id -u rwmember >/dev/null 2>&1 || useradd -M -s /bin/bash -G routeward rwmember
+id -u rwoutsider >/dev/null 2>&1 || useradd -M -s /bin/bash rwoutsider
+
+mkdir -p /etc/routeward
+cp /tmp/profile_proxy.json /etc/routeward/active_profile.json
+rm -f "${SOCKS_LOG}" /workspace/logs/RouteWard_*.log /run/routeward/routeward.sock
+
+"${BIN}" daemon >/tmp/rw_daemon.out 2>&1 &
+DAEMON_PID=$!
+
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+if [[ ! -S /run/routeward/routeward.sock ]]; then
+    echo "[FAIL] Scenario (g): /run/routeward/routeward.sock was not created by daemon"
+    cat /tmp/rw_daemon.out || true
+    exit 1
+fi
+
+# Verify single-instance guard rejects a second daemon
+set +e
+"${BIN}" daemon >/tmp/rw_daemon_dup.out 2>&1
+DUP_EXIT=$?
+set -e
+if [[ "${DUP_EXIT}" -eq 0 ]]; then
+    echo "[FAIL] Scenario (g): duplicate daemon instance was not rejected"
+    exit 1
+fi
+
+STATUS_G=$(su -s /bin/bash rwmember -c "${BIN} ctl status")
+START_G=$(su -s /bin/bash rwmember -c "${BIN} ctl start")
+wait_for_nft_table
+
+RESP_G=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+    curl --noproxy "" -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/scenario-g")
+sleep 0.2
+CONNS_G=$(su -s /bin/bash rwmember -c "${BIN} ctl connections")
+LOGS_G=$(su -s /bin/bash rwmember -c "${BIN} ctl logs")
+
+if [[ "${RESP_G}" == "ROUTEWARD_OK" ]] \
+    && echo "${STATUS_G}" | grep -q '"daemonConnected": true' \
+    && echo "${START_G}" | grep -q '"running": true' \
+    && echo "${CONNS_G}" | grep -q '"processName": "curl"' \
+    && echo "${CONNS_G}" | grep -q '"processPath": "/usr/bin/curl"' \
+    && echo "${CONNS_G}" | grep -Eq '"pid": [1-9][0-9]*' \
+    && echo "${CONNS_G}" | grep -Eq '"rxBytes": [1-9][0-9]*' \
+    && echo "${LOGS_G}" | grep -q "Accepted IPC client via SO_PEERCRED"; then
+    echo "[PASS] Scenario (g): non-root 'routeward' group member controlled daemon via ctl and curl connection reported PID, exe, rxBytes > 0"
+else
+    echo "[FAIL] Scenario (g)"
+    echo "STATUS_G=${STATUS_G}"
+    echo "START_G=${START_G}"
+    echo "CONNS_G=${CONNS_G}"
+    echo "LOGS_G=${LOGS_G}"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (h): Non-root user NOT in 'routeward' group is rejected by ctl
+# ---------------------------------------------------------------------------
+set +e
+su -s /bin/bash rwoutsider -c "${BIN} ctl status" >/tmp/ctl_h.out 2>&1
+OUTSIDER_EXIT=$?
+set -e
+
+if [[ "${OUTSIDER_EXIT}" -ne 0 ]]; then
+    echo "[PASS] Scenario (h): non-root user outside 'routeward' group rejected (exit=${OUTSIDER_EXIT})"
+else
+    echo "[FAIL] Scenario (h): user outside 'routeward' group was unexpectedly allowed"
+    cat /tmp/ctl_h.out || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (i): kill -9 (SIGKILL) of daemon removes nftables table via watchdog
+# ---------------------------------------------------------------------------
+if ! nft list table ip routeward >/dev/null 2>&1; then
+    echo "[FAIL] Scenario (i): table ip routeward was not active before kill -9 of daemon"
+    exit 1
+fi
+
+kill -9 "${DAEMON_PID}"
+wait "${DAEMON_PID}" 2>/dev/null || true
+sleep 0.5
+
+if ! nft list table ip routeward >/dev/null 2>&1; then
+    RESP_AFTER_DAEMON_KILL=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/after-daemon-kill9")
+    if [[ "${RESP_AFTER_DAEMON_KILL}" == "ROUTEWARD_OK" ]]; then
+        echo "[PASS] Scenario (i): SIGKILL (kill -9) of daemon triggered watchdog; table ip routeward deleted and fail-open verified"
+    else
+        echo "[FAIL] Scenario (i): fail-open HTTP request failed after daemon kill -9"
+        exit 1
+    fi
+else
+    echo "[FAIL] Scenario (i): table ip routeward still present after daemon kill -9"
+    exit 1
+fi
+
 kill "${MOCK_PID}" 2>/dev/null || true
-echo "=== ALL 6 LINUX CONTAINER SCENARIOS PASSED ==="
+echo "=== ALL 9 LINUX CONTAINER SCENARIOS PASSED ==="
