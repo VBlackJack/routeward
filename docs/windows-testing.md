@@ -19,26 +19,31 @@ To prevent accidental execution on a host workstation, the script refuses to run
 From an elevated Administrator PowerShell or Command Prompt session inside the folder containing `routeward.exe`:
 
 ```powershell
-# PowerShell 5.1:
+# PowerShell 5.1 (full execution inside the dedicated test VM):
 .\Invoke-RouteWardTests.ps1 -ConfirmTestMachine
 
 # Or via the batch launcher:
 .\Run-RouteWardTests.bat -ConfirmTestMachine
+
+# Dry-run mode (validates path resolution and IPC JSON response parsing against recorded fixtures without starting the daemon or WinDivert):
+.\Invoke-RouteWardTests.ps1 -DryRun
 ```
 
-All paths, endpoints, rule names, and timeouts are configurable via parameters (`-Socks5Host`, `-Socks5Port`, `-TestUrl`, `-PipeName`, `-TransparentRelayPort`, `-BinDir`, etc.). On exit (`try / finally`), the script always stops any daemon it started, runs `routeward.exe cleanup`, and restores `active_profile.json` if modified.
+All paths, endpoints, rule names, and timeouts are configurable via parameters (`-Socks5Host`, `-Socks5Port`, `-TestUrl`, `-PipeName`, `-TransparentRelayPort`, `-BinDir`, etc.). When executed outside the repository (for example from `C:\RouteWard`), the script automatically falls back to its built-in parameter defaults. On exit (`try / finally`), the script stops interception via `ctl stop`, terminates all tracked daemon PIDs, verifies no `routeward` process survives, runs `routeward.exe cleanup`, restores `active_profile.json` if modified, and records a final outbound `curl.exe` connectivity check.
 
 ## Covered Scenarios
 
+Each scenario establishes its own starting state independently:
+
 - **`(a)`**: Starts `routeward.exe daemon` in the background and verifies the Named Pipe (`\\.\pipe\routeward-daemon`) appears.
 - **`(b)`**: Verifies protected DACLs (`D:P`) restricted to `SYSTEM` and `Administrators` on `%ProgramData%\RouteWard` and `active_profile.json`, and checks the Named Pipe SDDL via `[System.IO.Directory]::GetAccessControl` to ensure `WD`, `BU`, and `AU` are absent.
-- **`(c)`**: Verifies `routeward.exe ctl status` (`daemonConnected=true`, `elevatedPrivileges=true`, `running=false`).
-- **`(d)`**: Runs `routeward.exe ctl start`, executes `curl.exe`, and verifies HTTP `200` and a tracked `curl.exe` connection with `matchedRule="CLI Tools via SOCKS5 Proxy"` and `rxBytes > 0`.
-- **`(e)`**: Verifies temporary `Block` rule insertion and removal via `ctl` (cleanly marked `[SKIP]` if `ctl` does not expose a rule-removal subcommand).
+- **`(c)`**: Verifies `routeward.exe ctl status` (`result.daemonConnected=true`, `result.elevatedPrivileges=true`, `result.running=false`).
+- **`(d)`**: Runs `routeward.exe ctl start`, executes `curl.exe`, and verifies HTTP `200` and a tracked `curl.exe` connection in `result` with `matchedRule="CLI Tools via SOCKS5 Proxy"` and `rxBytes > 0`.
+- **`(e)`**: Adds a temporary priority-1 `Block` rule for `curl.exe` via `routeward.exe ctl upsert-rule`, verifies `curl.exe` fails and is recorded as `blocked` in `ctl connections`, removes the rule via `routeward.exe ctl remove-rule --id <ID>`, and verifies via `ctl state` that the profile rules returned to their exact initial state.
 - **`(f)`**: Runs `routeward.exe ctl stop`, verifies removal of the `RouteWard_TransparentRelay_10810` firewall rule, and checks direct `curl.exe` HTTP `200`.
 - **`(g)`**: Starts interception, force-kills the daemon (`Stop-Process -Force`), verifies fail-open `curl.exe` HTTP `200`, and confirms the orphaned firewall rule remains present.
-- **`(h)`**: Restarts `routeward.exe daemon` and verifies automatic removal of the orphaned firewall rule at startup along with its daemon log entry.
-- **`(i)`**: Verifies that daemon logs (`%ProgramData%\RouteWard\logs`) and user logs (`%LOCALAPPDATA%\RouteWard\logs`) were updated during the run and that no `logs` directory was created in the current working directory.
+- **`(h)`**: Ensures the orphaned firewall rule is present with the daemon stopped, restarts `routeward.exe daemon`, and verifies automatic removal of the orphaned firewall rule at startup along with its daemon log entry.
+- **`(i)`**: Verifies that daemon logs (`%ProgramData%\RouteWard\logs`) and user logs (`%LOCALAPPDATA%\RouteWard\logs`, written at `INFO` level on every `ctl` invocation) were updated during the run and that no `logs` directory was created in the current working directory.
 
 ## Reading the Generated Report
 

@@ -278,8 +278,29 @@ impl RouteWardController {
         self.telemetry.flush_file_logger();
     }
 
+    /// Checks whether `cleanup` is allowed to run (refusing if a daemon is active unless `force` is true).
+    pub fn check_cleanup_allowed(&self, force: bool) -> RouteWardResult<()> {
+        if !force && crate::ipc::transport::is_daemon_ipc_active(&self.constants.ipc) {
+            let msg = self
+                .i18n
+                .t(crate::error::ERR_KEY_CLEANUP_DAEMON_ACTIVE)
+                .to_string();
+            self.telemetry
+                .push_log(LogLevel::Warn, COMPONENT_ENGINE, msg.clone());
+            self.telemetry.flush_file_logger();
+            return Err(RouteWardError::DaemonError {
+                key: crate::error::ERR_KEY_CLEANUP_DAEMON_ACTIVE,
+                detail: msg,
+            });
+        }
+        Ok(())
+    }
+
     /// Removes orphaned OS interception rules (Linux `nftables` table or Windows firewall rule).
-    pub fn cleanup_orphaned_rules(&self) -> RouteWardResult<()> {
+    /// Refuses to run while a `routeward daemon` instance is active unless `force` is `true`.
+    pub fn cleanup_orphaned_rules(&self, force: bool) -> RouteWardResult<()> {
+        self.check_cleanup_allowed(force)?;
+
         #[cfg(windows)]
         {
             let rule_name = format!(

@@ -68,7 +68,13 @@ sudo ./target/release/routeward daemon
 ./target/release/routeward ctl status
 ./target/release/routeward ctl start
 ./target/release/routeward ctl connections
+./target/release/routeward ctl upsert-rule --json '{"id":"rule-1","name":"Custom","enabled":true,"priority":5,"processPatterns":["curl"],"domainPatterns":[],"ipCidrs":[],"portRanges":[],"protocol":"tcp","action":{"type":"block"}}'
+./target/release/routeward ctl remove-rule --id rule-1
 ./target/release/routeward ctl stop
+
+# Cleanup orphaned OS rules after a crash (refused while a daemon is active unless --force is passed):
+sudo ./target/release/routeward cleanup
+sudo ./target/release/routeward cleanup --force
 ```
 
 ### Windows Two-Step Launch (Named Pipe)

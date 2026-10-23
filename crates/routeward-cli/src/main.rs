@@ -84,7 +84,11 @@ enum Commands {
         domain: String,
     },
     /// Remove orphaned OS interception rules (Linux nftables table or Windows firewall rule)
-    Cleanup,
+    Cleanup {
+        /// Force removal even if a RouteWard daemon instance appears active
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -106,11 +110,90 @@ enum CtlCommands {
         #[arg(long)]
         json: String,
     },
+    /// Remove a routing rule by its identifier on the daemon
+    RemoveRule {
+        #[arg(long)]
+        id: String,
+    },
     /// Actively terminate an open connection by its identifier
     TerminateConnection {
         #[arg(long)]
         id: String,
     },
+}
+
+fn ctl_action_into_ipc(
+    action: CtlCommands,
+) -> Result<(&'static str, IpcCommand), serde_json::Error> {
+    match action {
+        CtlCommands::Status => Ok(("status", IpcCommand::GetDiagnostics)),
+        CtlCommands::State => Ok(("state", IpcCommand::GetState)),
+        CtlCommands::Start => Ok(("start", IpcCommand::ToggleEngine { start: true })),
+        CtlCommands::Stop => Ok(("stop", IpcCommand::ToggleEngine { start: false })),
+        CtlCommands::Connections => Ok(("connections", IpcCommand::ListConnections)),
+        CtlCommands::Logs => Ok(("logs", IpcCommand::ListLogs)),
+        CtlCommands::UpsertRule { json } => {
+            let rule: RoutingRule = serde_json::from_str(&json)?;
+            Ok(("upsert-rule", IpcCommand::UpsertRule { rule }))
+        }
+        CtlCommands::RemoveRule { id } => {
+            Ok(("remove-rule", IpcCommand::RemoveRule { rule_id: id }))
+        }
+        CtlCommands::TerminateConnection { id } => Ok((
+            "terminate-connection",
+            IpcCommand::TerminateConnection { connection_id: id },
+        )),
+    }
+}
+
+async fn execute_ctl_action(
+    client: &IpcClient,
+    user_logger: &FileLogger,
+    action: CtlCommands,
+) -> Result<routeward_core::ipc::protocol::IpcResponse, Box<dyn std::error::Error>> {
+    let (cmd_label, ipc_cmd) = match ctl_action_into_ipc(action) {
+        Ok(pair) => pair,
+        Err(err) => {
+            user_logger.log(
+                LogLevel::Info,
+                COMPONENT_CLI_CTL,
+                &format!("Executed ctl command 'upsert-rule': outcome=invalid_json ({err})"),
+            );
+            return Err(err.into());
+        }
+    };
+
+    let response = match client.call_raw(ipc_cmd).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            user_logger.log(
+                LogLevel::Info,
+                COMPONENT_CLI_CTL,
+                &format!("Executed ctl command '{cmd_label}': outcome=ipc_error ({err})"),
+            );
+            return Err(err.into());
+        }
+    };
+
+    if response.ok {
+        user_logger.log(
+            LogLevel::Info,
+            COMPONENT_CLI_CTL,
+            &format!("Executed ctl command '{cmd_label}': outcome=success"),
+        );
+    } else {
+        let err_msg = response
+            .error
+            .clone()
+            .unwrap_or_else(|| "Daemon returned error".to_string());
+        user_logger.log(
+            LogLevel::Info,
+            COMPONENT_CLI_CTL,
+            &format!("Executed ctl command '{cmd_label}': outcome=daemon_error ({err_msg})"),
+        );
+    }
+
+    Ok(response)
 }
 
 async fn wait_for_shutdown_signal() {
@@ -142,43 +225,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             true,
         );
         let client = IpcClient::new(constants.ipc);
-        let ipc_cmd = match action {
-            CtlCommands::Status => IpcCommand::GetDiagnostics,
-            CtlCommands::State => IpcCommand::GetState,
-            CtlCommands::Start => IpcCommand::ToggleEngine { start: true },
-            CtlCommands::Stop => IpcCommand::ToggleEngine { start: false },
-            CtlCommands::Connections => IpcCommand::ListConnections,
-            CtlCommands::Logs => IpcCommand::ListLogs,
-            CtlCommands::UpsertRule { json } => {
-                let rule: RoutingRule = serde_json::from_str(&json)?;
-                IpcCommand::UpsertRule { rule }
-            }
-            CtlCommands::TerminateConnection { id } => {
-                IpcCommand::TerminateConnection { connection_id: id }
-            }
-        };
-
-        let response = match client.call_raw(ipc_cmd).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                user_logger.log(
-                    LogLevel::Error,
-                    COMPONENT_CLI_CTL,
-                    &format!("Failed to execute ctl command against daemon: {err}"),
-                );
-                return Err(err.into());
-            }
-        };
+        let response = execute_ctl_action(&client, &user_logger, action).await?;
         println!("{}", serde_json::to_string_pretty(&response)?);
         if !response.ok {
             let err_msg = response
                 .error
                 .unwrap_or_else(|| "Daemon returned error".to_string());
-            user_logger.log(
-                LogLevel::Warn,
-                COMPONENT_CLI_CTL,
-                &format!("Daemon returned error for ctl command: {err_msg}"),
-            );
             return Err(err_msg.into());
         }
         return Ok(());
@@ -217,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let _ = controller.cleanup_orphaned_rules();
+        let _ = controller.cleanup_orphaned_rules(true);
         println!("=== {} ===", controller.i18n.t("cli.engine.daemon.banner"));
         println!("{}", controller.i18n.t("cli.engine.cleanup.completed"));
         #[cfg(unix)]
@@ -255,7 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let controller = match args.command {
-        Commands::Run { .. } | Commands::Cleanup => {
+        Commands::Run { .. } | Commands::Cleanup { .. } => {
             RouteWardController::new(constants, profile, &args.locale)
         }
         _ => RouteWardController::new_user_cli(constants, profile, &args.locale),
@@ -352,12 +404,176 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }))?
             );
         }
-        Commands::Cleanup => {
-            controller.cleanup_orphaned_rules()?;
+        Commands::Cleanup { force } => {
+            if let Err(err) = controller.cleanup_orphaned_rules(force) {
+                let localized = controller.i18n.t(err.i18n_key());
+                eprintln!("{localized}");
+                return Err(err.into());
+            }
             println!("{}", controller.i18n.t("cli.engine.cleanup.completed"));
         }
         Commands::Daemon { .. } | Commands::Ctl { .. } => unreachable!(),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use routeward_core::error::ERR_KEY_CLEANUP_DAEMON_ACTIVE;
+    use routeward_core::ipc::protocol::DaemonFullState;
+
+    #[tokio::test]
+    async fn cleanup_refused_when_test_daemon_listens_and_accepted_with_force() {
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let unique_id = routeward_core::ipc::generate_ephemeral_token();
+        constants.ipc.windows_pipe_name = format!(r"\\.\pipe\routeward-cleanup-test-{unique_id}");
+        let temp_sock = std::env::temp_dir().join(format!("routeward-cleanup-{unique_id}.sock"));
+        constants.ipc.unix_socket_path = temp_sock.to_string_lossy().into_owned();
+        constants.network.default_transparent_tcp_port = 59998;
+        constants.network.linux_nft_binary = "true".to_string();
+
+        let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        profile.enable_logging = false;
+
+        let daemon_ctrl = RouteWardController::new(constants.clone(), profile.clone(), "en");
+        let service =
+            DaemonIpcService::bind_for_test(daemon_ctrl.clone()).expect("bind test daemon");
+        let daemon_task = tokio::spawn(async move {
+            let _ = service.run_accept_loop().await;
+        });
+
+        let cleanup_ctrl = RouteWardController::new(constants.clone(), profile, "en");
+
+        // 1. Without --force, cleanup must be refused while the daemon is listening
+        let refused = cleanup_ctrl.cleanup_orphaned_rules(false);
+        match refused {
+            Err(RouteWardError::DaemonError { key, .. }) => {
+                assert_eq!(key, ERR_KEY_CLEANUP_DAEMON_ACTIVE);
+            }
+            other => panic!("Expected ERR_KEY_CLEANUP_DAEMON_ACTIVE, got {other:?}"),
+        }
+
+        // 2. With --force (force = true), cleanup must be accepted
+        cleanup_ctrl
+            .cleanup_orphaned_rules(true)
+            .expect("cleanup with --force should succeed while daemon is active");
+
+        daemon_task.abort();
+    }
+
+    #[tokio::test]
+    async fn ctl_upsert_and_remove_rule_restores_identical_profile_and_writes_info_log() {
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let unique_id = routeward_core::ipc::generate_ephemeral_token();
+        constants.ipc.windows_pipe_name = format!(r"\\.\pipe\routeward-ctl-rule-test-{unique_id}");
+        let temp_sock = std::env::temp_dir().join(format!("routeward-ctl-rule-{unique_id}.sock"));
+        constants.ipc.unix_socket_path = temp_sock.to_string_lossy().into_owned();
+
+        let temp_prof_path =
+            std::env::temp_dir().join(format!("routeward_ctl_prof_{unique_id}.json"));
+        constants.ipc.windows_profile_path = temp_prof_path.to_string_lossy().into_owned();
+        constants.ipc.linux_profile_path = temp_prof_path.to_string_lossy().into_owned();
+
+        let temp_user_log_dir =
+            std::env::temp_dir().join(format!("routeward_ctl_user_logs_{unique_id}"));
+        let _ = std::fs::remove_dir_all(&temp_user_log_dir);
+
+        let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        profile.enable_logging = false;
+        let initial_rules_json =
+            serde_json::to_string(&profile.rules).expect("serialize initial rules");
+
+        let daemon_ctrl = RouteWardController::new(constants.clone(), profile, "en");
+        let service =
+            DaemonIpcService::bind_for_test(daemon_ctrl.clone()).expect("bind test daemon");
+        let daemon_task = tokio::spawn(async move {
+            let _ = service.run_accept_loop().await;
+        });
+
+        let client = IpcClient::new(constants.ipc.clone());
+        let user_logger =
+            FileLogger::new(&temp_user_log_dir, &constants.telemetry.log_app_name, true);
+
+        // 1. Add a temporary Block rule via CtlCommands::UpsertRule
+        let temp_rule_json = r#"{
+            "id": "rule-temp-block-test",
+            "name": "Temp Block Rule",
+            "enabled": true,
+            "priority": 1,
+            "processPatterns": ["curl.exe"],
+            "domainPatterns": [],
+            "ipCidrs": [],
+            "portRanges": [],
+            "protocol": "tcp",
+            "action": { "type": "block" }
+        }"#
+        .to_string();
+
+        let upsert_resp = execute_ctl_action(
+            &client,
+            &user_logger,
+            CtlCommands::UpsertRule {
+                json: temp_rule_json,
+            },
+        )
+        .await
+        .expect("execute ctl upsert-rule");
+        assert!(upsert_resp.ok);
+
+        let state_after_add = execute_ctl_action(&client, &user_logger, CtlCommands::State)
+            .await
+            .expect("execute ctl state");
+        let parsed_after_add: DaemonFullState =
+            serde_json::from_value(state_after_add.result.expect("state result"))
+                .expect("decode DaemonFullState");
+        assert!(parsed_after_add
+            .profile
+            .rules
+            .iter()
+            .any(|r| r.id == "rule-temp-block-test"));
+
+        // 2. Remove the temporary rule via CtlCommands::RemoveRule
+        let remove_resp = execute_ctl_action(
+            &client,
+            &user_logger,
+            CtlCommands::RemoveRule {
+                id: "rule-temp-block-test".to_string(),
+            },
+        )
+        .await
+        .expect("execute ctl remove-rule");
+        assert!(remove_resp.ok);
+
+        let state_after_remove = execute_ctl_action(&client, &user_logger, CtlCommands::State)
+            .await
+            .expect("execute ctl state after remove");
+        let parsed_after_remove: DaemonFullState =
+            serde_json::from_value(state_after_remove.result.expect("state result"))
+                .expect("decode DaemonFullState");
+        let final_rules_json = serde_json::to_string(&parsed_after_remove.profile.rules)
+            .expect("serialize final rules");
+        assert_eq!(
+            final_rules_json, initial_rules_json,
+            "Profile rules must return to identical state after remove-rule"
+        );
+
+        // 3. Verify INFO lines were written to user log for each ctl invocation
+        let log_files: Vec<_> = std::fs::read_dir(&temp_user_log_dir)
+            .expect("user log dir exists")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(log_files.len(), 1);
+        let log_text = std::fs::read_to_string(log_files[0].path()).expect("read user log");
+        assert!(log_text
+            .contains("[INFO] [CliCtl] Executed ctl command 'upsert-rule': outcome=success"));
+        assert!(log_text
+            .contains("[INFO] [CliCtl] Executed ctl command 'remove-rule': outcome=success"));
+        assert!(log_text.contains("[INFO] [CliCtl] Executed ctl command 'state': outcome=success"));
+
+        daemon_task.abort();
+        let _ = std::fs::remove_file(&temp_prof_path);
+        let _ = std::fs::remove_dir_all(&temp_user_log_dir);
+    }
 }

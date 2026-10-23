@@ -68,7 +68,13 @@ sudo ./target/release/routeward daemon
 ./target/release/routeward ctl status
 ./target/release/routeward ctl start
 ./target/release/routeward ctl connections
+./target/release/routeward ctl upsert-rule --json '{"id":"rule-1","name":"Custom","enabled":true,"priority":5,"processPatterns":["curl"],"domainPatterns":[],"ipCidrs":[],"portRanges":[],"protocol":"tcp","action":{"type":"block"}}'
+./target/release/routeward ctl remove-rule --id rule-1
 ./target/release/routeward ctl stop
+
+# Nettoyage des regles OS orphelines apres un crash (refuse si un daemon est actif, sauf avec --force) :
+sudo ./target/release/routeward cleanup
+sudo ./target/release/routeward cleanup --force
 ```
 
 ### Lancement en deux etapes sous Windows (Named Pipe)

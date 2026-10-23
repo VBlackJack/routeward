@@ -22,6 +22,12 @@ param(
     [switch]$ConfirmTestMachine,
 
     [Parameter(Mandatory = $false)]
+    [switch]$DryRun,
+
+    [Parameter(Mandatory = $false)]
+    [string]$SampleResponsesJsonPath = "",
+
+    [Parameter(Mandatory = $false)]
     [string]$BinDir = (Get-Location).Path,
 
     [Parameter(Mandatory = $false)]
@@ -125,10 +131,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------------------
-# Guardrail 1: Refuse execution without explicit -ConfirmTestMachine switch
+# Guardrail 1: Refuse execution without explicit -ConfirmTestMachine or -DryRun
 # ---------------------------------------------------------------------------
-if (-not $ConfirmTestMachine.IsPresent) {
-    Write-Host "[ABORT] Refusing to run without the explicit -ConfirmTestMachine switch." -ForegroundColor Yellow
+if (-not $ConfirmTestMachine.IsPresent -and -not $DryRun.IsPresent) {
+    Write-Host "[ABORT] Refusing to run without the explicit -ConfirmTestMachine switch (or -DryRun)." -ForegroundColor Yellow
     Write-Host "This script starts WinDivert packet interception and controls the RouteWard daemon."
     Write-Host "Launch inside the dedicated Windows test VM with:"
     Write-Host "  .\Invoke-RouteWardTests.ps1 -ConfirmTestMachine"
@@ -136,10 +142,27 @@ if (-not $ConfirmTestMachine.IsPresent) {
 }
 
 # ---------------------------------------------------------------------------
-# Load defaults from configs/ when present (zero hardcoding)
+# Safe out-of-repository path resolution & config loading (Bug 1 fix)
 # ---------------------------------------------------------------------------
-$repoRootCandidate = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-if ([string]::IsNullOrWhiteSpace($SystemConstantsJsonPath)) {
+function Resolve-OptionalRepoRoot {
+    param([string]$StartDir)
+    if ([string]::IsNullOrWhiteSpace($StartDir)) {
+        return ""
+    }
+    $parent1 = Split-Path -Parent $StartDir
+    if ([string]::IsNullOrWhiteSpace($parent1)) {
+        return ""
+    }
+    $parent2 = Split-Path -Parent $parent1
+    if ([string]::IsNullOrWhiteSpace($parent2)) {
+        return ""
+    }
+    return $parent2
+}
+
+$repoRootCandidate = Resolve-OptionalRepoRoot -StartDir $PSScriptRoot
+
+if ([string]::IsNullOrWhiteSpace($SystemConstantsJsonPath) -and (-not [string]::IsNullOrWhiteSpace($repoRootCandidate))) {
     $candidateConsts = Join-Path $repoRootCandidate "configs\system_constants.json"
     if (Test-Path -LiteralPath $candidateConsts) {
         $SystemConstantsJsonPath = $candidateConsts
@@ -161,7 +184,7 @@ if (-not [string]::IsNullOrWhiteSpace($SystemConstantsJsonPath) -and (Test-Path 
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($DefaultProfileJsonPath)) {
+if ([string]::IsNullOrWhiteSpace($DefaultProfileJsonPath) -and (-not [string]::IsNullOrWhiteSpace($repoRootCandidate))) {
     $candidateProf = Join-Path $repoRootCandidate "configs\default_profile.json"
     if (Test-Path -LiteralPath $candidateProf) {
         $DefaultProfileJsonPath = $candidateProf
@@ -189,6 +212,86 @@ $activeProfilePath = Join-Path $programDataAppDir $ProfileFileName
 $daemonLogsDir = Join-Path $programDataAppDir $LogsFolderName
 $userLogsDir = Join-Path (Join-Path $localAppDataRoot $AppDataFolderName) $LogsFolderName
 $logWildcard = "${LogFilePrefix}_*.log"
+
+# ---------------------------------------------------------------------------
+# Strict IPC Response Parser (Bug 2 fix: validates {"id":...,"ok":true,"result":...})
+# ---------------------------------------------------------------------------
+function ConvertFrom-CtlResponseJson {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$RawJson,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Context,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$RequiredResultProperties = @(),
+
+        [Parameter(Mandatory = $false)]
+        [switch]$ExpectResultArray,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$RequiredArrayElementProperties = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RawJson)) {
+        throw "ctl [$Context] returned empty output instead of JSON IpcResponse."
+    }
+
+    try {
+        $parsed = $RawJson | ConvertFrom-Json
+    } catch {
+        throw "ctl [$Context] output is not valid JSON: $($_.Exception.Message)"
+    }
+
+    if ($null -eq $parsed) {
+        throw "ctl [$Context] JSON deserialized to null."
+    }
+
+    $topProps = @($parsed.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($topProps -notcontains "ok") {
+        throw "ctl [$Context] response schema mismatch: missing top-level 'ok' field (found properties: $($topProps -join ', '))."
+    }
+
+    if ($parsed.ok -ne $true) {
+        $errDetail = if ($topProps -contains "error" -and $null -ne $parsed.error) { [string]$parsed.error } else { "unknown error" }
+        throw "ctl [$Context] returned ok=false: $errDetail"
+    }
+
+    if ($topProps -notcontains "result") {
+        throw "ctl [$Context] response schema mismatch: missing top-level 'result' field on ok=true IpcResponse (found properties: $($topProps -join ', '))."
+    }
+
+    $resVal = $parsed.result
+    if ($null -eq $resVal) {
+        throw "ctl [$Context] response schema mismatch: 'result' field is null."
+    }
+
+    if ($ExpectResultArray.IsPresent) {
+        $items = @($resVal)
+        if ($RequiredArrayElementProperties.Count -gt 0 -and $items.Count -gt 0) {
+            $firstElemProps = @($items[0].PSObject.Properties | ForEach-Object { $_.Name })
+            foreach ($reqElemProp in $RequiredArrayElementProperties) {
+                if ($firstElemProps -notcontains $reqElemProp) {
+                    throw "ctl [$Context] array element schema mismatch: missing property '$reqElemProp' (found: $($firstElemProps -join ', '))."
+                }
+            }
+        }
+        return ,$items
+    }
+
+    if ($RequiredResultProperties.Count -gt 0) {
+        $resProps = @($resVal.PSObject.Properties | ForEach-Object { $_.Name })
+        foreach ($reqProp in $RequiredResultProperties) {
+            if ($resProps -notcontains $reqProp) {
+                throw "ctl [$Context] result schema mismatch: missing property 'result.$reqProp' (found: $($resProps -join ', '))."
+            }
+        }
+    }
+
+    return $resVal
+}
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -247,10 +350,37 @@ function Wait-ForNamedPipe {
     return (Test-NamedPipeExists -FullPipePath $FullPipePath)
 }
 
+function Wait-ForNamedPipeAbsent {
+    param(
+        [string]$FullPipePath,
+        [int]$TimeoutMs,
+        [int]$IntervalMs
+    )
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($stopwatch.ElapsedMilliseconds -lt $TimeoutMs) {
+        if (-not (Test-NamedPipeExists -FullPipePath $FullPipePath)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds $IntervalMs
+    }
+    return (-not (Test-NamedPipeExists -FullPipePath $FullPipePath))
+}
+
 function Test-FirewallRulePresent {
     param([string]$RuleName)
     $null = & netsh.exe advfirewall firewall show rule name="$RuleName" 2>&1
     return ($LASTEXITCODE -eq 0)
+}
+
+function Ensure-SyntheticFirewallRulePresent {
+    param(
+        [string]$RuleName,
+        [string]$ProgramPath,
+        [int]$Port
+    )
+    if (-not (Test-FirewallRulePresent -RuleName $RuleName)) {
+        $null = & netsh.exe advfirewall firewall add rule name="$RuleName" dir=in action=allow program="$ProgramPath" enable=yes profile=any protocol=TCP localport=$Port 2>&1
+    }
 }
 
 function Remove-SensitiveText {
@@ -263,7 +393,180 @@ function Remove-SensitiveText {
     return $redacted
 }
 
+# ---------------------------------------------------------------------------
+# DryRun Mode: Validate out-of-repo path resolution and IPC response parser
+#              against recorded sample responses without starting WinDivert/daemon
+# ---------------------------------------------------------------------------
+if ($DryRun.IsPresent) {
+    Write-Host "=== RouteWard Windows Test Suite - DRY RUN MODE (No daemon / No WinDivert) ===" -ForegroundColor Cyan
+
+    # 1. Verify out-of-repo path resolution (e.g., C:\RouteWard where second Split-Path is empty)
+    $simulatedStandaloneRoot = Resolve-OptionalRepoRoot -StartDir "C:\RouteWard"
+    if ($simulatedStandaloneRoot -ne "") {
+        throw "DryRun failed: expected empty repo root for 'C:\RouteWard', got '$simulatedStandaloneRoot'"
+    }
+    Write-Host "[DRYRUN-PASS] Out-of-repo path resolution ('C:\RouteWard') succeeded without Join-Path error." -ForegroundColor Green
+
+    # 2. Load sample ctl responses fixture and verify strict parser
+    if ([string]::IsNullOrWhiteSpace($SampleResponsesJsonPath)) {
+        $SampleResponsesJsonPath = Join-Path $PSScriptRoot "fixtures\sample_ctl_responses.json"
+    }
+    if (-not (Test-Path -LiteralPath $SampleResponsesJsonPath)) {
+        throw "DryRun failed: missing sample responses fixture at '$SampleResponsesJsonPath'."
+    }
+
+    $fixtures = Get-Content -LiteralPath $SampleResponsesJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+
+    $diagStopped = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.statusStopped | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-statusStopped" `
+        -RequiredResultProperties @("daemonConnected", "elevatedPrivileges", "running")
+    if ($diagStopped.daemonConnected -ne $true -or $diagStopped.elevatedPrivileges -ne $true -or $diagStopped.running -ne $false) {
+        throw "DryRun failed: unexpected values in statusStopped fixture."
+    }
+    Write-Host "[DRYRUN-PASS] Parsed 'ctl status' (stopped) IpcResponse.result schema." -ForegroundColor Green
+
+    $diagRunning = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.startRunning | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-startRunning" `
+        -RequiredResultProperties @("daemonConnected", "elevatedPrivileges", "running")
+    if ($diagRunning.running -ne $true) {
+        throw "DryRun failed: expected running=true in startRunning fixture."
+    }
+    Write-Host "[DRYRUN-PASS] Parsed 'ctl start' (running) IpcResponse.result schema." -ForegroundColor Green
+
+    $connsProxied = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.connectionsProxied | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-connectionsProxied" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("processName", "matchedRule", "rxBytes", "status")
+    if ($connsProxied.Count -ne 1 -or $connsProxied[0].processName -ne "curl.exe" -or $connsProxied[0].rxBytes -le 0) {
+        throw "DryRun failed: unexpected connectionsProxied payload."
+    }
+    Write-Host "[DRYRUN-PASS] Parsed 'ctl connections' (proxied curl.exe, rxBytes=$($connsProxied[0].rxBytes)) array schema." -ForegroundColor Green
+
+    $connsBlocked = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.connectionsBlocked | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-connectionsBlocked" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("processName", "matchedRule", "rxBytes", "status")
+    if ($connsBlocked.Count -ne 1 -or $connsBlocked[0].status -ne "blocked") {
+        throw "DryRun failed: unexpected connectionsBlocked payload."
+    }
+    Write-Host "[DRYRUN-PASS] Parsed 'ctl connections' (blocked curl.exe) array schema." -ForegroundColor Green
+
+    $upsertAck = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.upsertRuleOk | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-upsertRuleOk" `
+        -RequiredResultProperties @("ok")
+    $removeAck = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.removeRuleOk | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-removeRuleOk" `
+        -RequiredResultProperties @("ok")
+    if ($upsertAck.ok -ne $true -or $removeAck.ok -ne $true) {
+        throw "DryRun failed: unexpected upsert/remove rule response."
+    }
+    Write-Host "[DRYRUN-PASS] Parsed 'ctl upsert-rule' and 'ctl remove-rule' responses." -ForegroundColor Green
+
+    $stateObj = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.stateSample | ConvertTo-Json -Depth 8) `
+        -Context "DryRun-stateSample" `
+        -RequiredResultProperties @("diagnostics", "profile")
+    if (@($stateObj.profile.rules).Count -ne 1) {
+        throw "DryRun failed: unexpected rules count in stateSample."
+    }
+    Write-Host "[DRYRUN-PASS] Parsed 'ctl state' full daemon state response." -ForegroundColor Green
+
+    # Verify legacy 'data' field is rejected with a clear schema mismatch message
+    $rejectedLegacy = $false
+    try {
+        $null = ConvertFrom-CtlResponseJson `
+            -RawJson ($fixtures.legacyMalformedDataField | ConvertTo-Json -Depth 6) `
+            -Context "DryRun-legacyMalformedDataField" `
+            -RequiredResultProperties @("running")
+    } catch {
+        if ($_.Exception.Message -match "missing top-level 'result' field") {
+            $rejectedLegacy = $true
+        } else {
+            throw "DryRun failed: unexpected error message for malformed response: $($_.Exception.Message)"
+        }
+    }
+    if (-not $rejectedLegacy) {
+        throw "DryRun failed: legacy 'data' field response was not rejected."
+    }
+    Write-Host "[DRYRUN-PASS] Rejected malformed 'data' field response with explicit schema error." -ForegroundColor Green
+    Write-Host "=== DRY RUN COMPLETED SUCCESSFULLY (0 errors) ===" -ForegroundColor Green
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Guardrail 2: Pre-flight validation (before touching anything)
+# ---------------------------------------------------------------------------
+if (-not (Test-IsAdministrator)) {
+    Write-Host "[ABORT] Pre-flight check failed: PowerShell session must run as Administrator." -ForegroundColor Red
+    exit 2
+}
+
+$resolvedBinDir = $BinDir
+if (-not (Test-Path -LiteralPath (Join-Path $resolvedBinDir $RouteWardExeName))) {
+    if (Test-Path -LiteralPath (Join-Path $PSScriptRoot $RouteWardExeName)) {
+        $resolvedBinDir = $PSScriptRoot
+    } elseif (-not [string]::IsNullOrWhiteSpace($repoRootCandidate)) {
+        $releaseCandidate = Join-Path $repoRootCandidate "target\release"
+        if (Test-Path -LiteralPath (Join-Path $releaseCandidate $RouteWardExeName)) {
+            $resolvedBinDir = $releaseCandidate
+        }
+    }
+}
+
+$routeWardExePath = Join-Path $resolvedBinDir $RouteWardExeName
+$desktopExePath = Join-Path $resolvedBinDir $DesktopExeName
+
+if (-not (Test-Path -LiteralPath $routeWardExePath)) {
+    Write-Host "[ABORT] Pre-flight check failed: Missing CLI binary at '$routeWardExePath'." -ForegroundColor Red
+    exit 2
+}
+if (-not (Test-Path -LiteralPath $desktopExePath)) {
+    Write-Host "[ABORT] Pre-flight check failed: Missing desktop binary at '$desktopExePath'." -ForegroundColor Red
+    exit 2
+}
+if (-not (Test-Path -LiteralPath $CurlExePath)) {
+    Write-Host "[ABORT] Pre-flight check failed: Missing curl binary at '$CurlExePath'." -ForegroundColor Red
+    exit 2
+}
+
+$resolvedWinDivertFiles = New-Object System.Collections.Generic.List[string]
+foreach ($wdFile in $WinDivertFileNames) {
+    $directCandidate = Join-Path $resolvedBinDir $wdFile
+    $subDirCandidate = Join-Path (Join-Path $resolvedBinDir $WinDivertSubDir) $wdFile
+    if (Test-Path -LiteralPath $directCandidate) {
+        $resolvedWinDivertFiles.Add($directCandidate)
+    } elseif (Test-Path -LiteralPath $subDirCandidate) {
+        $resolvedWinDivertFiles.Add($subDirCandidate)
+    } else {
+        Write-Host "[ABORT] Pre-flight check failed: Missing WinDivert file '$wdFile' in '$resolvedBinDir' or '$subDirCandidate'." -ForegroundColor Red
+        exit 2
+    }
+}
+
+$runningRouteWard = @(Get-Process -Name "routeward", "routeward-desktop" -ErrorAction SilentlyContinue)
+if ($runningRouteWard.Count -gt 0) {
+    $runningList = ($runningRouteWard | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ", "
+    Write-Host "[ABORT] Pre-flight check failed: RouteWard process already running ($runningList)." -ForegroundColor Red
+    exit 2
+}
+
+if (-not (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs $TcpConnectTimeoutMs)) {
+    Write-Host "[ABORT] Pre-flight check failed: Upstream SOCKS5 proxy at ${Socks5Host}:${Socks5Port} is not reachable." -ForegroundColor Red
+    exit 2
+}
+
+# ---------------------------------------------------------------------------
+# Process & CTL Management (Bugs 3 & 4 fix: track all daemon PIDs and isolate scenarios)
+# ---------------------------------------------------------------------------
 $script:RawCtlCapture = New-Object System.Collections.Generic.List[string]
+$script:StartedDaemonPids = New-Object System.Collections.Generic.HashSet[int]
+$script:CurrentDaemonProc = $null
 
 function Invoke-RouteWardCtl {
     param(
@@ -319,87 +622,100 @@ function Invoke-UnproxiedCurl {
     }
 }
 
-function Start-DaemonBackground {
+function Start-TrackedDaemon {
     param(
         [string]$ExePath,
         [string]$WorkDir
     )
     $proc = Start-Process -FilePath $ExePath -ArgumentList @("daemon") -WorkingDirectory $WorkDir -WindowStyle Hidden -PassThru
+    $null = $script:StartedDaemonPids.Add([int]$proc.Id)
+    $script:CurrentDaemonProc = $proc
     return $proc
 }
 
-function Stop-DaemonProcess {
-    param([System.Diagnostics.Process]$ProcessObj)
-    if ($null -ne $ProcessObj) {
+function Stop-AllTrackedDaemons {
+    param(
+        [string]$ExePath,
+        [string]$FullPipePath,
+        [switch]$ForceKillOnly
+    )
+    # 1. If graceful stop is allowed and the pipe is present, ask the daemon to stop interception first
+    if (-not $ForceKillOnly.IsPresent -and (Test-NamedPipeExists -FullPipePath $FullPipePath)) {
         try {
-            if (-not $ProcessObj.HasExited) {
-                Stop-Process -Id $ProcessObj.Id -Force -ErrorAction SilentlyContinue
-                $null = $ProcessObj.WaitForExit(3000)
-            }
+            $null = Invoke-RouteWardCtl -ExePath $ExePath -CtlArgs @("stop") -Label "Cleanup-GracefulStop"
+            Start-Sleep -Milliseconds 150
         } catch {
-            # Ignore if process already exited
+            # Continue to PID termination
         }
     }
-}
 
-# ---------------------------------------------------------------------------
-# Guardrail 2: Pre-flight validation (before touching anything)
-# ---------------------------------------------------------------------------
-if (-not (Test-IsAdministrator)) {
-    Write-Host "[ABORT] Pre-flight check failed: PowerShell session must run as Administrator." -ForegroundColor Red
-    exit 2
-}
-
-$resolvedBinDir = $BinDir
-if (-not (Test-Path -LiteralPath (Join-Path $resolvedBinDir $RouteWardExeName))) {
-    $releaseCandidate = Join-Path $repoRootCandidate "target\release"
-    if (Test-Path -LiteralPath (Join-Path $PSScriptRoot $RouteWardExeName)) {
-        $resolvedBinDir = $PSScriptRoot
-    } elseif (Test-Path -LiteralPath (Join-Path $releaseCandidate $RouteWardExeName)) {
-        $resolvedBinDir = $releaseCandidate
+    # 2. Terminate every tracked daemon PID
+    foreach ($trackedPid in @($script:StartedDaemonPids)) {
+        $p = Get-Process -Id $trackedPid -ErrorAction SilentlyContinue
+        if ($null -ne $p) {
+            Stop-Process -Id $trackedPid -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $trackedPid -Timeout 5 -ErrorAction SilentlyContinue
+        }
     }
-}
 
-$routeWardExePath = Join-Path $resolvedBinDir $RouteWardExeName
-$desktopExePath = Join-Path $resolvedBinDir $DesktopExeName
-
-if (-not (Test-Path -LiteralPath $routeWardExePath)) {
-    Write-Host "[ABORT] Pre-flight check failed: Missing CLI binary at '$routeWardExePath'." -ForegroundColor Red
-    exit 2
-}
-if (-not (Test-Path -LiteralPath $desktopExePath)) {
-    Write-Host "[ABORT] Pre-flight check failed: Missing desktop binary at '$desktopExePath'." -ForegroundColor Red
-    exit 2
-}
-if (-not (Test-Path -LiteralPath $CurlExePath)) {
-    Write-Host "[ABORT] Pre-flight check failed: Missing curl binary at '$CurlExePath'." -ForegroundColor Red
-    exit 2
-}
-
-$resolvedWinDivertFiles = New-Object System.Collections.Generic.List[string]
-foreach ($wdFile in $WinDivertFileNames) {
-    $directCandidate = Join-Path $resolvedBinDir $wdFile
-    $subDirCandidate = Join-Path (Join-Path $resolvedBinDir $WinDivertSubDir) $wdFile
-    if (Test-Path -LiteralPath $directCandidate) {
-        $resolvedWinDivertFiles.Add($directCandidate)
-    } elseif (Test-Path -LiteralPath $subDirCandidate) {
-        $resolvedWinDivertFiles.Add($subDirCandidate)
-    } else {
-        Write-Host "[ABORT] Pre-flight check failed: Missing WinDivert file '$wdFile' in '$resolvedBinDir' or '$subDirCandidate'." -ForegroundColor Red
-        exit 2
+    # 3. Ensure no stray routeward daemon process survives
+    $strayProcs = @(Get-Process -Name "routeward" -ErrorAction SilentlyContinue)
+    foreach ($sp in $strayProcs) {
+        Stop-Process -Id $sp.Id -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $sp.Id -Timeout 5 -ErrorAction SilentlyContinue
     }
+
+    $script:CurrentDaemonProc = $null
+    $null = Wait-ForNamedPipeAbsent -FullPipePath $FullPipePath -TimeoutMs 3000 -IntervalMs 100
 }
 
-$runningRouteWard = @(Get-Process -Name "routeward", "routeward-desktop" -ErrorAction SilentlyContinue)
-if ($runningRouteWard.Count -gt 0) {
-    $runningList = ($runningRouteWard | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ", "
-    Write-Host "[ABORT] Pre-flight check failed: RouteWard process already running ($runningList)." -ForegroundColor Red
-    exit 2
-}
+function Ensure-ScenarioDaemonState {
+    param(
+        [string]$ExePath,
+        [string]$WorkDir,
+        [string]$FullPipePath,
+        [int]$TimeoutMs,
+        [int]$IntervalMs,
+        [bool]$RequireInterceptionRunning
+    )
+    $needStart = $true
+    if ($null -ne $script:CurrentDaemonProc -and (-not $script:CurrentDaemonProc.HasExited) -and (Test-NamedPipeExists -FullPipePath $FullPipePath)) {
+        $needStart = $false
+    }
 
-if (-not (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs $TcpConnectTimeoutMs)) {
-    Write-Host "[ABORT] Pre-flight check failed: Upstream SOCKS5 proxy at ${Socks5Host}:${Socks5Port} is not reachable." -ForegroundColor Red
-    exit 2
+    if ($needStart) {
+        Stop-AllTrackedDaemons -ExePath $ExePath -FullPipePath $FullPipePath -ForceKillOnly
+        $null = Start-TrackedDaemon -ExePath $ExePath -WorkDir $WorkDir
+        if (-not (Wait-ForNamedPipe -FullPipePath $FullPipePath -TimeoutMs $TimeoutMs -IntervalMs $IntervalMs)) {
+            throw "Failed to start daemon or bind pipe '$FullPipePath' within ${TimeoutMs}ms."
+        }
+    }
+
+    $statusRaw = Invoke-RouteWardCtl -ExePath $ExePath -CtlArgs @("status") -Label "EnsureState-status"
+    $diag = ConvertFrom-CtlResponseJson `
+        -RawJson $statusRaw.RawText `
+        -Context "EnsureState-status" `
+        -RequiredResultProperties @("daemonConnected", "elevatedPrivileges", "running")
+
+    if ($RequireInterceptionRunning -and (-not $diag.running)) {
+        $startRaw = Invoke-RouteWardCtl -ExePath $ExePath -CtlArgs @("start") -Label "EnsureState-start"
+        $startDiag = ConvertFrom-CtlResponseJson `
+            -RawJson $startRaw.RawText `
+            -Context "EnsureState-start" `
+            -RequiredResultProperties @("running")
+        if (-not $startDiag.running) {
+            throw "Ensure-ScenarioDaemonState failed to start interception."
+        }
+    } elseif ((-not $RequireInterceptionRunning) -and $diag.running) {
+        $stopRaw = Invoke-RouteWardCtl -ExePath $ExePath -CtlArgs @("stop") -Label "EnsureState-stop"
+        $stopDiag = ConvertFrom-CtlResponseJson `
+            -RawJson $stopRaw.RawText `
+            -Context "EnsureState-stop" `
+            -RequiredResultProperties @("running")
+        if ($stopDiag.running) {
+            throw "Ensure-ScenarioDaemonState failed to stop interception."
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -418,9 +734,9 @@ if ($profileExistedAtStart) {
 $profileCapturedAfterDaemonInit = $false
 $profileModifiedByScript = $false
 
-$script:DaemonProcess = $null
 $scenarioResults = New-Object System.Collections.Generic.List[PSCustomObject]
 $auditNotes = New-Object System.Collections.Generic.List[string]
+$postCleanupCurlStatus = "Not executed"
 
 function Record-ScenarioResult {
     param(
@@ -453,14 +769,15 @@ try {
     # Scenario (a): Start daemon in background; Named Pipe appears
     # -----------------------------------------------------------------------
     try {
-        $script:DaemonProcess = Start-DaemonBackground -ExePath $routeWardExePath -WorkDir $resolvedBinDir
+        Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
+        $procA = Start-TrackedDaemon -ExePath $routeWardExePath -WorkDir $resolvedBinDir
         $pipeReady = Wait-ForNamedPipe -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs
-        if ($pipeReady -and (-not $script:DaemonProcess.HasExited)) {
-            if (-not $profileExistedAtStart -and (Test-Path -LiteralPath $activeProfilePath)) {
+        if ($pipeReady -and (-not $procA.HasExited)) {
+            if ($null -eq $initialProfileBytes -and (Test-Path -LiteralPath $activeProfilePath)) {
                 $initialProfileBytes = [System.IO.File]::ReadAllBytes($activeProfilePath)
                 $profileCapturedAfterDaemonInit = $true
             }
-            Record-ScenarioResult -Id "a" -Status "PASS" -Title "Daemon background startup" -Detail "Daemon PID=$($script:DaemonProcess.Id) listening on $PipeName"
+            Record-ScenarioResult -Id "a" -Status "PASS" -Title "Daemon background startup" -Detail "Daemon PID=$($procA.Id) listening on $PipeName"
         } else {
             Record-ScenarioResult -Id "a" -Status "FAIL" -Title "Daemon background startup" -Detail "Pipe '$PipeName' did not appear within ${PipeReadyTimeoutMs}ms or daemon exited early"
         }
@@ -472,6 +789,8 @@ try {
     # Scenario (b): ACL checks on ProgramData\RouteWard, active_profile.json, and Named Pipe SDDL
     # -----------------------------------------------------------------------
     try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $false
+
         $aclErrors = New-Object System.Collections.Generic.List[string]
         foreach ($targetItem in @(
             @{ Label = "Directory"; Path = $programDataAppDir },
@@ -535,16 +854,20 @@ try {
     # Scenario (c): ctl status (daemon reachable, elevated, interception stopped)
     # -----------------------------------------------------------------------
     try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $false
+
         $statusRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("status") -Label "Scenario-c-status"
         if ($statusRes.ExitCode -ne 0) {
             Record-ScenarioResult -Id "c" -Status "FAIL" -Title "ctl status initial state" -Detail "ctl status exited with code $($statusRes.ExitCode)"
         } else {
-            $parsed = $statusRes.RawText | ConvertFrom-Json
-            $diag = $parsed.data
-            if ($parsed.ok -eq $true -and $diag.daemonConnected -eq $true -and $diag.elevatedPrivileges -eq $true -and $diag.running -eq $false) {
+            $diag = ConvertFrom-CtlResponseJson `
+                -RawJson $statusRes.RawText `
+                -Context "Scenario-c-status" `
+                -RequiredResultProperties @("daemonConnected", "elevatedPrivileges", "running")
+            if ($diag.daemonConnected -eq $true -and $diag.elevatedPrivileges -eq $true -and $diag.running -eq $false) {
                 Record-ScenarioResult -Id "c" -Status "PASS" -Title "ctl status initial state" -Detail "daemonConnected=true, elevatedPrivileges=true, running=false"
             } else {
-                Record-ScenarioResult -Id "c" -Status "FAIL" -Title "ctl status initial state" -Detail "Unexpected status payload: ok=$($parsed.ok), daemonConnected=$($diag.daemonConnected), elevated=$($diag.elevatedPrivileges), running=$($diag.running)"
+                Record-ScenarioResult -Id "c" -Status "FAIL" -Title "ctl status initial state" -Detail "Unexpected status values: daemonConnected=$($diag.daemonConnected), elevated=$($diag.elevatedPrivileges), running=$($diag.running)"
             }
         }
     } catch {
@@ -555,23 +878,31 @@ try {
     # Scenario (d): ctl start then curl.exe (HTTP 200, ctl connections shows curl.exe, expected rule, rxBytes > 0)
     # -----------------------------------------------------------------------
     try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $false
+
         $startRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("start") -Label "Scenario-d-start"
-        $startJson = $startRes.RawText | ConvertFrom-Json
-        if ($startRes.ExitCode -ne 0 -or $startJson.ok -ne $true -or $startJson.data.running -ne $true) {
-            Record-ScenarioResult -Id "d" -Status "FAIL" -Title "ctl start and SOCKS5 routing" -Detail "ctl start failed or running!=true"
+        $startDiag = ConvertFrom-CtlResponseJson `
+            -RawJson $startRes.RawText `
+            -Context "Scenario-d-start" `
+            -RequiredResultProperties @("running")
+
+        if ($startRes.ExitCode -ne 0 -or $startDiag.running -ne $true) {
+            Record-ScenarioResult -Id "d" -Status "FAIL" -Title "ctl start and SOCKS5 routing" -Detail "ctl start failed or result.running!=true"
         } else {
             $curlRes = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
             Start-Sleep -Milliseconds $PollIntervalMs
             $connsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-d-connections"
-            $connsJson = $connsRes.RawText | ConvertFrom-Json
+            $connsList = ConvertFrom-CtlResponseJson `
+                -RawJson $connsRes.RawText `
+                -Context "Scenario-d-connections" `
+                -ExpectResultArray `
+                -RequiredArrayElementProperties @("processName", "matchedRule", "rxBytes", "status")
 
             $matchingConn = $null
-            if ($null -ne $connsJson.data) {
-                foreach ($c in $connsJson.data) {
-                    if ($c.processName -ieq "curl.exe" -and $c.matchedRule -eq $ExpectedProxyRuleName -and ([int64]$c.rxBytes) -gt 0) {
-                        $matchingConn = $c
-                        break
-                    }
+            foreach ($c in $connsList) {
+                if ($c.processName -ieq "curl.exe" -and $c.matchedRule -eq $ExpectedProxyRuleName -and ([int64]$c.rxBytes) -gt 0) {
+                    $matchingConn = $c
+                    break
                 }
             }
 
@@ -586,59 +917,73 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (e): Temporary Block rule for curl.exe (SKIP if ctl cannot both add and remove rules)
+    # Scenario (e): Temporary Block rule for curl.exe via ctl upsert-rule / remove-rule
     # -----------------------------------------------------------------------
     try {
-        $prevEap = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try {
-            $ctlHelpOut = (& $routeWardExePath ctl --help 2>&1 | ForEach-Object { $_.ToString() }) -join "`n"
-        } finally {
-            $ErrorActionPreference = $prevEap
-        }
-        $hasUpsertRule = $ctlHelpOut -match "\bupsert-rule\b"
-        $hasRemoveRule = $ctlHelpOut -match "\b(remove-rule|delete-rule)\b"
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
 
-        if (-not ($hasUpsertRule -and $hasRemoveRule)) {
-            Record-ScenarioResult -Id "e" -Status "SKIP" -Title "Temporary Block rule via ctl" -Detail "routeward ctl exposes 'upsert-rule' but does not expose a 'remove-rule' subcommand to delete temporary test rules"
-        } else {
-            $removeCmd = $Matches[1]
-            $blockRuleObj = @{
-                id              = $TempBlockRuleId
-                name            = $TempBlockRuleName
-                enabled         = $true
-                priority        = 1
-                processPatterns = @("curl.exe")
-                domainPatterns  = @()
-                ipCidrs         = @()
-                portRanges      = @()
-                protocol        = "tcp"
-                action          = @{ type = "block" }
-            }
-            $blockRuleJson = $blockRuleObj | ConvertTo-Json -Compress -Depth 5
-            $profileModifiedByScript = $true
-            $upsertRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("upsert-rule", "--json", $blockRuleJson) -Label "Scenario-e-upsert-block"
+        $stateBeforeRaw = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("state") -Label "Scenario-e-state-before"
+        $stateBefore = ConvertFrom-CtlResponseJson `
+            -RawJson $stateBeforeRaw.RawText `
+            -Context "Scenario-e-state-before" `
+            -RequiredResultProperties @("profile")
+        $rulesBeforeJson = ($stateBefore.profile.rules | ConvertTo-Json -Compress -Depth 8)
+
+        $blockRuleObj = @{
+            id              = $TempBlockRuleId
+            name            = $TempBlockRuleName
+            enabled         = $true
+            priority        = 1
+            processPatterns = @("curl.exe")
+            domainPatterns  = @()
+            ipCidrs         = @()
+            portRanges      = @()
+            protocol        = "tcp"
+            action          = @{ type = "block" }
+        }
+        $blockRuleJson = $blockRuleObj | ConvertTo-Json -Compress -Depth 5
+        $profileModifiedByScript = $true
+
+        $upsertRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("upsert-rule", "--json", $blockRuleJson) -Label "Scenario-e-upsert-block"
+        $null = ConvertFrom-CtlResponseJson -RawJson $upsertRes.RawText -Context "Scenario-e-upsert-block" -RequiredResultProperties @("ok")
+
+        try {
             $curlBlocked = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec 5
             Start-Sleep -Milliseconds $PollIntervalMs
             $connsBlockedRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-e-connections"
-            $connsBlockedJson = $connsBlockedRes.RawText | ConvertFrom-Json
-            $remRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @($removeCmd, "--id", $TempBlockRuleId) -Label "Scenario-e-remove-block"
+            $connsBlockedList = ConvertFrom-CtlResponseJson `
+                -RawJson $connsBlockedRes.RawText `
+                -Context "Scenario-e-connections" `
+                -ExpectResultArray `
+                -RequiredArrayElementProperties @("processName", "matchedRule", "status")
+        } finally {
+            $remRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("remove-rule", "--id", $TempBlockRuleId) -Label "Scenario-e-remove-block"
+            $null = ConvertFrom-CtlResponseJson -RawJson $remRes.RawText -Context "Scenario-e-remove-block" -RequiredResultProperties @("ok")
+        }
 
-            $sawBlockedConn = $false
-            if ($null -ne $connsBlockedJson.data) {
-                foreach ($c in $connsBlockedJson.data) {
-                    if ($c.processName -ieq "curl.exe" -and $c.status -eq "blocked") {
-                        $sawBlockedConn = $true
-                        break
-                    }
-                }
-            }
+        $stateAfterRaw = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("state") -Label "Scenario-e-state-after"
+        $stateAfter = ConvertFrom-CtlResponseJson `
+            -RawJson $stateAfterRaw.RawText `
+            -Context "Scenario-e-state-after" `
+            -RequiredResultProperties @("profile")
+        $rulesAfterJson = ($stateAfter.profile.rules | ConvertTo-Json -Compress -Depth 8)
+        $profileRestoredIdentical = ($rulesBeforeJson -eq $rulesAfterJson)
+        if ($profileRestoredIdentical) {
+            $profileModifiedByScript = $false
+        }
 
-            if ($upsertRes.ExitCode -eq 0 -and $curlBlocked.ExitCode -ne 0 -and $sawBlockedConn -and $remRes.ExitCode -eq 0) {
-                Record-ScenarioResult -Id "e" -Status "PASS" -Title "Temporary Block rule via ctl" -Detail "curl failed as expected (exit=$($curlBlocked.ExitCode)), connection marked blocked, and temporary rule removed"
-            } else {
-                Record-ScenarioResult -Id "e" -Status "FAIL" -Title "Temporary Block rule via ctl" -Detail "upsertExit=$($upsertRes.ExitCode), curlExit=$($curlBlocked.ExitCode), sawBlocked=$sawBlockedConn, removeExit=$($remRes.ExitCode)"
+        $sawBlockedConn = $false
+        foreach ($c in $connsBlockedList) {
+            if ($c.processName -ieq "curl.exe" -and $c.status -eq "blocked") {
+                $sawBlockedConn = $true
+                break
             }
+        }
+
+        if ($curlBlocked.ExitCode -ne 0 -and $sawBlockedConn -and $profileRestoredIdentical) {
+            Record-ScenarioResult -Id "e" -Status "PASS" -Title "Temporary Block rule via ctl" -Detail "curl failed as expected (exit=$($curlBlocked.ExitCode)), connection marked blocked, rule removed and profile verified identical"
+        } else {
+            Record-ScenarioResult -Id "e" -Status "FAIL" -Title "Temporary Block rule via ctl" -Detail "curlExit=$($curlBlocked.ExitCode), sawBlocked=$sawBlockedConn, profileRestoredIdentical=$profileRestoredIdentical"
         }
     } catch {
         Record-ScenarioResult -Id "e" -Status "FAIL" -Title "Temporary Block rule via ctl" -Detail $_.Exception.Message
@@ -648,16 +993,21 @@ try {
     # Scenario (f): ctl stop removes firewall rule and curl returns HTTP 200 directly
     # -----------------------------------------------------------------------
     try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
         $stopRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("stop") -Label "Scenario-f-stop"
-        $stopJson = $stopRes.RawText | ConvertFrom-Json
+        $stopDiag = ConvertFrom-CtlResponseJson `
+            -RawJson $stopRes.RawText `
+            -Context "Scenario-f-stop" `
+            -RequiredResultProperties @("running")
         Start-Sleep -Milliseconds $PollIntervalMs
         $fwStillPresent = Test-FirewallRulePresent -RuleName $FirewallRuleName
         $curlDirect = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
 
-        if ($stopRes.ExitCode -eq 0 -and $stopJson.ok -eq $true -and $stopJson.data.running -eq $false -and (-not $fwStillPresent) -and $curlDirect.ExitCode -eq 0 -and $curlDirect.HttpCode -eq $ExpectedHttpStatus) {
+        if ($stopRes.ExitCode -eq 0 -and $stopDiag.running -eq $false -and (-not $fwStillPresent) -and $curlDirect.ExitCode -eq 0 -and $curlDirect.HttpCode -eq $ExpectedHttpStatus) {
             Record-ScenarioResult -Id "f" -Status "PASS" -Title "ctl stop and direct pass-through" -Detail "Firewall rule '$FirewallRuleName' removed and direct curl returned HTTP $($curlDirect.HttpCode)"
         } else {
-            Record-ScenarioResult -Id "f" -Status "FAIL" -Title "ctl stop and direct pass-through" -Detail "stopOk=$($stopJson.ok), running=$($stopJson.data.running), fwPresent=$fwStillPresent, curlHttp=$($curlDirect.HttpCode)"
+            Record-ScenarioResult -Id "f" -Status "FAIL" -Title "ctl stop and direct pass-through" -Detail "running=$($stopDiag.running), fwPresent=$fwStillPresent, curlHttp=$($curlDirect.HttpCode)"
         }
     } catch {
         Record-ScenarioResult -Id "f" -Status "FAIL" -Title "ctl stop and direct pass-through" -Detail $_.Exception.Message
@@ -667,21 +1017,16 @@ try {
     # Scenario (g): Crash test (ctl start, Stop-Process -Force on daemon, fail-open curl 200, orphaned firewall rule present)
     # -----------------------------------------------------------------------
     try {
-        $reStartRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("start") -Label "Scenario-g-start"
-        $reStartJson = $reStartRes.RawText | ConvertFrom-Json
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
         Start-Sleep -Milliseconds $PollIntervalMs
         $fwBeforeCrash = Test-FirewallRulePresent -RuleName $FirewallRuleName
 
-        if ($reStartRes.ExitCode -ne 0 -or $reStartJson.data.running -ne $true -or (-not $fwBeforeCrash)) {
-            Record-ScenarioResult -Id "g" -Status "FAIL" -Title "Daemon crash fail-open & orphaned rule" -Detail "Failed to start interception or create firewall rule before crash test"
+        if (-not $fwBeforeCrash) {
+            Record-ScenarioResult -Id "g" -Status "FAIL" -Title "Daemon crash fail-open & orphaned rule" -Detail "Firewall rule '$FirewallRuleName' was not present after ctl start"
         } else {
-            $killedPid = $script:DaemonProcess.Id
-            Stop-DaemonProcess -ProcessObj $script:DaemonProcess
-            $script:DaemonProcess = $null
+            $killedPid = $script:CurrentDaemonProc.Id
+            Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
             Start-Sleep -Milliseconds $PollIntervalMs
-
-            # Query ctl status while daemon is down so CLI records user-side disconnection log
-            $null = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("status") -Label "Scenario-g-status-while-down"
 
             $curlAfterCrash = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
             $fwOrphanPresent = Test-FirewallRulePresent -RuleName $FirewallRuleName
@@ -698,15 +1043,19 @@ try {
 
     # -----------------------------------------------------------------------
     # Scenario (h): Daemon restart automatically removes orphaned firewall rule and logs it
+    #               (Self-contained: ensures daemon is stopped and orphaned rule exists first)
     # -----------------------------------------------------------------------
     try {
+        Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
+        Ensure-SyntheticFirewallRulePresent -RuleName $FirewallRuleName -ProgramPath $routeWardExePath -Port $TransparentRelayPort
+
         $daemonLogBeforeLines = 0
         $existingDaemonLogs = @(Get-ChildItem -Path $daemonLogsDir -Filter $logWildcard -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
         if ($existingDaemonLogs.Count -gt 0) {
             $daemonLogBeforeLines = @(Get-Content -LiteralPath $existingDaemonLogs[0].FullName -Encoding UTF8).Count
         }
 
-        $script:DaemonProcess = Start-DaemonBackground -ExePath $routeWardExePath -WorkDir $resolvedBinDir
+        $null = Start-TrackedDaemon -ExePath $routeWardExePath -WorkDir $resolvedBinDir
         $pipeReadyAfterCrash = Wait-ForNamedPipe -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs
         Start-Sleep -Milliseconds $LogFlushWaitMs
 
@@ -741,7 +1090,10 @@ try {
     # Scenario (i): Daemon and user logs modified during test, no CWD 'logs' directory created
     # -----------------------------------------------------------------------
     try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $false
+        $null = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("status") -Label "Scenario-i-status-log-check"
         Start-Sleep -Milliseconds $LogFlushWaitMs
+
         $daemonLogFiles = @(Get-ChildItem -Path $daemonLogsDir -Filter $logWildcard -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
         $userLogFiles = @(Get-ChildItem -Path $userLogsDir -Filter $logWildcard -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
 
@@ -759,10 +1111,26 @@ try {
     }
 } finally {
     # -----------------------------------------------------------------------
-    # Guardrail 4: Always stop daemon, run routeward cleanup, and restore profile if modified
+    # Guardrail 4 (Bug 4 fix):
+    # 1. Stop interception via ctl stop, then terminate all tracked daemon PIDs
+    # 2. Verify zero routeward daemon processes remain alive
+    # 3. Run routeward cleanup only after all daemon processes have exited
+    # 4. Restore profile if modified
+    # 5. Verify outbound curl connectivity and record it in the report
     # -----------------------------------------------------------------------
-    Stop-DaemonProcess -ProcessObj $script:DaemonProcess
-    $script:DaemonProcess = $null
+    Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName
+
+    $survivingProcs = @(Get-Process -Name "routeward" -ErrorAction SilentlyContinue)
+    if ($survivingProcs.Count -gt 0) {
+        $survivingIds = ($survivingProcs | ForEach-Object { $_.Id }) -join ", "
+        $auditNotes.Add("WARNING: Surviving routeward processes detected before cleanup (PIDs: $survivingIds); forcing termination.")
+        foreach ($sp in $survivingProcs) {
+            Stop-Process -Id $sp.Id -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $sp.Id -Timeout 5 -ErrorAction SilentlyContinue
+        }
+    } else {
+        $auditNotes.Add("Verified 0 surviving routeward processes prior to running 'routeward cleanup'.")
+    }
 
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -771,6 +1139,12 @@ try {
         $cleanupExit = $LASTEXITCODE
         $cleanupStr = ($cleanupOut | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
         $script:RawCtlCapture.Add("--- [Finally-Cleanup] routeward cleanup (exit=$cleanupExit) ---`r`n$cleanupStr")
+        if ($cleanupExit -ne 0) {
+            $forceOut = & $routeWardExePath cleanup --force 2>&1
+            $forceExit = $LASTEXITCODE
+            $forceStr = ($forceOut | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+            $script:RawCtlCapture.Add("--- [Finally-Cleanup-Force] routeward cleanup --force (exit=$forceExit) ---`r`n$forceStr")
+        }
     } catch {
         $script:RawCtlCapture.Add("--- [Finally-Cleanup] routeward cleanup error: $($_.Exception.Message) ---")
     } finally {
@@ -784,6 +1158,16 @@ try {
         } catch {
             $auditNotes.Add("WARNING: Failed to restore original profile at '$activeProfilePath': $($_.Exception.Message)")
         }
+    }
+
+    try {
+        $finalCurl = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
+        $postCleanupCurlStatus = "HTTP $($finalCurl.HttpCode) (curl exit=$($finalCurl.ExitCode), target=$TestUrl)"
+        $auditNotes.Add("Post-cleanup outbound connectivity check: $postCleanupCurlStatus")
+        Write-Host "Post-cleanup outbound connectivity check: $postCleanupCurlStatus"
+    } catch {
+        $postCleanupCurlStatus = "ERROR: $($_.Exception.Message)"
+        $auditNotes.Add("Post-cleanup outbound connectivity check failed: $postCleanupCurlStatus")
     }
 }
 
@@ -809,6 +1193,7 @@ $reportLines.Add("Finished At: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'))
 $reportLines.Add("Host / OS  : $([Environment]::MachineName) - $([Environment]::OSVersion.VersionString)")
 $reportLines.Add("PS Version : $($PSVersionTable.PSVersion.ToString())")
 $reportLines.Add("Summary    : $summaryBanner")
+$reportLines.Add("Post-Cleanup Connectivity: $postCleanupCurlStatus")
 $reportLines.Add("================================================================================")
 $reportLines.Add("")
 $reportLines.Add("## 1. Scenario Results")
@@ -843,7 +1228,7 @@ try {
 
 if ($auditNotes.Count -gt 0) {
     $reportLines.Add("")
-    $reportLines.Add("## 3. Audit Notes")
+    $reportLines.Add("## 3. Audit Notes & Cleanup Verification")
     foreach ($note in $auditNotes) {
         $reportLines.Add("- $(Remove-SensitiveText -InputText $note)")
     }

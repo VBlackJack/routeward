@@ -397,5 +397,40 @@ else
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Scenario (k): 'routeward cleanup' is refused while daemon is active,
+#               leaving 'table ip routeward' intact
+# ---------------------------------------------------------------------------
+rm -f /run/routeward/routeward.sock
+"${BIN}" daemon >/tmp/rw_daemon_k.out 2>&1 &
+DAEMON_K_PID=$!
+
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+set +e
+"${BIN}" cleanup >/tmp/rw_cleanup_k.out 2>&1
+CLEANUP_K_EXIT=$?
+set -e
+
+if [[ "${CLEANUP_K_EXIT}" -ne 0 ]] && nft list table ip routeward >/dev/null 2>&1; then
+    echo "[PASS] Scenario (k): routeward cleanup refused while daemon is active (exit=${CLEANUP_K_EXIT}) and table ip routeward remained intact"
+else
+    echo "[FAIL] Scenario (k): expected cleanup refusal and intact nft table (exit=${CLEANUP_K_EXIT})"
+    cat /tmp/rw_cleanup_k.out || true
+    kill -TERM "${DAEMON_K_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+kill -TERM "${DAEMON_K_PID}" 2>/dev/null || true
+wait "${DAEMON_K_PID}" 2>/dev/null || true
+
 kill "${MOCK_PID}" 2>/dev/null || true
-echo "=== ALL 10 LINUX CONTAINER SCENARIOS PASSED ==="
+echo "=== ALL 11 LINUX CONTAINER SCENARIOS PASSED ==="

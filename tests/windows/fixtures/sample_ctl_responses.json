@@ -1,0 +1,131 @@
+{
+  "statusStopped": {
+    "id": "11111111-1111-4000-8000-000000000001",
+    "ok": true,
+    "result": {
+      "osName": "windows",
+      "driverBackend": "WinDivert 2.2 (Dynamic DLL)",
+      "elevatedPrivileges": true,
+      "running": false,
+      "daemonConnected": true,
+      "interceptionMode": "hybrid",
+      "relayTcpEndpoint": "127.0.0.1:10808",
+      "relayHttpEndpoint": "127.0.0.1:10809",
+      "dnsEndpoint": "127.0.0.1:10853",
+      "fakeIpCidr": "198.18.0.0/15"
+    }
+  },
+  "startRunning": {
+    "id": "11111111-1111-4000-8000-000000000002",
+    "ok": true,
+    "result": {
+      "osName": "windows",
+      "driverBackend": "WinDivert 2.2 (Dynamic DLL)",
+      "elevatedPrivileges": true,
+      "running": true,
+      "daemonConnected": true,
+      "interceptionMode": "hybrid",
+      "relayTcpEndpoint": "127.0.0.1:10808",
+      "relayHttpEndpoint": "127.0.0.1:10809",
+      "dnsEndpoint": "127.0.0.1:10853",
+      "fakeIpCidr": "198.18.0.0/15"
+    }
+  },
+  "connectionsProxied": {
+    "id": "11111111-1111-4000-8000-000000000003",
+    "ok": true,
+    "result": [
+      {
+        "id": "conn-sample-1",
+        "pid": 4812,
+        "processName": "curl.exe",
+        "processPath": "C:\\Windows\\System32\\curl.exe",
+        "targetHost": "93.184.216.34",
+        "resolvedDomain": null,
+        "targetPort": 80,
+        "protocol": "tcp",
+        "matchedRule": "CLI Tools via SOCKS5 Proxy",
+        "routeLabel": "Local SOCKS5 Gateway (Socks5)",
+        "latencyMs": 18,
+        "rxBytes": 1256,
+        "txBytes": 82,
+        "status": "closed",
+        "startedAt": "2026-10-23T19:30:00Z"
+      }
+    ]
+  },
+  "connectionsBlocked": {
+    "id": "11111111-1111-4000-8000-000000000004",
+    "ok": true,
+    "result": [
+      {
+        "id": "conn-sample-2",
+        "pid": 5104,
+        "processName": "curl.exe",
+        "processPath": "C:\\Windows\\System32\\curl.exe",
+        "targetHost": "93.184.216.34",
+        "resolvedDomain": null,
+        "targetPort": 80,
+        "protocol": "tcp",
+        "matchedRule": "Temporary Windows Regression Block Curl",
+        "routeLabel": "BLOCKED",
+        "latencyMs": 0,
+        "rxBytes": 0,
+        "txBytes": 0,
+        "status": "blocked",
+        "startedAt": "2026-10-23T19:30:05Z"
+      }
+    ]
+  },
+  "upsertRuleOk": {
+    "id": "11111111-1111-4000-8000-000000000005",
+    "ok": true,
+    "result": {
+      "ok": true
+    }
+  },
+  "removeRuleOk": {
+    "id": "11111111-1111-4000-8000-000000000006",
+    "ok": true,
+    "result": {
+      "ok": true
+    }
+  },
+  "stateSample": {
+    "id": "11111111-1111-4000-8000-000000000007",
+    "ok": true,
+    "result": {
+      "diagnostics": {
+        "osName": "windows",
+        "driverBackend": "WinDivert 2.2 (Dynamic DLL)",
+        "elevatedPrivileges": true,
+        "running": true,
+        "daemonConnected": true,
+        "interceptionMode": "hybrid",
+        "relayTcpEndpoint": "127.0.0.1:10808",
+        "relayHttpEndpoint": "127.0.0.1:10809",
+        "dnsEndpoint": "127.0.0.1:10853",
+        "fakeIpCidr": "198.18.0.0/15"
+      },
+      "profile": {
+        "profileId": "00000000-0000-4000-8000-000000000001",
+        "name": "Default Security Profile",
+        "rules": [
+          {
+            "id": "rule-cli-tools-chain",
+            "name": "CLI Tools via SOCKS5 Proxy",
+            "enabled": true,
+            "priority": 30
+          }
+        ]
+      }
+    }
+  },
+  "legacyMalformedDataField": {
+    "id": "11111111-1111-4000-8000-000000000099",
+    "ok": true,
+    "data": {
+      "running": false
+    }
+  }
+}

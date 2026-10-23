@@ -19,26 +19,31 @@ Pour empecher toute execution accidentelle hors machine de test, le script refus
 Depuis une console PowerShell ou Invite de commandes en Administrateur, dans le dossier contenant `routeward.exe` :
 
 ```powershell
-# PowerShell 5.1 :
+# PowerShell 5.1 (execution complete dans la VM de test dediee) :
 .\Invoke-RouteWardTests.ps1 -ConfirmTestMachine
 
 # Ou via le fichier .bat :
 .\Run-RouteWardTests.bat -ConfirmTestMachine
+
+# Mode DryRun (valide la resolution de chemins hors depot et le parseur JSON des reponses ctl sur fichier d'exemple sans lancer le daemon ni WinDivert) :
+.\Invoke-RouteWardTests.ps1 -DryRun
 ```
 
-Tous les chemins, ports, URL de test, noms de regles et delais sont parametrables (`-Socks5Host`, `-Socks5Port`, `-TestUrl`, `-PipeName`, `-TransparentRelayPort`, `-BinDir`, etc.). En sortie (`try / finally`), le script arrete systematiquement le daemon qu'il a lance, execute `routeward.exe cleanup`, et restaure `active_profile.json` s'il a ete modifie.
+Tous les chemins, ports, URL de test, noms de regles et delais sont parametrables (`-Socks5Host`, `-Socks5Port`, `-TestUrl`, `-PipeName`, `-TransparentRelayPort`, `-BinDir`, etc.). Lorsqu'il est lance hors du depot Git (par exemple depuis `C:\RouteWard`), le script utilise ses valeurs par defaut sans erreur. En sortie (`try / finally`), le script demande l'arret de l'interception (`ctl stop`), tue tous les PID de daemon qu'il a lances, verifie qu'aucun processus `routeward` ne survit, execute `routeward.exe cleanup`, restaure `active_profile.json` s'il a ete modifie, et verifie que `curl.exe` repond en sortie.
 
 ## Scenarios Couverts
 
+Chaque scenario etablit lui-meme son etat de depart de maniere independante :
+
 - **`(a)`** : Demarre `routeward.exe daemon` en arriere-plan et verifie l'apparition du Named Pipe (`\\.\pipe\routeward-daemon`).
 - **`(b)`** : Verifie les DACL protegees (`D:P`) limitees a `SYSTEM` et `Administrators` sur `%ProgramData%\RouteWard` et `active_profile.json`, ainsi que la SDDL du Named Pipe via `[System.IO.Directory]::GetAccessControl` (absence de `WD`, `BU` et `AU`).
-- **`(c)`** : Verifie `routeward.exe ctl status` (`daemonConnected=true`, `elevatedPrivileges=true`, `running=false`).
-- **`(d)`** : Execute `routeward.exe ctl start` puis `curl.exe`, verifie le code HTTP `200` et la presence de `curl.exe` dans `ctl connections` avec `matchedRule="CLI Tools via SOCKS5 Proxy"` et `rxBytes > 0`.
-- **`(e)`** : Teste l'ajout puis le retrait d'une regle `Block` temporaire pour `curl.exe` via `ctl` (passe proprement en `[SKIP]` si `ctl` ne fournit pas de sous-commande de suppression de regle).
+- **`(c)`** : Verifie `routeward.exe ctl status` (`result.daemonConnected=true`, `result.elevatedPrivileges=true`, `result.running=false`).
+- **`(d)`** : Execute `routeward.exe ctl start` puis `curl.exe`, verifie le code HTTP `200` et la presence de `curl.exe` dans `result` de `ctl connections` avec `matchedRule="CLI Tools via SOCKS5 Proxy"` et `rxBytes > 0`.
+- **`(e)`** : Ajoute une regle `Block` temporaire de priorite 1 pour `curl.exe` via `routeward.exe ctl upsert-rule`, verifie l'echec de `curl.exe` et l'etat `blocked` dans `ctl connections`, retire la regle via `routeward.exe ctl remove-rule --id <ID>`, et verifie via `ctl state` que le profil est revenu exactement a l'identique.
 - **`(f)`** : Execute `routeward.exe ctl stop`, verifie la suppression de la regle de pare-feu `RouteWard_TransparentRelay_10810` et le retour HTTP `200` de `curl.exe` en direct.
 - **`(g)`** : Demarre l'interception, tue brutalement le daemon (`Stop-Process -Force`), verifie que `curl.exe` repond `200` (fail-open) et que la regle de pare-feu orpheline est toujours presente.
-- **`(h)`** : Redemarre `routeward.exe daemon` et verifie que la regle de pare-feu orpheline est supprimee automatiquement au demarrage et mentionnee dans le journal du daemon.
-- **`(i)`** : Verifie que le journal daemon (`%ProgramData%\RouteWard\logs`) et le journal utilisateur (`%LOCALAPPDATA%\RouteWard\logs`) ont ete modifies pendant le test, et qu'aucun dossier `logs` n'a ete cree dans le repertoire courant.
+- **`(h)`** : S'assure que le daemon est arrete et que la regle de pare-feu orpheline est presente, redemarre `routeward.exe daemon`, et verifie que la regle orpheline est supprimee automatiquement au demarrage et mentionnee dans le journal du daemon.
+- **`(i)`** : Verifie que le journal daemon (`%ProgramData%\RouteWard\logs`) et le journal utilisateur (`%LOCALAPPDATA%\RouteWard\logs`, alimente en `INFO` a chaque appel `ctl`) ont ete modifies pendant le test, et qu'aucun dossier `logs` n'a ete cree dans le repertoire courant.
 
 ## Lecture du Rapport Genere
 

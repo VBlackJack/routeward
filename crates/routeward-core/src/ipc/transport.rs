@@ -370,6 +370,52 @@ pub async fn connect_ipc_stream(ipc_config: &IpcConstants) -> RouteWardResult<Ip
     }
 }
 
+/// Checks whether a `routeward daemon` instance is currently listening on the configured OS IPC endpoint.
+pub fn is_daemon_ipc_active(ipc_config: &IpcConstants) -> bool {
+    #[cfg(unix)]
+    {
+        let socket_path = std::path::Path::new(&ipc_config.unix_socket_path);
+        if !socket_path.exists() {
+            return false;
+        }
+        match std::os::unix::net::UnixStream::connect(socket_path) {
+            Ok(_stream) => true,
+            Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY,
+        };
+
+        match ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&ipc_config.windows_pipe_name)
+        {
+            Ok(temp_server) => {
+                drop(temp_server);
+                false
+            }
+            Err(err) => {
+                let raw = err.raw_os_error().unwrap_or(0) as u32;
+                if raw == ERROR_ACCESS_DENIED || raw == ERROR_PIPE_BUSY {
+                    true
+                } else {
+                    match ClientOptions::new().open(&ipc_config.windows_pipe_name) {
+                        Ok(_) => true,
+                        Err(c_err) => {
+                            let c_raw = c_err.raw_os_error().unwrap_or(0) as u32;
+                            c_raw != ERROR_FILE_NOT_FOUND
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 pub async fn connect_windows_named_pipe(pipe_name: &str) -> RouteWardResult<IpcStream> {
     use std::time::Duration;

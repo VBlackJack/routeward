@@ -629,7 +629,8 @@
       "not_elevated": "Administrator or root privileges are required to run routeward daemon",
       "ipc_error": "Daemon IPC communication error",
       "disconnected": "Privileged RouteWard daemon is not connected",
-      "insecure_profile": "Refusing to start: profile directory or file has insecure ownership or write permissions"
+      "insecure_profile": "Refusing to start: profile directory or file has insecure ownership or write permissions",
+      "cleanup_refused_active": "Refusing to run cleanup while a RouteWard daemon is active (stop the daemon first or pass --force)"
     }
   },
   "themeforge": {
