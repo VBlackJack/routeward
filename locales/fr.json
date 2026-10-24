@@ -613,6 +613,7 @@
       "handshake_failed": "Échec de la négociation protocolaire avec le proxy",
       "connection_timeout": "Délai d'attente dépassé lors de la connexion au proxy",
       "auth_rejected": "Le serveur proxy a rejeté les identifiants d'authentification",
+      "udp_not_supported": "Le serveur proxy en amont ne supporte pas SOCKS5 UDP ASSOCIATE",
       "invalid_uri": "Format d'URI de proxy invalide"
     },
     "rule": {

@@ -162,7 +162,9 @@ $script:ScenarioExecutionPlan = @(
     [PSCustomObject]@{ ExecutionOrder = 11; Id = "l"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Active Directory domain direct DNS bypass" },
     [PSCustomObject]@{ ExecutionOrder = 12; Id = "m"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Post-stop direct DNS resolution outside Fake-IP pool" },
     [PSCustomObject]@{ ExecutionOrder = 13; Id = "n"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "OS DNS cache flushed on engine startup" },
-    [PSCustomObject]@{ ExecutionOrder = 14; Id = "j"; RequiresSocks5 = $true;  StopsSocks5 = $true;  Title = "Kill-Switch blocks curl when SOCKS5 proxy is stopped" }
+    [PSCustomObject]@{ ExecutionOrder = 14; Id = "o"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "QUIC (UDP 443) rejected with ICMP Port Unreachable" },
+    [PSCustomObject]@{ ExecutionOrder = 15; Id = "p"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "LLMNR (UDP 5355) blocks public FQDNs and allows local names" },
+    [PSCustomObject]@{ ExecutionOrder = 16; Id = "j"; RequiresSocks5 = $true;  StopsSocks5 = $true;  Title = "Kill-Switch blocks curl when SOCKS5 proxy is stopped" }
 )
 
 function Get-ScenarioPlanEntry {
@@ -207,6 +209,76 @@ function Get-StartupDnsFlushMethodFromLogs {
         }
     }
     return ""
+}
+
+function New-DnsWireQueryPacket {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$QueryName,
+
+        [Parameter(Mandatory = $false)]
+        [uint16]$TransactionId = 0x5355
+    )
+    $bytes = New-Object System.Collections.Generic.List[byte]
+    # Header: ID, Flags=0x0000, QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+    $bytes.Add([byte](($TransactionId -shr 8) -band 0xFF))
+    $bytes.Add([byte]($TransactionId -band 0xFF))
+    $bytes.AddRange([byte[]]@(0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+
+    $trimmed = $QueryName.Trim().TrimEnd('.')
+    foreach ($label in ($trimmed -split '\.')) {
+        if (-not [string]::IsNullOrEmpty($label)) {
+            $labelBytes = [System.Text.Encoding]::ASCII.GetBytes($label)
+            $bytes.Add([byte]$labelBytes.Length)
+            $bytes.AddRange($labelBytes)
+        }
+    }
+    $bytes.Add([byte]0x00)
+    # QTYPE=1 (A), QCLASS=1 (IN)
+    $bytes.AddRange([byte[]]@(0x00, 0x01, 0x00, 0x01))
+    return ,$bytes.ToArray()
+}
+
+function Invoke-QuicUdp443Probe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetIp,
+
+        [Parameter(Mandatory = $false)]
+        [int]$Port = 443,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ReceiveTimeoutMs = 1500
+    )
+    $udp = New-Object System.Net.Sockets.UdpClient
+    try {
+        $udp.Client.ReceiveTimeout = $ReceiveTimeoutMs
+        $udp.Connect($TargetIp, $Port)
+        $payload = [System.Text.Encoding]::ASCII.GetBytes("QUIC_INITIAL_PROBE_42A")
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $null = $udp.Send($payload, $payload.Length)
+        $remoteEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+        try {
+            $null = $udp.Receive([ref]$remoteEp)
+            $sw.Stop()
+            return [PSCustomObject]@{
+                ClientErrorReceived = $false
+                SocketErrorCode     = "None"
+                DelayMs             = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+            }
+        } catch [System.Net.Sockets.SocketException] {
+            $sw.Stop()
+            $sockErr = $_.Exception.SocketErrorCode.ToString()
+            $isIcmpReject = ($sockErr -eq "ConnectionReset" -or $sockErr -eq "ConnectionRefused")
+            return [PSCustomObject]@{
+                ClientErrorReceived = $isIcmpReject
+                SocketErrorCode     = $sockErr
+                DelayMs             = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+            }
+        }
+    } finally {
+        $udp.Close()
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -896,20 +968,37 @@ if ($DryRun.IsPresent) {
     if ($frExtractedMethod -ne "dnsapi.dll!DnsFlushResolverCache") {
         throw "DryRun failed: expected invariant English method from localized log, got '$frExtractedMethod'."
     }
-    if ($script:ScenarioExecutionPlan.Count -ne 14) {
-        throw "DryRun failed: expected 14 scenarios in ScenarioExecutionPlan, got $($script:ScenarioExecutionPlan.Count)."
+    if ($script:ScenarioExecutionPlan.Count -ne 16) {
+        throw "DryRun failed: expected 16 scenarios in ScenarioExecutionPlan, got $($script:ScenarioExecutionPlan.Count)."
     }
     $lastScenario = $script:ScenarioExecutionPlan[$script:ScenarioExecutionPlan.Count - 1]
-    if ($lastScenario.Id -ne "j" -or $lastScenario.ExecutionOrder -ne 14 -or (-not $lastScenario.StopsSocks5)) {
-        throw "DryRun failed: Scenario (j) must execute last (ExecutionOrder=14, StopsSocks5=true)."
+    if ($lastScenario.Id -ne "j" -or $lastScenario.ExecutionOrder -ne 16 -or (-not $lastScenario.StopsSocks5)) {
+        throw "DryRun failed: Scenario (j) must execute last (ExecutionOrder=16, StopsSocks5=true)."
     }
     foreach ($planItem in $script:ScenarioExecutionPlan) {
         if ($planItem.RequiresSocks5 -and $planItem.Id -ne "j" -and $planItem.ExecutionOrder -ge $lastScenario.ExecutionOrder) {
             throw "DryRun failed: Scenario ($($planItem.Id)) requires SOCKS5 and must run before Scenario (j)."
         }
     }
+    $llmnrTestPkt = New-DnsWireQueryPacket -QueryName "public-leak.routeward.test" -TransactionId 0x5355
+    if ($llmnrTestPkt.Length -le 20 -or $llmnrTestPkt[0] -ne 0x53 -or $llmnrTestPkt[1] -ne 0x55) {
+        throw "DryRun failed: New-DnsWireQueryPacket produced unexpected wire bytes."
+    }
+    $connsQuicLlmnrDryRun = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.connectionsQuicAndLlmnrBlocked | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-connectionsQuicAndLlmnrBlocked" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("processName", "targetPort", "protocol", "matchedRule", "status")
+    $logsQuicLlmnrDryRun = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.logsQuicAndLlmnrBlocked | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-logsQuicAndLlmnrBlocked" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("level", "component", "message")
+    if ($connsQuicLlmnrDryRun.Count -ne 2 -or $logsQuicLlmnrDryRun.Count -ne 2) {
+        throw "DryRun failed: unexpected connectionsQuicAndLlmnrBlocked or logsQuicAndLlmnrBlocked count."
+    }
     $orderChain = ($script:ScenarioExecutionPlan | ForEach-Object { "{0:D2}:({1})" -f $_.ExecutionOrder, $_.Id }) -join " -> "
-    Write-Host "[DRYRUN-PASS] Verified Fake-IP CIDR pool helper, 'ctl fake-ips', domain-routed connection, English-only OS DNS cache flush parser, and explicit execution order ($orderChain)." -ForegroundColor Green
+    Write-Host "[DRYRUN-PASS] Verified Fake-IP CIDR pool helper, 'ctl fake-ips', QUIC/LLMNR fixtures, English-only OS DNS cache flush parser, and explicit execution order ($orderChain)." -ForegroundColor Green
 
     $upsertAck = ConvertFrom-CtlResponseJson `
         -RawJson ($fixtures.upsertRuleOk | ConvertTo-Json -Depth 6) `
@@ -1732,7 +1821,121 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (j) [Order 14/14 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) —
+    # Scenario (o) [Order 14/16]: QUIC (UDP 443) rejected with inbound ICMPv4
+    #               Port Unreachable (Type 3, Code 3), client error delay measured
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+        $quicProbe = Invoke-QuicUdp443Probe -TargetIp $ExternalDnsServer -Port 443 -ReceiveTimeoutMs 1500
+        Start-Sleep -Milliseconds $PollIntervalMs
+
+        $connsResO = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-o-connections"
+        $connsListO = ConvertFrom-CtlResponseJson `
+            -RawJson $connsResO.RawText `
+            -Context "Scenario-o-connections" `
+            -ExpectResultArray `
+            -RequiredArrayElementProperties @("targetHost", "targetPort", "protocol", "matchedRule", "status")
+
+        $logsResO = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-o-logs"
+        $logsListO = ConvertFrom-CtlResponseJson `
+            -RawJson $logsResO.RawText `
+            -Context "Scenario-o-logs" `
+            -ExpectResultArray `
+            -RequiredArrayElementProperties @("level", "component", "message")
+
+        $sawQuicBlockedConn = $false
+        foreach ($c in $connsListO) {
+            if ([int]$c.targetPort -eq 443 -and $c.protocol -eq "udp" -and $c.matchedRule -eq "SecurityPolicy:blockQuicUdp443" -and $c.status -eq "blocked") {
+                $sawQuicBlockedConn = $true
+                break
+            }
+        }
+
+        $sawQuicWarnLog = $false
+        foreach ($l in $logsListO) {
+            if ($l.level -eq "WARN" -and ([string]$l.message).Contains("Rejected QUIC (UDP port 443) with ICMP Port Unreachable")) {
+                $sawQuicWarnLog = $true
+                break
+            }
+        }
+
+        if ($sawQuicBlockedConn -and $sawQuicWarnLog) {
+            Record-ScenarioResult -Id "o" -Status "PASS" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail "UDP 443 toward ${ExternalDnsServer}:443 rejected (clientError=$($quicProbe.SocketErrorCode), measuredDelay=$($quicProbe.DelayMs) ms, matchedRule=SecurityPolicy:blockQuicUdp443, status=blocked)"
+        } else {
+            Record-ScenarioResult -Id "o" -Status "FAIL" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail "clientError=$($quicProbe.SocketErrorCode), delayMs=$($quicProbe.DelayMs), sawBlockedConn=$sawQuicBlockedConn, sawWarnLog=$sawQuicWarnLog"
+        }
+    } catch {
+        Record-ScenarioResult -Id "o" -Status "FAIL" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (p) [Order 15/16]: LLMNR (UDP 5355) blocks public FQDNs with
+    #               rate-limited WARN and allows local single-label names
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+        $publicLlmnrFqdn = "public-leak.routeward.test"
+        $localLlmnrName = "fileserver"
+        $publicPkt = New-DnsWireQueryPacket -QueryName $publicLlmnrFqdn -TransactionId 0x5355
+        $localPkt = New-DnsWireQueryPacket -QueryName $localLlmnrName -TransactionId 0x5356
+
+        $llmnrSock = New-Object System.Net.Sockets.UdpClient
+        try {
+            $null = $llmnrSock.Send($publicPkt, $publicPkt.Length, $ExternalDnsServer, 5355)
+            $null = $llmnrSock.Send($localPkt, $localPkt.Length, $ExternalDnsServer, 5355)
+        } finally {
+            $llmnrSock.Close()
+        }
+        Start-Sleep -Milliseconds $PollIntervalMs
+
+        $connsResP = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-p-connections"
+        $connsListP = ConvertFrom-CtlResponseJson `
+            -RawJson $connsResP.RawText `
+            -Context "Scenario-p-connections" `
+            -ExpectResultArray `
+            -RequiredArrayElementProperties @("targetPort", "protocol", "matchedRule", "status")
+
+        $logsResP = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-p-logs"
+        $logsListP = ConvertFrom-CtlResponseJson `
+            -RawJson $logsResP.RawText `
+            -Context "Scenario-p-logs" `
+            -ExpectResultArray `
+            -RequiredArrayElementProperties @("level", "component", "message")
+
+        $sawPublicFqdnBlocked = $false
+        $sawLocalNameBlocked = $false
+        foreach ($c in $connsListP) {
+            if ([int]$c.targetPort -eq 5355 -and $c.protocol -eq "udp" -and $c.matchedRule -eq "LocalNameGuard:LLMNR" -and $c.status -eq "blocked") {
+                if ($c.resolvedDomain -ieq $publicLlmnrFqdn) {
+                    $sawPublicFqdnBlocked = $true
+                }
+                if ($c.resolvedDomain -ieq $localLlmnrName) {
+                    $sawLocalNameBlocked = $true
+                }
+            }
+        }
+
+        $sawLlmnrWarnLog = $false
+        foreach ($l in $logsListP) {
+            if ($l.level -eq "WARN" -and ([string]$l.message).Contains("Blocked public FQDN `"$publicLlmnrFqdn`" over LLMNR")) {
+                $sawLlmnrWarnLog = $true
+                break
+            }
+        }
+
+        if ($sawPublicFqdnBlocked -and (-not $sawLocalNameBlocked) -and $sawLlmnrWarnLog) {
+            Record-ScenarioResult -Id "p" -Status "PASS" -Title "LLMNR (UDP 5355) blocks public FQDNs and allows local names" -Detail "Public FQDN '$publicLlmnrFqdn' blocked (LocalNameGuard:LLMNR, WARN logged); local name '$localLlmnrName' allowed directly"
+        } else {
+            Record-ScenarioResult -Id "p" -Status "FAIL" -Title "LLMNR (UDP 5355) blocks public FQDNs and allows local names" -Detail "sawPublicFqdnBlocked=$sawPublicFqdnBlocked, sawLocalNameBlocked=$sawLocalNameBlocked, sawLlmnrWarnLog=$sawLlmnrWarnLog"
+        }
+    } catch {
+        Record-ScenarioResult -Id "p" -Status "FAIL" -Title "LLMNR (UDP 5355) blocks public FQDNs and allows local names" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (j) [Order 16/16 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) —
     #               SOCKS5 proxy stopped during test, curl.exe matched by Proxy rule
     #               fails without falling back to Direct, and ctl connections reports Blocked
     # -----------------------------------------------------------------------

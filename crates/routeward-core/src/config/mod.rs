@@ -123,9 +123,27 @@ pub struct NetworkConstants {
     pub default_relay_http_port: u16,
     pub default_transparent_tcp_port: u16,
     pub default_dns_listen_port: u16,
+    #[serde(default = "default_local_name_inspect_port")]
+    pub default_local_name_inspect_port: u16,
+    #[serde(default = "default_quic_default_port")]
+    pub quic_default_port: u16,
+    #[serde(default = "default_mdns_standard_port")]
+    pub mdns_standard_port: u16,
+    #[serde(default = "default_llmnr_standard_port")]
+    pub llmnr_standard_port: u16,
+    #[serde(default = "default_netbios_ns_standard_port")]
+    pub netbios_ns_standard_port: u16,
     pub tcp_connect_timeout_ms: u64,
     pub proxy_handshake_timeout_ms: u64,
     pub udp_association_timeout_ms: u64,
+    #[serde(default = "default_udp_association_idle_timeout_secs")]
+    pub udp_association_idle_timeout_secs: u64,
+    #[serde(default = "default_max_udp_associations")]
+    pub max_udp_associations: usize,
+    #[serde(default = "default_udp_capability_cache_secs")]
+    pub udp_capability_cache_secs: u64,
+    #[serde(default = "default_udp_warn_rate_limit_secs")]
+    pub udp_warn_rate_limit_secs: u64,
     pub relay_buffer_size_bytes: usize,
     pub max_concurrent_connections: usize,
     pub pid_fallback_retries: u32,
@@ -135,6 +153,12 @@ pub struct NetworkConstants {
     pub windivert_dll_paths: Vec<String>,
     #[serde(default = "default_linux_fwmark")]
     pub linux_fwmark: u32,
+    #[serde(default = "default_linux_tproxy_fwmark")]
+    pub linux_tproxy_fwmark: u32,
+    #[serde(default = "default_linux_tproxy_route_table")]
+    pub linux_tproxy_route_table: u32,
+    #[serde(default = "default_linux_tproxy_rule_priority")]
+    pub linux_tproxy_rule_priority: u32,
     #[serde(default = "default_linux_nft_binary")]
     pub linux_nft_binary: String,
     #[serde(default = "default_linux_nft_table_name")]
@@ -151,6 +175,54 @@ pub struct NetworkConstants {
 
 fn default_linux_fwmark() -> u32 {
     0x5257
+}
+
+fn default_local_name_inspect_port() -> u16 {
+    10854
+}
+
+fn default_quic_default_port() -> u16 {
+    443
+}
+
+fn default_mdns_standard_port() -> u16 {
+    5353
+}
+
+fn default_llmnr_standard_port() -> u16 {
+    5355
+}
+
+fn default_netbios_ns_standard_port() -> u16 {
+    137
+}
+
+fn default_udp_association_idle_timeout_secs() -> u64 {
+    60
+}
+
+fn default_max_udp_associations() -> usize {
+    512
+}
+
+fn default_udp_capability_cache_secs() -> u64 {
+    300
+}
+
+fn default_udp_warn_rate_limit_secs() -> u64 {
+    30
+}
+
+fn default_linux_tproxy_fwmark() -> u32 {
+    21080
+}
+
+fn default_linux_tproxy_route_table() -> u32 {
+    100
+}
+
+fn default_linux_tproxy_rule_priority() -> u32 {
+    10810
 }
 
 fn default_linux_nft_binary() -> String {
@@ -417,12 +489,18 @@ pub struct ProtocolConstants {
     pub socks5_reply_succeeded: u8,
     #[serde(default = "default_socks5_reply_general_failure")]
     pub socks5_reply_general_failure: u8,
+    #[serde(default = "default_socks5_reply_command_not_supported")]
+    pub socks5_reply_command_not_supported: u8,
     pub http_success_status_prefix: String,
     pub http_alt_success_status_prefix: String,
 }
 
 fn default_socks5_reply_general_failure() -> u8 {
     1
+}
+
+fn default_socks5_reply_command_not_supported() -> u8 {
+    7
 }
 
 impl SystemConstants {
@@ -558,11 +636,17 @@ pub enum ChainStrategy {
 pub struct SecurityPolicyConfig {
     pub kill_switch_enabled: bool,
     pub block_udp_on_tcp_only_proxy: bool,
+    #[serde(default = "default_block_quic_udp_443")]
+    pub block_quic_udp_443: bool,
     pub strict_dns_no_local_fallback: bool,
     #[serde(default = "default_block_encrypted_dns_bypass")]
     pub block_encrypted_dns_bypass: bool,
     #[serde(default = "default_unknown_process_action")]
     pub unknown_process_action: RuleAction,
+}
+
+fn default_block_quic_udp_443() -> bool {
+    true
 }
 
 fn default_block_encrypted_dns_bypass() -> bool {
@@ -578,6 +662,7 @@ impl Default for SecurityPolicyConfig {
         Self {
             kill_switch_enabled: true,
             block_udp_on_tcp_only_proxy: true,
+            block_quic_udp_443: true,
             strict_dns_no_local_fallback: true,
             block_encrypted_dns_bypass: true,
             unknown_process_action: RuleAction::Block,

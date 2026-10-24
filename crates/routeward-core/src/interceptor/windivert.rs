@@ -30,10 +30,13 @@ use crate::config::{RuleAction, TransportProtocol};
 #[cfg(windows)]
 use crate::dns::codec::{enforce_udp_truncation, parse_dns_query};
 #[cfg(windows)]
+use crate::dns::LocalNameQueryDecision;
+#[cfg(windows)]
 use crate::interceptor::nat::{
-    build_forged_ipv4_udp_reply, parse_ipv4_tcp_meta, parse_ipv4_udp_meta,
-    parse_ipv6_transport_meta, reflect_outbound_to_local_relay, reflect_relay_reply_to_client,
-    Ipv4TcpPacketMeta, NatSessionEntry, PendingSynOutcome, PendingSynQueue, PidResolutionSource,
+    build_forged_ipv4_icmp_port_unreachable, build_forged_ipv4_udp_reply, is_private_or_local_ipv4,
+    parse_ipv4_tcp_meta, parse_ipv4_udp_meta, parse_ipv6_transport_meta,
+    reflect_outbound_to_local_relay, reflect_relay_reply_to_client, Ipv4TcpPacketMeta,
+    NatSessionEntry, PendingSynOutcome, PendingSynQueue, PidResolutionSource,
 };
 #[cfg(windows)]
 use crate::process::ProcessResolver;
@@ -81,11 +84,23 @@ const PACKET_BUFFER_SIZE: usize = 65535;
 const BIT_OUTBOUND: u64 = 1 << 17;
 const BIT_IMPOSTOR: u64 = 1 << 19;
 
-/// Builds the `WINDIVERT_LAYER_NETWORK` filter string for outbound IPv4 TCP + UDP (53/853)
-/// and IPv6 DNS/DoT (53/853) packets.
+/// Builds the `WINDIVERT_LAYER_NETWORK` filter string for outbound IPv4 TCP + UDP (53/853/443/5353/5355/137)
+/// and IPv6 DNS/DoT/QUIC/mDNS/LLMNR packets.
 pub fn build_network_filter_string(dns_port: u16, dot_port: u16) -> String {
+    build_network_filter_string_full(dns_port, dot_port, 443, 5353, 5355, 137)
+}
+
+/// Builds the full `WINDIVERT_LAYER_NETWORK` filter string using all configured DNS, QUIC, and local name ports.
+pub fn build_network_filter_string_full(
+    dns_port: u16,
+    dot_port: u16,
+    quic_port: u16,
+    mdns_port: u16,
+    llmnr_port: u16,
+    netbios_ns_port: u16,
+) -> String {
     format!(
-        "outbound and !loopback and ((ip and (tcp or udp.DstPort == {dns_port} or udp.DstPort == {dot_port})) or (ipv6 and (tcp.DstPort == {dns_port} or udp.DstPort == {dns_port} or tcp.DstPort == {dot_port} or udp.DstPort == {dot_port})))"
+        "outbound and !loopback and ((ip and (tcp or udp.DstPort == {dns_port} or udp.DstPort == {dot_port} or udp.DstPort == {quic_port} or udp.DstPort == {mdns_port} or udp.DstPort == {llmnr_port} or udp.DstPort == {netbios_ns_port})) or (ipv6 and (tcp.DstPort == {dns_port} or udp.DstPort == {dns_port} or tcp.DstPort == {dot_port} or udp.DstPort == {dot_port} or udp.DstPort == {quic_port} or udp.DstPort == {mdns_port} or udp.DstPort == {llmnr_port})))"
     )
 }
 
@@ -761,7 +776,14 @@ impl Interceptor for WinDivertInterceptor {
         let api = Self::load_dynamic_api(&net_consts.windivert_dll_paths)?;
 
         let sock_filter = CString::new(SOCKET_FILTER_TCP_OUTBOUND).expect("valid CString");
-        let net_filter_str = build_network_filter_string(dns_port, dot_port);
+        let net_filter_str = build_network_filter_string_full(
+            dns_port,
+            dot_port,
+            net_consts.quic_default_port,
+            net_consts.mdns_standard_port,
+            net_consts.llmnr_standard_port,
+            net_consts.netbios_ns_standard_port,
+        );
         let net_filter = CString::new(net_filter_str).expect("valid CString");
 
         let socket_handle = unsafe {
@@ -949,7 +971,14 @@ impl Interceptor for WinDivertInterceptor {
         let net_consts = &controller.constants.network;
         let dns_port = controller.constants.dns.dns_standard_port;
         let dot_port = controller.constants.dns.dns_over_tls_port;
-        let net_filter_str = build_network_filter_string(dns_port, dot_port);
+        let net_filter_str = build_network_filter_string_full(
+            dns_port,
+            dot_port,
+            net_consts.quic_default_port,
+            net_consts.mdns_standard_port,
+            net_consts.llmnr_standard_port,
+            net_consts.netbios_ns_standard_port,
+        );
         let net_filter = CString::new(net_filter_str).expect("valid CString");
 
         // Open the new WinDivert network handle and start its reflection worker BEFORE closing the old handle,
@@ -1032,6 +1061,10 @@ impl WinDivertInterceptor {
     ) {
         let dns_port = ctrl_net.constants.dns.dns_standard_port;
         let dot_port = ctrl_net.constants.dns.dns_over_tls_port;
+        let quic_port = ctrl_net.constants.network.quic_default_port;
+        let mdns_port = ctrl_net.constants.network.mdns_standard_port;
+        let llmnr_port = ctrl_net.constants.network.llmnr_standard_port;
+        let netbios_ns_port = ctrl_net.constants.network.netbios_ns_standard_port;
         std::thread::spawn(move || {
             let handle = net_handle_usize as *mut c_void;
             let mut packet_buf = vec![0u8; PACKET_BUFFER_SIZE];
@@ -1056,10 +1089,15 @@ impl WinDivertInterceptor {
                 let pkt_len = recv_len as usize;
                 let packet = &mut packet_buf[..pkt_len];
 
-                // Case 0: Outbound IPv6 DNS (port 53) or DoT (port 853) — unconditionally blocked until Batch 4.3
+                // Case 0: Outbound IPv6 DNS (port 53), DoT (port 853), QUIC (port 443), or mDNS/LLMNR
                 if let Some(v6_meta) = parse_ipv6_transport_meta(packet) {
-                    let kill_switch_enabled =
-                        ctrl_net.profile.read().security_policy.kill_switch_enabled;
+                    let (kill_switch_enabled, block_quic) = {
+                        let prof = ctrl_net.profile.read();
+                        (
+                            prof.security_policy.kill_switch_enabled,
+                            prof.security_policy.block_quic_udp_443,
+                        )
+                    };
                     if should_block_outbound_ipv6_dns_or_dot(
                         v6_meta.dst_port,
                         dns_port,
@@ -1109,9 +1147,27 @@ impl WinDivertInterceptor {
                         // Drop outbound IPv6 DNS (port 53) and DoT (port 853) so Windows falls back to IPv4 DNS immediately
                         continue;
                     }
+                    if v6_meta.next_header == crate::interceptor::nat::IPPROTO_UDP {
+                        if v6_meta.dst_port == quic_port && block_quic {
+                            continue;
+                        }
+                        if v6_meta.dst_port == mdns_port || v6_meta.dst_port == llmnr_port {
+                            if pkt_len >= 48 {
+                                let udp_payload = &packet[48..pkt_len];
+                                if !matches!(
+                                    ctrl_net.dns.classify_local_name_query(udp_payload),
+                                    LocalNameQueryDecision::AllowLocal { .. }
+                                ) {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                    }
                 }
 
-                // Case 1: Outbound IPv4 UDP DNS (port 53) or DoT/DoQ (port 853)
+                // Case 1: Outbound IPv4 UDP DNS (53), DoQ (853), QUIC (443), mDNS (5353), LLMNR (5355), or NetBIOS-NS (137)
                 if let Some(udp_meta) = parse_ipv4_udp_meta(packet) {
                     if !ctrl_net.nat_table.is_self_udp_port(udp_meta.src_port) {
                         if udp_meta.dst_port == dot_port
@@ -1145,6 +1201,165 @@ impl WinDivertInterceptor {
                                     protocol: TransportProtocol::Udp,
                                     matched_rule: "SecurityPolicy:blockEncryptedDnsBypass"
                                         .to_string(),
+                                    route_label: "BLOCKED".to_string(),
+                                    latency_ms: 0,
+                                    rx_bytes: 0,
+                                    tx_bytes: 0,
+                                    status: ConnectionStatus::Blocked,
+                                    started_at: Utc::now(),
+                                },
+                                false,
+                            );
+                            continue;
+                        }
+
+                        // QUIC (UDP 443): reject with inbound ICMPv4 Port Unreachable (Type 3, Code 3), falling back to drop
+                        if udp_meta.dst_port == quic_port
+                            && ctrl_net.profile.read().security_policy.block_quic_udp_443
+                        {
+                            if let Some(mut icmp_reply) =
+                                build_forged_ipv4_icmp_port_unreachable(packet)
+                            {
+                                let mut reply_addr = addr;
+                                reply_addr.set_outbound(false);
+                                reply_addr.clear_impostor();
+                                let mut send_len: u32 = 0;
+                                unsafe {
+                                    let _ = (api.calc_checksums)(
+                                        icmp_reply.as_mut_ptr() as *mut c_void,
+                                        icmp_reply.len() as u32,
+                                        &mut reply_addr as *mut WinDivertAddress,
+                                        0,
+                                    );
+                                    let _ = (api.send)(
+                                        handle,
+                                        icmp_reply.as_ptr() as *const c_void,
+                                        icmp_reply.len() as u32,
+                                        &mut send_len,
+                                        &reply_addr as *const WinDivertAddress,
+                                    );
+                                }
+                            }
+                            ctrl_net.push_rate_limited_warn(
+                                &format!("quic:{}:{}", udp_meta.dst_ip, udp_meta.dst_port),
+                                COMPONENT_WINDIVERT,
+                                format!(
+                                    "Rejected QUIC (UDP port {}) with ICMP Port Unreachable {}:{} -> {}:{} [blockQuicUdp443=true]",
+                                    quic_port,
+                                    udp_meta.src_ip,
+                                    udp_meta.src_port,
+                                    udp_meta.dst_ip,
+                                    udp_meta.dst_port
+                                ),
+                            );
+                            ctrl_net.telemetry.record_connection(
+                                TrackedConnection {
+                                    id: Uuid::new_v4().to_string(),
+                                    pid: 0,
+                                    process_name: "quic-udp-443".to_string(),
+                                    process_path: "quic-udp-443".to_string(),
+                                    target_host: udp_meta.dst_ip.to_string(),
+                                    resolved_domain: ctrl_net.dns.resolve_fake_ip(&udp_meta.dst_ip),
+                                    target_port: udp_meta.dst_port,
+                                    protocol: TransportProtocol::Udp,
+                                    matched_rule: "SecurityPolicy:blockQuicUdp443".to_string(),
+                                    route_label: "BLOCKED".to_string(),
+                                    latency_ms: 0,
+                                    rx_bytes: 0,
+                                    tx_bytes: 0,
+                                    status: ConnectionStatus::Blocked,
+                                    started_at: Utc::now(),
+                                },
+                                false,
+                            );
+                            continue;
+                        }
+
+                        // LLMNR (5355) and mDNS (5353): allow local names directly, block public FQDNs
+                        if udp_meta.dst_port == llmnr_port || udp_meta.dst_port == mdns_port {
+                            let proto_label = if udp_meta.dst_port == llmnr_port {
+                                "LLMNR"
+                            } else {
+                                "mDNS"
+                            };
+                            let udp_payload = &packet[udp_meta.payload_offset
+                                ..udp_meta.payload_offset + udp_meta.payload_len];
+                            match ctrl_net.dns.classify_local_name_query(udp_payload) {
+                                LocalNameQueryDecision::AllowLocal { qname } => {
+                                    ctrl_net.telemetry.push_log(
+                                        LogLevel::Debug,
+                                        COMPONENT_WINDIVERT,
+                                        format!(
+                                            "Allowed local {proto_label} query \"{qname}\" (UDP port {}) -> {}:{}",
+                                            udp_meta.dst_port, udp_meta.dst_ip, udp_meta.dst_port
+                                        ),
+                                    );
+                                    // Fall through to api.send to pass directly
+                                }
+                                LocalNameQueryDecision::BlockPublicFqdn { qname } => {
+                                    ctrl_net.push_rate_limited_warn(
+                                        &format!("{proto_label}:{qname}"),
+                                        COMPONENT_WINDIVERT,
+                                        format!(
+                                            "Blocked public FQDN \"{qname}\" over {proto_label} (UDP port {}) {}:{} -> {}:{}",
+                                            udp_meta.dst_port,
+                                            udp_meta.src_ip,
+                                            udp_meta.src_port,
+                                            udp_meta.dst_ip,
+                                            udp_meta.dst_port
+                                        ),
+                                    );
+                                    ctrl_net.telemetry.record_connection(
+                                        TrackedConnection {
+                                            id: Uuid::new_v4().to_string(),
+                                            pid: 0,
+                                            process_name: proto_label.to_lowercase(),
+                                            process_path: proto_label.to_lowercase(),
+                                            target_host: udp_meta.dst_ip.to_string(),
+                                            resolved_domain: Some(qname),
+                                            target_port: udp_meta.dst_port,
+                                            protocol: TransportProtocol::Udp,
+                                            matched_rule: format!("LocalNameGuard:{proto_label}"),
+                                            route_label: "BLOCKED".to_string(),
+                                            latency_ms: 0,
+                                            rx_bytes: 0,
+                                            tx_bytes: 0,
+                                            status: ConnectionStatus::Blocked,
+                                            started_at: Utc::now(),
+                                        },
+                                        false,
+                                    );
+                                    continue;
+                                }
+                                LocalNameQueryDecision::BlockMalformed => {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // NetBIOS-NS (137): block if targeting a non-local / public IPv4 address
+                        if udp_meta.dst_port == netbios_ns_port
+                            && !is_private_or_local_ipv4(udp_meta.dst_ip)
+                        {
+                            ctrl_net.push_rate_limited_warn(
+                                &format!("netbios:{}", udp_meta.dst_ip),
+                                COMPONENT_WINDIVERT,
+                                format!(
+                                    "Blocked NetBIOS-NS (UDP port {}) toward public IP {}:{}",
+                                    netbios_ns_port, udp_meta.dst_ip, udp_meta.dst_port
+                                ),
+                            );
+                            ctrl_net.telemetry.record_connection(
+                                TrackedConnection {
+                                    id: Uuid::new_v4().to_string(),
+                                    pid: 0,
+                                    process_name: "netbios-ns".to_string(),
+                                    process_path: "netbios-ns".to_string(),
+                                    target_host: udp_meta.dst_ip.to_string(),
+                                    resolved_domain: None,
+                                    target_port: udp_meta.dst_port,
+                                    protocol: TransportProtocol::Udp,
+                                    matched_rule: "LocalNameGuard:NetBIOS".to_string(),
                                     route_label: "BLOCKED".to_string(),
                                     latency_ms: 0,
                                     rx_bytes: 0,
@@ -1373,6 +1588,10 @@ mod tests {
         let filter = build_network_filter_string(53, 853);
         assert!(filter.contains("udp.DstPort == 53"));
         assert!(filter.contains("udp.DstPort == 853"));
+        assert!(filter.contains("udp.DstPort == 443"));
+        assert!(filter.contains("udp.DstPort == 5353"));
+        assert!(filter.contains("udp.DstPort == 5355"));
+        assert!(filter.contains("udp.DstPort == 137"));
         assert!(filter.contains("ipv6 and (tcp.DstPort == 53 or udp.DstPort == 53"));
 
         // IPv6 ports 53 and 853 are blocked even when killSwitchEnabled=false

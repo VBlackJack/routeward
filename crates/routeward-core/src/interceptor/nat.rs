@@ -30,8 +30,13 @@ const TCP_MIN_HEADER_LEN: usize = 20;
 const UDP_HEADER_LEN: usize = 8;
 const IPV6_VERSION: u8 = 6;
 const IPV6_HEADER_LEN: usize = 40;
+pub const IPPROTO_ICMP: u8 = 1;
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
+pub const ICMPV4_TYPE_DEST_UNREACHABLE: u8 = 3;
+pub const ICMPV4_CODE_PORT_UNREACHABLE: u8 = 3;
+const ICMPV4_HEADER_LEN: usize = 8;
+const IPV4_FRAG_MORE_OR_OFFSET_MASK: u16 = 0x3FFF;
 const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_RST: u8 = 0x04;
@@ -801,6 +806,87 @@ pub fn recompute_ipv4_and_tcp_checksums(packet: &mut [u8], ihl: usize) {
     packet[ihl + 16..ihl + 18].copy_from_slice(&tcp_csum.to_be_bytes());
 }
 
+/// Returns `true` if `packet` is a fragmented IPv4 packet (`MF` bit `0x2000` set or non-zero fragment offset `0x1FFF`).
+pub fn is_ipv4_packet_fragmented(packet: &[u8]) -> bool {
+    if packet.len() < IPV4_MIN_HEADER_LEN || (packet[0] >> 4) != IPV4_VERSION {
+        return false;
+    }
+    let frag_field = u16::from_be_bytes([packet[6], packet[7]]);
+    (frag_field & IPV4_FRAG_MORE_OR_OFFSET_MASK) != 0
+}
+
+/// Returns `true` if `ip` is a local, RFC 1918 private, link-local, multicast, or broadcast IPv4 address
+/// (used to restrict NetBIOS-NS `UDP 137` to local networks and block public IP destinations).
+pub fn is_private_or_local_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+}
+
+/// Builds a forged RFC 792 ICMPv4 Destination Unreachable / Port Unreachable (`Type = 3`, `Code = 3`)
+/// packet in response to `original_ipv4_packet`, swapping source and destination IPv4 addresses and
+/// embedding the original IPv4 header plus the first 8 bytes of the transport header.
+pub fn build_forged_ipv4_icmp_port_unreachable(original_ipv4_packet: &[u8]) -> Option<Vec<u8>> {
+    if original_ipv4_packet.len() < IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN {
+        return None;
+    }
+    if (original_ipv4_packet[0] >> 4) != IPV4_VERSION {
+        return None;
+    }
+    let orig_ihl = ((original_ipv4_packet[0] & 0x0F) as usize) * 4;
+    if orig_ihl < IPV4_MIN_HEADER_LEN {
+        return None;
+    }
+    let quoted_len = orig_ihl.checked_add(UDP_HEADER_LEN)?;
+    if original_ipv4_packet.len() < quoted_len {
+        return None;
+    }
+
+    let orig_src_ip = Ipv4Addr::new(
+        original_ipv4_packet[12],
+        original_ipv4_packet[13],
+        original_ipv4_packet[14],
+        original_ipv4_packet[15],
+    );
+    let orig_dst_ip = Ipv4Addr::new(
+        original_ipv4_packet[16],
+        original_ipv4_packet[17],
+        original_ipv4_packet[18],
+        original_ipv4_packet[19],
+    );
+
+    let icmp_len = ICMPV4_HEADER_LEN.checked_add(quoted_len)?;
+    let total_len = IPV4_MIN_HEADER_LEN.checked_add(icmp_len)?;
+    if total_len > u16::MAX as usize {
+        return None;
+    }
+
+    let mut pkt = vec![0u8; total_len];
+    pkt[0] = 0x45; // IPv4, IHL = 5 (20 bytes)
+    pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    pkt[6..8].copy_from_slice(&[0x40, 0x00]); // Don't Fragment
+    pkt[8] = 64; // TTL
+    pkt[9] = IPPROTO_ICMP;
+    pkt[12..16].copy_from_slice(&orig_dst_ip.octets());
+    pkt[16..20].copy_from_slice(&orig_src_ip.octets());
+
+    let ip_csum = ones_complement_checksum(&pkt[..IPV4_MIN_HEADER_LEN], 0);
+    pkt[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    let icmp_offset = IPV4_MIN_HEADER_LEN;
+    pkt[icmp_offset] = ICMPV4_TYPE_DEST_UNREACHABLE;
+    pkt[icmp_offset + 1] = ICMPV4_CODE_PORT_UNREACHABLE;
+    // Bytes 2..4 = checksum (0 initially), Bytes 4..8 = unused (0)
+    pkt[icmp_offset + ICMPV4_HEADER_LEN..].copy_from_slice(&original_ipv4_packet[..quoted_len]);
+
+    let icmp_csum = ones_complement_checksum(&pkt[icmp_offset..], 0);
+    pkt[icmp_offset + 2..icmp_offset + 4].copy_from_slice(&icmp_csum.to_be_bytes());
+
+    Some(pkt)
+}
+
 fn ones_complement_checksum(bytes: &[u8], initial_sum: u32) -> u16 {
     let mut sum = initial_sum;
     let mut idx = 0;
@@ -1103,5 +1189,52 @@ mod tests {
         assert_eq!(v6_meta.next_header, IPPROTO_UDP);
         assert_eq!(v6_meta.src_port, 54321);
         assert_eq!(v6_meta.dst_port, 53);
+    }
+
+    #[test]
+    fn builds_valid_icmpv4_port_unreachable_and_detects_ipv4_fragmentation() {
+        let client_ip = Ipv4Addr::new(192, 168, 1, 25);
+        let target_ip = Ipv4Addr::new(93, 184, 215, 14);
+        let quic_payload = b"\xc0\x00\x00\x00\x01\x08\x01\x02\x03\x04\x05\x06\x07\x08";
+
+        let orig_udp = build_forged_ipv4_udp_reply(client_ip, 55443, target_ip, 443, quic_payload)
+            .expect("build outbound QUIC UDP packet");
+        assert!(!is_ipv4_packet_fragmented(&orig_udp));
+
+        let icmp_pkt = build_forged_ipv4_icmp_port_unreachable(&orig_udp)
+            .expect("build ICMPv4 Port Unreachable");
+        // Total length: 20 (outer IPv4) + 8 (ICMP header) + 20 (orig IPv4) + 8 (orig UDP header) = 56 bytes
+        assert_eq!(icmp_pkt.len(), 56);
+        assert_eq!(icmp_pkt[0], 0x45);
+        assert_eq!(icmp_pkt[9], IPPROTO_ICMP);
+        assert_eq!(&icmp_pkt[12..16], &target_ip.octets());
+        assert_eq!(&icmp_pkt[16..20], &client_ip.octets());
+        // Outer IPv4 header checksum verifies to 0
+        assert_eq!(ones_complement_checksum(&icmp_pkt[..20], 0), 0);
+
+        // ICMPv4 Type = 3 (Dest Unreachable), Code = 3 (Port Unreachable), checksum verifies to 0
+        assert_eq!(icmp_pkt[20], ICMPV4_TYPE_DEST_UNREACHABLE);
+        assert_eq!(icmp_pkt[21], ICMPV4_CODE_PORT_UNREACHABLE);
+        assert_eq!(ones_complement_checksum(&icmp_pkt[20..], 0), 0);
+        // Embedded payload matches original IPv4 header + first 8 bytes of UDP header
+        assert_eq!(&icmp_pkt[28..56], &orig_udp[..28]);
+
+        // Fragmentation detection: More Fragments (MF = 0x2000) and non-zero fragment offset
+        let mut frag_mf = orig_udp.clone();
+        frag_mf[6] = 0x20;
+        frag_mf[7] = 0x00;
+        assert!(is_ipv4_packet_fragmented(&frag_mf));
+
+        let mut frag_offset = orig_udp.clone();
+        frag_offset[6] = 0x00;
+        frag_offset[7] = 0x10;
+        assert!(is_ipv4_packet_fragmented(&frag_offset));
+
+        // Private / local IPv4 check for NetBIOS-NS 137 filtering
+        assert!(is_private_or_local_ipv4(Ipv4Addr::new(192, 168, 1, 255)));
+        assert!(is_private_or_local_ipv4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(is_private_or_local_ipv4(Ipv4Addr::new(169, 254, 10, 20)));
+        assert!(is_private_or_local_ipv4(Ipv4Addr::new(255, 255, 255, 255)));
+        assert!(!is_private_or_local_ipv4(target_ip));
     }
 }

@@ -26,14 +26,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN rustup toolchain install stable --component rustfmt,clippy
 
 WORKDIR /workspace
-COPY . /workspace
-
-RUN sed -i 's/\r$//' /workspace/tests/linux/run-scenarios.sh /workspace/tests/linux/mock_servers.py \
-    && chmod +x /workspace/tests/linux/run-scenarios.sh /workspace/tests/linux/mock_servers.py
+COPY Cargo.toml Cargo.lock /workspace/
+COPY configs /workspace/configs
+COPY locales /workspace/locales
+COPY crates /workspace/crates
+COPY apps /workspace/apps
+COPY ui /workspace/ui
 
 RUN cargo fmt --check \
     && cargo clippy -p routeward-core -p routeward-cli --all-targets -- -D warnings \
     && cargo test -p routeward-core -p routeward-cli \
-    && cargo build --release -p routeward-cli
+    && cargo build --release -p routeward-cli \
+    && cargo build --release -p routeward-core --example socks5_udp_test_server
+
+COPY tests/linux /workspace/tests/linux
+RUN sed -i 's/\r$//' /workspace/tests/linux/run-scenarios.sh /workspace/tests/linux/mock_servers.py \
+    && chmod +x /workspace/tests/linux/run-scenarios.sh /workspace/tests/linux/mock_servers.py
 
 CMD ["/workspace/tests/linux/run-scenarios.sh"]

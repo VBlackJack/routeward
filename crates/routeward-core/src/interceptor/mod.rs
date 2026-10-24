@@ -31,9 +31,10 @@ use crate::dns::codec::{
     parse_ipv4_ptr_qname, rewrite_transaction_id, DnsQueryPacket, DNS_MAX_TCP_MESSAGE_BYTES,
     QTYPE_A, QTYPE_AAAA, QTYPE_PTR, RCODE_FORMERR, RCODE_NXDOMAIN, RCODE_REFUSED, RCODE_SERVFAIL,
 };
-use crate::dns::FakeIpEngine;
+use crate::dns::{FakeIpEngine, LocalNameQueryDecision};
 use crate::error::{
     RouteWardError, RouteWardResult, ERR_KEY_HANDSHAKE_FAILED, ERR_KEY_PROXY_NOT_FOUND,
+    ERR_KEY_RULE_BLOCKED, ERR_KEY_UDP_NOT_SUPPORTED,
 };
 use crate::i18n::I18nRegistry;
 use crate::interceptor::backend::Interceptor;
@@ -43,17 +44,21 @@ use crate::interceptor::nftables::NftablesInterceptor;
 use crate::interceptor::windivert::WinDivertInterceptor;
 use crate::process::{ProcessAttribution, ProcessResolver};
 use crate::proxy::sni::TlsSniExtractor;
+use crate::proxy::udp::{
+    decode_socks5_udp_datagram, encode_socks5_udp_datagram, Socks5UdpTarget, UdpAssociationManager,
+};
 use crate::proxy::uri::ProxyUriCodec;
 use crate::proxy::ProxyConnector;
 use crate::rules::{ConnectionRequest, RuleEngine, RuleEvaluationResult};
 use crate::telemetry::{ConnectionStatus, LogLevel, TelemetryHub, TrackedConnection};
 use chrono::Utc;
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use uuid::Uuid;
@@ -106,6 +111,39 @@ pub enum DnsResolverMode {
     RemoteViaProxy,
 }
 
+/// Rate limiter for repetitive UDP/QUIC/LLMNR/mDNS/NetBIOS-NS `WARN` logs with per-category hit counters.
+#[derive(Clone)]
+pub struct WarnRateLimiter {
+    entries: Arc<DashMap<String, (Instant, u64)>>,
+    interval: Duration,
+}
+
+impl WarnRateLimiter {
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            entries: Arc::new(DashMap::new()),
+            interval,
+        }
+    }
+
+    /// Increments the hit counter for `category_key` and returns `(should_emit_warn_now, total_count)`.
+    pub fn should_log(&self, category_key: &str) -> (bool, u64) {
+        let now = Instant::now();
+        if let Some(mut entry) = self.entries.get_mut(category_key) {
+            let (last_logged, count) = *entry.value();
+            let next_count = count + 1;
+            if now.duration_since(last_logged) >= self.interval {
+                *entry.value_mut() = (now, next_count);
+                return (true, next_count);
+            }
+            entry.value_mut().1 = next_count;
+            return (false, next_count);
+        }
+        self.entries.insert(category_key.to_string(), (now, 1));
+        (true, 1)
+    }
+}
+
 #[derive(Clone)]
 pub struct RouteWardController {
     pub constants: Arc<SystemConstants>,
@@ -115,6 +153,9 @@ pub struct RouteWardController {
     pub process_resolver: ProcessResolver,
     pub telemetry: TelemetryHub,
     pub nat_table: TransparentNatTable,
+    pub udp_manager: UdpAssociationManager,
+    warn_rate_limiter: WarnRateLimiter,
+    fragmented_udp_drop_count: Arc<AtomicU64>,
     last_seen_orig_resolver: Arc<RwLock<Option<SocketAddr>>>,
     system_resolvers_override: Arc<RwLock<Option<Vec<SocketAddr>>>>,
     interceptor_backend: Arc<dyn Interceptor>,
@@ -162,6 +203,11 @@ impl RouteWardController {
         #[cfg(not(windows))]
         let interceptor_backend: Arc<dyn Interceptor> = Arc::new(NftablesInterceptor::new());
 
+        let udp_manager = UdpAssociationManager::new(&constants);
+        let warn_rate_limiter = WarnRateLimiter::new(Duration::from_secs(
+            constants.network.udp_warn_rate_limit_secs.max(1),
+        ));
+
         let controller = Self {
             constants: Arc::new(constants),
             profile: Arc::new(RwLock::new(profile)),
@@ -170,6 +216,9 @@ impl RouteWardController {
             process_resolver,
             telemetry,
             nat_table,
+            udp_manager,
+            warn_rate_limiter,
+            fragmented_udp_drop_count: Arc::new(AtomicU64::new(0)),
             last_seen_orig_resolver: Arc::new(RwLock::new(None)),
             system_resolvers_override: Arc::new(RwLock::new(None)),
             interceptor_backend,
@@ -354,6 +403,47 @@ impl RouteWardController {
             }
         });
 
+        let local_name_ctrl = self.clone();
+        tokio::spawn(async move {
+            let inspect_port = local_name_ctrl
+                .constants
+                .network
+                .default_local_name_inspect_port;
+            let bind_addr = format!(
+                "{}:{}",
+                local_name_ctrl.constants.network.transparent_bind_host, inspect_port
+            );
+            if let Ok(socket) = UdpSocket::bind(&bind_addr).await {
+                NftablesInterceptor::enable_udp_pktinfo(&socket);
+                let socket = Arc::new(socket);
+                local_name_ctrl.telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_ENGINE,
+                    format!("Listening for redirected LLMNR/mDNS UDP inspection on {bind_addr}"),
+                );
+                let mut buf = vec![0u8; 4096];
+                while local_name_ctrl.is_running() {
+                    if let Ok((len, peer_addr, local_dst_ip)) =
+                        NftablesInterceptor::recv_udp_with_local_ip(&socket, &mut buf).await
+                    {
+                        let pkt_bytes = buf[..len].to_vec();
+                        let sock_reply = Arc::clone(&socket);
+                        let ctrl_inspect = local_name_ctrl.clone();
+                        tokio::spawn(async move {
+                            ctrl_inspect
+                                .handle_local_name_udp_datagram(
+                                    &pkt_bytes,
+                                    peer_addr,
+                                    local_dst_ip,
+                                    &sock_reply,
+                                )
+                                .await;
+                        });
+                    }
+                }
+            }
+        });
+
         let bootstrap_ctrl = self.clone();
         tokio::spawn(async move {
             bootstrap_ctrl.bootstrap_resolve_proxy_hosts().await;
@@ -378,6 +468,7 @@ impl RouteWardController {
     pub fn stop_engine(&self) {
         let was_active = self.interceptor_backend.is_active();
         self.interceptor_backend.stop();
+        self.udp_manager.clear_all();
         let was_running = self.running.swap(false, Ordering::SeqCst);
         if was_running || was_active {
             self.flush_os_dns_cache("shutdown");
@@ -1049,6 +1140,8 @@ impl RouteWardController {
         };
 
         if proxies_changed {
+            self.udp_manager.capability_cache().clear();
+            self.udp_manager.clear_all();
             let literal_endpoints: Vec<(Ipv4Addr, u16)> = {
                 let prof = self.profile.read();
                 prof.proxies
@@ -1180,6 +1273,504 @@ impl RouteWardController {
         TlsSniExtractor::extract_sni(packet)
     }
 
+    /// Emits a rate-limited `WARN` log entry and returns the total hit count for `category_key`.
+    pub fn push_rate_limited_warn(
+        &self,
+        category_key: &str,
+        component: &str,
+        message: impl Into<String>,
+    ) -> u64 {
+        let (should_log, count) = self.warn_rate_limiter.should_log(category_key);
+        if should_log {
+            self.telemetry.push_log(
+                LogLevel::Warn,
+                component,
+                format!("{} [count=#{count}]", message.into()),
+            );
+        }
+        count
+    }
+
+    /// Returns the total number of fragmented UDP datagrams dropped by the proxy fragmentation guard.
+    pub fn fragmented_udp_drop_count(&self) -> u64 {
+        self.fragmented_udp_drop_count.load(Ordering::SeqCst)
+    }
+
+    /// Evaluates routing rules for a single UDP datagram and forwards it through a SOCKS5 `UDP ASSOCIATE`
+    /// session (`Proxy` / `Chain`) or directly (`Direct`), enforcing per-datagram rule evaluation,
+    /// Fake-IP reverse lookup (`ATYP = 0x03`), QUIC (`UDP 443`) and DoQ (`UDP 853`) blocking,
+    /// fragmentation blocking, and Kill-Switch enforcement.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_udp_datagram(
+        &self,
+        client_addr: SocketAddr,
+        process_name: &str,
+        process_path: Option<&str>,
+        pid: u32,
+        target: &Socks5UdpTarget,
+        payload: &[u8],
+        is_fragmented: bool,
+    ) -> RouteWardResult<Vec<u8>> {
+        let raw_host = target.host_string();
+        let target_port = target.port();
+        let target_ip_str = match target {
+            Socks5UdpTarget::Ipv4(ip, _) => Some(ip.to_string()),
+            Socks5UdpTarget::Ipv6(ip, _) => Some(ip.to_string()),
+            Socks5UdpTarget::Domain(_, _) => None,
+        };
+
+        let mut eval = self.evaluate_rule(&ConnectionRequest {
+            process_name: process_name.to_string(),
+            process_path: process_path.map(|s| s.to_string()),
+            target_host: raw_host.clone(),
+            target_ip: target_ip_str,
+            target_port,
+            protocol: TransportProtocol::Udp,
+        });
+
+        let (kill_switch_enabled, block_udp_on_tcp_only, block_quic_443, block_encrypted_dns) = {
+            let prof = self.profile.read();
+            (
+                prof.security_policy.kill_switch_enabled,
+                prof.security_policy.block_udp_on_tcp_only_proxy,
+                prof.security_policy.block_quic_udp_443,
+                prof.security_policy.block_encrypted_dns_bypass,
+            )
+        };
+
+        if target_port == self.constants.network.quic_default_port && block_quic_443 {
+            self.push_rate_limited_warn(
+                "quic_udp_443",
+                COMPONENT_ENGINE,
+                format!(
+                    "Blocked QUIC UDP/{} datagram from PID={} process=\"{}\" -> {}:{} (blockQuicUdp443=true)",
+                    target_port, pid, process_name, raw_host, target_port
+                ),
+            );
+            eval.matched_rule_name = "SecurityPolicy:blockQuicUdp443".to_string();
+            eval.action = RuleAction::Block;
+        } else if target_port == self.constants.dns.dns_over_tls_port && block_encrypted_dns {
+            self.push_rate_limited_warn(
+                "doq_udp_853",
+                COMPONENT_DNS,
+                format!(
+                    "Blocked encrypted DNS (UDP/{}) datagram from PID={} process=\"{}\" -> {}:{}",
+                    target_port, pid, process_name, raw_host, target_port
+                ),
+            );
+            eval.matched_rule_name = "SecurityPolicy:blockEncryptedDnsBypass".to_string();
+            eval.action = RuleAction::Block;
+        }
+
+        // Decision 3: Fragmented UDP datagram whose rule is Proxy/Chain is blocked when kill switch is active.
+        if is_fragmented
+            && matches!(
+                eval.action,
+                RuleAction::Proxy { .. } | RuleAction::Chain { .. }
+            )
+        {
+            let drop_count = self
+                .fragmented_udp_drop_count
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            self.push_rate_limited_warn(
+                "udp_fragmented_proxy",
+                COMPONENT_ENGINE,
+                format!(
+                    "Fragmented UDP datagram #{drop_count} from PID={} process=\"{}\" -> {}:{} matched proxied rule \"{}\" (v1 does not reassemble IPv4 UDP fragments; killSwitchEnabled={})",
+                    pid, process_name, raw_host, target_port, eval.matched_rule_name, kill_switch_enabled
+                ),
+            );
+            if kill_switch_enabled {
+                eval.matched_rule_name = "SecurityPolicy:FragmentedUdpBlocked".to_string();
+                eval.action = RuleAction::Block;
+            } else {
+                eval.action = RuleAction::Direct;
+            }
+        }
+
+        let effective_target = if let Some(ref dom) = eval.effective_domain {
+            Socks5UdpTarget::Domain(dom.clone(), target_port)
+        } else {
+            target.clone()
+        };
+
+        let proc_basename = ProcessResolver::extract_basename(process_name);
+        let proc_path_str = process_path.unwrap_or(process_name).to_string();
+
+        match &eval.action {
+            RuleAction::Block => {
+                self.telemetry.record_connection(
+                    TrackedConnection {
+                        id: Uuid::new_v4().to_string(),
+                        pid,
+                        process_name: proc_basename,
+                        process_path: proc_path_str,
+                        target_host: raw_host,
+                        resolved_domain: eval.effective_domain,
+                        target_port,
+                        protocol: TransportProtocol::Udp,
+                        matched_rule: eval.matched_rule_name.clone(),
+                        route_label: ROUTE_BLOCK_LABEL.to_string(),
+                        latency_ms: 0,
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        status: ConnectionStatus::Blocked,
+                        started_at: Utc::now(),
+                    },
+                    false,
+                );
+                Err(RouteWardError::BlockedByPolicy {
+                    key: ERR_KEY_RULE_BLOCKED,
+                    rule_name: eval.matched_rule_name,
+                })
+            }
+            RuleAction::Direct => {
+                let dst_addr: SocketAddr = match &effective_target {
+                    Socks5UdpTarget::Ipv4(ip, port) => SocketAddr::new(IpAddr::V4(*ip), *port),
+                    Socks5UdpTarget::Ipv6(ip, port) => SocketAddr::new(IpAddr::V6(*ip), *port),
+                    Socks5UdpTarget::Domain(dom, port) => {
+                        let ip = self.resolve_host_direct_ipv4(dom).await?;
+                        SocketAddr::new(IpAddr::V4(ip), *port)
+                    }
+                };
+                let timeout_dur = Duration::from_millis(
+                    self.constants
+                        .network
+                        .tcp_connect_timeout_ms
+                        .clamp(500, 3500),
+                );
+                let resp = self
+                    .query_dns_udp_direct_protected(payload, dst_addr, timeout_dur)
+                    .await
+                    .map_err(RouteWardError::Io)?;
+                self.telemetry.record_connection(
+                    TrackedConnection {
+                        id: Uuid::new_v4().to_string(),
+                        pid,
+                        process_name: proc_basename,
+                        process_path: proc_path_str,
+                        target_host: raw_host,
+                        resolved_domain: eval.effective_domain,
+                        target_port,
+                        protocol: TransportProtocol::Udp,
+                        matched_rule: eval.matched_rule_name,
+                        route_label: ROUTE_DIRECT_LABEL.to_string(),
+                        latency_ms: 4,
+                        rx_bytes: resp.len() as u64,
+                        tx_bytes: payload.len() as u64,
+                        status: ConnectionStatus::Active,
+                        started_at: Utc::now(),
+                    },
+                    false,
+                );
+                Ok(resp)
+            }
+            RuleAction::Proxy { target_id } => {
+                let node = {
+                    let prof = self.profile.read();
+                    prof.proxies
+                        .iter()
+                        .find(|p| &p.id == target_id)
+                        .cloned()
+                        .ok_or_else(|| RouteWardError::ProxyNotFound {
+                            key: ERR_KEY_PROXY_NOT_FOUND,
+                            proxy_id: target_id.clone(),
+                        })?
+                };
+                let resolved_node = self.prepare_proxy_node_with_bootstrap(node).await?;
+                let _self_guard = self.register_self_proxy_connect_hint(&resolved_node);
+
+                let ctrl_warn = self.clone();
+                let res = self
+                    .udp_manager
+                    .exchange_datagram_via_node(
+                        client_addr,
+                        &resolved_node,
+                        &effective_target,
+                        payload,
+                        &self.constants,
+                        Some(&self.nat_table),
+                        |unsupported_node, reason| {
+                            ctrl_warn.telemetry.push_log(
+                                LogLevel::Warn,
+                                COMPONENT_PROXY,
+                                format!(
+                                    "{}: node=\"{}\" (id={}, reason={}; cached for {}s)",
+                                    ctrl_warn.i18n.t(ERR_KEY_UDP_NOT_SUPPORTED),
+                                    unsupported_node.name,
+                                    unsupported_node.id,
+                                    reason,
+                                    ctrl_warn.constants.network.udp_capability_cache_secs
+                                ),
+                            );
+                        },
+                    )
+                    .await;
+
+                match res {
+                    Ok(reply) => {
+                        self.telemetry.record_connection(
+                            TrackedConnection {
+                                id: Uuid::new_v4().to_string(),
+                                pid,
+                                process_name: proc_basename,
+                                process_path: proc_path_str,
+                                target_host: raw_host,
+                                resolved_domain: eval.effective_domain,
+                                target_port,
+                                protocol: TransportProtocol::Udp,
+                                matched_rule: eval.matched_rule_name,
+                                route_label: format!("{} (SOCKS5 UDP)", reply.proxy_name),
+                                latency_ms: 8,
+                                rx_bytes: reply.payload.len() as u64,
+                                tx_bytes: payload.len() as u64,
+                                status: ConnectionStatus::Active,
+                                started_at: Utc::now(),
+                            },
+                            true,
+                        );
+                        Ok(reply.payload)
+                    }
+                    Err(err) => {
+                        // Decision 7: Proxy refusing UDP ASSOCIATE or failing with Kill-Switch / blockUdpOnTcpOnlyProxy -> Block, never Direct
+                        if kill_switch_enabled
+                            || block_udp_on_tcp_only
+                            || matches!(err, RouteWardError::UdpAssociateUnsupported { .. })
+                        {
+                            self.push_rate_limited_warn(
+                                "udp_proxy_killswitch",
+                                COMPONENT_ENGINE,
+                                format!(
+                                    "Kill-Switch blocked UDP datagram PID={} process=\"{}\" -> {}:{} [rule=\"{}\"]: {}",
+                                    pid, proc_basename, raw_host, target_port, eval.matched_rule_name, err
+                                ),
+                            );
+                            self.telemetry.record_connection(
+                                TrackedConnection {
+                                    id: Uuid::new_v4().to_string(),
+                                    pid,
+                                    process_name: proc_basename,
+                                    process_path: proc_path_str,
+                                    target_host: raw_host,
+                                    resolved_domain: eval.effective_domain,
+                                    target_port,
+                                    protocol: TransportProtocol::Udp,
+                                    matched_rule: eval.matched_rule_name,
+                                    route_label: ROUTE_BLOCK_LABEL.to_string(),
+                                    latency_ms: 0,
+                                    rx_bytes: 0,
+                                    tx_bytes: 0,
+                                    status: ConnectionStatus::Blocked,
+                                    started_at: Utc::now(),
+                                },
+                                false,
+                            );
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            RuleAction::Chain { target_id } => {
+                let (strategy, hops) = {
+                    let prof = self.profile.read();
+                    let chain =
+                        prof.chains
+                            .iter()
+                            .find(|c| &c.id == target_id)
+                            .ok_or_else(|| RouteWardError::ProxyNotFound {
+                                key: ERR_KEY_PROXY_NOT_FOUND,
+                                proxy_id: target_id.clone(),
+                            })?;
+                    let mut nodes = Vec::new();
+                    for pid in &chain.proxy_ids {
+                        if let Some(n) = prof.proxies.iter().find(|p| &p.id == pid) {
+                            nodes.push(n.clone());
+                        }
+                    }
+                    (chain.strategy, nodes)
+                };
+                let mut resolved_hops = Vec::with_capacity(hops.len());
+                for hop in hops {
+                    match self.prepare_proxy_node_with_bootstrap(hop.clone()).await {
+                        Ok(resolved) => {
+                            let _ = self.register_self_proxy_connect_hint(&resolved);
+                            resolved_hops.push(resolved);
+                        }
+                        Err(_) => resolved_hops.push(hop),
+                    }
+                }
+
+                let ctrl_warn = self.clone();
+                let res = self
+                    .udp_manager
+                    .exchange_datagram_via_group(
+                        client_addr,
+                        strategy,
+                        &resolved_hops,
+                        0,
+                        &effective_target,
+                        payload,
+                        &self.constants,
+                        Some(&self.nat_table),
+                        |unsupported_node, reason| {
+                            ctrl_warn.telemetry.push_log(
+                                LogLevel::Warn,
+                                COMPONENT_PROXY,
+                                format!(
+                                    "{}: node=\"{}\" (id={}, reason={}; cached for {}s)",
+                                    ctrl_warn.i18n.t(ERR_KEY_UDP_NOT_SUPPORTED),
+                                    unsupported_node.name,
+                                    unsupported_node.id,
+                                    reason,
+                                    ctrl_warn.constants.network.udp_capability_cache_secs
+                                ),
+                            );
+                        },
+                    )
+                    .await;
+
+                match res {
+                    Ok(reply) => {
+                        self.telemetry.record_connection(
+                            TrackedConnection {
+                                id: Uuid::new_v4().to_string(),
+                                pid,
+                                process_name: proc_basename,
+                                process_path: proc_path_str,
+                                target_host: raw_host,
+                                resolved_domain: eval.effective_domain,
+                                target_port,
+                                protocol: TransportProtocol::Udp,
+                                matched_rule: eval.matched_rule_name,
+                                route_label: format!("Group -> {} (SOCKS5 UDP)", reply.proxy_name),
+                                latency_ms: 8,
+                                rx_bytes: reply.payload.len() as u64,
+                                tx_bytes: payload.len() as u64,
+                                status: ConnectionStatus::Active,
+                                started_at: Utc::now(),
+                            },
+                            true,
+                        );
+                        Ok(reply.payload)
+                    }
+                    Err(err) => {
+                        if kill_switch_enabled
+                            || block_udp_on_tcp_only
+                            || matches!(err, RouteWardError::UdpAssociateUnsupported { .. })
+                        {
+                            self.push_rate_limited_warn(
+                                "udp_group_killswitch",
+                                COMPONENT_ENGINE,
+                                format!(
+                                    "Kill-Switch blocked group UDP datagram PID={} process=\"{}\" -> {}:{} [rule=\"{}\"]: {}",
+                                    pid, proc_basename, raw_host, target_port, eval.matched_rule_name, err
+                                ),
+                            );
+                            self.telemetry.record_connection(
+                                TrackedConnection {
+                                    id: Uuid::new_v4().to_string(),
+                                    pid,
+                                    process_name: proc_basename,
+                                    process_path: proc_path_str,
+                                    target_host: raw_host,
+                                    resolved_domain: eval.effective_domain,
+                                    target_port,
+                                    protocol: TransportProtocol::Udp,
+                                    matched_rule: eval.matched_rule_name,
+                                    route_label: ROUTE_BLOCK_LABEL.to_string(),
+                                    latency_ms: 0,
+                                    rx_bytes: 0,
+                                    tx_bytes: 0,
+                                    status: ConnectionStatus::Blocked,
+                                    started_at: Utc::now(),
+                                },
+                                false,
+                            );
+                        }
+                        Err(err)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_local_name_udp_datagram(
+        &self,
+        payload: &[u8],
+        peer_addr: SocketAddr,
+        local_dst_ip: Option<Ipv4Addr>,
+        reply_sock: &UdpSocket,
+    ) {
+        match self.dns.classify_local_name_query(payload) {
+            LocalNameQueryDecision::BlockPublicFqdn { qname } => {
+                self.push_rate_limited_warn(
+                    "local_name_public_fqdn",
+                    COMPONENT_DNS,
+                    format!(
+                        "Blocked public FQDN \"{qname}\" on local name resolution protocol (LLMNR/mDNS) from {peer_addr}"
+                    ),
+                );
+                self.telemetry.record_connection(
+                    TrackedConnection {
+                        id: Uuid::new_v4().to_string(),
+                        pid: 0,
+                        process_name: "local-name-proto".to_string(),
+                        process_path: "local-name-proto".to_string(),
+                        target_host: qname.clone(),
+                        resolved_domain: Some(qname),
+                        target_port: self.constants.network.llmnr_standard_port,
+                        protocol: TransportProtocol::Udp,
+                        matched_rule: "SecurityPolicy:LocalNamePublicFqdnBlocked".to_string(),
+                        route_label: ROUTE_BLOCK_LABEL.to_string(),
+                        latency_ms: 0,
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        status: ConnectionStatus::Blocked,
+                        started_at: Utc::now(),
+                    },
+                    false,
+                );
+            }
+            LocalNameQueryDecision::BlockMalformed => {}
+            LocalNameQueryDecision::AllowLocal { qname } => {
+                let candidate_ports = [
+                    self.constants.network.llmnr_standard_port,
+                    self.constants.network.mdns_standard_port,
+                ];
+                if let Some(orig_dst) =
+                    self.lookup_udp_conntrack_orig_dst(peer_addr, &candidate_ports)
+                {
+                    self.telemetry.push_log(
+                        LogLevel::Debug,
+                        COMPONENT_DNS,
+                        format!(
+                            "Forwarding allowed local name query \"{qname}\" from {peer_addr} directly to {orig_dst}"
+                        ),
+                    );
+                    if let Ok(resp) = self
+                        .query_dns_udp_direct_protected(
+                            payload,
+                            orig_dst,
+                            Duration::from_millis(300),
+                        )
+                        .await
+                    {
+                        if !resp.is_empty() {
+                            let _ = NftablesInterceptor::send_udp_from_local_ip(
+                                reply_sock,
+                                &resp,
+                                peer_addr,
+                                local_dst_ip,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn handle_local_socks5_client(
         &self,
         mut client: TcpStream,
@@ -1226,6 +1817,70 @@ impl RouteWardController {
         let target_port = u16::from_be_bytes(port_bytes);
 
         let proc_id = self.process_resolver.resolve_by_local_tcp_port(client_port);
+
+        if req_head[1] == proto.socks5_cmd_udp_associate {
+            let udp_relay =
+                UdpSocket::bind(format!("{}:0", self.constants.network.local_bind_host)).await?;
+            let relay_addr = udp_relay.local_addr()?;
+            let bind_ip = match relay_addr.ip() {
+                IpAddr::V4(v4) => v4,
+                IpAddr::V6(_) => Ipv4Addr::LOCALHOST,
+            };
+            let bind_port = relay_addr.port().to_be_bytes();
+            let ip_octets = bind_ip.octets();
+            let assoc_reply = [
+                proto.socks5_version,
+                proto.socks5_reply_succeeded,
+                0x00,
+                proto.socks5_atyp_ipv4,
+                ip_octets[0],
+                ip_octets[1],
+                ip_octets[2],
+                ip_octets[3],
+                bind_port[0],
+                bind_port[1],
+            ];
+            client.write_all(&assoc_reply).await?;
+
+            let mut tcp_probe = [0u8; 1];
+            let mut udp_buf = vec![0u8; 65535];
+            while self.is_running() {
+                tokio::select! {
+                    read_res = client.read(&mut tcp_probe) => {
+                        match read_res {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    recv_res = udp_relay.recv_from(&mut udp_buf) => {
+                        let Ok((n, udp_peer)) = recv_res else {
+                            break;
+                        };
+                        let Ok((target, payload)) = decode_socks5_udp_datagram(&udp_buf[..n], proto) else {
+                            continue;
+                        };
+                        if let Ok(reply_payload) = self
+                            .forward_udp_datagram(
+                                udp_peer,
+                                &proc_id.name,
+                                Some(&proc_id.executable_path),
+                                proc_id.pid,
+                                &target,
+                                payload,
+                                false,
+                            )
+                            .await
+                        {
+                            if let Ok(encoded_reply) = encode_socks5_udp_datagram(&target, &reply_payload, proto) {
+                                let _ = udp_relay.send_to(&encoded_reply, udp_peer).await;
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         let target_ip_str = target_host
             .parse::<Ipv4Addr>()
             .ok()
@@ -2861,24 +3516,31 @@ impl RouteWardController {
     }
 
     fn lookup_udp_orig_dns_resolver(&self, peer_addr: SocketAddr) -> Option<SocketAddr> {
+        self.lookup_udp_conntrack_orig_dst(peer_addr, &[self.constants.dns.dns_standard_port])
+    }
+
+    fn lookup_udp_conntrack_orig_dst(
+        &self,
+        peer_addr: SocketAddr,
+        candidate_dports: &[u16],
+    ) -> Option<SocketAddr> {
         #[cfg(target_os = "linux")]
         {
             let sport_tag = format!("sport={}", peer_addr.port());
-            let dport_tag = format!("dport={}", self.constants.dns.dns_standard_port);
             if let Ok(content) = std::fs::read_to_string("/proc/net/nf_conntrack") {
                 for line in content.lines() {
-                    if line.contains("udp")
-                        && line.contains(&sport_tag)
-                        && line.contains(&dport_tag)
-                    {
-                        for token in line.split_whitespace() {
-                            if let Some(ip_str) = token.strip_prefix("dst=") {
-                                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                                    if !ip.is_loopback() {
-                                        return Some(SocketAddr::new(
-                                            IpAddr::V4(ip),
-                                            self.constants.dns.dns_standard_port,
-                                        ));
+                    if !line.contains("udp") || !line.contains(&sport_tag) {
+                        continue;
+                    }
+                    for &dport in candidate_dports {
+                        let dport_tag = format!("dport={dport}");
+                        if line.contains(&dport_tag) {
+                            for token in line.split_whitespace() {
+                                if let Some(ip_str) = token.strip_prefix("dst=") {
+                                    if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                        if !ip.is_loopback() {
+                                            return Some(SocketAddr::new(IpAddr::V4(ip), dport));
+                                        }
                                     }
                                 }
                             }
@@ -2887,7 +3549,7 @@ impl RouteWardController {
                 }
             }
         }
-        let _ = peer_addr;
+        let _ = (peer_addr, candidate_dports);
         None
     }
 
@@ -4378,6 +5040,7 @@ mod tests {
         constants.network.default_relay_tcp_port = 0;
         constants.network.default_transparent_tcp_port = 0;
         constants.network.default_dns_listen_port = 0;
+        constants.network.default_local_name_inspect_port = 0;
         let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
         profile.enable_logging = false;
         profile.security_policy.kill_switch_enabled = false;
@@ -4403,5 +5066,217 @@ mod tests {
 
         controller.stop_engine();
         assert!(!controller.is_running());
+    }
+
+    #[tokio::test]
+    async fn forward_udp_datagram_evaluates_rules_per_datagram_and_enforces_fragmentation_and_kill_switch(
+    ) {
+        use crate::config::{PortRange, ProxyProtocol, RoutingRule, RuleAction, TransportProtocol};
+        use crate::proxy::udp::{decode_socks5_udp_datagram, encode_socks5_udp_datagram};
+
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let proto_consts = constants.protocols.clone();
+
+        // 1. Direct UDP echo server
+        let direct_echo = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind direct echo");
+        let direct_echo_addr = direct_echo.local_addr().expect("direct echo addr");
+        let _direct_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, peer)) = direct_echo.recv_from(&mut buf).await {
+                let mut reply = b"DIRECT:".to_vec();
+                reply.extend_from_slice(&buf[..n]);
+                let _ = direct_echo.send_to(&reply, peer).await;
+            }
+        });
+
+        // 2. Mock SOCKS5 UDP relay + TCP control server that records ATYP and echoes "PROXIED:" + payload
+        let socks_udp = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind socks udp"),
+        );
+        let socks_udp_addr = socks_udp.local_addr().expect("socks udp addr");
+        let last_atyp = Arc::new(parking_lot::Mutex::new(String::new()));
+        let last_atyp_bg = last_atyp.clone();
+        let socks_udp_bg = socks_udp.clone();
+        let proto_bg = proto_consts.clone();
+        let _socks_udp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            while let Ok((n, peer)) = socks_udp_bg.recv_from(&mut buf).await {
+                if let Ok((target, payload)) = decode_socks5_udp_datagram(&buf[..n], &proto_bg) {
+                    *last_atyp_bg.lock() = match &target {
+                        Socks5UdpTarget::Domain(dom, port) => format!("Domain({dom}:{port})"),
+                        Socks5UdpTarget::Ipv4(ip, port) => format!("Ipv4({ip}:{port})"),
+                        Socks5UdpTarget::Ipv6(ip, port) => format!("Ipv6({ip}:{port})"),
+                    };
+                    let mut echoed = b"PROXIED:".to_vec();
+                    echoed.extend_from_slice(payload);
+                    if let Ok(enc) = encode_socks5_udp_datagram(&target, &echoed, &proto_bg) {
+                        let _ = socks_udp_bg.send_to(&enc, peer).await;
+                    }
+                }
+            }
+        });
+
+        let socks_tcp = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind socks tcp");
+        let socks_tcp_addr = socks_tcp.local_addr().expect("socks tcp addr");
+        let _socks_tcp_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = socks_tcp.accept().await {
+                let relay_port = socks_udp_addr.port();
+                tokio::spawn(async move {
+                    let mut g = [0u8; 2];
+                    if stream.read_exact(&mut g).await.is_err() {
+                        return;
+                    }
+                    let mut m = vec![0u8; g[1] as usize];
+                    let _ = stream.read_exact(&mut m).await;
+                    let _ = stream.write_all(&[0x05, 0x00]).await;
+
+                    let mut h = [0u8; 4];
+                    if stream.read_exact(&mut h).await.is_err() {
+                        return;
+                    }
+                    let mut tail = [0u8; 6];
+                    let _ = stream.read_exact(&mut tail).await;
+                    let pb = relay_port.to_be_bytes();
+                    let _ = stream
+                        .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, pb[0], pb[1]])
+                        .await;
+                    let mut eof = [0u8; 16];
+                    let _ = stream.read(&mut eof).await;
+                });
+            }
+        });
+
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.security_policy.kill_switch_enabled = true;
+        profile.proxies = vec![ProxyNode {
+            id: "socks-udp-1".to_string(),
+            name: "SOCKS5 UDP Node".to_string(),
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: socks_tcp_addr.port(),
+            auth: None,
+            tls: false,
+            sni: None,
+            udp_enabled: true,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        }];
+        profile.rules = vec![
+            RoutingRule {
+                id: "rule-udp-proxy-domain".to_string(),
+                name: "Proxy UDP Domain".to_string(),
+                enabled: true,
+                priority: 1,
+                process_patterns: vec![],
+                domain_patterns: vec!["*.proxied.routeward.test".to_string()],
+                ip_cidrs: vec![],
+                port_ranges: vec![],
+                protocol: TransportProtocol::Udp,
+                action: RuleAction::Proxy {
+                    target_id: "socks-udp-1".to_string(),
+                },
+            },
+            RoutingRule {
+                id: "rule-udp-direct".to_string(),
+                name: "Direct UDP Port".to_string(),
+                enabled: true,
+                priority: 2,
+                process_patterns: vec![],
+                domain_patterns: vec![],
+                ip_cidrs: vec![],
+                port_ranges: vec![PortRange {
+                    start: direct_echo_addr.port(),
+                    end: direct_echo_addr.port(),
+                }],
+                protocol: TransportProtocol::Udp,
+                action: RuleAction::Direct,
+            },
+        ];
+        profile.default_action = RuleAction::Block;
+
+        let controller = RouteWardController::new(constants, profile, "en");
+        let fake_ip = controller
+            .dns
+            .allocate_or_get("echo.proxied.routeward.test")
+            .expect("allocate fake ip");
+
+        let client_sock: SocketAddr = "127.0.0.1:54321".parse().expect("client_sock");
+        let proxied_target = Socks5UdpTarget::Ipv4(fake_ip, 9999);
+        let direct_target = match direct_echo_addr {
+            SocketAddr::V4(v4) => Socks5UdpTarget::Ipv4(*v4.ip(), v4.port()),
+            SocketAddr::V6(v6) => Socks5UdpTarget::Ipv6(*v6.ip(), v6.port()),
+        };
+
+        // Same client socket -> Destination 1 (Fake-IP for echo.proxied.routeward.test:9999) -> Proxied with ATYP=0x03 Domain
+        let reply1 = controller
+            .forward_udp_datagram(
+                client_sock,
+                "udp-client",
+                Some("/bin/udp-client"),
+                4242,
+                &proxied_target,
+                b"hello-proxy",
+                false,
+            )
+            .await
+            .expect("proxied datagram should succeed");
+        assert_eq!(reply1, b"PROXIED:hello-proxy");
+        assert_eq!(
+            *last_atyp.lock(),
+            "Domain(echo.proxied.routeward.test:9999)"
+        );
+
+        // Same client socket -> Destination 2 (direct_echo_addr) -> Direct
+        let reply2 = controller
+            .forward_udp_datagram(
+                client_sock,
+                "udp-client",
+                Some("/bin/udp-client"),
+                4242,
+                &direct_target,
+                b"hello-direct",
+                false,
+            )
+            .await
+            .expect("direct datagram should succeed");
+        assert_eq!(reply2, b"DIRECT:hello-direct");
+
+        // Fragmented datagram whose rule is Proxy -> Blocked when Kill-Switch is active, counter incremented
+        let frag_proxy_res = controller
+            .forward_udp_datagram(
+                client_sock,
+                "udp-client",
+                Some("/bin/udp-client"),
+                4242,
+                &proxied_target,
+                b"frag-proxy",
+                true,
+            )
+            .await;
+        assert!(frag_proxy_res.is_err());
+        assert_eq!(controller.fragmented_udp_drop_count(), 1);
+
+        // Fragmented datagram whose rule is Direct -> Passes
+        let frag_direct_reply = controller
+            .forward_udp_datagram(
+                client_sock,
+                "udp-client",
+                Some("/bin/udp-client"),
+                4242,
+                &direct_target,
+                b"frag-direct",
+                true,
+            )
+            .await
+            .expect("fragmented direct datagram should pass");
+        assert_eq!(frag_direct_reply, b"DIRECT:frag-direct");
     }
 }

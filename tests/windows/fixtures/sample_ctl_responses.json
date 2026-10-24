@@ -206,6 +206,66 @@
       }
     ]
   },
+  "connectionsQuicAndLlmnrBlocked": {
+    "id": "11111111-1111-4000-8000-000000000013",
+    "ok": true,
+    "result": [
+      {
+        "id": "conn-sample-quic",
+        "pid": 0,
+        "processName": "quic-udp-443",
+        "processPath": "quic-udp-443",
+        "targetHost": "9.9.9.9",
+        "resolvedDomain": null,
+        "targetPort": 443,
+        "protocol": "udp",
+        "matchedRule": "SecurityPolicy:blockQuicUdp443",
+        "routeLabel": "BLOCKED",
+        "latencyMs": 0,
+        "rxBytes": 0,
+        "txBytes": 0,
+        "status": "blocked",
+        "startedAt": "2026-10-24T12:03:00Z"
+      },
+      {
+        "id": "conn-sample-llmnr",
+        "pid": 0,
+        "processName": "llmnr",
+        "processPath": "llmnr",
+        "targetHost": "224.0.0.252",
+        "resolvedDomain": "public-leak.routeward.test",
+        "targetPort": 5355,
+        "protocol": "udp",
+        "matchedRule": "LocalNameGuard:LLMNR",
+        "routeLabel": "BLOCKED",
+        "latencyMs": 0,
+        "rxBytes": 0,
+        "txBytes": 0,
+        "status": "blocked",
+        "startedAt": "2026-10-24T12:03:01Z"
+      }
+    ]
+  },
+  "logsQuicAndLlmnrBlocked": {
+    "id": "11111111-1111-4000-8000-000000000014",
+    "ok": true,
+    "result": [
+      {
+        "id": "log-sample-quic",
+        "timestamp": "2026-10-24T12:03:00Z",
+        "level": "WARN",
+        "component": "WinDivert",
+        "message": "Rejected QUIC (UDP port 443) with ICMP Port Unreachable 10.0.2.15:54120 -> 9.9.9.9:443 [blockQuicUdp443=true] [count=#1]"
+      },
+      {
+        "id": "log-sample-llmnr",
+        "timestamp": "2026-10-24T12:03:01Z",
+        "level": "WARN",
+        "component": "WinDivert",
+        "message": "Blocked public FQDN \"public-leak.routeward.test\" over LLMNR (UDP port 5355) 10.0.2.15:54121 -> 224.0.0.252:5355 [count=#1]"
+      }
+    ]
+  },
   "legacyMalformedDataField": {
     "id": "11111111-1111-4000-8000-000000000099",
     "ok": true,

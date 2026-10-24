@@ -44,6 +44,17 @@ pub struct FakeIpEntry {
     pub ttl_remaining_seconds: i64,
 }
 
+/// Classification result for an outbound LLMNR (`UDP 5355`) or mDNS (`UDP 5353`) datagram payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalNameQueryDecision {
+    /// Local name (single-label without dot, `.local`, AD suffix / `bypassDomains`, private reverse zone): allow in `Direct`.
+    AllowLocal { qname: String },
+    /// Public FQDN on a link-local name resolution protocol: block and log a rate-limited `WARN`.
+    BlockPublicFqdn { qname: String },
+    /// Malformed DNS/LLMNR/mDNS wire payload: drop without panic.
+    BlockMalformed,
+}
+
 #[derive(Debug, Clone)]
 struct InternalRecord {
     fake_ip: Ipv4Addr,
@@ -204,6 +215,64 @@ impl FakeIpEngine {
         }
 
         false
+    }
+
+    /// Classifies an outbound LLMNR (`UDP 5355`) or mDNS (`UDP 5353`) wire payload.
+    ///
+    /// - Local names (single-label without dot, `.local`, AD suffixes, `bypassDomains`, private reverse zones)
+    ///   return [`LocalNameQueryDecision::AllowLocal`].
+    /// - Any public FQDN returns [`LocalNameQueryDecision::BlockPublicFqdn`].
+    /// - Unparseable payloads return [`LocalNameQueryDecision::BlockMalformed`].
+    pub fn classify_local_name_query(&self, payload: &[u8]) -> LocalNameQueryDecision {
+        if let Ok(query) = codec::parse_dns_query(payload) {
+            let qname = normalize_domain_name(&query.question.qname);
+            if qname.is_empty() {
+                return LocalNameQueryDecision::BlockMalformed;
+            }
+            if self.is_bypassed(&qname) && !self.is_doh_canary(&qname) {
+                return LocalNameQueryDecision::AllowLocal { qname };
+            } else {
+                return LocalNameQueryDecision::BlockPublicFqdn { qname };
+            }
+        }
+
+        if let Ok(msg) = codec::parse_dns_message(payload) {
+            let mut first_local: Option<String> = None;
+            for q in &msg.questions {
+                let name = normalize_domain_name(&q.qname);
+                if name.is_empty() {
+                    continue;
+                }
+                if !self.is_bypassed(&name) || self.is_doh_canary(&name) {
+                    return LocalNameQueryDecision::BlockPublicFqdn { qname: name };
+                }
+                if first_local.is_none() {
+                    first_local = Some(name);
+                }
+            }
+            for rr in msg
+                .answers
+                .iter()
+                .chain(msg.authorities.iter())
+                .chain(msg.additionals.iter())
+            {
+                let name = normalize_domain_name(&rr.name);
+                if name.is_empty() {
+                    continue;
+                }
+                if !self.is_bypassed(&name) || self.is_doh_canary(&name) {
+                    return LocalNameQueryDecision::BlockPublicFqdn { qname: name };
+                }
+                if first_local.is_none() {
+                    first_local = Some(name);
+                }
+            }
+            if let Some(qname) = first_local {
+                return LocalNameQueryDecision::AllowLocal { qname };
+            }
+        }
+
+        LocalNameQueryDecision::BlockMalformed
     }
 
     pub fn allocate_or_get(&self, domain: &str) -> Option<Ipv4Addr> {
@@ -922,5 +991,68 @@ nameserver 10.200.1.1
         constants.dns.max_cache_entries = 0;
         let zero_engine = FakeIpEngine::new(&profile.dns_config, &constants.dns);
         assert!(zero_engine.allocate_or_get("any.routeward.test").is_none());
+    }
+
+    #[test]
+    fn classifies_llmnr_and_mdns_local_names_vs_public_fqdns() {
+        let constants = SystemConstants::load_embedded().unwrap();
+        let mut profile = ProfileConfig::load_embedded_default().unwrap();
+        profile
+            .dns_config
+            .bypass_domains
+            .push("*.corp.contoso.com".to_string());
+        let engine = FakeIpEngine::new(&profile.dns_config, &constants.dns);
+
+        // 1. Single-label short name ("fileserver") -> AllowLocal
+        let short_q = codec::build_a_query(0x1001, "fileserver").unwrap();
+        assert_eq!(
+            engine.classify_local_name_query(&short_q),
+            LocalNameQueryDecision::AllowLocal {
+                qname: "fileserver".to_string()
+            }
+        );
+
+        // 2. .local mDNS name ("printer.local") -> AllowLocal
+        let mdns_q = codec::build_a_query(0x1002, "printer.local").unwrap();
+        assert_eq!(
+            engine.classify_local_name_query(&mdns_q),
+            LocalNameQueryDecision::AllowLocal {
+                qname: "printer.local".to_string()
+            }
+        );
+
+        // 3. Configured AD/bypass suffix ("dc01.corp.contoso.com") -> AllowLocal
+        let ad_q = codec::build_a_query(0x1003, "dc01.corp.contoso.com").unwrap();
+        assert_eq!(
+            engine.classify_local_name_query(&ad_q),
+            LocalNameQueryDecision::AllowLocal {
+                qname: "dc01.corp.contoso.com".to_string()
+            }
+        );
+
+        // 4. Private reverse zone ("10.1.168.192.in-addr.arpa") -> AllowLocal
+        let ptr_q =
+            codec::build_query(0x1004, "10.1.168.192.in-addr.arpa", codec::QTYPE_PTR).unwrap();
+        assert_eq!(
+            engine.classify_local_name_query(&ptr_q),
+            LocalNameQueryDecision::AllowLocal {
+                qname: "10.1.168.192.in-addr.arpa".to_string()
+            }
+        );
+
+        // 5. Public FQDN ("leak.example.com") -> BlockPublicFqdn
+        let pub_q = codec::build_a_query(0x1005, "leak.example.com").unwrap();
+        assert_eq!(
+            engine.classify_local_name_query(&pub_q),
+            LocalNameQueryDecision::BlockPublicFqdn {
+                qname: "leak.example.com".to_string()
+            }
+        );
+
+        // 6. Malformed payload -> BlockMalformed without panic
+        assert_eq!(
+            engine.classify_local_name_query(&[0x00, 0x01, 0x02]),
+            LocalNameQueryDecision::BlockMalformed
+        );
     }
 }

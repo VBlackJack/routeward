@@ -876,7 +876,214 @@ fi
 kill -TERM "${DAEMON_R_PID}" 2>/dev/null || true
 wait "${DAEMON_R_PID}" 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# Scenario (u): End-to-end UDP exchange between client and UDP echo server
+#               THROUGH socks5_udp_test_server using the engine's SOCKS5 UDP
+#               client (Fake-IP reverse resolution to ATYP=0x03 domain)
+# ---------------------------------------------------------------------------
+UDP_TEST_SRV="/workspace/target/release/examples/socks5_udp_test_server"
+rm -f /tmp/udp_srv_u.json /run/routeward/routeward.sock
+
+"${UDP_TEST_SRV}" \
+    --bind 127.0.0.1:1082 \
+    --udp-echo-bind "${TARGET_IP}:19999" \
+    --echo-prefix "UDP_ECHO_OK:" \
+    --map-domain "udp.routeward.test=${TARGET_IP}" \
+    --stats-file /tmp/udp_srv_u.json >/tmp/udp_srv_u.out 2>&1 &
+UDP_SRV_U_PID=$!
+sleep 0.3
+
+cat > /tmp/profile_udp_u.json <<EOF
+{
+  "profileId": "00000000-0000-4000-8000-000000000201",
+  "name": "LinuxUdpAssociateProfile",
+  "version": "2026.1022.00",
+  "enableLogging": true,
+  "interceptionMode": "hybrid",
+  "themeConfig": { "theme": "Drakul", "accent": "Default" },
+  "securityPolicy": {
+    "killSwitchEnabled": true,
+    "blockUdpOnTcpOnlyProxy": true,
+    "strictDnsNoLocalFallback": true,
+    "blockEncryptedDnsBypass": true,
+    "blockQuicUdp443": true,
+    "unknownProcessAction": { "type": "block" }
+  },
+  "defaultAction": { "type": "proxy", "targetId": "socks-udp-1082" },
+  "dnsConfig": {
+    "enableFakeIp": true,
+    "remoteDnsResolution": true,
+    "fakeIpCidr": "198.18.0.0/15",
+    "upstreamDns": "${TARGET_IP}:53",
+    "bypassDomains": ["corp.contoso.com", "localhost", "*.local"]
+  },
+  "proxies": [
+    {
+      "id": "socks-udp-1082",
+      "name": "SOCKS5 UDP Relay 1082",
+      "protocol": "socks5",
+      "host": "127.0.0.1",
+      "port": 1082,
+      "auth": null,
+      "udpEnabled": true,
+      "tls": false,
+      "sni": null,
+      "enabled": true,
+      "lastLatencyMs": null,
+      "exitIp": null
+    }
+  ],
+  "chains": [],
+  "rules": []
+}
+EOF
+
+cp /tmp/profile_udp_u.json /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
+
+"${BIN}" daemon >/tmp/rw_daemon_u.out 2>&1 &
+DAEMON_U_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+DNS_U_OUT=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "udp.routeward.test" 1)
+FAKE_IP_U=$(echo "${DNS_U_OUT}" | sed -n 's/.*IP=\([0-9.]*\) .*/\1/p')
+
+UDP_U_RESP=$(python3 /workspace/tests/linux/mock_servers.py --socks5-udp-exchange 10808 "${FAKE_IP_U}" 19999 "hello-udp-42a")
+STATS_U=$(cat /tmp/udp_srv_u.json 2>/dev/null || echo "{}")
+
+if [[ "${UDP_U_RESP}" == "UDP_OK BODY=UDP_ECHO_OK:hello-udp-42a" ]] \
+    && echo "${STATS_U}" | grep -q '"udp_associate_requests":1' \
+    && echo "${STATS_U}" | grep -q '"udp_datagrams_relayed":1' \
+    && echo "${STATS_U}" | grep -q '"udp_echo_received":1' \
+    && echo "${STATS_U}" | grep -q '"last_udp_target":"Domain(udp.routeward.test:19999)"'; then
+    echo "[PASS] Scenario (u): End-to-end UDP exchange via SOCKS5 UDP ASSOCIATE succeeded (${UDP_U_RESP}; ATYP=Domain(udp.routeward.test:19999))"
+else
+    echo "[FAIL] Scenario (u)"
+    echo "DNS_U_OUT=${DNS_U_OUT} FAKE_IP_U=${FAKE_IP_U}"
+    echo "UDP_U_RESP=${UDP_U_RESP}"
+    echo "STATS_U=${STATS_U}"
+    kill -TERM "${DAEMON_U_PID}" "${UDP_SRV_U_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+kill -TERM "${UDP_SRV_U_PID}" 2>/dev/null || true
+wait "${UDP_SRV_U_PID}" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Scenario (v): Proxy refusing UDP ASSOCIATE (REP=0x07) + Kill-Switch =
+#               blocked, 0 datagrams received by target, single WARN per node
+# ---------------------------------------------------------------------------
+rm -f /tmp/udp_srv_v.json
+"${UDP_TEST_SRV}" \
+    --bind 127.0.0.1:1083 \
+    --udp-echo-bind "${TARGET_IP}:19998" \
+    --disable-udp-associate \
+    --stats-file /tmp/udp_srv_v.json >/tmp/udp_srv_v.out 2>&1 &
+UDP_SRV_V_PID=$!
+sleep 0.3
+
+sed -e 's/"socks-udp-1082"/"socks-no-udp-1083"/g' \
+    -e 's/"port": 1082/"port": 1083/' \
+    /tmp/profile_udp_u.json > /tmp/profile_udp_v.json
+
+"${BIN}" ctl replace-profile --json-file /tmp/profile_udp_v.json >/dev/null
+sleep 0.2
+
+set +e
+UDP_V_RESP1=$(python3 /workspace/tests/linux/mock_servers.py --socks5-udp-exchange 10808 "${TARGET_IP}" 19998 "blocked-datagram-1")
+UDP_V_EXIT1=$?
+UDP_V_RESP2=$(python3 /workspace/tests/linux/mock_servers.py --socks5-udp-exchange 10808 "${TARGET_IP}" 19998 "blocked-datagram-2")
+UDP_V_EXIT2=$?
+set -e
+
+STATS_V=$(cat /tmp/udp_srv_v.json 2>/dev/null || echo "{}")
+LOGS_V=$("${BIN}" ctl logs)
+WARN_COUNT_V=$(echo "${LOGS_V}" | grep -c 'REP=0x07 (Command not supported)' || true)
+
+if [[ "${UDP_V_EXIT1}" -ne 0 ]] \
+    && [[ "${UDP_V_EXIT2}" -ne 0 ]] \
+    && echo "${STATS_V}" | grep -q '"udp_associate_refused":1' \
+    && echo "${STATS_V}" | grep -q '"udp_echo_received":0' \
+    && [[ "${WARN_COUNT_V}" -eq 1 ]]; then
+    echo "[PASS] Scenario (v): Refused UDP ASSOCIATE (REP=0x07) enforced Kill-Switch (0 target datagrams, cached after 1st probe, single WARN)"
+else
+    echo "[FAIL] Scenario (v)"
+    echo "UDP_V_EXIT1=${UDP_V_EXIT1} UDP_V_RESP1=${UDP_V_RESP1}"
+    echo "UDP_V_EXIT2=${UDP_V_EXIT2} UDP_V_RESP2=${UDP_V_RESP2}"
+    echo "STATS_V=${STATS_V}"
+    echo "WARN_COUNT_V=${WARN_COUNT_V}"
+    echo "LOGS_V=${LOGS_V}"
+    kill -TERM "${DAEMON_U_PID}" "${UDP_SRV_V_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+kill -TERM "${UDP_SRV_V_PID}" 2>/dev/null || true
+wait "${UDP_SRV_V_PID}" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Scenario (w): QUIC (UDP 443) rejected with ICMP Port Unreachable (client
+#               error delay measured and displayed, 0 target datagrams);
+#               LLMNR (UDP 5355) public FQDN blocked, local short name allowed
+# ---------------------------------------------------------------------------
+rm -f /tmp/udp_443_hits.log /tmp/llmnr_5355_hits.log
+
+QUIC_W_OUT=$(python3 /workspace/tests/linux/mock_servers.py --quic-udp-probe "${TARGET_IP}" 443)
+python3 /workspace/tests/linux/mock_servers.py --llmnr-query "${TARGET_IP}" "public.leak.example.com" >/dev/null
+python3 /workspace/tests/linux/mock_servers.py --llmnr-query "${TARGET_IP}" "fileserver" >/dev/null
+sleep 0.3
+
+LOGS_W=$("${BIN}" ctl logs)
+
+if echo "${QUIC_W_OUT}" | grep -Eq "QUIC_(REJECTED|ERROR) ERR=(ConnectionRefusedError|PermissionError:1)" \
+    && [[ ! -s /tmp/udp_443_hits.log ]] \
+    && grep -q "LLMNR_5355 .* fileserver" /tmp/llmnr_5355_hits.log \
+    && ! grep -q "public.leak.example.com" /tmp/llmnr_5355_hits.log \
+    && echo "${LOGS_W}" | grep -q "Blocked public FQDN .*public.leak.example.com.* on local name resolution protocol"; then
+    echo "[PASS] Scenario (w): QUIC UDP 443 rejected (${QUIC_W_OUT}, 0 target datagrams); LLMNR public FQDN blocked and local short name allowed"
+else
+    echo "[FAIL] Scenario (w)"
+    echo "QUIC_W_OUT=${QUIC_W_OUT}"
+    cat /tmp/udp_443_hits.log 2>/dev/null || true
+    cat /tmp/llmnr_5355_hits.log 2>/dev/null || true
+    echo "LOGS_W=${LOGS_W}"
+    kill -TERM "${DAEMON_U_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (x): kill -9 of daemon — watchdog removes nftables rules so
+#               UDP 443 and UDP 5355 (LLMNR) are no longer blocked
+# ---------------------------------------------------------------------------
+kill -9 "${DAEMON_U_PID}"
+wait "${DAEMON_U_PID}" 2>/dev/null || true
+sleep 0.5
+
+rm -f /tmp/udp_443_hits.log /tmp/llmnr_5355_hits.log
+python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b'QUIC_AFTER_KILL9', ('${TARGET_IP}', 443)); s.close()"
+python3 /workspace/tests/linux/mock_servers.py --llmnr-query "${TARGET_IP}" "after-kill9.example.com" >/dev/null
+sleep 0.2
+
+if ! nft list table ip routeward >/dev/null 2>&1 \
+    && ! nft list table ip6 routeward >/dev/null 2>&1 \
+    && grep -q "UDP_443 " /tmp/udp_443_hits.log \
+    && grep -q "after-kill9.example.com" /tmp/llmnr_5355_hits.log; then
+    echo "[PASS] Scenario (x): SIGKILL (kill -9) watchdog restored direct UDP 443 and UDP 5355 traffic immediately"
+else
+    echo "[FAIL] Scenario (x)"
+    cat /tmp/udp_443_hits.log 2>/dev/null || true
+    cat /tmp/llmnr_5355_hits.log 2>/dev/null || true
+    exit 1
+fi
+
 cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
 kill "${MOCK_PID}" 2>/dev/null || true
 
-echo "=== ALL 20 LINUX CONTAINER SCENARIOS PASSED ==="
+echo "=== ALL 24 LINUX CONTAINER SCENARIOS PASSED ==="

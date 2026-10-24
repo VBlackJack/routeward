@@ -156,7 +156,7 @@ flowchart TD
 
 | Path | Crate / Package | Responsibility |
 | :--- | :--- | :--- |
-| `crates/routeward-core` | `routeward-core` | `Interceptor` trait, `WinDivertInterceptor` (Windows), `NftablesInterceptor` (Linux), `TransparentNatTable`, `ProcessResolver`, `RuleEngine`, `ProxyConnector`, and daily `FileLogger`. |
+| `crates/routeward-core` | `routeward-core` | `Interceptor` trait, `WinDivertInterceptor` (Windows), `NftablesInterceptor` (Linux), `TransparentNatTable`, `ProcessResolver`, `RuleEngine`, `ProxyConnector` (TCP + SOCKS5 `UDP ASSOCIATE` via `UdpAssociationManager`), QUIC (`UDP 443`) ICMP Port Unreachable rejection, LLMNR (`5355`) / mDNS (`5353`) / NetBIOS-NS (`137`) leak guard, and daily `FileLogger`. |
 | `crates/routeward-cli` | `routeward-cli` (`routeward`) | Command-line interface (`run --duration-secs`, `cleanup`, `check`, `eval`, `fake-ip`). |
 | `apps/desktop` | `routeward-desktop` | Native desktop shell built with `tao` and `wry` serving the compiled `ui/dist` bundle. |
 | `ui` | `routeward-ui` | React 18 + TypeScript + Tailwind CSS interface with ThemeForge palettes. |

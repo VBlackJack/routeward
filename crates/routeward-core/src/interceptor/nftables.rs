@@ -98,7 +98,49 @@ impl NftablesInterceptor {
         block_encrypted_dns: bool,
         upstream_endpoints: &[(Ipv4Addr, u16)],
     ) -> String {
-        let mut script = String::with_capacity(768);
+        Self::build_nft_table_ruleset_full(
+            table_name,
+            chain_name,
+            fwmark,
+            relay_port,
+            dns_listen_port,
+            10854,
+            dns_standard_port,
+            dot_port,
+            443,
+            5353,
+            5355,
+            137,
+            block_encrypted_dns,
+            true,
+            upstream_endpoints,
+        )
+    }
+
+    /// Generates the dedicated IPv4 `nftables` ruleset including:
+    /// - DNS port 53 (UDP and TCP) redirection to `dns_listen_port`
+    /// - mDNS (`5353`) and LLMNR (`5355`) UDP redirection to `local_name_inspect_port` (`10854`)
+    /// - optional DoT/DoQ (`UDP 853`) and QUIC (`UDP 443`) `reject` (ICMPv4 Port Unreachable)
+    /// - NetBIOS-NS (`UDP 137`) drop toward non-local/public IPv4 addresses
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_nft_table_ruleset_full(
+        table_name: &str,
+        chain_name: &str,
+        fwmark: u32,
+        relay_port: u16,
+        dns_listen_port: u16,
+        local_name_inspect_port: u16,
+        dns_standard_port: u16,
+        dot_port: u16,
+        quic_port: u16,
+        mdns_port: u16,
+        llmnr_port: u16,
+        netbios_ns_port: u16,
+        block_encrypted_dns: bool,
+        block_quic_udp_443: bool,
+        upstream_endpoints: &[(Ipv4Addr, u16)],
+    ) -> String {
+        let mut script = String::with_capacity(1024);
         script.push_str(&format!("table ip {table_name} {{\n"));
         script.push_str(&format!("    chain {chain_name} {{\n"));
         script.push_str("        type nat hook output priority -100; policy accept;\n");
@@ -110,6 +152,9 @@ impl NftablesInterceptor {
         script.push_str(&format!(
             "        tcp dport {dns_standard_port} redirect to :{dns_listen_port}\n"
         ));
+        script.push_str(&format!(
+            "        udp dport {{ {mdns_port}, {llmnr_port} }} redirect to :{local_name_inspect_port}\n"
+        ));
         for (ip, port) in upstream_endpoints {
             if !ip.is_loopback() {
                 script.push_str(&format!("        ip daddr {ip} tcp dport {port} return\n"));
@@ -119,14 +164,20 @@ impl NftablesInterceptor {
             "        tcp dport 1-65535 redirect to :{relay_port}\n"
         ));
         script.push_str("    }\n");
+        script.push_str("    chain filter_output {\n");
+        script.push_str("        type filter hook output priority 0; policy accept;\n");
+        script.push_str(&format!("        meta mark {fwmark} return\n"));
+        script.push_str("        ip daddr 127.0.0.0/8 return\n");
         if block_encrypted_dns {
-            script.push_str("    chain filter_output {\n");
-            script.push_str("        type filter hook output priority 0; policy accept;\n");
-            script.push_str(&format!("        meta mark {fwmark} return\n"));
-            script.push_str("        ip daddr 127.0.0.0/8 return\n");
             script.push_str(&format!("        udp dport {dot_port} reject\n"));
-            script.push_str("    }\n");
         }
+        if block_quic_udp_443 {
+            script.push_str(&format!("        udp dport {quic_port} reject\n"));
+        }
+        script.push_str(&format!(
+            "        udp dport {netbios_ns_port} ip daddr != {{ 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }} drop\n"
+        ));
+        script.push_str("    }\n");
         script.push_str("}\n");
         script
     }
@@ -178,18 +229,64 @@ impl NftablesInterceptor {
         block_encrypted_dns: bool,
         upstream_endpoints: &[(Ipv4Addr, u16)],
     ) -> String {
-        let mut batch = String::with_capacity(1536);
-        batch.push_str(&format!("table ip {table_name}\n"));
-        batch.push_str(&format!("delete table ip {table_name}\n"));
-        batch.push_str(&Self::build_nft_table_ruleset_with_dns(
+        Self::build_atomic_replace_ruleset_full(
             table_name,
             chain_name,
             fwmark,
             relay_port,
             dns_listen_port,
+            10854,
             dns_standard_port,
             dot_port,
+            443,
+            5353,
+            5355,
+            137,
+            kill_switch_enabled,
             block_encrypted_dns,
+            true,
+            upstream_endpoints,
+        )
+    }
+
+    /// Builds a single atomic `nft -f -` transaction script with all UDP/QUIC/local-name parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_atomic_replace_ruleset_full(
+        table_name: &str,
+        chain_name: &str,
+        fwmark: u32,
+        relay_port: u16,
+        dns_listen_port: u16,
+        local_name_inspect_port: u16,
+        dns_standard_port: u16,
+        dot_port: u16,
+        quic_port: u16,
+        mdns_port: u16,
+        llmnr_port: u16,
+        netbios_ns_port: u16,
+        kill_switch_enabled: bool,
+        block_encrypted_dns: bool,
+        block_quic_udp_443: bool,
+        upstream_endpoints: &[(Ipv4Addr, u16)],
+    ) -> String {
+        let mut batch = String::with_capacity(1536);
+        batch.push_str(&format!("table ip {table_name}\n"));
+        batch.push_str(&format!("delete table ip {table_name}\n"));
+        batch.push_str(&Self::build_nft_table_ruleset_full(
+            table_name,
+            chain_name,
+            fwmark,
+            relay_port,
+            dns_listen_port,
+            local_name_inspect_port,
+            dns_standard_port,
+            dot_port,
+            quic_port,
+            mdns_port,
+            llmnr_port,
+            netbios_ns_port,
+            block_encrypted_dns,
+            block_quic_udp_443,
             upstream_endpoints,
         ));
         if let Some(ip6_script) = Self::build_nft_ip6_table_ruleset(
@@ -601,13 +698,19 @@ impl Interceptor for NftablesInterceptor {
         // 4. Build and load the dedicated nftables tables via `nft -f -`
         let upstream_endpoints = controller.nat_table.upstream_endpoints();
         let dns_listen_port = net.default_dns_listen_port;
+        let local_name_inspect_port = net.default_local_name_inspect_port;
+        let quic_port = net.quic_default_port;
+        let mdns_port = net.mdns_standard_port;
+        let llmnr_port = net.llmnr_standard_port;
+        let netbios_ns_port = net.netbios_ns_standard_port;
         let dns_standard_port = controller.constants.dns.dns_standard_port;
         let dot_port = controller.constants.dns.dns_over_tls_port;
-        let (kill_switch_enabled, block_encrypted_dns) = {
+        let (kill_switch_enabled, block_encrypted_dns, block_quic_udp_443) = {
             let prof = controller.profile.read();
             (
                 prof.security_policy.kill_switch_enabled,
                 prof.security_policy.block_encrypted_dns_bypass,
+                prof.security_policy.block_quic_udp_443,
             )
         };
 
@@ -699,15 +802,21 @@ impl Interceptor for NftablesInterceptor {
             telemetry: controller.telemetry.clone(),
         });
 
-        let ruleset = Self::build_nft_table_ruleset_with_dns(
+        let ruleset = Self::build_nft_table_ruleset_full(
             &table_name,
             &chain_name,
             fwmark,
             relay_port,
             dns_listen_port,
+            local_name_inspect_port,
             dns_standard_port,
             dot_port,
+            quic_port,
+            mdns_port,
+            llmnr_port,
+            netbios_ns_port,
             block_encrypted_dns,
+            block_quic_udp_443,
             &upstream_endpoints,
         );
 
@@ -788,27 +897,39 @@ impl Interceptor for NftablesInterceptor {
         let fwmark = net.linux_fwmark;
         let relay_port = net.default_transparent_tcp_port;
         let dns_listen_port = net.default_dns_listen_port;
+        let local_name_inspect_port = net.default_local_name_inspect_port;
+        let quic_port = net.quic_default_port;
+        let mdns_port = net.mdns_standard_port;
+        let llmnr_port = net.llmnr_standard_port;
+        let netbios_ns_port = net.netbios_ns_standard_port;
         let dns_standard_port = controller.constants.dns.dns_standard_port;
         let dot_port = controller.constants.dns.dns_over_tls_port;
         let upstream_endpoints = controller.nat_table.upstream_endpoints();
-        let (kill_switch_enabled, block_encrypted_dns) = {
+        let (kill_switch_enabled, block_encrypted_dns, block_quic_udp_443) = {
             let prof = controller.profile.read();
             (
                 prof.security_policy.kill_switch_enabled,
                 prof.security_policy.block_encrypted_dns_bypass,
+                prof.security_policy.block_quic_udp_443,
             )
         };
 
-        let atomic_batch = Self::build_atomic_replace_ruleset(
+        let atomic_batch = Self::build_atomic_replace_ruleset_full(
             &table_name,
             &chain_name,
             fwmark,
             relay_port,
             dns_listen_port,
+            local_name_inspect_port,
             dns_standard_port,
             dot_port,
+            quic_port,
+            mdns_port,
+            llmnr_port,
+            netbios_ns_port,
             kill_switch_enabled,
             block_encrypted_dns,
+            block_quic_udp_443,
             &upstream_endpoints,
         );
 
@@ -906,9 +1027,12 @@ mod tests {
         assert!(ruleset.contains("ip daddr 127.0.0.0/8 return"));
         assert!(ruleset.contains("udp dport 53 redirect to :10853"));
         assert!(ruleset.contains("tcp dport 53 redirect to :10853"));
+        assert!(ruleset.contains("udp dport { 5353, 5355 } redirect to :10854"));
         assert!(ruleset.contains("ip daddr 192.168.31.10 tcp dport 1080 return"));
         assert!(ruleset.contains("tcp dport 1-65535 redirect to :10810"));
         assert!(ruleset.contains("udp dport 853 reject"));
+        assert!(ruleset.contains("udp dport 443 reject"));
+        assert!(ruleset.contains("udp dport 137 ip daddr !="));
 
         let ip6_ruleset = NftablesInterceptor::build_nft_ip6_table_ruleset(
             "routeward",

@@ -139,6 +139,7 @@ export interface DnsConfig {
 export interface SecurityPolicyConfig {
   killSwitchEnabled: boolean;
   blockUdpOnTcpOnlyProxy: boolean;
+  blockQuicUdp443?: boolean;
   strictDnsNoLocalFallback: boolean;
   blockEncryptedDnsBypass?: boolean;
   unknownProcessAction?: RuleAction;

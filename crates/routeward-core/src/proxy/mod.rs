@@ -15,12 +15,13 @@
  */
 
 pub mod sni;
+pub mod udp;
 pub mod uri;
 
 use crate::config::{ChainStrategy, ProtocolConstants, ProxyNode, ProxyProtocol, SystemConstants};
 use crate::error::{
     RouteWardError, RouteWardResult, ERR_KEY_AUTH_REJECTED, ERR_KEY_CHAIN_EMPTY,
-    ERR_KEY_CONNECTION_TIMEOUT, ERR_KEY_HANDSHAKE_FAILED,
+    ERR_KEY_CONNECTION_TIMEOUT, ERR_KEY_HANDSHAKE_FAILED, ERR_KEY_UDP_NOT_SUPPORTED,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -349,6 +350,14 @@ impl ProxyConnector {
         let mut reply_head = [0u8; 4];
         stream.read_exact(&mut reply_head).await?;
         if reply_head[1] != proto.socks5_reply_succeeded {
+            if command == proto.socks5_cmd_udp_associate
+                && reply_head[1] == proto.socks5_reply_command_not_supported
+            {
+                return Err(RouteWardError::UdpAssociateUnsupported {
+                    key: ERR_KEY_UDP_NOT_SUPPORTED,
+                    proxy_id: node.id.clone(),
+                });
+            }
             return Err(RouteWardError::ProtocolHandshake {
                 key: ERR_KEY_HANDSHAKE_FAILED,
                 detail: format!("SOCKS5 reply code: {}", reply_head[1]),

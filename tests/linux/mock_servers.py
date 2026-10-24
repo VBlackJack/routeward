@@ -18,10 +18,12 @@ import socket
 import struct
 import sys
 import threading
+import time
 
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 18080
 HTTPS_PORT = 443
+LLMNR_PORT = 5355
 DNS_HOST = "10.200.1.1"
 DNS_PORT = 53
 DNS_ANSWER_IP = "10.200.1.1"
@@ -33,6 +35,8 @@ SOCKS_LOG_PATH = "/tmp/socks5_hits.log"
 HTTP_LOG_PATH = "/tmp/http_target_hits.log"
 HTTPS_LOG_PATH = "/tmp/https_443_hits.log"
 DNS_LOG_PATH = "/tmp/dns_hits.log"
+UDP_443_LOG_PATH = "/tmp/udp_443_hits.log"
+LLMNR_LOG_PATH = "/tmp/llmnr_5355_hits.log"
 
 
 def parse_dns_question(data: bytes):
@@ -357,6 +361,135 @@ def run_socks5_server() -> None:
         threading.Thread(target=handle_socks5_client, args=(conn,), daemon=True).start()
 
 
+def run_udp_443_server() -> None:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HTTP_HOST, HTTPS_PORT))
+    while True:
+        try:
+            data, addr = srv.recvfrom(4096)
+            with open(UDP_443_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"UDP_443 {addr[0]}:{addr[1]} len={len(data)}\n")
+        except Exception:
+            pass
+
+
+def run_llmnr_5355_server() -> None:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HTTP_HOST, LLMNR_PORT))
+    while True:
+        try:
+            data, addr = srv.recvfrom(4096)
+            parsed = parse_dns_question(data)
+            qname = parsed[0] if parsed else "MALFORMED"
+            with open(LLMNR_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"LLMNR_5355 {addr[0]}:{addr[1]} {qname}\n")
+        except Exception:
+            pass
+
+
+def perform_socks5_udp_exchange_cli(
+    local_socks_port: int, target_ip: str, target_port: int, payload_str: str
+) -> int:
+    ctrl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ctrl.settimeout(3.0)
+    ctrl.connect(("127.0.0.1", local_socks_port))
+    ctrl.sendall(b"\x05\x01\x00")
+    greeting = ctrl.recv(2)
+    if len(greeting) < 2 or greeting[1] != 0:
+        print("HANDSHAKE_FAILED")
+        ctrl.close()
+        return 1
+
+    # Send CMD=0x03 (UDP ASSOCIATE) with 0.0.0.0:0
+    ctrl.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+    rep = ctrl.recv(10)
+    if len(rep) < 10 or rep[1] != 0:
+        print(f"ASSOCIATE_FAILED REP={rep[1] if len(rep) > 1 else -1}")
+        ctrl.close()
+        return 1
+
+    bnd_ip = socket.inet_ntoa(rep[4:8])
+    bnd_port = struct.unpack("!H", rep[8:10])[0]
+
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.settimeout(2.5)
+    pkt = (
+        b"\x00\x00\x00\x01"
+        + socket.inet_aton(target_ip)
+        + struct.pack("!H", target_port)
+        + payload_str.encode("utf-8")
+    )
+    udp_sock.sendto(pkt, (bnd_ip, bnd_port))
+    try:
+        resp, _ = udp_sock.recvfrom(4096)
+    except socket.timeout:
+        print("UDP_TIMEOUT")
+        udp_sock.close()
+        ctrl.close()
+        return 2
+
+    udp_sock.close()
+    ctrl.close()
+    if len(resp) < 10:
+        print("SHORT_REPLY")
+        return 1
+    atyp = resp[3]
+    if atyp == 1:
+        hdr_len = 10
+    elif atyp == 3:
+        hdr_len = 7 + resp[4]
+    elif atyp == 4:
+        hdr_len = 22
+    else:
+        print("BAD_ATYP")
+        return 1
+    body = resp[hdr_len:].decode("utf-8", errors="replace")
+    print(f"UDP_OK BODY={body}")
+    return 0
+
+
+def perform_quic_udp_probe_cli(target_ip: str, target_port: int) -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(1.5)
+    sock.connect((target_ip, target_port))
+    t0 = time.perf_counter()
+    try:
+        sock.send(b"QUIC_INITIAL_PROBE")
+        sock.recv(1024)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"QUIC_UNEXPECTED_RECV DELAY_MS={elapsed_ms:.2f}")
+        sock.close()
+        return 1
+    except ConnectionRefusedError:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"QUIC_REJECTED ERR=ConnectionRefusedError DELAY_MS={elapsed_ms:.2f}")
+        sock.close()
+        return 0
+    except OSError as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"QUIC_ERROR ERR={type(exc).__name__}:{exc.errno} DELAY_MS={elapsed_ms:.2f}")
+        sock.close()
+        return 0
+
+
+def perform_llmnr_query_cli(target_ip: str, qname: str) -> int:
+    pkt = bytearray(struct.pack("!HHHHHH", 0x5355, 0x0000, 1, 0, 0, 0))
+    for label in qname.strip(".").split("."):
+        if label:
+            enc = label.encode("ascii")
+            pkt.append(len(enc))
+            pkt.extend(enc)
+    pkt.append(0)
+    pkt.extend(struct.pack("!HH", 1, 1))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.sendto(bytes(pkt), (target_ip, LLMNR_PORT))
+    sock.close()
+    print(f"LLMNR_SENT QNAME={qname}")
+    return 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "--dns-query":
         srv_ip = sys.argv[2]
@@ -367,11 +500,28 @@ if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "--tls-sni-probe":
         sys.exit(perform_tls_sni_probe_cli(sys.argv[2], sys.argv[3]))
 
+    if len(sys.argv) >= 6 and sys.argv[1] == "--socks5-udp-exchange":
+        sys.exit(
+            perform_socks5_udp_exchange_cli(
+                int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5]
+            )
+        )
+
+    if len(sys.argv) >= 4 and sys.argv[1] == "--quic-udp-probe":
+        sys.exit(perform_quic_udp_probe_cli(sys.argv[2], int(sys.argv[3])))
+
+    if len(sys.argv) >= 4 and sys.argv[1] == "--llmnr-query":
+        sys.exit(perform_llmnr_query_cli(sys.argv[2], sys.argv[3]))
+
     http_only = "--http-only" in sys.argv
     t_http = threading.Thread(target=run_http_server, daemon=True)
     t_http.start()
     t_https = threading.Thread(target=run_https_443_server, daemon=True)
     t_https.start()
+    t_udp_443 = threading.Thread(target=run_udp_443_server, daemon=True)
+    t_udp_443.start()
+    t_llmnr = threading.Thread(target=run_llmnr_5355_server, daemon=True)
+    t_llmnr.start()
     t_dns_udp = threading.Thread(target=run_dns_udp_server, daemon=True)
     t_dns_udp.start()
     t_dns_tcp = threading.Thread(target=run_dns_tcp_server, daemon=True)

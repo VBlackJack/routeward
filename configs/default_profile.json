@@ -11,6 +11,7 @@
   "securityPolicy": {
     "killSwitchEnabled": true,
     "blockUdpOnTcpOnlyProxy": true,
+    "blockQuicUdp443": true,
     "strictDnsNoLocalFallback": true,
     "blockEncryptedDnsBypass": true,
     "unknownProcessAction": {
