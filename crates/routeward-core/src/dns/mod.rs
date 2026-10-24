@@ -117,6 +117,11 @@ impl FakeIpEngine {
         }
 
         let allocated_ip = self.next_ip_in_subnet();
+        if let Some(prev_domain) = self.ip_to_domain.insert(allocated_ip, normalized.clone()) {
+            if prev_domain != normalized {
+                self.domain_to_record.remove(&prev_domain);
+            }
+        }
         let record = InternalRecord {
             fake_ip: allocated_ip,
             domain: normalized.clone(),
@@ -124,9 +129,12 @@ impl FakeIpEngine {
             expires_at: next_expiry,
         };
 
-        self.ip_to_domain.insert(allocated_ip, normalized.clone());
         self.domain_to_record.insert(normalized, record);
         Some(allocated_ip)
+    }
+
+    pub fn is_in_fake_subnet(&self, ip: &Ipv4Addr) -> bool {
+        self.subnet.contains(ip)
     }
 
     pub fn resolve_fake_ip(&self, ip: &Ipv4Addr) -> Option<String> {
@@ -134,10 +142,19 @@ impl FakeIpEngine {
             return None;
         }
         let domain = self.ip_to_domain.get(ip)?.value().clone();
+        let now = Utc::now();
         if let Some(mut rec) = self.domain_to_record.get_mut(&domain) {
+            if rec.expires_at <= now {
+                drop(rec);
+                self.domain_to_record.remove(&domain);
+                self.ip_to_domain.remove(ip);
+                return None;
+            }
             rec.hits += 1;
+            return Some(domain);
         }
-        Some(domain)
+        self.ip_to_domain.remove(ip);
+        None
     }
 
     pub fn resolve_host_string(&self, host_or_ip: &str) -> Option<String> {

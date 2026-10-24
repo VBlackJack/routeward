@@ -478,7 +478,7 @@ pub struct SecurityPolicyConfig {
 }
 
 fn default_unknown_process_action() -> RuleAction {
-    RuleAction::Direct
+    RuleAction::Block
 }
 
 impl Default for SecurityPolicyConfig {
@@ -487,7 +487,7 @@ impl Default for SecurityPolicyConfig {
             kill_switch_enabled: true,
             block_udp_on_tcp_only_proxy: true,
             strict_dns_no_local_fallback: true,
-            unknown_process_action: RuleAction::Direct,
+            unknown_process_action: RuleAction::Block,
         }
     }
 }

@@ -365,14 +365,32 @@ impl WinDivertInterceptor {
             let proc_id = ctrl.process_resolver.resolve_by_pid(pid);
             let dst_ip_str = meta.dst_ip.to_string();
 
-            let eval = ctrl.evaluate_rule(&ConnectionRequest {
-                process_name: proc_id.name.clone(),
-                process_path: Some(proc_id.executable_path.clone()),
-                target_host: dst_ip_str.clone(),
-                target_ip: Some(dst_ip_str.clone()),
-                target_port: meta.dst_port,
-                protocol: TransportProtocol::Tcp,
-            });
+            let eval = if proc_id.is_unattributed() {
+                let (unknown_action, rule_name) = ctrl.resolve_unknown_process_action(
+                    COMPONENT_WINDIVERT,
+                    meta.src_port,
+                    &dst_ip_str,
+                    meta.dst_port,
+                    "process image unavailable",
+                );
+                let resolved_dom = ctrl.dns.resolve_fake_ip(&meta.dst_ip);
+                crate::rules::RuleEvaluationResult {
+                    matched_rule_id: "security-policy-unknown-process".to_string(),
+                    matched_rule_name: rule_name,
+                    action: unknown_action,
+                    effective_domain: resolved_dom.clone(),
+                    resolved_from_fake_ip: resolved_dom.is_some(),
+                }
+            } else {
+                ctrl.evaluate_rule(&ConnectionRequest {
+                    process_name: proc_id.name.clone(),
+                    process_path: Some(proc_id.executable_path.clone()),
+                    target_host: dst_ip_str.clone(),
+                    target_ip: Some(dst_ip_str.clone()),
+                    target_port: meta.dst_port,
+                    protocol: TransportProtocol::Tcp,
+                })
+            };
 
             match &eval.action {
                 RuleAction::Proxy { .. } | RuleAction::Chain { .. } => {
@@ -706,8 +724,8 @@ impl Interceptor for WinDivertInterceptor {
                 Duration::from_millis(ctrl_syn.constants.network.pending_syn_timeout_ms);
 
             while active_syn.load(Ordering::Relaxed) {
-                let outcomes = syn_queue_worker.poll_ready(
-                    &ctrl_syn.nat_table,
+                let outcomes = ctrl_syn.poll_pending_syns(
+                    &syn_queue_worker,
                     syn_timeout,
                     ProcessResolver::find_pid_for_tcp_port,
                 );
@@ -730,19 +748,13 @@ impl Interceptor for WinDivertInterceptor {
                                 Some((pid, source)),
                             );
                         }
-                        PendingSynOutcome::TimedOutFailOpen {
+                        PendingSynOutcome::TimedOutDropped { .. } => {
+                            // Packet was dropped inside poll_pending_syns and logged at INFO with drop_count
+                        }
+                        PendingSynOutcome::TimedOutReinject {
                             payload: (pkt, addr),
-                            meta,
-                            elapsed_ms,
+                            ..
                         } => {
-                            ctrl_syn.telemetry.push_log(
-                                LogLevel::Warn,
-                                COMPONENT_WINDIVERT,
-                                format!(
-                                    "Pending SYN PID resolution timed out after {}ms for {}:{} -> {}:{}, reinjecting unmodified (fail-open)",
-                                    elapsed_ms, meta.src_ip, meta.src_port, meta.dst_ip, meta.dst_port
-                                ),
-                            );
                             let mut send_len: u32 = 0;
                             unsafe {
                                 let _ = (api.send)(
@@ -792,22 +804,25 @@ impl Interceptor for WinDivertInterceptor {
                 if let Some(meta) = parse_ipv4_tcp_meta(packet) {
                     // Case A: Outbound reply from our local transparent relay back to the client
                     if meta.src_port == relay_port {
-                        if let Some(session) = ctrl_net
+                        let Some(session) = ctrl_net
                             .nat_table
                             .get_session_by_relay_peer(meta.dst_ip, meta.dst_port)
-                        {
-                            if reflect_relay_reply_to_client(packet, &session) {
-                                addr.set_outbound(false);
-                                addr.clear_impostor();
-                                unsafe {
-                                    let _ = (api.calc_checksums)(
-                                        packet.as_mut_ptr() as *mut c_void,
-                                        pkt_len as u32,
-                                        &mut addr as *mut WinDivertAddress,
-                                        0,
-                                    );
-                                }
-                            }
+                        else {
+                            // Never emit unreflected local relay teardown packets onto the wire
+                            continue;
+                        };
+                        if !reflect_relay_reply_to_client(packet, &session) {
+                            continue;
+                        }
+                        addr.set_outbound(false);
+                        addr.clear_impostor();
+                        unsafe {
+                            let _ = (api.calc_checksums)(
+                                packet.as_mut_ptr() as *mut c_void,
+                                pkt_len as u32,
+                                &mut addr as *mut WinDivertAddress,
+                                0,
+                            );
                         }
                     } else if let Some(existing_session) = ctrl_net
                         .nat_table

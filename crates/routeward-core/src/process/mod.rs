@@ -55,6 +55,15 @@ pub struct ActiveOsSocket {
     pub remote_port: u16,
 }
 
+impl ProcessIdentity {
+    /// Returns `true` if no concrete process executable could be attributed (`pid == 0`, `"system"`, or `"pid:<n>"`).
+    pub fn is_unattributed(&self) -> bool {
+        self.pid == 0
+            || self.name == UNKNOWN_PROCESS_NAME
+            || self.executable_path.starts_with("pid:")
+    }
+}
+
 impl Default for ProcessIdentity {
     fn default() -> Self {
         Self {
@@ -180,8 +189,9 @@ impl ProcessResolver {
             }
         }
 
-        let executable_path =
-            Self::query_executable_path(pid).unwrap_or_else(|| format!("pid:{pid}"));
+        let queried_path = Self::query_executable_path(pid);
+        let has_resolved_image = queried_path.is_some();
+        let executable_path = queried_path.unwrap_or_else(|| format!("pid:{pid}"));
         let name = Self::extract_basename(&executable_path);
 
         let identity = ProcessIdentity {
@@ -190,13 +200,15 @@ impl ProcessResolver {
             executable_path,
         };
 
-        self.cache.insert(
-            pid,
-            CachedProcess {
-                identity: identity.clone(),
-                cached_at: Instant::now(),
-            },
-        );
+        if has_resolved_image {
+            self.cache.insert(
+                pid,
+                CachedProcess {
+                    identity: identity.clone(),
+                    cached_at: Instant::now(),
+                },
+            );
+        }
 
         identity
     }

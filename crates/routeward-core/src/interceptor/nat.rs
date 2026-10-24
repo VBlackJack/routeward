@@ -20,6 +20,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -147,11 +148,19 @@ pub enum PendingSynOutcome<T> {
         pid: u32,
         source: PidResolutionSource,
     },
-    /// Timeout expired without resolving a PID; caller must reinject the SYN unmodified (fail-open).
-    TimedOutFailOpen {
+    /// Timeout expired without resolving a PID while `killSwitchEnabled=true`; the SYN payload is
+    /// dropped without response so the client retransmits the SYN (~1 s later) after attribution succeeds.
+    TimedOutDropped {
+        meta: Ipv4TcpPacketMeta,
+        elapsed_ms: u64,
+        drop_count: u64,
+    },
+    /// Timeout expired without resolving a PID while `killSwitchEnabled=false`; caller reinjects the SYN unmodified (fail-open).
+    TimedOutReinject {
         payload: T,
         meta: Ipv4TcpPacketMeta,
         elapsed_ms: u64,
+        reinject_count: u64,
     },
 }
 
@@ -194,12 +203,13 @@ impl<T> PendingSynQueue<T> {
         self.inner.lock().is_empty()
     }
 
-    /// Polls all queued SYN packets without sleeping, returning resolved or timed-out (fail-open) outcomes
-    /// and keeping still-pending entries in the queue.
+    /// Polls all queued SYN packets without sleeping, returning resolved, dropped (`killSwitchEnabled=true`),
+    /// or reinjected (`killSwitchEnabled=false`) outcomes and keeping still-pending entries in the queue.
     pub fn poll_ready<F>(
         &self,
         nat: &TransparentNatTable,
         timeout: Duration,
+        kill_switch_enabled: bool,
         fallback_fn: F,
     ) -> Vec<PendingSynOutcome<T>>
     where
@@ -225,11 +235,23 @@ impl<T> PendingSynQueue<T> {
             } else {
                 let elapsed = entry.enqueued_at.elapsed();
                 if elapsed >= timeout {
-                    outcomes.push(PendingSynOutcome::TimedOutFailOpen {
-                        payload: entry.payload,
-                        meta: entry.meta,
-                        elapsed_ms: elapsed.as_millis() as u64,
-                    });
+                    let elapsed_ms = elapsed.as_millis() as u64;
+                    if kill_switch_enabled {
+                        let drop_count = nat.record_dropped_unattributed_syn();
+                        outcomes.push(PendingSynOutcome::TimedOutDropped {
+                            meta: entry.meta,
+                            elapsed_ms,
+                            drop_count,
+                        });
+                    } else {
+                        let reinject_count = nat.record_reinjected_unattributed_syn();
+                        outcomes.push(PendingSynOutcome::TimedOutReinject {
+                            payload: entry.payload,
+                            meta: entry.meta,
+                            elapsed_ms,
+                            reinject_count,
+                        });
+                    }
                 } else {
                     queue.push_back(entry);
                 }
@@ -251,6 +273,8 @@ pub struct TransparentNatTable {
     local_socks_port: u16,
     local_http_port: u16,
     upstream_endpoints: Arc<RwLock<Vec<(Ipv4Addr, u16)>>>,
+    dropped_unattributed_syn_count: Arc<AtomicU64>,
+    reinjected_unattributed_syn_count: Arc<AtomicU64>,
 }
 
 impl TransparentNatTable {
@@ -270,7 +294,34 @@ impl TransparentNatTable {
             local_socks_port,
             local_http_port,
             upstream_endpoints: Arc::new(RwLock::new(Vec::new())),
+            dropped_unattributed_syn_count: Arc::new(AtomicU64::new(0)),
+            reinjected_unattributed_syn_count: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Increments and returns the 1-based counter of timed-out Pending SYNs dropped while `killSwitchEnabled=true`.
+    pub fn record_dropped_unattributed_syn(&self) -> u64 {
+        self.dropped_unattributed_syn_count
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    /// Returns the total number of timed-out Pending SYNs dropped while `killSwitchEnabled=true`.
+    pub fn dropped_unattributed_syn_count(&self) -> u64 {
+        self.dropped_unattributed_syn_count.load(Ordering::SeqCst)
+    }
+
+    /// Increments and returns the 1-based counter of timed-out Pending SYNs reinjected while `killSwitchEnabled=false`.
+    pub fn record_reinjected_unattributed_syn(&self) -> u64 {
+        self.reinjected_unattributed_syn_count
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    /// Returns the total number of timed-out Pending SYNs reinjected while `killSwitchEnabled=false`.
+    pub fn reinjected_unattributed_syn_count(&self) -> u64 {
+        self.reinjected_unattributed_syn_count
+            .load(Ordering::SeqCst)
     }
 
     /// Updates the list of upstream proxy IPv4 endpoints excluded from interception to avoid loops.
@@ -567,13 +618,13 @@ mod tests {
         assert_eq!(queue.len(), 2);
 
         // Poll 1: neither is resolved yet, timeout (50 ms) has not elapsed -> both remain queued
-        let outcomes_1 = queue.poll_ready(&nat, Duration::from_millis(50), |_| None);
+        let outcomes_1 = queue.poll_ready(&nat, Duration::from_millis(50), true, |_| None);
         assert!(outcomes_1.is_empty());
         assert_eq!(queue.len(), 2);
 
         // Late SOCKET event arrives for port 51001
         nat.record_socket_event(51001, 4632);
-        let outcomes_2 = queue.poll_ready(&nat, Duration::from_millis(50), |_| None);
+        let outcomes_2 = queue.poll_ready(&nat, Duration::from_millis(50), true, |_| None);
         assert_eq!(outcomes_2.len(), 1);
         assert_eq!(
             outcomes_2[0],
@@ -586,16 +637,40 @@ mod tests {
         );
         assert_eq!(queue.len(), 1);
 
-        // Poll 3 with 0ms timeout: remaining unresolved SYN (port 51002) times out and triggers fail-open
-        let outcomes_3 = queue.poll_ready(&nat, Duration::ZERO, |_| None);
+        // Poll 3 with 0ms timeout and killSwitchEnabled=true: unresolved SYN is dropped (not reinjected)
+        let outcomes_3 = queue.poll_ready(&nat, Duration::ZERO, true, |_| None);
         assert_eq!(outcomes_3.len(), 1);
         match &outcomes_3[0] {
-            PendingSynOutcome::TimedOutFailOpen { payload, meta, .. } => {
+            PendingSynOutcome::TimedOutDropped {
+                meta, drop_count, ..
+            } => {
+                assert_eq!(meta.src_port, 51002);
+                assert_eq!(*drop_count, 1);
+            }
+            other => panic!("Expected TimedOutDropped, got {other:?}"),
+        }
+        assert_eq!(nat.dropped_unattributed_syn_count(), 1);
+        assert_eq!(nat.reinjected_unattributed_syn_count(), 0);
+        assert!(queue.is_empty());
+
+        // Poll 4 with 0ms timeout and killSwitchEnabled=false: unresolved SYN is returned for reinjection
+        queue.enqueue(pkt_timeout.clone(), meta_timeout);
+        let outcomes_4 = queue.poll_ready(&nat, Duration::ZERO, false, |_| None);
+        assert_eq!(outcomes_4.len(), 1);
+        match &outcomes_4[0] {
+            PendingSynOutcome::TimedOutReinject {
+                payload,
+                meta,
+                reinject_count,
+                ..
+            } => {
                 assert_eq!(payload, &pkt_timeout);
                 assert_eq!(meta.src_port, 51002);
+                assert_eq!(*reinject_count, 1);
             }
-            other => panic!("Expected TimedOutFailOpen, got {other:?}"),
+            other => panic!("Expected TimedOutReinject, got {other:?}"),
         }
+        assert_eq!(nat.reinjected_unattributed_syn_count(), 1);
         assert!(queue.is_empty());
     }
 

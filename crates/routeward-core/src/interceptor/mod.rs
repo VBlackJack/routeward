@@ -28,14 +28,12 @@ use crate::dns::FakeIpEngine;
 use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_PROXY_NOT_FOUND};
 use crate::i18n::I18nRegistry;
 use crate::interceptor::backend::Interceptor;
-use crate::interceptor::nat::TransparentNatTable;
+use crate::interceptor::nat::{PendingSynOutcome, PendingSynQueue, TransparentNatTable};
 #[cfg(not(windows))]
 use crate::interceptor::nftables::NftablesInterceptor;
 #[cfg(windows)]
 use crate::interceptor::windivert::WinDivertInterceptor;
-#[cfg(not(windows))]
-use crate::process::ProcessAttribution;
-use crate::process::ProcessResolver;
+use crate::process::{ProcessAttribution, ProcessResolver};
 use crate::proxy::sni::TlsSniExtractor;
 use crate::proxy::uri::ProxyUriCodec;
 use crate::proxy::ProxyConnector;
@@ -54,6 +52,7 @@ use uuid::Uuid;
 
 const COMPONENT_ENGINE: &str = "InterceptorEngine";
 const COMPONENT_TRANSPARENT: &str = "TransparentRelay";
+const COMPONENT_WINDIVERT: &str = "WinDivert";
 const COMPONENT_RULE: &str = "RuleEngine";
 const COMPONENT_PROXY: &str = "ProxyConnector";
 const COMPONENT_DNS: &str = "FakeIpDNS";
@@ -348,7 +347,271 @@ impl RouteWardController {
 
     pub fn evaluate_rule(&self, req: &ConnectionRequest) -> RuleEvaluationResult {
         let prof = self.profile.read();
+        let parsed_v4 = req
+            .target_ip
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            .or_else(|| req.target_host.parse::<Ipv4Addr>().ok());
+        if prof.dns_config.enable_fake_ip {
+            if let Some(v4) = parsed_v4 {
+                if self.dns.is_in_fake_subnet(&v4) && self.dns.resolve_fake_ip(&v4).is_none() {
+                    self.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_DNS,
+                        format!(
+                            "Blocked connection to unmapped or expired Fake-IP {}:{} for process=\"{}\"",
+                            v4, req.target_port, req.process_name
+                        ),
+                    );
+                    return RuleEvaluationResult {
+                        matched_rule_id: "fake-ip-unmapped".to_string(),
+                        matched_rule_name: "FakeIP:UnmappedOrExpired".to_string(),
+                        action: RuleAction::Block,
+                        effective_domain: None,
+                        resolved_from_fake_ip: false,
+                    };
+                }
+            }
+        }
         RuleEngine::evaluate(req, &prof.rules, &prof.default_action, Some(&self.dns))
+    }
+
+    /// Polls `PendingSynQueue` using the active `securityPolicy.killSwitchEnabled` setting and logs
+    /// timed-out unattributed SYNs (`INFO` with drop counter when dropped, `WARN` with reinject counter when released).
+    pub fn poll_pending_syns<T, F>(
+        &self,
+        queue: &PendingSynQueue<T>,
+        timeout: Duration,
+        fallback_fn: F,
+    ) -> Vec<PendingSynOutcome<T>>
+    where
+        F: Fn(u16) -> Option<u32>,
+    {
+        let kill_switch_enabled = self.profile.read().security_policy.kill_switch_enabled;
+        let outcomes = queue.poll_ready(&self.nat_table, timeout, kill_switch_enabled, fallback_fn);
+        for outcome in &outcomes {
+            match outcome {
+                PendingSynOutcome::Resolved { .. } => {}
+                PendingSynOutcome::TimedOutDropped {
+                    meta,
+                    elapsed_ms,
+                    drop_count,
+                } => {
+                    self.telemetry.push_log(
+                        LogLevel::Info,
+                        COMPONENT_WINDIVERT,
+                        format!(
+                            "Dropped unattributed Pending SYN #{} after {}ms for {}:{} -> {}:{} (killSwitchEnabled=true; awaiting client TCP SYN retransmission)",
+                            drop_count, elapsed_ms, meta.src_ip, meta.src_port, meta.dst_ip, meta.dst_port
+                        ),
+                    );
+                }
+                PendingSynOutcome::TimedOutReinject {
+                    meta,
+                    elapsed_ms,
+                    reinject_count,
+                    ..
+                } => {
+                    self.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_WINDIVERT,
+                        format!(
+                            "Released unattributed Pending SYN #{} after {}ms for {}:{} -> {}:{} (killSwitchEnabled=false; reinjecting unmodified fail-open)",
+                            reinject_count, elapsed_ms, meta.src_ip, meta.src_port, meta.dst_ip, meta.dst_port
+                        ),
+                    );
+                }
+            }
+        }
+        outcomes
+    }
+
+    /// Resolves the effective `RuleAction` for an unattributed socket (`ProcessAttribution::Unknown`
+    /// or unreadable process image), enforcing `RuleAction::Block` and logging `WARN` when
+    /// `securityPolicy.killSwitchEnabled` is `true` and `unknownProcessAction` is `Direct`.
+    pub fn resolve_unknown_process_action(
+        &self,
+        component: &str,
+        client_port: u16,
+        target_host: &str,
+        target_port: u16,
+        reason: &str,
+    ) -> (RuleAction, String) {
+        let (kill_switch_enabled, configured_action) = {
+            let prof = self.profile.read();
+            (
+                prof.security_policy.kill_switch_enabled,
+                prof.security_policy.unknown_process_action.clone(),
+            )
+        };
+
+        if kill_switch_enabled && configured_action == RuleAction::Direct {
+            self.telemetry.push_log(
+                LogLevel::Warn,
+                component,
+                format!(
+                    "Unattributed socket on client port {} -> {}:{} (reason={}); overriding unknownProcessAction=Direct to Block because killSwitchEnabled=true",
+                    client_port, target_host, target_port, reason
+                ),
+            );
+            (
+                RuleAction::Block,
+                "SecurityPolicy:unknownProcessAction(KillSwitchOverride)".to_string(),
+            )
+        } else {
+            self.telemetry.push_log(
+                LogLevel::Warn,
+                component,
+                format!(
+                    "Unattributed socket on client port {} -> {}:{} (reason={}); applying unknownProcessAction={:?} (killSwitchEnabled={})",
+                    client_port, target_host, target_port, reason, configured_action, kill_switch_enabled
+                ),
+            );
+            (
+                configured_action,
+                "SecurityPolicy:unknownProcessAction".to_string(),
+            )
+        }
+    }
+
+    /// Evaluates process attribution for a transparent connection, applying `resolve_unknown_process_action`
+    /// whenever the socket is `ProcessAttribution::Unknown` or its executable image could not be resolved.
+    pub fn attribute_or_apply_unknown_policy(
+        &self,
+        attribution: ProcessAttribution,
+        client_port: u16,
+        target_host: &str,
+        target_port: u16,
+        orig_dst_ip: Option<&Ipv4Addr>,
+    ) -> (
+        u32,
+        String,
+        String,
+        RuleAction,
+        String,
+        Option<String>,
+        &'static str,
+    ) {
+        match attribution {
+            ProcessAttribution::Single(identity) if !identity.is_unattributed() => {
+                let eval = self.evaluate_rule(&ConnectionRequest {
+                    process_name: identity.name.clone(),
+                    process_path: Some(identity.executable_path.clone()),
+                    target_host: target_host.to_string(),
+                    target_ip: Some(target_host.to_string()),
+                    target_port,
+                    protocol: TransportProtocol::Tcp,
+                });
+                (
+                    identity.pid,
+                    identity.name,
+                    identity.executable_path,
+                    eval.action,
+                    eval.matched_rule_name,
+                    eval.effective_domain,
+                    "procfs_single",
+                )
+            }
+            ProcessAttribution::Shared {
+                primary,
+                candidate_pids,
+            } if !primary.is_unattributed() => {
+                self.telemetry.push_log(
+                    LogLevel::Warn,
+                    COMPONENT_TRANSPARENT,
+                    format!(
+                        "Shared socket across forked PIDs {:?} on client port {}; attributing to primary PID={} process=\"{}\" exe=\"{}\"",
+                        candidate_pids,
+                        client_port,
+                        primary.pid,
+                        primary.name,
+                        primary.executable_path
+                    ),
+                );
+                let eval = self.evaluate_rule(&ConnectionRequest {
+                    process_name: primary.name.clone(),
+                    process_path: Some(primary.executable_path.clone()),
+                    target_host: target_host.to_string(),
+                    target_ip: Some(target_host.to_string()),
+                    target_port,
+                    protocol: TransportProtocol::Tcp,
+                });
+                (
+                    primary.pid,
+                    primary.name,
+                    primary.executable_path,
+                    eval.action,
+                    eval.matched_rule_name,
+                    eval.effective_domain,
+                    "procfs_shared_fork",
+                )
+            }
+            ProcessAttribution::Single(identity) => {
+                let reason = format!(
+                    "process image unavailable for PID={} ({})",
+                    identity.pid, identity.executable_path
+                );
+                let (unknown_action, rule_name) = self.resolve_unknown_process_action(
+                    COMPONENT_TRANSPARENT,
+                    client_port,
+                    target_host,
+                    target_port,
+                    &reason,
+                );
+                let resolved_dom = orig_dst_ip.and_then(|ip| self.dns.resolve_fake_ip(ip));
+                (
+                    identity.pid,
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                    unknown_action,
+                    rule_name,
+                    resolved_dom,
+                    "procfs_unknown",
+                )
+            }
+            ProcessAttribution::Shared { primary, .. } => {
+                let reason = format!(
+                    "process image unavailable for shared primary PID={} ({})",
+                    primary.pid, primary.executable_path
+                );
+                let (unknown_action, rule_name) = self.resolve_unknown_process_action(
+                    COMPONENT_TRANSPARENT,
+                    client_port,
+                    target_host,
+                    target_port,
+                    &reason,
+                );
+                let resolved_dom = orig_dst_ip.and_then(|ip| self.dns.resolve_fake_ip(ip));
+                (
+                    primary.pid,
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                    unknown_action,
+                    rule_name,
+                    resolved_dom,
+                    "procfs_unknown",
+                )
+            }
+            ProcessAttribution::Unknown { reason } => {
+                let (unknown_action, rule_name) = self.resolve_unknown_process_action(
+                    COMPONENT_TRANSPARENT,
+                    client_port,
+                    target_host,
+                    target_port,
+                    &reason,
+                );
+                let resolved_dom = orig_dst_ip.and_then(|ip| self.dns.resolve_fake_ip(ip));
+                (
+                    0,
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                    unknown_action,
+                    rule_name,
+                    resolved_dom,
+                    "procfs_unknown",
+                )
+            }
+        }
     }
 
     pub fn simulate_connection(&self, req: ConnectionRequest) -> TrackedConnection {
@@ -745,14 +1008,30 @@ impl RouteWardController {
         let target_port = u16::from_be_bytes(port_bytes);
 
         let proc_id = self.process_resolver.resolve_by_local_tcp_port(client_port);
-        let eval = self.evaluate_rule(&ConnectionRequest {
+        let target_ip_str = target_host
+            .parse::<Ipv4Addr>()
+            .ok()
+            .map(|ip| ip.to_string());
+        let mut eval = self.evaluate_rule(&ConnectionRequest {
             process_name: proc_id.name.clone(),
             process_path: Some(proc_id.executable_path.clone()),
             target_host: target_host.clone(),
-            target_ip: None,
+            target_ip: target_ip_str,
             target_port,
             protocol: TransportProtocol::Tcp,
         });
+        if proc_id.is_unattributed() && eval.action == RuleAction::Direct {
+            let (action, matched_rule_name) = self.resolve_unknown_process_action(
+                COMPONENT_ENGINE,
+                client_port,
+                &target_host,
+                target_port,
+                "local SOCKS5 client PID or executable image unavailable",
+            );
+            eval.matched_rule_id = "unknown-process-action".to_string();
+            eval.matched_rule_name = matched_rule_name;
+            eval.action = action;
+        }
 
         let effective_host = eval
             .effective_domain
@@ -1106,87 +1385,13 @@ impl RouteWardController {
                     matched_rule_name,
                     effective_domain,
                     res_source,
-                ) = match attribution {
-                    ProcessAttribution::Single(identity) => {
-                        let eval = self.evaluate_rule(&ConnectionRequest {
-                            process_name: identity.name.clone(),
-                            process_path: Some(identity.executable_path.clone()),
-                            target_host: target_host.clone(),
-                            target_ip: Some(target_host.clone()),
-                            target_port,
-                            protocol: TransportProtocol::Tcp,
-                        });
-                        (
-                            identity.pid,
-                            identity.name,
-                            identity.executable_path,
-                            eval.action,
-                            eval.matched_rule_name,
-                            eval.effective_domain,
-                            "procfs_single",
-                        )
-                    }
-                    ProcessAttribution::Shared {
-                        primary,
-                        candidate_pids,
-                    } => {
-                        self.telemetry.push_log(
-                            LogLevel::Warn,
-                            COMPONENT_TRANSPARENT,
-                            format!(
-                                "Shared socket across forked PIDs {:?} on client port {}; attributing to primary PID={} process=\"{}\" exe=\"{}\"",
-                                candidate_pids,
-                                client_port,
-                                primary.pid,
-                                primary.name,
-                                primary.executable_path
-                            ),
-                        );
-                        let eval = self.evaluate_rule(&ConnectionRequest {
-                            process_name: primary.name.clone(),
-                            process_path: Some(primary.executable_path.clone()),
-                            target_host: target_host.clone(),
-                            target_ip: Some(target_host.clone()),
-                            target_port,
-                            protocol: TransportProtocol::Tcp,
-                        });
-                        (
-                            primary.pid,
-                            primary.name,
-                            primary.executable_path,
-                            eval.action,
-                            eval.matched_rule_name,
-                            eval.effective_domain,
-                            "procfs_shared_fork",
-                        )
-                    }
-                    ProcessAttribution::Unknown { reason } => {
-                        let unknown_action = self
-                            .profile
-                            .read()
-                            .security_policy
-                            .unknown_process_action
-                            .clone();
-                        let resolved_dom = self.dns.resolve_fake_ip(orig_dst.ip());
-                        self.telemetry.push_log(
-                            LogLevel::Warn,
-                            COMPONENT_TRANSPARENT,
-                            format!(
-                                "Unattributed socket on client port {} -> {}:{} (reason={}); applying unknownProcessAction={:?}",
-                                client_port, target_host, target_port, reason, unknown_action
-                            ),
-                        );
-                        (
-                            0,
-                            "unknown".to_string(),
-                            "unknown".to_string(),
-                            unknown_action,
-                            "SecurityPolicy:unknownProcessAction".to_string(),
-                            resolved_dom,
-                            "procfs_unknown",
-                        )
-                    }
-                };
+                ) = self.attribute_or_apply_unknown_policy(
+                    attribution,
+                    client_port,
+                    &target_host,
+                    target_port,
+                    Some(orig_dst.ip()),
+                );
 
                 let effective_host = effective_domain
                     .clone()
@@ -2040,5 +2245,185 @@ mod tests {
         #[cfg(windows)]
         let _ = crate::config::security::apply_windows_sddl_dacl(&temp_path, "D:(A;;FA;;;WD)");
         let _ = std::fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn expired_pending_syn_dropped_with_info_counter_when_kill_switch_enabled_and_reinjected_with_warn_when_disabled(
+    ) {
+        use crate::interceptor::nat::Ipv4TcpPacketMeta;
+
+        let syn_meta = Ipv4TcpPacketMeta {
+            ip_header_len: 20,
+            total_len: 40,
+            src_ip: Ipv4Addr::new(10, 0, 0, 5),
+            dst_ip: Ipv4Addr::new(93, 184, 216, 34),
+            src_port: 51111,
+            dst_port: 443,
+            tcp_flags: 0x02,
+        };
+
+        // 1. Kill switch enabled -> timed-out SYN is dropped (never reinjected), counter incremented, INFO log emitted
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile_ks_on = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile_ks_on.enable_logging = false;
+        profile_ks_on.security_policy.kill_switch_enabled = true;
+        let ctrl_ks_on = RouteWardController::new(constants.clone(), profile_ks_on, "en");
+
+        let queue_on = PendingSynQueue::new();
+        queue_on.enqueue(vec![0x45, 0x00, 0x00, 0x28], syn_meta);
+
+        let outcomes_on = ctrl_ks_on.poll_pending_syns(&queue_on, Duration::ZERO, |_| None);
+        assert_eq!(outcomes_on.len(), 1);
+        assert!(matches!(
+            outcomes_on[0],
+            PendingSynOutcome::TimedOutDropped { drop_count: 1, .. }
+        ));
+        assert_eq!(ctrl_ks_on.nat_table.dropped_unattributed_syn_count(), 1);
+        assert_eq!(ctrl_ks_on.nat_table.reinjected_unattributed_syn_count(), 0);
+
+        let logs_on = ctrl_ks_on.telemetry.list_logs();
+        assert!(logs_on.iter().any(|l| l.level == LogLevel::Info
+            && l.component == COMPONENT_WINDIVERT
+            && l.message.contains("Dropped unattributed Pending SYN #1")
+            && l.message.contains("killSwitchEnabled=true")));
+
+        // 2. Kill switch disabled -> timed-out SYN is reinjected, counter incremented, WARN log emitted
+        let mut profile_ks_off = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile_ks_off.enable_logging = false;
+        profile_ks_off.security_policy.kill_switch_enabled = false;
+        let ctrl_ks_off = RouteWardController::new(constants, profile_ks_off, "en");
+
+        let queue_off = PendingSynQueue::new();
+        queue_off.enqueue(vec![0x45, 0x00, 0x00, 0x28], syn_meta);
+
+        let outcomes_off = ctrl_ks_off.poll_pending_syns(&queue_off, Duration::ZERO, |_| None);
+        assert_eq!(outcomes_off.len(), 1);
+        assert!(matches!(
+            outcomes_off[0],
+            PendingSynOutcome::TimedOutReinject {
+                reinject_count: 1,
+                ..
+            }
+        ));
+        assert_eq!(ctrl_ks_off.nat_table.dropped_unattributed_syn_count(), 0);
+        assert_eq!(ctrl_ks_off.nat_table.reinjected_unattributed_syn_count(), 1);
+
+        let logs_off = ctrl_ks_off.telemetry.list_logs();
+        assert!(logs_off.iter().any(|l| l.level == LogLevel::Warn
+            && l.component == COMPONENT_WINDIVERT
+            && l.message.contains("Released unattributed Pending SYN #1")
+            && l.message.contains("killSwitchEnabled=false")));
+    }
+
+    #[test]
+    fn unknown_process_attribution_enforces_block_and_warns_with_kill_switch_and_defaults_to_block()
+    {
+        use crate::config::SecurityPolicyConfig;
+        use crate::process::ProcessIdentity;
+
+        // 1. Verify default_profile.json and SecurityPolicyConfig::default() default to Block
+        let embedded_profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        assert_eq!(
+            embedded_profile.security_policy.unknown_process_action,
+            RuleAction::Block
+        );
+        assert_eq!(
+            SecurityPolicyConfig::default().unknown_process_action,
+            RuleAction::Block
+        );
+
+        // 2. When killSwitchEnabled = true and unknownProcessAction = Direct, override to Block with WARN
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = embedded_profile.clone();
+        profile.enable_logging = false;
+        profile.security_policy.kill_switch_enabled = true;
+        profile.security_policy.unknown_process_action = RuleAction::Direct;
+        let ctrl_ks_on = RouteWardController::new(constants.clone(), profile, "en");
+
+        let (pid, proc_name, _, action, rule_name, _, source) = ctrl_ks_on
+            .attribute_or_apply_unknown_policy(
+                ProcessAttribution::Unknown {
+                    reason: "socket closed before procfs scan".to_string(),
+                },
+                54321,
+                "93.184.216.34",
+                443,
+                Some(&Ipv4Addr::new(93, 184, 216, 34)),
+            );
+        assert_eq!(pid, 0);
+        assert_eq!(proc_name, "unknown");
+        assert_eq!(action, RuleAction::Block);
+        assert_eq!(
+            rule_name,
+            "SecurityPolicy:unknownProcessAction(KillSwitchOverride)"
+        );
+        assert_eq!(source, "procfs_unknown");
+
+        let logs = ctrl_ks_on.telemetry.list_logs();
+        assert!(logs.iter().any(|l| l.level == LogLevel::Warn
+            && l.component == COMPONENT_TRANSPARENT
+            && l.message
+                .contains("overriding unknownProcessAction=Direct to Block")));
+
+        // 3. Synthetic "pid:<n>" fallback identity is also treated as unattributed and blocked
+        let (pid2, _, _, action2, _, _, source2) = ctrl_ks_on.attribute_or_apply_unknown_policy(
+            ProcessAttribution::Single(ProcessIdentity {
+                pid: 9999,
+                name: "pid:9999".to_string(),
+                executable_path: "pid:9999".to_string(),
+            }),
+            54322,
+            "93.184.216.34",
+            443,
+            None,
+        );
+        assert_eq!(pid2, 9999);
+        assert_eq!(action2, RuleAction::Block);
+        assert_eq!(source2, "procfs_unknown");
+
+        // 4. When killSwitchEnabled = false and unknownProcessAction = Direct, honors Direct and logs WARN
+        let mut profile_ks_off = embedded_profile;
+        profile_ks_off.enable_logging = false;
+        profile_ks_off.security_policy.kill_switch_enabled = false;
+        profile_ks_off.security_policy.unknown_process_action = RuleAction::Direct;
+        let ctrl_ks_off = RouteWardController::new(constants, profile_ks_off, "en");
+
+        let (_, _, _, action_off, rule_off, _, _) = ctrl_ks_off.attribute_or_apply_unknown_policy(
+            ProcessAttribution::Unknown {
+                reason: "ephemeral socket closed".to_string(),
+            },
+            54323,
+            "93.184.216.34",
+            443,
+            None,
+        );
+        assert_eq!(action_off, RuleAction::Direct);
+        assert_eq!(rule_off, "SecurityPolicy:unknownProcessAction");
+    }
+
+    #[test]
+    fn unmapped_fake_ip_in_cidr_is_blocked_and_never_leaks_direct() {
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.default_action = RuleAction::Direct;
+        let controller = RouteWardController::new(constants, profile, "en");
+
+        // Unallocated IP inside 198.18.0.0/15 Fake-IP pool must be blocked
+        let eval = controller.evaluate_rule(&ConnectionRequest {
+            process_name: "curl.exe".to_string(),
+            process_path: Some("C:\\Windows\\System32\\curl.exe".to_string()),
+            target_host: "198.18.9.99".to_string(),
+            target_ip: Some("198.18.9.99".to_string()),
+            target_port: 443,
+            protocol: TransportProtocol::Tcp,
+        });
+        assert_eq!(eval.action, RuleAction::Block);
+        assert_eq!(eval.matched_rule_name, "FakeIP:UnmappedOrExpired");
+
+        let logs = controller.telemetry.list_logs();
+        assert!(logs.iter().any(|l| l.level == LogLevel::Warn
+            && l.message
+                .contains("Blocked connection to unmapped or expired Fake-IP 198.18.9.99:443")));
     }
 }

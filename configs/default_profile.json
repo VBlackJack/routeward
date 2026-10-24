@@ -13,7 +13,7 @@
     "blockUdpOnTcpOnlyProxy": true,
     "strictDnsNoLocalFallback": true,
     "unknownProcessAction": {
-      "type": "direct"
+      "type": "block"
     }
   },
   "defaultAction": {

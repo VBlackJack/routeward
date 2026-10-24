@@ -48,7 +48,7 @@ write_profile() {
     "killSwitchEnabled": true,
     "blockUdpOnTcpOnlyProxy": true,
     "strictDnsNoLocalFallback": true,
-    "unknownProcessAction": { "type": "direct" }
+    "unknownProcessAction": { "type": "block" }
   },
   "defaultAction": { "type": "direct" },
   "dnsConfig": {
