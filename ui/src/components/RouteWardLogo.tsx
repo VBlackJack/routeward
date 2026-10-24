@@ -45,12 +45,19 @@ export const RouteWardLogo: React.FC<RouteWardLogoProps> = ({
           xmlns="http://www.w3.org/2000/svg"
         >
           <path
-            d="M15 39V9H27L34 16V20L27 27H15M22 27L32 37"
+            d="M15 39V9H27L34 16V20L27 27H15"
             fill="none"
             stroke="#A170E6"
             strokeWidth="6"
             strokeLinecap="square"
             strokeLinejoin="miter"
+          />
+          <path
+            d="M22 27L32 37"
+            fill="none"
+            stroke="#A170E6"
+            strokeWidth="6"
+            strokeLinecap="butt"
           />
           <rect x="30" y="33" width="9" height="9" rx="1.5" fill="#50FA7B" />
         </svg>
