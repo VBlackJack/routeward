@@ -75,7 +75,7 @@ impl RuleEngine {
             }
         }
 
-        if effective_domain.is_none() && parsed_target_ip.is_none() {
+        if effective_domain.is_none() && IpAddr::from_str(&request.target_host).is_err() {
             effective_domain = Some(request.target_host.to_lowercase());
         }
 

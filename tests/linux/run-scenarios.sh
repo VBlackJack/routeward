@@ -775,7 +775,108 @@ else
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Scenario (r): AD bypass domain with silent internal DNS (and systemd-resolved
+#               127.0.0.53 stub fallback) returns SERVFAIL and sends 0 queries
+#               to simulated public upstreamDns (${TARGET_IP}:53)
+# ---------------------------------------------------------------------------
+SILENT_INTERNAL_DNS="10.200.1.2"
+ip addr add "${SILENT_INTERNAL_DNS}/32" dev lo 2>/dev/null || true
+mkdir -p /run/systemd/resolve
+echo "nameserver 127.0.0.53" > /etc/resolv.conf
+echo "nameserver ${SILENT_INTERNAL_DNS}" > /run/systemd/resolve/resolv.conf
+
+rm -f "${SOCKS_LOG}" /tmp/dns_hits.log /tmp/https_443_hits.log /run/routeward/routeward.sock
+cp /tmp/profile_dns_fakeip.json /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
+
+"${BIN}" daemon >/tmp/rw_daemon_r.out 2>&1 &
+DAEMON_R_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+rm -f /tmp/dns_hits.log "${SOCKS_LOG}"
+DNS_R=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${SILENT_INTERNAL_DNS}" "dc01.corp.contoso.com" 1)
+
+if echo "${DNS_R}" | grep -q "RCODE=2 ANCOUNT=0" \
+    && [[ ! -s /tmp/dns_hits.log ]] \
+    && [[ ! -s "${SOCKS_LOG}" ]]; then
+    echo "[PASS] Scenario (r): AD bypass domain with silent internal DNS returned SERVFAIL (${DNS_R}) with 0 queries to public upstreamDns"
+else
+    echo "[FAIL] Scenario (r)"
+    echo "DNS_R=${DNS_R}"
+    cat /tmp/dns_hits.log 2>/dev/null || true
+    cat "${SOCKS_LOG}" 2>/dev/null || true
+    kill -TERM "${DAEMON_R_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (s): HTTPS connection to literal IP (${TARGET_IP}:443) with TLS SNI
+#               matching a Proxy domain rule (*.routeward.test) is routed via
+#               SOCKS5 with ATYP=domain
+# ---------------------------------------------------------------------------
+echo "nameserver ${TARGET_IP}" > /etc/resolv.conf
+rm -f /run/systemd/resolve/resolv.conf "${SOCKS_LOG}" /tmp/https_443_hits.log
+
+RESP_S=$(python3 /workspace/tests/linux/mock_servers.py --tls-sni-probe "${TARGET_IP}" "sni.routeward.test")
+sleep 0.2
+
+if [[ "${RESP_S}" == "HTTPS_SNI_OK" ]] \
+    && grep -q "CONNECT sni.routeward.test:443" "${SOCKS_LOG}" \
+    && grep -q "^TLS_443 " /tmp/https_443_hits.log; then
+    echo "[PASS] Scenario (s): HTTPS connection to literal IP ${TARGET_IP}:443 with SNI sni.routeward.test routed via SOCKS5 (${RESP_S})"
+else
+    echo "[FAIL] Scenario (s)"
+    echo "RESP_S=${RESP_S}"
+    cat "${SOCKS_LOG}" 2>/dev/null || true
+    cat /tmp/https_443_hits.log 2>/dev/null || true
+    kill -TERM "${DAEMON_R_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (t): Live change of securityPolicy via ctl replace-profile applied
+#               atomically without restarting the engine, while IPv6 53/853
+#               remains blocked unconditionally
+# ---------------------------------------------------------------------------
+sed -e 's/"killSwitchEnabled": true/"killSwitchEnabled": false/' \
+    -e 's/"blockEncryptedDnsBypass": true/"blockEncryptedDnsBypass": false/' \
+    /tmp/profile_dns_fakeip.json > /tmp/profile_hot_reload.json
+
+"${BIN}" ctl replace-profile --json-file /tmp/profile_hot_reload.json >/dev/null
+sleep 0.2
+
+NFT_IP4_T=$(nft list table ip routeward)
+NFT_IP6_T=$(nft list table ip6 routeward)
+LOGS_T=$("${BIN}" ctl logs)
+
+if kill -0 "${DAEMON_R_PID}" 2>/dev/null \
+    && ! echo "${NFT_IP4_T}" | grep -q "udp dport 853 reject" \
+    && echo "${NFT_IP6_T}" | grep -q "udp dport 53 reject" \
+    && echo "${NFT_IP6_T}" | grep -q "tcp dport 853 reject with tcp reset" \
+    && echo "${LOGS_T}" | grep -q "securityPolicyChanged=true"; then
+    echo "[PASS] Scenario (t): Live securityPolicy change applied atomically without restarting daemon (IPv6 53/853 still blocked)"
+else
+    echo "[FAIL] Scenario (t)"
+    echo "NFT_IP4_T=${NFT_IP4_T}"
+    echo "NFT_IP6_T=${NFT_IP6_T}"
+    echo "LOGS_T=${LOGS_T}"
+    kill -TERM "${DAEMON_R_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+kill -TERM "${DAEMON_R_PID}" 2>/dev/null || true
+wait "${DAEMON_R_PID}" 2>/dev/null || true
+
 cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
 kill "${MOCK_PID}" 2>/dev/null || true
 
-echo "=== ALL 17 LINUX CONTAINER SCENARIOS PASSED ==="
+echo "=== ALL 20 LINUX CONTAINER SCENARIOS PASSED ==="

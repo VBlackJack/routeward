@@ -580,7 +580,9 @@
         "listening_transparent": "Relais TCP transparent (WinDivert reflect) en écoute",
         "interception_active": "Interception de paquets active via le moteur",
         "duration_limit": "Arrêt automatique programmé après (secondes)",
-        "ready": "Moteur d'interception actif. Appuyez sur Ctrl+C pour arrêter."
+        "ready": "Moteur d'interception actif. Appuyez sur Ctrl+C pour arrêter.",
+        "dns_cache_flushed": "Cache DNS de l'OS vidé",
+        "reloaded_live": "Règles d'interception et amorçage proxy réappliqués à chaud"
       },
       "check": {
         "testing": "Test de connectivité du serveur proxy en amont",

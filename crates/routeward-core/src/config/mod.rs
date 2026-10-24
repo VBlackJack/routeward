@@ -141,6 +141,12 @@ pub struct NetworkConstants {
     pub linux_nft_table_name: String,
     #[serde(default = "default_linux_nft_chain_name")]
     pub linux_nft_chain_name: String,
+    #[serde(default = "default_tls_sni_default_port")]
+    pub tls_sni_default_port: u16,
+    #[serde(default = "default_tls_sni_peek_timeout_ms")]
+    pub tls_sni_peek_timeout_ms: u64,
+    #[serde(default = "default_tls_sni_max_bytes")]
+    pub tls_sni_max_bytes: usize,
 }
 
 fn default_linux_fwmark() -> u32 {
@@ -159,6 +165,18 @@ fn default_linux_nft_chain_name() -> String {
     "output".to_string()
 }
 
+fn default_tls_sni_default_port() -> u16 {
+    443
+}
+
+fn default_tls_sni_peek_timeout_ms() -> u64 {
+    200
+}
+
+fn default_tls_sni_max_bytes() -> usize {
+    4096
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DnsConstants {
@@ -174,6 +192,10 @@ pub struct DnsConstants {
     pub dns_standard_port: u16,
     #[serde(default = "default_dns_over_tls_port")]
     pub dns_over_tls_port: u16,
+    #[serde(default = "default_linux_resolv_conf_path")]
+    pub linux_resolv_conf_path: String,
+    #[serde(default = "default_linux_systemd_resolv_conf_path")]
+    pub linux_systemd_resolv_conf_path: String,
     #[serde(default = "default_doh_canary_domains")]
     pub doh_canary_domains: Vec<String>,
     #[serde(default = "default_bypass_suffixes")]
@@ -192,6 +214,14 @@ fn default_dns_standard_port() -> u16 {
 
 fn default_dns_over_tls_port() -> u16 {
     853
+}
+
+fn default_linux_resolv_conf_path() -> String {
+    "/etc/resolv.conf".to_string()
+}
+
+fn default_linux_systemd_resolv_conf_path() -> String {
+    "/run/systemd/resolve/resolv.conf".to_string()
 }
 
 fn default_doh_canary_domains() -> Vec<String> {
@@ -439,7 +469,7 @@ pub enum TransportProtocol {
     Any,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProxyCredentials {
     pub username: String,
@@ -488,7 +518,7 @@ impl std::fmt::Debug for ProxyCredentials {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProxyNode {
     pub id: String,
@@ -523,7 +553,7 @@ pub enum ChainStrategy {
     LoadBalance,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SecurityPolicyConfig {
     pub kill_switch_enabled: bool,
@@ -609,7 +639,7 @@ pub struct RoutingRule {
     pub action: RuleAction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DnsConfig {
     pub enable_fake_ip: bool,

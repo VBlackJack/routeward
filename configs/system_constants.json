@@ -22,7 +22,10 @@
     "linuxFwmark": 21079,
     "linuxNftBinary": "nft",
     "linuxNftTableName": "routeward",
-    "linuxNftChainName": "output"
+    "linuxNftChainName": "output",
+    "tlsSniDefaultPort": 443,
+    "tlsSniPeekTimeoutMs": 200,
+    "tlsSniMaxBytes": 4096
   },
   "dns": {
     "fakeIpCidr": "198.18.0.0/15",
@@ -34,6 +37,8 @@
     "dnsQueryPacketMaxBytes": 512,
     "dnsStandardPort": 53,
     "dnsOverTlsPort": 853,
+    "linuxResolvConfPath": "/etc/resolv.conf",
+    "linuxSystemdResolvConfPath": "/run/systemd/resolve/resolv.conf",
     "dohCanaryDomains": [
       "use-application-dns.net"
     ],

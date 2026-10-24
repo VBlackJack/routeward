@@ -30,6 +30,12 @@ pub trait Interceptor: Send + Sync {
     /// Starts packet capture and transparent redirection toward `controller`.
     fn start(&self, controller: RouteWardController) -> RouteWardResult<()>;
 
+    /// Reapplies packet capture / firewall rules in-place without any permissive gap.
+    fn reload(&self, controller: RouteWardController) -> RouteWardResult<()> {
+        let _ = controller;
+        Ok(())
+    }
+
     /// Stops packet capture and releases any kernel/OS handles immediately (fail-open).
     fn stop(&self);
 

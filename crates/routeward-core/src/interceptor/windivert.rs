@@ -20,6 +20,8 @@ use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_INTERCEPTOR_DRIVER};
 use crate::interceptor::backend::Interceptor;
 use crate::interceptor::RouteWardController;
 use parking_lot::Mutex;
+#[cfg(windows)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -85,6 +87,17 @@ pub fn build_network_filter_string(dns_port: u16, dot_port: u16) -> String {
     format!(
         "outbound and !loopback and ((ip and (tcp or udp.DstPort == {dns_port} or udp.DstPort == {dot_port})) or (ipv6 and (tcp.DstPort == {dns_port} or udp.DstPort == {dns_port} or tcp.DstPort == {dot_port} or udp.DstPort == {dot_port})))"
     )
+}
+
+/// Returns `true` if an outbound IPv6 packet targeting `dst_port` must be blocked while the engine runs
+/// (ports 53 and 853 are unconditionally blocked in IPv6 until Batch 4.3, regardless of `killSwitchEnabled`).
+pub fn should_block_outbound_ipv6_dns_or_dot(
+    dst_port: u16,
+    dns_port: u16,
+    dot_port: u16,
+    _kill_switch_enabled: bool,
+) -> bool {
+    dst_port == dns_port || dst_port == dot_port
 }
 
 /// Binary-compatible representation of WinDivert 2.2 `WINDIVERT_ADDRESS` (80 bytes).
@@ -194,7 +207,8 @@ struct WinDivertApi {
 struct ActiveHandles {
     api: WinDivertApi,
     socket_handle: usize,
-    network_handle: usize,
+    network_handle: Arc<AtomicUsize>,
+    pending_syn_queue: PendingSynQueue<(Vec<u8>, WinDivertAddress)>,
     firewall_rule_name: String,
     telemetry: TelemetryHub,
 }
@@ -541,12 +555,18 @@ impl WinDivertInterceptor {
                     return;
                 }
                 RuleAction::Direct => {
-                    if ctrl.dns.is_in_fake_subnet(&meta.dst_ip) {
+                    let is_fake_ip = ctrl.dns.is_in_fake_subnet(&meta.dst_ip);
+                    let needs_sni_inspection = !is_fake_ip
+                        && meta.dst_port == ctrl.constants.network.tls_sni_default_port
+                        && ctrl.has_enabled_domain_rules();
+                    if is_fake_ip || needs_sni_inspection {
                         ctrl.telemetry.push_log(
                             LogLevel::Info,
                             COMPONENT_WINDIVERT,
                             format!(
-                                "Reflecting Direct Fake-IP SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} [rule=\"{}\"]",
+                                "Reflecting Direct SYN (fakeIp={}, sniInspect={}) PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} [rule=\"{}\"]",
+                                is_fake_ip,
+                                needs_sni_inspection,
                                 proc_id.pid,
                                 proc_id.name,
                                 proc_id.executable_path,
@@ -786,17 +806,18 @@ impl Interceptor for WinDivertInterceptor {
         self.active.store(true, Ordering::SeqCst);
         let sock_handle_usize = socket_handle as usize;
         let net_handle_usize = network_handle as usize;
+        let shared_net_handle = Arc::new(AtomicUsize::new(net_handle_usize));
+        let pending_syn_queue: PendingSynQueue<(Vec<u8>, WinDivertAddress)> =
+            PendingSynQueue::new();
 
         *self.handles.lock() = Some(ActiveHandles {
             api,
             socket_handle: sock_handle_usize,
-            network_handle: net_handle_usize,
+            network_handle: Arc::clone(&shared_net_handle),
+            pending_syn_queue: pending_syn_queue.clone(),
             firewall_rule_name,
             telemetry: controller.telemetry.clone(),
         });
-
-        let pending_syn_queue: PendingSynQueue<(Vec<u8>, WinDivertAddress)> =
-            PendingSynQueue::new();
 
         // 1. Spawn WINDIVERT_LAYER_SOCKET listener thread
         let active_sock = Arc::clone(&self.active);
@@ -827,14 +848,15 @@ impl Interceptor for WinDivertInterceptor {
         let active_syn = Arc::clone(&self.active);
         let ctrl_syn = controller.clone();
         let syn_queue_worker = pending_syn_queue.clone();
+        let net_handle_for_syn = Arc::clone(&shared_net_handle);
         std::thread::spawn(move || {
-            let handle = net_handle_usize as *mut c_void;
             let poll_interval =
                 Duration::from_millis(ctrl_syn.constants.network.pid_fallback_delay_ms.max(1));
             let syn_timeout =
                 Duration::from_millis(ctrl_syn.constants.network.pending_syn_timeout_ms);
 
             while active_syn.load(Ordering::Relaxed) {
+                let handle = net_handle_for_syn.load(Ordering::Acquire) as *mut c_void;
                 let outcomes = ctrl_syn.poll_pending_syns(
                     &syn_queue_worker,
                     syn_timeout,
@@ -885,9 +907,131 @@ impl Interceptor for WinDivertInterceptor {
         });
 
         // 3. Spawn non-blocking WINDIVERT_LAYER_NETWORK packet reflection thread
-        let active_net = Arc::clone(&self.active);
-        let ctrl_net = controller.clone();
-        let syn_queue_producer = pending_syn_queue;
+        Self::spawn_network_reflection_thread(
+            Arc::clone(&self.active),
+            controller,
+            api,
+            net_handle_usize,
+            pending_syn_queue,
+        );
+
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn start(&self, _controller: RouteWardController) -> RouteWardResult<()> {
+        Err(RouteWardError::InterceptorError {
+            key: ERR_KEY_INTERCEPTOR_DRIVER,
+            detail: "WinDivert backend is only supported on Windows".to_string(),
+        })
+    }
+
+    #[cfg(windows)]
+    fn reload(&self, controller: RouteWardController) -> RouteWardResult<()> {
+        use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
+
+        if !self.is_active() {
+            return Ok(());
+        }
+
+        let (api, shared_net_handle, pending_syn_queue) = {
+            let guard = self.handles.lock();
+            let Some(ref handles) = *guard else {
+                return Ok(());
+            };
+            (
+                handles.api,
+                Arc::clone(&handles.network_handle),
+                handles.pending_syn_queue.clone(),
+            )
+        };
+
+        let net_consts = &controller.constants.network;
+        let dns_port = controller.constants.dns.dns_standard_port;
+        let dot_port = controller.constants.dns.dns_over_tls_port;
+        let net_filter_str = build_network_filter_string(dns_port, dot_port);
+        let net_filter = CString::new(net_filter_str).expect("valid CString");
+
+        // Open the new WinDivert network handle and start its reflection worker BEFORE closing the old handle,
+        // guaranteeing zero permissive window during the switchover.
+        let new_network_handle = unsafe {
+            (api.open)(
+                net_filter.as_ptr(),
+                WINDIVERT_LAYER_NETWORK,
+                net_consts.windivert_priority,
+                0,
+            )
+        };
+        if new_network_handle.is_null() || new_network_handle == INVALID_HANDLE_VALUE {
+            let err_code = unsafe { GetLastError() };
+            return Err(RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_OPEN,
+                detail: format!(
+                    "WinDivertOpen(NETWORK) live reload failed with Win32 error {err_code}"
+                ),
+            });
+        }
+
+        let new_net_usize = new_network_handle as usize;
+        Self::spawn_network_reflection_thread(
+            Arc::clone(&self.active),
+            controller.clone(),
+            api,
+            new_net_usize,
+            pending_syn_queue,
+        );
+
+        let old_net_usize = shared_net_handle.swap(new_net_usize, Ordering::SeqCst);
+        unsafe {
+            let old_ptr = old_net_usize as *mut c_void;
+            let _ = (api.shutdown)(old_ptr, WINDIVERT_SHUTDOWN_BOTH);
+            let _ = (api.close)(old_ptr);
+        }
+
+        controller.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_WINDIVERT,
+            "Reopened WinDivert network filter before closing previous handle (zero permissive window)"
+                .to_string(),
+        );
+
+        Ok(())
+    }
+
+    fn stop(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        #[cfg(windows)]
+        {
+            if let Some(handles) = self.handles.lock().take() {
+                unsafe {
+                    let sock = handles.socket_handle as *mut c_void;
+                    let net = handles.network_handle.load(Ordering::SeqCst) as *mut c_void;
+                    let _ = (handles.api.shutdown)(sock, WINDIVERT_SHUTDOWN_BOTH);
+                    let _ = (handles.api.close)(sock);
+                    let _ = (handles.api.shutdown)(net, WINDIVERT_SHUTDOWN_BOTH);
+                    let _ = (handles.api.close)(net);
+                }
+                Self::remove_scoped_firewall_rule(&handles.firewall_rule_name, &handles.telemetry);
+            }
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(windows)]
+impl WinDivertInterceptor {
+    fn spawn_network_reflection_thread(
+        active_net: Arc<AtomicBool>,
+        ctrl_net: RouteWardController,
+        api: WinDivertApi,
+        net_handle_usize: usize,
+        syn_queue_producer: PendingSynQueue<(Vec<u8>, WinDivertAddress)>,
+    ) {
+        let dns_port = ctrl_net.constants.dns.dns_standard_port;
+        let dot_port = ctrl_net.constants.dns.dns_over_tls_port;
         std::thread::spawn(move || {
             let handle = net_handle_usize as *mut c_void;
             let mut packet_buf = vec![0u8; PACKET_BUFFER_SIZE];
@@ -912,55 +1056,57 @@ impl Interceptor for WinDivertInterceptor {
                 let pkt_len = recv_len as usize;
                 let packet = &mut packet_buf[..pkt_len];
 
-                // Case 0: Outbound IPv6 DNS (port 53) or DoT (port 853)
+                // Case 0: Outbound IPv6 DNS (port 53) or DoT (port 853) — unconditionally blocked until Batch 4.3
                 if let Some(v6_meta) = parse_ipv6_transport_meta(packet) {
-                    let (kill_switch_enabled, block_encrypted_dns) = {
-                        let prof = ctrl_net.profile.read();
-                        (
-                            prof.security_policy.kill_switch_enabled,
-                            prof.security_policy.block_encrypted_dns_bypass,
-                        )
-                    };
-                    if v6_meta.dst_port == dot_port && (block_encrypted_dns || kill_switch_enabled)
-                    {
-                        ctrl_net.telemetry.push_log(
-                            LogLevel::Warn,
-                            COMPONENT_WINDIVERT,
-                            format!(
-                                "Blocked outbound IPv6 DoT packet [{}]:{} -> [{}]:{}",
-                                v6_meta.src_ip, v6_meta.src_port, v6_meta.dst_ip, v6_meta.dst_port
-                            ),
-                        );
-                        ctrl_net.telemetry.record_connection(
-                            TrackedConnection {
-                                id: Uuid::new_v4().to_string(),
-                                pid: 0,
-                                process_name: "ipv6-dns".to_string(),
-                                process_path: "ipv6-dns".to_string(),
-                                target_host: v6_meta.dst_ip.to_string(),
-                                resolved_domain: None,
-                                target_port: v6_meta.dst_port,
-                                protocol: if v6_meta.next_header
-                                    == crate::interceptor::nat::IPPROTO_TCP
-                                {
-                                    TransportProtocol::Tcp
-                                } else {
-                                    TransportProtocol::Udp
+                    let kill_switch_enabled =
+                        ctrl_net.profile.read().security_policy.kill_switch_enabled;
+                    if should_block_outbound_ipv6_dns_or_dot(
+                        v6_meta.dst_port,
+                        dns_port,
+                        dot_port,
+                        kill_switch_enabled,
+                    ) {
+                        if v6_meta.dst_port == dot_port {
+                            ctrl_net.telemetry.push_log(
+                                LogLevel::Warn,
+                                COMPONENT_WINDIVERT,
+                                format!(
+                                    "Blocked outbound IPv6 DoT packet [{}]:{} -> [{}]:{}",
+                                    v6_meta.src_ip,
+                                    v6_meta.src_port,
+                                    v6_meta.dst_ip,
+                                    v6_meta.dst_port
+                                ),
+                            );
+                            ctrl_net.telemetry.record_connection(
+                                TrackedConnection {
+                                    id: Uuid::new_v4().to_string(),
+                                    pid: 0,
+                                    process_name: "ipv6-dns".to_string(),
+                                    process_path: "ipv6-dns".to_string(),
+                                    target_host: v6_meta.dst_ip.to_string(),
+                                    resolved_domain: None,
+                                    target_port: v6_meta.dst_port,
+                                    protocol: if v6_meta.next_header
+                                        == crate::interceptor::nat::IPPROTO_TCP
+                                    {
+                                        TransportProtocol::Tcp
+                                    } else {
+                                        TransportProtocol::Udp
+                                    },
+                                    matched_rule: "SecurityPolicy:blockEncryptedDnsBypass"
+                                        .to_string(),
+                                    route_label: "BLOCKED".to_string(),
+                                    latency_ms: 0,
+                                    rx_bytes: 0,
+                                    tx_bytes: 0,
+                                    status: ConnectionStatus::Blocked,
+                                    started_at: Utc::now(),
                                 },
-                                matched_rule: "SecurityPolicy:blockEncryptedDnsBypass".to_string(),
-                                route_label: "BLOCKED".to_string(),
-                                latency_ms: 0,
-                                rx_bytes: 0,
-                                tx_bytes: 0,
-                                status: ConnectionStatus::Blocked,
-                                started_at: Utc::now(),
-                            },
-                            false,
-                        );
-                        continue;
-                    }
-                    if v6_meta.dst_port == dns_port && kill_switch_enabled {
-                        // Drop outbound IPv6 DNS so Windows falls back to IPv4 DNS immediately
+                                false,
+                            );
+                        }
+                        // Drop outbound IPv6 DNS (port 53) and DoT (port 853) so Windows falls back to IPv4 DNS immediately
                         continue;
                     }
                 }
@@ -1012,6 +1158,10 @@ impl Interceptor for WinDivertInterceptor {
                         }
 
                         if udp_meta.dst_port == dns_port {
+                            ctrl_net.record_orig_dns_resolver(SocketAddr::new(
+                                IpAddr::V4(udp_meta.dst_ip),
+                                udp_meta.dst_port,
+                            ));
                             let dns_payload = &packet[udp_meta.payload_offset
                                 ..udp_meta.payload_offset + udp_meta.payload_len];
                             if let Some(fast_resp) = ctrl_net.resolve_dns_query_fast(dns_payload) {
@@ -1196,38 +1346,6 @@ impl Interceptor for WinDivertInterceptor {
                 }
             }
         });
-
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
-    fn start(&self, _controller: RouteWardController) -> RouteWardResult<()> {
-        Err(RouteWardError::InterceptorError {
-            key: ERR_KEY_INTERCEPTOR_DRIVER,
-            detail: "WinDivert backend is only supported on Windows".to_string(),
-        })
-    }
-
-    fn stop(&self) {
-        self.active.store(false, Ordering::SeqCst);
-        #[cfg(windows)]
-        {
-            if let Some(handles) = self.handles.lock().take() {
-                unsafe {
-                    let sock = handles.socket_handle as *mut c_void;
-                    let net = handles.network_handle as *mut c_void;
-                    let _ = (handles.api.shutdown)(sock, WINDIVERT_SHUTDOWN_BOTH);
-                    let _ = (handles.api.close)(sock);
-                    let _ = (handles.api.shutdown)(net, WINDIVERT_SHUTDOWN_BOTH);
-                    let _ = (handles.api.close)(net);
-                }
-                Self::remove_scoped_firewall_rule(&handles.firewall_rule_name, &handles.telemetry);
-            }
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
     }
 }
 
@@ -1256,5 +1374,10 @@ mod tests {
         assert!(filter.contains("udp.DstPort == 53"));
         assert!(filter.contains("udp.DstPort == 853"));
         assert!(filter.contains("ipv6 and (tcp.DstPort == 53 or udp.DstPort == 53"));
+
+        // IPv6 ports 53 and 853 are blocked even when killSwitchEnabled=false
+        assert!(should_block_outbound_ipv6_dns_or_dot(53, 53, 853, false));
+        assert!(should_block_outbound_ipv6_dns_or_dot(853, 53, 853, false));
+        assert!(!should_block_outbound_ipv6_dns_or_dot(443, 53, 853, false));
     }
 }

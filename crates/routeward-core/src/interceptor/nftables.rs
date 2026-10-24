@@ -132,41 +132,80 @@ impl NftablesInterceptor {
     }
 
     /// Generates the dedicated IPv6 `nftables` ruleset (`table ip6 <table_name>`) to block
-    /// outbound IPv6 DNS (port 53) and DoT (port 853) when the kill switch or encrypted DNS guard is active,
-    /// forcing the OS to fall back to IPv4 DNS resolvers until full IPv6 interception in Batch 4.3.
+    /// outbound IPv6 DNS (port 53) and DoT (port 853) unconditionally while the engine runs
+    /// (independently of `killSwitchEnabled`), forcing the OS to fall back to IPv4 DNS resolvers
+    /// until full IPv6 interception in Batch 4.3.
     pub fn build_nft_ip6_table_ruleset(
         table_name: &str,
         chain_name: &str,
         fwmark: u32,
         dns_standard_port: u16,
         dot_port: u16,
-        kill_switch_enabled: bool,
-        block_encrypted_dns: bool,
+        _kill_switch_enabled: bool,
+        _block_encrypted_dns: bool,
     ) -> Option<String> {
-        if !kill_switch_enabled && !block_encrypted_dns {
-            return None;
-        }
         let mut script = String::with_capacity(512);
         script.push_str(&format!("table ip6 {table_name} {{\n"));
         script.push_str(&format!("    chain {chain_name} {{\n"));
         script.push_str("        type filter hook output priority 0; policy accept;\n");
         script.push_str(&format!("        meta mark {fwmark} return\n"));
         script.push_str("        ip6 daddr ::1 return\n");
-        if kill_switch_enabled {
-            script.push_str(&format!("        udp dport {dns_standard_port} reject\n"));
-            script.push_str(&format!(
-                "        tcp dport {dns_standard_port} reject with tcp reset\n"
-            ));
-        }
-        if block_encrypted_dns || kill_switch_enabled {
-            script.push_str(&format!("        udp dport {dot_port} reject\n"));
-            script.push_str(&format!(
-                "        tcp dport {dot_port} reject with tcp reset\n"
-            ));
-        }
+        script.push_str(&format!("        udp dport {dns_standard_port} reject\n"));
+        script.push_str(&format!(
+            "        tcp dport {dns_standard_port} reject with tcp reset\n"
+        ));
+        script.push_str(&format!("        udp dport {dot_port} reject\n"));
+        script.push_str(&format!(
+            "        tcp dport {dot_port} reject with tcp reset\n"
+        ));
         script.push_str("    }\n");
         script.push_str("}\n");
         Some(script)
+    }
+
+    /// Builds a single atomic `nft -f -` transaction script that replaces both `table ip <table_name>`
+    /// and `table ip6 <table_name>` in one kernel commit without any permissive window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_atomic_replace_ruleset(
+        table_name: &str,
+        chain_name: &str,
+        fwmark: u32,
+        relay_port: u16,
+        dns_listen_port: u16,
+        dns_standard_port: u16,
+        dot_port: u16,
+        kill_switch_enabled: bool,
+        block_encrypted_dns: bool,
+        upstream_endpoints: &[(Ipv4Addr, u16)],
+    ) -> String {
+        let mut batch = String::with_capacity(1536);
+        batch.push_str(&format!("table ip {table_name}\n"));
+        batch.push_str(&format!("delete table ip {table_name}\n"));
+        batch.push_str(&Self::build_nft_table_ruleset_with_dns(
+            table_name,
+            chain_name,
+            fwmark,
+            relay_port,
+            dns_listen_port,
+            dns_standard_port,
+            dot_port,
+            block_encrypted_dns,
+            upstream_endpoints,
+        ));
+        if let Some(ip6_script) = Self::build_nft_ip6_table_ruleset(
+            table_name,
+            chain_name,
+            fwmark,
+            dns_standard_port,
+            dot_port,
+            kill_switch_enabled,
+            block_encrypted_dns,
+        ) {
+            batch.push_str(&format!("table ip6 {table_name}\n"));
+            batch.push_str(&format!("delete table ip6 {table_name}\n"));
+            batch.push_str(&ip6_script);
+        }
+        batch
     }
 
     /// Deletes the dedicated `nftables` tables (`ip` and `ip6`) if they exist.
@@ -734,6 +773,91 @@ impl Interceptor for NftablesInterceptor {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    fn reload(&self, controller: RouteWardController) -> RouteWardResult<()> {
+        use std::io::Write;
+
+        if !self.is_active() {
+            return Ok(());
+        }
+
+        let net = &controller.constants.network;
+        let nft_bin = net.linux_nft_binary.clone();
+        let table_name = net.linux_nft_table_name.clone();
+        let chain_name = net.linux_nft_chain_name.clone();
+        let fwmark = net.linux_fwmark;
+        let relay_port = net.default_transparent_tcp_port;
+        let dns_listen_port = net.default_dns_listen_port;
+        let dns_standard_port = controller.constants.dns.dns_standard_port;
+        let dot_port = controller.constants.dns.dns_over_tls_port;
+        let upstream_endpoints = controller.nat_table.upstream_endpoints();
+        let (kill_switch_enabled, block_encrypted_dns) = {
+            let prof = controller.profile.read();
+            (
+                prof.security_policy.kill_switch_enabled,
+                prof.security_policy.block_encrypted_dns_bypass,
+            )
+        };
+
+        let atomic_batch = Self::build_atomic_replace_ruleset(
+            &table_name,
+            &chain_name,
+            fwmark,
+            relay_port,
+            dns_listen_port,
+            dns_standard_port,
+            dot_port,
+            kill_switch_enabled,
+            block_encrypted_dns,
+            &upstream_endpoints,
+        );
+
+        let mut apply_child = Command::new(&nft_bin)
+            .args(["-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                detail: format!("Could not spawn {nft_bin} -f - for atomic reload: {err}"),
+            })?;
+
+        if let Some(mut stdin) = apply_child.stdin.take() {
+            let _ = stdin.write_all(atomic_batch.as_bytes());
+        }
+
+        let apply_out =
+            apply_child
+                .wait_with_output()
+                .map_err(|err| RouteWardError::InterceptorError {
+                    key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                    detail: format!("Failed waiting for {nft_bin} -f - atomic reload: {err}"),
+                })?;
+
+        if !apply_out.status.success() {
+            let stderr = String::from_utf8_lossy(&apply_out.stderr)
+                .trim()
+                .to_string();
+            return Err(RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                detail: format!(
+                    "nft -f - rejected atomic table reload for \"{table_name}\": {stderr}"
+                ),
+            });
+        }
+
+        controller.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_NFTABLES,
+            format!(
+                "Atomically replaced nftables tables \"ip {table_name}\" and \"ip6 {table_name}\" (killSwitchEnabled={kill_switch_enabled}, blockEncryptedDnsBypass={block_encrypted_dns})"
+            ),
+        );
+
+        Ok(())
+    }
+
     fn stop(&self) {
         self.active.store(false, Ordering::SeqCst);
         if let Some(mut state) = self.state.lock().take() {
@@ -792,15 +916,31 @@ mod tests {
             21079,
             53,
             853,
-            true,
-            true,
+            false,
+            false,
         )
-        .expect("ip6 ruleset generated");
+        .expect("ip6 ruleset generated even when killSwitchEnabled=false");
         assert!(ip6_ruleset.contains("table ip6 routeward {"));
         assert!(ip6_ruleset.contains("udp dport 53 reject"));
         assert!(ip6_ruleset.contains("tcp dport 53 reject with tcp reset"));
         assert!(ip6_ruleset.contains("udp dport 853 reject"));
         assert!(ip6_ruleset.contains("tcp dport 853 reject with tcp reset"));
+
+        let atomic_batch = NftablesInterceptor::build_atomic_replace_ruleset(
+            "routeward",
+            "output",
+            21079,
+            10810,
+            10853,
+            53,
+            853,
+            false,
+            false,
+            &upstreams,
+        );
+        assert!(atomic_batch.contains("table ip routeward\ndelete table ip routeward\n"));
+        assert!(atomic_batch.contains("table ip6 routeward\ndelete table ip6 routeward\n"));
+        assert!(!atomic_batch.contains("udp dport 853 reject\n    }\n}\ntable ip6"));
     }
 
     #[test]

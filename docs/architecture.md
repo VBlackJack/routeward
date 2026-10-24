@@ -103,6 +103,24 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
   - Until full IPv6 interception in Batch 4.3, when `killSwitchEnabled = true`, blocks outbound **IPv6 port `53` and port `853`** (UDP and TCP) on both Windows (`WinDivert` drop) and Linux (`table ip6 routeward` `reject` / `reject with tcp reset`, guarded by the same fail-open watchdog and `routeward cleanup`), forcing immediate fallback to IPv4 DNS.
 - **Privacy-Preserving DNS Logging**: Ordinary DNS queries and Fake-IP allocations are logged exclusively at `DEBUG` level (never `INFO`), keeping telemetry and daily log files free of per-query noise while exposing active Fake-IP allocations via `routeward ctl fake-ips` (`ctl flush-fake-ips`) and the UI DNS tab. DNS errors (`SERVFAIL`, unreachable proxy, blocked DoT/canary) are logged at `WARN`.
 
+### Milestone 4 - Batch 4.1.1 Status (DNS Leak Closure, TLS SNI Inspection, OS Cache Flush, and Live Policy Reload)
+- **Strict Internal-Only DNS Resolution for Bypassed Domains (`DnsResolverMode::BypassOnlySystem`)**:
+  - Domains matching `dnsConfig.bypassDomains`, Active Directory / machine DNS suffixes, single-label names, `.local`/`.localhost`, or private reverse zones **never** query `upstreamDns`, `default_upstream`, or `fallback_dns_server`.
+  - They query exclusively `orig_resolver`, `last_seen_orig_resolver`, and active system resolvers (`GetAdaptersAddresses` on Windows; `/etc/resolv.conf` on Linux, automatically falling back to `/run/systemd/resolve/resolv.conf` when `/etc/resolv.conf` only contains the `127.0.0.53` stub). If no internal resolver responds, RouteWard returns **`SERVFAIL` (`RCODE = 2`)** and never contacts a public resolver.
+- **Unconditional IPv6 Port 53 and Port 853 Blocking**:
+  - Until full IPv6 interception in Batch 4.3, outbound IPv6 UDP and TCP traffic on ports `53` and `853` is blocked whenever the engine is running, independently of `securityPolicy.killSwitchEnabled`, on both Linux (`table ip6 routeward`) and Windows (`WinDivert`).
+- **System-First Resolution for `Direct` Flows (`DnsResolverMode::DirectPreferSystem`)**:
+  - When resolving a non-bypassed domain for a `Direct` flow (`resolve_host_direct_ipv4_all` or a `Direct` DNS rule), RouteWard queries `orig_resolver`, `last_seen_orig_resolver`, and active system resolvers (`GetAdaptersAddresses` on Windows; `/etc/resolv.conf` / `/run/systemd/resolve/resolv.conf` on Linux) before considering `upstreamDns`. `upstreamDns` is only used if no system or previously observed `orig_resolver` exists, and **never** for a bypassed domain.
+- **Automatic OS DNS Resolver Cache Flush on Engine Start and Stop (`dns::flush_os_dns_cache`)**:
+  - On engine startup (`start_engine`) and shutdown (`stop_engine`), RouteWard flushes the OS client DNS cache (`dnsapi.dll!DnsFlushResolverCache` with fallback to `ipconfig /flushdns` on Windows without touching the Windows DNS Server role; `resolvectl flush-caches` on Linux when `systemd-resolved` is active, otherwise ignored with a `DEBUG` log).
+- **TLS `ClientHello` SNI Inspection on the Transparent TCP Relay (`peek_tls_client_hello_sni`)**:
+  - When a transparent TCP connection targets a non-Fake-IP literal IPv4 address on port `443` (`network.tlsSniDefaultPort`), RouteWard peeks the initial payload (bounded by `network.tlsSniPeekTimeoutMs = 200` ms and `network.tlsSniMaxBytes = 4096` bytes without consuming bytes from the socket) and extracts the TLS `ClientHello` SNI via `TlsSniExtractor`.
+  - If an SNI hostname is present, routing rules are re-evaluated with both the SNI hostname and destination IP; if routed to a `Proxy` or `Chain`, the extracted SNI domain is sent to the upstream proxy (`ATYP = 0x03`) and the full `ClientHello` is forwarded intact. On Windows, `WinDivertInterceptor` also reflects port `443` `Direct` SYNs to the transparent relay when domain rules are enabled so SNI inspection can upgrade them to `Proxy`, `Chain`, or `Block`.
+- **Atomic Live Reload of `securityPolicy`, `dnsConfig`, and `proxies` (`Interceptor::reload`)**:
+  - Modifying `securityPolicy`, `dnsConfig`, or `proxies` via `replace_profile` (`routeward ctl replace-profile` or the UI) while the engine is running atomically reapplies active interception rules (`nft -f -` single-transaction replacement of `table ip` and `table ip6` on Linux; opening the new `WinDivert` network handle before closing the old handle on Windows) and re-runs proxy bootstrap without restarting the engine or entering a permissive window. Logged at `INFO`.
+- **Full Fake-IP Pool Eviction and `SERVFAIL` Guard (`FakeIpEngine::evict_oldest`)**:
+  - When the Fake-IP pool reaches capacity (`dns.maxCacheEntries`), RouteWard first evicts expired entries (`evict_expired`) and then evicts the oldest entry (`evict_oldest`). If allocation still fails, RouteWard returns **`SERVFAIL` (`RCODE = 2`)** and never falls back to cleartext DNS.
+
 ## Component Diagram
 
 ```mermaid

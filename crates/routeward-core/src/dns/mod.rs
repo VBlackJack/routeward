@@ -22,8 +22,9 @@ use dashmap::DashMap;
 use ipnet::Ipv4Net;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const DEFAULT_FALLBACK_NET: [u8; 4] = [198, 18, 0, 0];
@@ -31,6 +32,7 @@ const DEFAULT_FALLBACK_PREFIX: u8 = 15;
 const HOST_OFFSET_START: u32 = 1;
 const WILDCARD_PREFIX: &str = "*.";
 const ENV_EXTRA_DNS_SUFFIXES: &str = "ROUTEWARD_SYSTEM_DNS_SUFFIXES";
+const ENV_SYSTEM_DNS_RESOLVERS: &str = "ROUTEWARD_SYSTEM_DNS_RESOLVERS";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +50,7 @@ struct InternalRecord {
     domain: String,
     hits: u64,
     expires_at: DateTime<Utc>,
+    seq: u64,
 }
 
 #[derive(Clone)]
@@ -61,6 +64,7 @@ pub struct FakeIpEngine {
     private_reverse_zones: Arc<Vec<String>>,
     doh_canary_domains: Arc<Vec<String>>,
     cursor: Arc<Mutex<u32>>,
+    access_seq: Arc<AtomicU64>,
     domain_to_record: Arc<DashMap<String, InternalRecord>>,
     ip_to_domain: Arc<DashMap<Ipv4Addr, String>>,
 }
@@ -105,9 +109,17 @@ impl FakeIpEngine {
             private_reverse_zones: Arc::new(reverse_zones),
             doh_canary_domains: Arc::new(canary_domains),
             cursor: Arc::new(Mutex::new(HOST_OFFSET_START)),
+            access_seq: Arc::new(AtomicU64::new(1)),
             domain_to_record: Arc::new(DashMap::new()),
             ip_to_domain: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Creates a `FakeIpEngine` with a custom `max_entries` limit (useful for testing pool saturation).
+    pub fn with_max_entries(&self, max_entries: usize) -> Self {
+        let mut cloned = self.clone();
+        cloned.max_entries = max_entries;
+        cloned
     }
 
     /// Updates the configurable bypass domain list from a refreshed `DnsConfig`.
@@ -201,20 +213,47 @@ impl FakeIpEngine {
             return None;
         }
 
+        let capacity = self.effective_capacity();
+        if capacity == 0 {
+            return None;
+        }
+
         let now = Utc::now();
         let next_expiry = now + chrono::Duration::seconds(self.ttl_seconds);
+        let seq = self.access_seq.fetch_add(1, Ordering::Relaxed);
 
         if let Some(mut existing) = self.domain_to_record.get_mut(&normalized) {
             existing.hits += 1;
             existing.expires_at = next_expiry;
+            existing.seq = seq;
             return Some(existing.fake_ip);
         }
 
-        if self.domain_to_record.len() >= self.max_entries {
+        let mut evicted_ip = None;
+        if self.domain_to_record.len() >= capacity {
             self.evict_expired();
+            while self.domain_to_record.len() >= capacity {
+                match self.evict_oldest() {
+                    Some(ip) => {
+                        if evicted_ip.is_none() {
+                            evicted_ip = Some(ip);
+                        }
+                    }
+                    None => break,
+                }
+            }
         }
 
-        let allocated_ip = self.next_ip_in_subnet();
+        if self.domain_to_record.len() >= capacity {
+            return None;
+        }
+
+        let candidate_ip = self.next_ip_in_subnet();
+        let allocated_ip = if self.ip_to_domain.contains_key(&candidate_ip) {
+            evicted_ip.unwrap_or(candidate_ip)
+        } else {
+            candidate_ip
+        };
         if let Some(prev_domain) = self.ip_to_domain.insert(allocated_ip, normalized.clone()) {
             if prev_domain != normalized {
                 self.domain_to_record.remove(&prev_domain);
@@ -225,10 +264,35 @@ impl FakeIpEngine {
             domain: normalized.clone(),
             hits: 1,
             expires_at: next_expiry,
+            seq,
         };
 
         self.domain_to_record.insert(normalized, record);
         Some(allocated_ip)
+    }
+
+    fn effective_capacity(&self) -> usize {
+        let base = u32::from(self.subnet.network());
+        let broadcast = u32::from(self.subnet.broadcast());
+        let usable_hosts = broadcast.saturating_sub(base + 1).max(1) as usize;
+        self.max_entries.min(usable_hosts)
+    }
+
+    /// Evicts the least-recently accessed / oldest entry from the Fake-IP pool.
+    pub fn evict_oldest(&self) -> Option<Ipv4Addr> {
+        let oldest = self
+            .domain_to_record
+            .iter()
+            .min_by_key(|item| (item.value().seq, item.value().expires_at))
+            .map(|item| (item.key().clone(), item.value().fake_ip));
+
+        if let Some((domain, ip)) = oldest {
+            self.domain_to_record.remove(&domain);
+            self.ip_to_domain.remove(&ip);
+            Some(ip)
+        } else {
+            None
+        }
     }
 
     pub fn is_in_fake_subnet(&self, ip: &Ipv4Addr) -> bool {
@@ -249,6 +313,7 @@ impl FakeIpEngine {
                 return None;
             }
             rec.hits += 1;
+            rec.seq = self.access_seq.fetch_add(1, Ordering::Relaxed);
             return Some(domain);
         }
         self.ip_to_domain.remove(ip);
@@ -388,9 +453,11 @@ pub fn detect_system_dns_suffixes() -> Vec<String> {
 
     #[cfg(not(windows))]
     {
-        if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
-            for parsed in parse_resolv_conf_suffixes(&content) {
-                push_unique_normalized_suffix(&mut suffixes, &parsed);
+        for path in ["/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"] {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for parsed in parse_resolv_conf_suffixes(&content) {
+                    push_unique_normalized_suffix(&mut suffixes, &parsed);
+                }
             }
         }
     }
@@ -441,7 +508,7 @@ pub fn parse_resolv_conf_suffixes(content: &str) -> Vec<String> {
     suffixes
 }
 
-/// Extracts the first non-loopback IPv4 nameserver from `/etc/resolv.conf` if present.
+/// Extracts non-loopback IPv4 nameservers from a `resolv.conf` file content.
 pub fn parse_resolv_conf_nameservers(content: &str) -> Vec<Ipv4Addr> {
     let mut servers = Vec::new();
     for line in content.lines() {
@@ -450,7 +517,7 @@ pub fn parse_resolv_conf_nameservers(content: &str) -> Vec<Ipv4Addr> {
         if let (Some(dir), Some(addr_str)) = (tokens.next(), tokens.next()) {
             if dir.eq_ignore_ascii_case("nameserver") {
                 if let Ok(ip) = addr_str.parse::<Ipv4Addr>() {
-                    if !ip.is_loopback() && !servers.contains(&ip) {
+                    if !ip.is_loopback() && !ip.is_unspecified() && !servers.contains(&ip) {
                         servers.push(ip);
                     }
                 }
@@ -458,6 +525,241 @@ pub fn parse_resolv_conf_nameservers(content: &str) -> Vec<Ipv4Addr> {
         }
     }
     servers
+}
+
+/// Resolves Linux non-loopback IPv4 nameservers from `/etc/resolv.conf`, falling back to
+/// `/run/systemd/resolve/resolv.conf` when `/etc/resolv.conf` only contains the `127.0.0.53` stub.
+pub fn resolve_linux_resolv_conf_nameservers(
+    etc_resolv: Option<&str>,
+    systemd_resolv: Option<&str>,
+) -> Vec<Ipv4Addr> {
+    if let Some(etc_content) = etc_resolv {
+        let primary = parse_resolv_conf_nameservers(etc_content);
+        if !primary.is_empty() {
+            return primary;
+        }
+    }
+    if let Some(systemd_content) = systemd_resolv {
+        return parse_resolv_conf_nameservers(systemd_content);
+    }
+    Vec::new()
+}
+
+/// Detects the active system IPv4 DNS resolvers:
+/// - On Windows: queries active network adapters via `GetAdaptersAddresses` (`Win32_NetworkManagement_IpHelper`).
+/// - On Linux: reads `/etc/resolv.conf` and falls back to `/run/systemd/resolve/resolv.conf` if `/etc/resolv.conf` only contains `127.0.0.53`.
+pub fn detect_system_dns_resolvers(constants: &DnsConstants) -> Vec<SocketAddr> {
+    let dns_port = constants.dns_standard_port;
+    let mut out = Vec::new();
+
+    if let Ok(override_raw) = std::env::var(ENV_SYSTEM_DNS_RESOLVERS) {
+        let trimmed = override_raw.trim();
+        if trimmed.eq_ignore_ascii_case("none") {
+            return out;
+        }
+        for token in trimmed.split([',', ';', ' ']) {
+            let tok = token.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            if let Ok(sa) = tok.parse::<SocketAddr>() {
+                if !sa.ip().is_loopback() && !sa.ip().is_unspecified() && !out.contains(&sa) {
+                    out.push(sa);
+                }
+            } else if let Ok(ip) = tok.parse::<Ipv4Addr>() {
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    let sa = SocketAddr::new(IpAddr::V4(ip), dns_port);
+                    if !out.contains(&sa) {
+                        out.push(sa);
+                    }
+                }
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        for ip in query_windows_adapter_dns_servers() {
+            let sa = SocketAddr::new(IpAddr::V4(ip), dns_port);
+            if !out.contains(&sa) {
+                out.push(sa);
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let etc_content = std::fs::read_to_string(&constants.linux_resolv_conf_path).ok();
+        let systemd_content =
+            std::fs::read_to_string(&constants.linux_systemd_resolv_conf_path).ok();
+        for ip in resolve_linux_resolv_conf_nameservers(
+            etc_content.as_deref(),
+            systemd_content.as_deref(),
+        ) {
+            let sa = SocketAddr::new(IpAddr::V4(ip), dns_port);
+            if !out.contains(&sa) {
+                out.push(sa);
+            }
+        }
+    }
+
+    out
+}
+
+#[cfg(windows)]
+fn query_windows_adapter_dns_servers() -> Vec<Ipv4Addr> {
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_FRIENDLY_NAME,
+        GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
+
+    const IF_OPER_STATUS_UP: i32 = 1;
+    const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+    const INITIAL_BUF_LEN: u32 = 16384;
+    const MAX_TRIES: usize = 3;
+
+    let flags = GAA_FLAG_SKIP_UNICAST
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_FRIENDLY_NAME;
+
+    let mut buf_len: u32 = INITIAL_BUF_LEN;
+    let mut buffer: Vec<u8> = vec![0u8; buf_len as usize];
+
+    for _ in 0..MAX_TRIES {
+        buffer.resize(buf_len as usize, 0);
+        let ret = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                flags,
+                std::ptr::null(),
+                buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut buf_len,
+            )
+        };
+        if ret == NO_ERROR {
+            break;
+        }
+        if ret != ERROR_BUFFER_OVERFLOW {
+            return Vec::new();
+        }
+    }
+
+    let mut servers = Vec::new();
+    let mut adapter_ptr = buffer.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+
+    unsafe {
+        while !adapter_ptr.is_null() {
+            let adapter = &*adapter_ptr;
+            if adapter.OperStatus == IF_OPER_STATUS_UP
+                && adapter.IfType != IF_TYPE_SOFTWARE_LOOPBACK
+            {
+                let mut dns_ptr = adapter.FirstDnsServerAddress;
+                while !dns_ptr.is_null() {
+                    let dns_entry = &*dns_ptr;
+                    let sa_ptr = dns_entry.Address.lpSockaddr;
+                    let sa_len = dns_entry.Address.iSockaddrLength as usize;
+                    if !sa_ptr.is_null()
+                        && sa_len >= std::mem::size_of::<SOCKADDR_IN>()
+                        && (*sa_ptr).sa_family == AF_INET
+                    {
+                        let sin = &*(sa_ptr as *const SOCKADDR_IN);
+                        let raw_ip = u32::from_be(sin.sin_addr.S_un.S_addr);
+                        let ip = Ipv4Addr::from(raw_ip);
+                        if !ip.is_loopback() && !ip.is_unspecified() && !servers.contains(&ip) {
+                            servers.push(ip);
+                        }
+                    }
+                    dns_ptr = dns_entry.Next;
+                }
+            }
+            adapter_ptr = adapter.Next;
+        }
+    }
+
+    servers
+}
+
+/// Flushes the OS client DNS resolver cache (without touching the Windows DNS Server role):
+/// - Windows: invokes `dnsapi.dll!DnsFlushResolverCache`, falling back to `ipconfig /flushdns`.
+/// - Linux: invokes `resolvectl flush-caches` if `systemd-resolved` is active.
+pub fn flush_os_dns_cache() -> Result<&'static str, String> {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::FreeLibrary;
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+        type FnDnsFlushResolverCache = unsafe extern "system" fn() -> i32;
+
+        let dll_wide: Vec<u16> = OsStr::new("dnsapi.dll")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let flushed_via_api = unsafe {
+            let module = LoadLibraryW(dll_wide.as_ptr());
+            if !module.is_null() {
+                let proc = GetProcAddress(module, c"DnsFlushResolverCache".as_ptr() as *const u8);
+                let ok = if let Some(func_ptr) = proc {
+                    let flush_fn = std::mem::transmute::<
+                        unsafe extern "system" fn() -> isize,
+                        FnDnsFlushResolverCache,
+                    >(func_ptr);
+                    flush_fn() != 0
+                } else {
+                    false
+                };
+                let _ = FreeLibrary(module);
+                ok
+            } else {
+                false
+            }
+        };
+
+        if flushed_via_api {
+            return Ok("dnsapi.dll!DnsFlushResolverCache");
+        }
+
+        match std::process::Command::new("ipconfig")
+            .arg("/flushdns")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(out) if out.status.success() => Ok("ipconfig /flushdns"),
+            Ok(out) => Err(format!(
+                "ipconfig /flushdns exited with {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(err) => Err(format!("ipconfig /flushdns failed: {err}")),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        match std::process::Command::new("resolvectl")
+            .arg("flush-caches")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(out) if out.status.success() => Ok("resolvectl flush-caches"),
+            Ok(out) => Err(format!(
+                "resolvectl flush-caches exited with {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(err) => Err(format!("resolvectl unavailable: {err}")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -565,5 +867,60 @@ nameserver 10.200.1.1
         );
         let nameservers = parse_resolv_conf_nameservers(resolv_sample);
         assert_eq!(nameservers, vec![Ipv4Addr::new(10, 200, 1, 1)]);
+    }
+
+    #[test]
+    fn linux_resolv_conf_falls_back_to_systemd_resolved_when_only_stub_present() {
+        let stub_only_etc = "nameserver 127.0.0.53\noptions edns0 trust-ad\n";
+        let systemd_real = "nameserver 10.42.0.10\nnameserver 10.42.0.11\n";
+
+        let resolved =
+            resolve_linux_resolv_conf_nameservers(Some(stub_only_etc), Some(systemd_real));
+        assert_eq!(
+            resolved,
+            vec![Ipv4Addr::new(10, 42, 0, 10), Ipv4Addr::new(10, 42, 0, 11)]
+        );
+
+        let direct_etc = "nameserver 192.168.50.1\n";
+        let resolved_direct =
+            resolve_linux_resolv_conf_nameservers(Some(direct_etc), Some(systemd_real));
+        assert_eq!(resolved_direct, vec![Ipv4Addr::new(192, 168, 50, 1)]);
+    }
+
+    #[test]
+    fn full_fake_ip_pool_evicts_oldest_entry_and_returns_none_when_capacity_zero() {
+        let mut constants = SystemConstants::load_embedded().unwrap();
+        constants.dns.max_cache_entries = 2;
+        let profile = ProfileConfig::load_embedded_default().unwrap();
+        let engine = FakeIpEngine::new(&profile.dns_config, &constants.dns);
+
+        let ip1 = engine
+            .allocate_or_get("first.routeward.test")
+            .expect("allocate first");
+        let ip2 = engine
+            .allocate_or_get("second.routeward.test")
+            .expect("allocate second");
+        assert_ne!(ip1, ip2);
+
+        // Touch first.routeward.test so second.routeward.test becomes the oldest accessed entry
+        let _ = engine.resolve_fake_ip(&ip1);
+
+        let ip3 = engine
+            .allocate_or_get("third.routeward.test")
+            .expect("allocate third by evicting oldest");
+        assert!(engine.resolve_fake_ip(&ip1).is_some());
+        assert!(
+            engine.resolve_fake_ip(&ip2).is_none(),
+            "Oldest entry (second.routeward.test) must have been evicted"
+        );
+        assert_eq!(
+            engine.resolve_fake_ip(&ip3).as_deref(),
+            Some("third.routeward.test")
+        );
+
+        // Zero capacity pool returns None immediately
+        constants.dns.max_cache_entries = 0;
+        let zero_engine = FakeIpEngine::new(&profile.dns_config, &constants.dns);
+        assert!(zero_engine.allocate_or_get("any.routeward.test").is_none());
     }
 }

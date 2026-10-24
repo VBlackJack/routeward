@@ -21,7 +21,8 @@ import threading
 
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 18080
-DNS_HOST = "0.0.0.0"
+HTTPS_PORT = 443
+DNS_HOST = "10.200.1.1"
 DNS_PORT = 53
 DNS_ANSWER_IP = "10.200.1.1"
 SOCKS_HOST = "127.0.0.1"
@@ -30,6 +31,7 @@ SO_MARK_OPTION = 36
 ROUTEWARD_FWMARK = 21079
 SOCKS_LOG_PATH = "/tmp/socks5_hits.log"
 HTTP_LOG_PATH = "/tmp/http_target_hits.log"
+HTTPS_LOG_PATH = "/tmp/https_443_hits.log"
 DNS_LOG_PATH = "/tmp/dns_hits.log"
 
 
@@ -223,6 +225,60 @@ def run_http_server() -> None:
         threading.Thread(target=handle_http_client, args=(conn,), daemon=True).start()
 
 
+def handle_https_443_client(conn: socket.socket) -> None:
+    try:
+        raw = conn.recv(4096)
+        with open(HTTPS_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"TLS_443 len={len(raw)}\n")
+        conn.sendall(b"HTTPS_SNI_OK")
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def run_https_443_server() -> None:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HTTP_HOST, HTTPS_PORT))
+    srv.listen(64)
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle_https_443_client, args=(conn,), daemon=True).start()
+
+
+def build_tls_client_hello(sni: str) -> bytes:
+    sni_bytes = sni.encode("ascii")
+    sni_list = struct.pack("!BH", 0x00, len(sni_bytes)) + sni_bytes
+    sni_ext_data = struct.pack("!H", len(sni_list)) + sni_list
+    ext = struct.pack("!HH", 0x0000, len(sni_ext_data)) + sni_ext_data
+    ch_body = (
+        b"\x03\x03"
+        + (b"\x11" * 32)
+        + b"\x00"
+        + struct.pack("!H", 2)
+        + b"\x13\x01"
+        + b"\x01\x00"
+        + struct.pack("!H", len(ext))
+        + ext
+    )
+    ch_len = len(ch_body)
+    handshake = bytes([0x01, (ch_len >> 16) & 0xFF, (ch_len >> 8) & 0xFF, ch_len & 0xFF]) + ch_body
+    return b"\x16\x03\x01" + struct.pack("!H", len(handshake)) + handshake
+
+
+def perform_tls_sni_probe_cli(target_ip: str, sni: str) -> int:
+    hello = build_tls_client_hello(sni)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(4.0)
+    sock.connect((target_ip, HTTPS_PORT))
+    sock.sendall(hello)
+    resp = sock.recv(1024)
+    sock.close()
+    print(resp.decode("utf-8", errors="replace"))
+    return 0
+
+
 def pipe_sockets(a: socket.socket, b: socket.socket) -> None:
     try:
         while True:
@@ -308,9 +364,14 @@ if __name__ == "__main__":
         qtype_arg = int(sys.argv[4]) if len(sys.argv) >= 5 else 1
         sys.exit(perform_dns_query_cli(srv_ip, qname_arg, qtype_arg))
 
+    if len(sys.argv) >= 4 and sys.argv[1] == "--tls-sni-probe":
+        sys.exit(perform_tls_sni_probe_cli(sys.argv[2], sys.argv[3]))
+
     http_only = "--http-only" in sys.argv
     t_http = threading.Thread(target=run_http_server, daemon=True)
     t_http.start()
+    t_https = threading.Thread(target=run_https_443_server, daemon=True)
+    t_https.start()
     t_dns_udp = threading.Thread(target=run_dns_udp_server, daemon=True)
     t_dns_udp.start()
     t_dns_tcp = threading.Thread(target=run_dns_tcp_server, daemon=True)

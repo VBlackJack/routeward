@@ -90,6 +90,22 @@ fn default_daemon_connected() -> bool {
     true
 }
 
+/// Policy controlling which DNS resolvers `candidate_dns_resolvers` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsResolverMode {
+    /// Bypassed domain (`bypassDomains`, AD suffixes, single-label, `.local`, private reverse zones):
+    /// ONLY `orig_resolver`, active system resolvers, and `last_seen_orig_resolver`.
+    /// NEVER `upstreamDns`, `default_upstream`, or `fallback_dns_server`.
+    BypassOnlySystem,
+    /// Direct flow resolution (non-bypassed domain):
+    /// `orig_resolver`, active system resolvers, and `last_seen_orig_resolver` first;
+    /// `upstreamDns` (and `default_upstream`/`fallback_dns_server`) ONLY if nothing else exists.
+    DirectPreferSystem,
+    /// Remote DNS-over-TCP via Proxy or Chain:
+    /// configured `upstreamDns`, `orig_resolver`, `default_upstream`, `fallback_dns_server`.
+    RemoteViaProxy,
+}
+
 #[derive(Clone)]
 pub struct RouteWardController {
     pub constants: Arc<SystemConstants>,
@@ -99,6 +115,8 @@ pub struct RouteWardController {
     pub process_resolver: ProcessResolver,
     pub telemetry: TelemetryHub,
     pub nat_table: TransparentNatTable,
+    last_seen_orig_resolver: Arc<RwLock<Option<SocketAddr>>>,
+    system_resolvers_override: Arc<RwLock<Option<Vec<SocketAddr>>>>,
     interceptor_backend: Arc<dyn Interceptor>,
     running: Arc<AtomicBool>,
 }
@@ -152,6 +170,8 @@ impl RouteWardController {
             process_resolver,
             telemetry,
             nat_table,
+            last_seen_orig_resolver: Arc::new(RwLock::new(None)),
+            system_resolvers_override: Arc::new(RwLock::new(None)),
             interceptor_backend,
             running: Arc::new(AtomicBool::new(false)),
         };
@@ -183,6 +203,7 @@ impl RouteWardController {
             COMPONENT_ENGINE,
             self.i18n.t("cli.engine.startup.banner"),
         );
+        self.flush_os_dns_cache("startup");
 
         let ticker_ctrl = self.clone();
         tokio::spawn(async move {
@@ -355,14 +376,62 @@ impl RouteWardController {
     }
 
     pub fn stop_engine(&self) {
+        let was_active = self.interceptor_backend.is_active();
         self.interceptor_backend.stop();
-        self.running.store(false, Ordering::SeqCst);
+        let was_running = self.running.swap(false, Ordering::SeqCst);
+        if was_running || was_active {
+            self.flush_os_dns_cache("shutdown");
+        }
         self.telemetry.push_log(
             LogLevel::Info,
             COMPONENT_ENGINE,
             self.i18n.t("app.header.engine.stopped"),
         );
         self.telemetry.flush_file_logger();
+    }
+
+    /// Flushes the OS client DNS resolver cache (`dnsapi.dll!DnsFlushResolverCache` / `ipconfig /flushdns`
+    /// on Windows; `resolvectl flush-caches` on Linux if `systemd-resolved` is active).
+    pub fn flush_os_dns_cache(&self, stage: &str) {
+        match crate::dns::flush_os_dns_cache() {
+            Ok(method) => {
+                self.telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_DNS,
+                    format!(
+                        "{} ({stage} via {method})",
+                        self.i18n.t("cli.engine.startup.dns_cache_flushed")
+                    ),
+                );
+            }
+            Err(detail) => {
+                self.telemetry.push_log(
+                    LogLevel::Debug,
+                    COMPONENT_DNS,
+                    format!("Skipped OS DNS cache flush on {stage}: {detail}"),
+                );
+            }
+        }
+    }
+
+    /// Records the most recently observed non-loopback (or non-53/10853 safe loopback) original DNS resolver targeted by the OS.
+    pub fn record_orig_dns_resolver(&self, addr: SocketAddr) {
+        let dns_port = self.constants.dns.dns_standard_port;
+        let local_dns_listen_port = self.constants.network.default_dns_listen_port;
+        let is_safe_loopback = addr.ip().is_loopback()
+            && addr.port() != dns_port
+            && addr.port() != local_dns_listen_port;
+        if (!addr.ip().is_loopback() || is_safe_loopback) && !addr.ip().is_unspecified() {
+            *self.last_seen_orig_resolver.write() = Some(addr);
+        }
+    }
+
+    /// Returns `true` if the active profile has at least one enabled rule with non-empty `domainPatterns`.
+    pub fn has_enabled_domain_rules(&self) -> bool {
+        let prof = self.profile.read();
+        prof.rules
+            .iter()
+            .any(|r| r.enabled && !r.domain_patterns.is_empty())
     }
 
     /// Checks whether `cleanup` is allowed to run (refusing if a daemon is active unless `force` is true).
@@ -947,13 +1016,16 @@ impl RouteWardController {
         self.nat_table.set_upstream_endpoints(upstream_endpoints);
     }
 
-    /// Replaces the active in-memory profile and synchronizes logging and upstream loop exclusions.
+    /// Replaces the active in-memory profile, synchronizes logging and upstream loop exclusions,
+    /// and if the engine is running when `securityPolicy`, `dnsConfig`, or `proxies` changed,
+    /// atomically reapplies active interception rules and re-runs proxy bootstrap.
     pub fn replace_profile(&self, mut new_profile: ProfileConfig) {
         self.telemetry
             .set_file_logging_enabled(new_profile.enable_logging);
         self.dns
             .update_bypass_domains(new_profile.dns_config.bypass_domains.clone());
-        {
+
+        let (security_changed, dns_changed, proxies_changed) = {
             let mut prof = self.profile.write();
             for incoming_node in &mut new_profile.proxies {
                 if let Some(ref mut incoming_creds) = incoming_node.auth {
@@ -969,9 +1041,60 @@ impl RouteWardController {
                     incoming_creds.has_password = incoming_creds.has_password();
                 }
             }
+            let sec_diff = prof.security_policy != new_profile.security_policy;
+            let dns_diff = prof.dns_config != new_profile.dns_config;
+            let prx_diff = prof.proxies != new_profile.proxies;
             *prof = new_profile;
+            (sec_diff, dns_diff, prx_diff)
+        };
+
+        if proxies_changed {
+            let literal_endpoints: Vec<(Ipv4Addr, u16)> = {
+                let prof = self.profile.read();
+                prof.proxies
+                    .iter()
+                    .filter_map(|p| p.host.parse::<Ipv4Addr>().ok().map(|ip| (ip, p.port)))
+                    .collect()
+            };
+            self.nat_table.set_upstream_endpoints(literal_endpoints);
+        } else {
+            self.sync_upstream_proxy_exclusions();
         }
-        self.sync_upstream_proxy_exclusions();
+
+        if self.is_running() && (security_changed || dns_changed || proxies_changed) {
+            self.reapply_active_interception_rules(security_changed, dns_changed);
+            if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+                let ctrl_boot = self.clone();
+                rt_handle.spawn(async move {
+                    let before = ctrl_boot.nat_table.upstream_endpoints();
+                    ctrl_boot.bootstrap_resolve_proxy_hosts().await;
+                    let after = ctrl_boot.nat_table.upstream_endpoints();
+                    if before != after && ctrl_boot.interceptor_backend.is_active() {
+                        let _ = ctrl_boot.interceptor_backend.reload(ctrl_boot.clone());
+                    }
+                });
+            }
+        }
+    }
+
+    fn reapply_active_interception_rules(&self, security_changed: bool, dns_changed: bool) {
+        if self.interceptor_backend.is_active() {
+            if let Err(err) = self.interceptor_backend.reload(self.clone()) {
+                self.telemetry.push_log(
+                    LogLevel::Warn,
+                    COMPONENT_ENGINE,
+                    format!("Failed to reload active interception backend rules: {err}"),
+                );
+            }
+        }
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_ENGINE,
+            format!(
+                "{} (securityPolicyChanged={security_changed}, dnsConfigChanged={dns_changed})",
+                self.i18n.t("cli.engine.startup.reloaded_live")
+            ),
+        );
     }
 
     /// Atomically saves the active profile to `path`.
@@ -1317,12 +1440,54 @@ impl RouteWardController {
         let _ = client.shutdown().await;
     }
 
+    /// Peeks at the initial bytes of an accepted TCP stream on port 443 (with a bounded timeout
+    /// and maximum buffer size) to extract the TLS `ClientHello` SNI hostname without consuming
+    /// bytes from the socket receive buffer.
+    async fn peek_tls_client_hello_sni(&self, client: &TcpStream) -> Option<String> {
+        let max_bytes = self.constants.network.tls_sni_max_bytes.clamp(64, 16384);
+        let timeout_dur =
+            Duration::from_millis(self.constants.network.tls_sni_peek_timeout_ms.max(10));
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        let mut buf = vec![0u8; max_bytes];
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            let peeked = match tokio::time::timeout(remaining, client.peek(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return None,
+                Ok(Ok(n)) => n,
+            };
+
+            // A TLS Handshake record always starts with 0x16. Abort immediately on any non-TLS byte.
+            if buf[0] != 0x16 {
+                return None;
+            }
+
+            if let Some(sni) = TlsSniExtractor::extract_sni(&buf[..peeked]) {
+                return Some(sni);
+            }
+
+            if peeked >= 5 {
+                let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+                let total_needed = (5 + record_len).min(max_bytes);
+                if peeked >= total_needed {
+                    return None;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     pub async fn handle_transparent_tcp_client(
         &self,
         mut client: TcpStream,
         peer_addr: SocketAddr,
     ) -> RouteWardResult<()> {
-        if let Some(session) = self.nat_table.validate_relay_peer_addr(peer_addr) {
+        if let Some(mut session) = self.nat_table.validate_relay_peer_addr(peer_addr) {
             let target_host = session.orig_dst_ip.to_string();
             let target_port = session.orig_dst_port;
             if target_port == self.constants.dns.dns_standard_port {
@@ -1339,14 +1504,88 @@ impl RouteWardController {
                     .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
                 return res;
             }
-            let resolved_domain = self.dns.resolve_fake_ip(&session.orig_dst_ip);
-            let effective_host = resolved_domain
-                .clone()
-                .unwrap_or_else(|| target_host.clone());
+            let is_fake_ip = self.dns.is_in_fake_subnet(&session.orig_dst_ip);
+            let mut resolved_domain = self.dns.resolve_fake_ip(&session.orig_dst_ip);
+
+            // Point 5: When destination is not a Fake-IP and port is 443, extract TLS ClientHello SNI
+            // and re-evaluate domain routing rules.
+            if !is_fake_ip
+                && resolved_domain.is_none()
+                && target_port == self.constants.network.tls_sni_default_port
+            {
+                if let Some(sni_domain) = self.peek_tls_client_hello_sni(&client).await {
+                    let eval = self.evaluate_rule(&ConnectionRequest {
+                        process_name: session.process_name.clone(),
+                        process_path: Some(session.process_path.clone()),
+                        target_host: sni_domain.clone(),
+                        target_ip: Some(target_host.clone()),
+                        target_port,
+                        protocol: TransportProtocol::Tcp,
+                    });
+                    session.action = eval.action;
+                    session.matched_rule_name = eval.matched_rule_name;
+                    resolved_domain = Some(sni_domain);
+                }
+            }
+
+            if session.action == RuleAction::Block {
+                self.telemetry.push_log(
+                    LogLevel::Warn,
+                    COMPONENT_TRANSPARENT,
+                    format!(
+                        "Blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} (domain={:?}) [rule=\"{}\"]",
+                        session.pid,
+                        session.process_name,
+                        session.process_path,
+                        session.resolution_source.as_str(),
+                        target_host,
+                        target_port,
+                        resolved_domain,
+                        session.matched_rule_name
+                    ),
+                );
+                self.telemetry.record_connection(
+                    TrackedConnection {
+                        id: Uuid::new_v4().to_string(),
+                        pid: session.pid,
+                        process_name: session.process_name.clone(),
+                        process_path: session.process_path.clone(),
+                        target_host,
+                        resolved_domain,
+                        target_port,
+                        protocol: TransportProtocol::Tcp,
+                        matched_rule: session.matched_rule_name.clone(),
+                        route_label: ROUTE_BLOCK_LABEL.to_string(),
+                        latency_ms: 0,
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        status: ConnectionStatus::Blocked,
+                        started_at: Utc::now(),
+                    },
+                    false,
+                );
+                let _ = client.shutdown().await;
+                self.nat_table
+                    .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
+                return Ok(());
+            }
+
             let is_proxied_rule = matches!(
                 session.action,
                 RuleAction::Proxy { .. } | RuleAction::Chain { .. }
             );
+            let effective_host = if is_proxied_rule || is_fake_ip {
+                resolved_domain
+                    .clone()
+                    .unwrap_or_else(|| target_host.clone())
+            } else {
+                target_host.clone()
+            };
+            let direct_fallback_host = if is_fake_ip {
+                effective_host.clone()
+            } else {
+                target_host.clone()
+            };
             let kill_switch_enabled = self.profile.read().security_policy.kill_switch_enabled;
 
             let (mut outbound, effective_action) = match self
@@ -1410,7 +1649,11 @@ impl RouteWardController {
                             ),
                         );
                         match self
-                            .open_outbound_stream(&RuleAction::Direct, &effective_host, target_port)
+                            .open_outbound_stream(
+                                &RuleAction::Direct,
+                                &direct_fallback_host,
+                                target_port,
+                            )
                             .await
                         {
                             Ok(direct_stream) => (direct_stream, RuleAction::Direct),
@@ -1507,6 +1750,14 @@ impl RouteWardController {
                         .await;
                 }
 
+                let is_fake_ip = self.dns.is_in_fake_subnet(orig_dst.ip());
+                let sni_domain =
+                    if !is_fake_ip && target_port == self.constants.network.tls_sni_default_port {
+                        self.peek_tls_client_hello_sni(&client).await
+                    } else {
+                        None
+                    };
+
                 let attribution = self
                     .process_resolver
                     .resolve_tcp_port_attribution(client_port);
@@ -1517,7 +1768,7 @@ impl RouteWardController {
                     proc_path,
                     mut eval_action,
                     mut matched_rule_name,
-                    effective_domain,
+                    mut effective_domain,
                     res_source,
                 ) = self.attribute_or_apply_unknown_policy(
                     attribution,
@@ -1526,6 +1777,22 @@ impl RouteWardController {
                     target_port,
                     Some(orig_dst.ip()),
                 );
+
+                if let Some(ref sni) = sni_domain {
+                    if proc_name != "unknown" {
+                        let sni_eval = self.evaluate_rule(&ConnectionRequest {
+                            process_name: proc_name.clone(),
+                            process_path: Some(proc_path.clone()),
+                            target_host: sni.clone(),
+                            target_ip: Some(target_host.clone()),
+                            target_port,
+                            protocol: TransportProtocol::Tcp,
+                        });
+                        eval_action = sni_eval.action;
+                        matched_rule_name = sni_eval.matched_rule_name;
+                    }
+                    effective_domain = Some(sni.clone());
+                }
 
                 if target_port == self.constants.dns.dns_over_tls_port
                     && self
@@ -1546,9 +1813,22 @@ impl RouteWardController {
                     matched_rule_name = "SecurityPolicy:blockEncryptedDnsBypass".to_string();
                 }
 
-                let effective_host = effective_domain
-                    .clone()
-                    .unwrap_or_else(|| target_host.clone());
+                let is_proxied_rule = matches!(
+                    eval_action,
+                    RuleAction::Proxy { .. } | RuleAction::Chain { .. }
+                );
+                let effective_host = if is_proxied_rule || is_fake_ip {
+                    effective_domain
+                        .clone()
+                        .unwrap_or_else(|| target_host.clone())
+                } else {
+                    target_host.clone()
+                };
+                let direct_fallback_host = if is_fake_ip {
+                    effective_host.clone()
+                } else {
+                    target_host.clone()
+                };
 
                 if eval_action == RuleAction::Block {
                     self.telemetry.push_log(
@@ -1589,10 +1869,6 @@ impl RouteWardController {
                     return Ok(());
                 }
 
-                let is_proxied_rule = matches!(
-                    eval_action,
-                    RuleAction::Proxy { .. } | RuleAction::Chain { .. }
-                );
                 let kill_switch_enabled = self.profile.read().security_policy.kill_switch_enabled;
 
                 let (mut outbound, effective_action) = match self
@@ -1651,7 +1927,7 @@ impl RouteWardController {
                             match self
                                 .open_outbound_stream(
                                     &RuleAction::Direct,
-                                    &effective_host,
+                                    &direct_fallback_host,
                                     target_port,
                                 )
                                 .await
@@ -1971,6 +2247,15 @@ impl RouteWardController {
                         self.dns.os_response_ttl_seconds(),
                     ));
                 }
+                self.telemetry.push_log(
+                    LogLevel::Warn,
+                    COMPONENT_DNS,
+                    format!(
+                        "Fake-IP pool exhausted for \"{}\"; returning SERVFAIL without cleartext DNS fallback",
+                        qname
+                    ),
+                );
+                return Some(build_rcode_response(&query, RCODE_SERVFAIL));
             } else if qtype == QTYPE_AAAA {
                 self.telemetry.push_log(
                     LogLevel::Debug,
@@ -1993,6 +2278,10 @@ impl RouteWardController {
         orig_resolver: Option<SocketAddr>,
         is_udp: bool,
     ) -> Vec<u8> {
+        if let Some(orig) = orig_resolver {
+            self.record_orig_dns_resolver(orig);
+        }
+
         if let Some(fast_resp) = self.resolve_dns_query_fast(raw_query) {
             if is_udp {
                 if let Ok(parsed_q) = parse_dns_query(raw_query) {
@@ -2016,8 +2305,10 @@ impl RouteWardController {
         let qname = &query.question.qname;
 
         // 1. Bypassed domain: resolve directly toward the DNS server that the OS originally targeted
+        // or active system resolvers; never query upstreamDns, default_upstream, or fallback_dns_server.
         if self.dns.is_bypassed(qname) {
-            let resolvers = self.candidate_dns_resolvers(orig_resolver, true);
+            let resolvers =
+                self.candidate_dns_resolvers(orig_resolver, DnsResolverMode::BypassOnlySystem);
             for resolver_addr in &resolvers {
                 match self
                     .forward_dns_query_direct(raw_query, &query, *resolver_addr, is_udp)
@@ -2051,7 +2342,7 @@ impl RouteWardController {
                 LogLevel::Warn,
                 COMPONENT_DNS,
                 format!(
-                    "Direct DNS resolution failed for bypassed domain \"{}\" across {:?}; returning SERVFAIL",
+                    "Direct DNS resolution failed for bypassed domain \"{}\" across {:?}; returning SERVFAIL without querying public upstream resolvers",
                     qname, resolvers
                 ),
             );
@@ -2070,7 +2361,8 @@ impl RouteWardController {
                 build_rcode_response(&query, RCODE_REFUSED)
             }
             RuleAction::Direct => {
-                let resolvers = self.candidate_dns_resolvers(orig_resolver, true);
+                let resolvers = self
+                    .candidate_dns_resolvers(orig_resolver, DnsResolverMode::DirectPreferSystem);
                 for resolver_addr in &resolvers {
                     if let Ok(resp) = self
                         .forward_dns_query_direct(raw_query, &query, *resolver_addr, is_udp)
@@ -2090,7 +2382,8 @@ impl RouteWardController {
                 build_rcode_response(&query, RCODE_SERVFAIL)
             }
             RuleAction::Proxy { .. } | RuleAction::Chain { .. } => {
-                let resolvers = self.candidate_dns_resolvers(orig_resolver, false);
+                let resolvers =
+                    self.candidate_dns_resolvers(orig_resolver, DnsResolverMode::RemoteViaProxy);
                 let mut last_err = String::from("no upstream DNS server configured");
                 for resolver_addr in &resolvers {
                     match self
@@ -2148,7 +2441,9 @@ impl RouteWardController {
                         qname, last_err
                     ),
                 );
-                for resolver_addr in self.candidate_dns_resolvers(orig_resolver, true) {
+                for resolver_addr in
+                    self.candidate_dns_resolvers(orig_resolver, DnsResolverMode::DirectPreferSystem)
+                {
                     if let Ok(resp) = self
                         .forward_dns_query_direct(raw_query, &query, resolver_addr, is_udp)
                         .await
@@ -2290,7 +2585,12 @@ impl RouteWardController {
                 detail: e.to_string(),
             })?;
 
-        let resolvers = self.candidate_dns_resolvers(None, true);
+        let resolver_mode = if self.dns.is_bypassed(trimmed) {
+            DnsResolverMode::BypassOnlySystem
+        } else {
+            DnsResolverMode::DirectPreferSystem
+        };
+        let resolvers = self.candidate_dns_resolvers(None, resolver_mode);
         let mut last_err = String::from("no direct DNS resolver reachable");
         for resolver_addr in resolvers {
             match self
@@ -2594,7 +2894,21 @@ impl RouteWardController {
     fn candidate_dns_resolvers(
         &self,
         orig_resolver: Option<SocketAddr>,
-        for_bypass: bool,
+        mode: DnsResolverMode,
+    ) -> Vec<SocketAddr> {
+        let sys_resolvers = if let Some(ref ov) = *self.system_resolvers_override.read() {
+            ov.clone()
+        } else {
+            crate::dns::detect_system_dns_resolvers(&self.constants.dns)
+        };
+        self.candidate_dns_resolvers_with_system(orig_resolver, mode, &sys_resolvers)
+    }
+
+    fn candidate_dns_resolvers_with_system(
+        &self,
+        orig_resolver: Option<SocketAddr>,
+        mode: DnsResolverMode,
+        system_resolvers: &[SocketAddr],
     ) -> Vec<SocketAddr> {
         let mut list = Vec::new();
         let dns_port = self.constants.dns.dns_standard_port;
@@ -2624,33 +2938,59 @@ impl RouteWardController {
             None
         };
 
-        if (!for_bypass || orig_resolver.is_none()) && configured_upstream != *default_upstream {
-            if let Some(sa) = parse_host_port(&configured_upstream) {
-                push_unique(&mut list, sa);
-            }
-        }
-
-        if let Some(orig) = orig_resolver {
-            push_unique(&mut list, orig);
-        }
-
-        #[cfg(not(windows))]
-        {
-            if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
-                for ip in crate::dns::parse_resolv_conf_nameservers(&content) {
-                    push_unique(&mut list, SocketAddr::new(IpAddr::V4(ip), dns_port));
+        match mode {
+            DnsResolverMode::BypassOnlySystem => {
+                if let Some(orig) = orig_resolver {
+                    push_unique(&mut list, orig);
+                }
+                if let Some(last_orig) = *self.last_seen_orig_resolver.read() {
+                    push_unique(&mut list, last_orig);
+                }
+                for sa in system_resolvers {
+                    push_unique(&mut list, *sa);
                 }
             }
-        }
-
-        if let Some(sa) = parse_host_port(&configured_upstream) {
-            push_unique(&mut list, sa);
-        }
-        if let Some(sa) = parse_host_port(default_upstream) {
-            push_unique(&mut list, sa);
-        }
-        if let Some(sa) = parse_host_port(&self.constants.dns.fallback_dns_server) {
-            push_unique(&mut list, sa);
+            DnsResolverMode::DirectPreferSystem => {
+                if let Some(orig) = orig_resolver {
+                    push_unique(&mut list, orig);
+                }
+                if let Some(last_orig) = *self.last_seen_orig_resolver.read() {
+                    push_unique(&mut list, last_orig);
+                }
+                for sa in system_resolvers {
+                    push_unique(&mut list, *sa);
+                }
+                if list.is_empty() {
+                    if let Some(sa) = parse_host_port(&configured_upstream) {
+                        push_unique(&mut list, sa);
+                    }
+                    if let Some(sa) = parse_host_port(default_upstream) {
+                        push_unique(&mut list, sa);
+                    }
+                    if let Some(sa) = parse_host_port(&self.constants.dns.fallback_dns_server) {
+                        push_unique(&mut list, sa);
+                    }
+                }
+            }
+            DnsResolverMode::RemoteViaProxy => {
+                if configured_upstream != *default_upstream {
+                    if let Some(sa) = parse_host_port(&configured_upstream) {
+                        push_unique(&mut list, sa);
+                    }
+                }
+                if let Some(orig) = orig_resolver {
+                    push_unique(&mut list, orig);
+                }
+                if let Some(sa) = parse_host_port(&configured_upstream) {
+                    push_unique(&mut list, sa);
+                }
+                if let Some(sa) = parse_host_port(default_upstream) {
+                    push_unique(&mut list, sa);
+                }
+                if let Some(sa) = parse_host_port(&self.constants.dns.fallback_dns_server) {
+                    push_unique(&mut list, sa);
+                }
+            }
         }
 
         list
@@ -3717,5 +4057,351 @@ mod tests {
             "Bootstrap proxy resolution must register (10.10.99.88, 1080) in nat_table.upstream_endpoints, got {:?}",
             endpoints
         );
+    }
+
+    #[tokio::test]
+    async fn bypassed_domains_never_query_public_upstream_and_return_servfail_when_internal_dns_silent(
+    ) {
+        use crate::dns::codec::{build_a_query, parse_dns_message, RCODE_SERVFAIL};
+
+        // Simulated public upstream DNS trap server — must receive 0 queries for bypassed domains
+        let public_trap_udp = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind public trap udp");
+        let public_trap_addr = public_trap_udp.local_addr().expect("public trap addr");
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let public_hits_bg = public_hits.clone();
+        let _trap_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((_, _)) = public_trap_udp.recv_from(&mut buf).await {
+                public_hits_bg.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        // Silent / unreachable internal resolver
+        let silent_internal_port = allocate_closed_port();
+        let silent_internal_addr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), silent_internal_port);
+
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        constants.network.tcp_connect_timeout_ms = 500;
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.dns_config.enable_fake_ip = true;
+        profile.dns_config.upstream_dns = public_trap_addr.to_string();
+        profile.dns_config.bypass_domains = vec!["corp.contoso.com".to_string()];
+
+        let controller = RouteWardController::new(constants, profile, "en");
+        *controller.system_resolvers_override.write() = Some(vec![silent_internal_addr]);
+
+        // Verify candidate_dns_resolvers_with_system for BypassOnlySystem never includes public upstreams
+        let candidates = controller.candidate_dns_resolvers_with_system(
+            Some(silent_internal_addr),
+            DnsResolverMode::BypassOnlySystem,
+            &[],
+        );
+        assert_eq!(candidates, vec![silent_internal_addr]);
+        assert!(!candidates.contains(&public_trap_addr));
+
+        for bypassed_name in [
+            "dc01.corp.contoso.com",
+            "printer.local",
+            "dc01",
+            "1.0.0.10.in-addr.arpa",
+        ] {
+            let raw_q = build_a_query(0x9001, bypassed_name).expect("build query");
+            let resp = controller
+                .resolve_dns_query_async(&raw_q, Some(silent_internal_addr), true)
+                .await;
+            let msg = parse_dns_message(&resp).expect("parse SERVFAIL response");
+            assert_eq!(
+                msg.rcode(),
+                RCODE_SERVFAIL,
+                "Bypassed domain {bypassed_name} must return SERVFAIL when internal DNS is silent"
+            );
+        }
+
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            0,
+            "Bypassed domains must NEVER query public upstreamDns"
+        );
+    }
+
+    #[test]
+    fn direct_flow_resolution_prefers_system_and_last_orig_resolver_before_upstream_dns() {
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        let upstream_addr: SocketAddr = "198.51.100.53:53".parse().unwrap();
+        profile.dns_config.upstream_dns = upstream_addr.to_string();
+
+        let controller = RouteWardController::new(constants, profile, "en");
+        let sys_ip = Ipv4Addr::new(10, 20, 30, 40);
+        let sys_sock = SocketAddr::new(IpAddr::V4(sys_ip), 53);
+        let orig_sock: SocketAddr = "10.20.30.1:53".parse().unwrap();
+
+        controller.record_orig_dns_resolver(orig_sock);
+
+        // When system resolvers or last_seen_orig_resolver exist, DirectPreferSystem uses them and NOT upstreamDns
+        let direct_list = controller.candidate_dns_resolvers_with_system(
+            None,
+            DnsResolverMode::DirectPreferSystem,
+            &[sys_sock],
+        );
+        assert_eq!(direct_list, vec![orig_sock, sys_sock]);
+        assert!(!direct_list.contains(&upstream_addr));
+
+        // When no orig_resolver, no last_seen_orig_resolver, and no system resolvers exist:
+        // DirectPreferSystem falls back to upstreamDns, whereas BypassOnlySystem stays empty.
+        *controller.last_seen_orig_resolver.write() = None;
+        let direct_fallback = controller.candidate_dns_resolvers_with_system(
+            None,
+            DnsResolverMode::DirectPreferSystem,
+            &[],
+        );
+        assert!(direct_fallback.contains(&upstream_addr));
+
+        let bypass_empty = controller.candidate_dns_resolvers_with_system(
+            None,
+            DnsResolverMode::BypassOnlySystem,
+            &[],
+        );
+        assert!(bypass_empty.is_empty());
+    }
+
+    fn build_sample_tls_client_hello(sni: &str) -> Vec<u8> {
+        let sni_bytes = sni.as_bytes();
+        // server_name extension payload: list_len(2) + name_type(1=0) + host_len(2) + host
+        let mut sni_ext_data = Vec::new();
+        let list_len = (1 + 2 + sni_bytes.len()) as u16;
+        sni_ext_data.extend_from_slice(&list_len.to_be_bytes());
+        sni_ext_data.push(0x00); // host_name type
+        sni_ext_data.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+        sni_ext_data.extend_from_slice(sni_bytes);
+
+        // Extension header: type(2=0x0000) + len(2) + data
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&0x0000u16.to_be_bytes());
+        extensions.extend_from_slice(&(sni_ext_data.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&sni_ext_data);
+
+        // ClientHello body: client_version(2) + random(32) + session_id_len(1=0)
+        // + cipher_suites_len(2=2) + cipher_suite(2) + comp_methods_len(1=1) + comp_method(1=0)
+        // + extensions_len(2) + extensions
+        let mut ch_body = Vec::new();
+        ch_body.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+        ch_body.extend_from_slice(&[0x11; 32]); // Random
+        ch_body.push(0x00); // Session ID len = 0
+        ch_body.extend_from_slice(&2u16.to_be_bytes()); // Cipher suites len = 2
+        ch_body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        ch_body.push(0x01); // Compression methods len = 1
+        ch_body.push(0x00); // null compression
+        ch_body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        ch_body.extend_from_slice(&extensions);
+
+        // Handshake message: msg_type(1=1 ClientHello) + len(3) + ch_body
+        let ch_len = ch_body.len();
+        let mut handshake = vec![
+            0x01,
+            ((ch_len >> 16) & 0xFF) as u8,
+            ((ch_len >> 8) & 0xFF) as u8,
+            (ch_len & 0xFF) as u8,
+        ];
+        handshake.extend_from_slice(&ch_body);
+
+        // TLS record: content_type(1=22 Handshake) + version(2=0x0301) + len(2) + handshake
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[tokio::test]
+    async fn transparent_relay_extracts_tls_sni_on_port_443_and_routes_literal_ip_via_socks5() {
+        use crate::config::RoutingRule;
+
+        let client_hello = build_sample_tls_client_hello("sni.routeward.test");
+        let expected_hello_len = client_hello.len();
+
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind socks5");
+        let socks_port = socks_listener.local_addr().expect("socks addr").port();
+        let observed_domain = Arc::new(RwLock::new(String::new()));
+        let observed_domain_bg = observed_domain.clone();
+        let observed_hello_len = Arc::new(AtomicUsize::new(0));
+        let observed_hello_len_bg = observed_hello_len.clone();
+
+        let _socks_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = socks_listener.accept().await {
+                let mut greet = [0u8; 3];
+                if stream.read_exact(&mut greet).await.is_err() {
+                    return;
+                }
+                let _ = stream.write_all(&[0x05, 0x00]).await;
+
+                let mut hdr = [0u8; 4];
+                if stream.read_exact(&mut hdr).await.is_err() {
+                    return;
+                }
+                if hdr[3] == 0x03 {
+                    let mut len = [0u8; 1];
+                    let _ = stream.read_exact(&mut len).await;
+                    let mut dom_port = vec![0u8; (len[0] as usize) + 2];
+                    let _ = stream.read_exact(&mut dom_port).await;
+                    let dom = String::from_utf8_lossy(&dom_port[..len[0] as usize]).to_string();
+                    *observed_domain_bg.write() = dom;
+                }
+                let _ = stream
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x01, 0xBB])
+                    .await;
+
+                let mut hello_buf = vec![0u8; expected_hello_len];
+                if stream.read_exact(&mut hello_buf).await.is_ok() {
+                    observed_hello_len_bg.store(hello_buf.len(), Ordering::SeqCst);
+                    let _ = stream.write_all(b"SNI_PROXIED_OK").await;
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.proxies = vec![make_proxy_node("proxy-sni", socks_port, None, None)];
+        profile.default_action = RuleAction::Direct;
+        profile.rules = vec![RoutingRule {
+            id: "rule-sni-domain".to_string(),
+            name: "Route SNI Domain Via Proxy".to_string(),
+            enabled: true,
+            priority: 1,
+            process_patterns: Vec::new(),
+            domain_patterns: vec!["*.routeward.test".to_string()],
+            ip_cidrs: Vec::new(),
+            port_ranges: Vec::new(),
+            protocol: TransportProtocol::Tcp,
+            action: RuleAction::Proxy {
+                target_id: "proxy-sni".to_string(),
+            },
+        }];
+
+        let controller = Arc::new(RouteWardController::new(constants, profile, "en"));
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+        let relay_addr = relay_listener.local_addr().expect("relay_addr");
+        let mut client_stream = TcpStream::connect(relay_addr)
+            .await
+            .expect("client connect");
+        let peer_addr = client_stream.local_addr().expect("client local_addr");
+        let (server_stream, accepted_peer) = relay_listener.accept().await.expect("accept");
+
+        // Insert a NAT session targeting a non-Fake-IP literal IPv4 address on port 443 initially marked Direct
+        controller.nat_table.insert_session(NatSessionEntry {
+            client_ip: Ipv4Addr::LOCALHOST,
+            client_port: peer_addr.port(),
+            orig_dst_ip: Ipv4Addr::LOCALHOST,
+            orig_dst_port: 443,
+            pid: 4242,
+            process_name: "curl.exe".to_string(),
+            process_path: "C:\\Windows\\System32\\curl.exe".to_string(),
+            resolution_source: PidResolutionSource::SocketLayer,
+            action: RuleAction::Direct,
+            matched_rule_name: "Default".to_string(),
+            created_at: Instant::now(),
+        });
+
+        let client_task = tokio::spawn(async move {
+            client_stream
+                .write_all(&client_hello)
+                .await
+                .expect("write ClientHello");
+            let mut resp = Vec::new();
+            let _ = client_stream.read_to_end(&mut resp).await;
+            resp
+        });
+
+        let res = controller
+            .handle_transparent_tcp_client(server_stream, accepted_peer)
+            .await;
+        assert!(res.is_ok());
+
+        let reply = client_task.await.expect("client_task join");
+        assert_eq!(reply, b"SNI_PROXIED_OK");
+        assert_eq!(*observed_domain.read(), "sni.routeward.test");
+        assert_eq!(
+            observed_hello_len.load(Ordering::SeqCst),
+            expected_hello_len,
+            "Peeked TLS ClientHello bytes must be forwarded intact to upstream proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_fake_ip_pool_returns_servfail_without_real_dns_fallback() {
+        use crate::dns::codec::{build_a_query, parse_dns_message, RCODE_SERVFAIL};
+
+        let trap_udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind trap udp");
+        let trap_addr = trap_udp.local_addr().expect("trap addr");
+        let trap_hits = Arc::new(AtomicUsize::new(0));
+        let trap_hits_bg = trap_hits.clone();
+        let _trap_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((_, _)) = trap_udp.recv_from(&mut buf).await {
+                trap_hits_bg.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        constants.dns.max_cache_entries = 0; // Simulate an unallocatable full Fake-IP pool
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.dns_config.enable_fake_ip = true;
+        profile.dns_config.upstream_dns = trap_addr.to_string();
+
+        let controller = RouteWardController::new(constants, profile, "en");
+        let raw_query = build_a_query(0x6161, "overflow.routeward.test").expect("build query");
+
+        let resp = controller
+            .resolve_dns_query_async(&raw_query, Some(trap_addr), true)
+            .await;
+        let msg = parse_dns_message(&resp).expect("parse SERVFAIL");
+        assert_eq!(msg.rcode(), RCODE_SERVFAIL);
+        assert_eq!(
+            trap_hits.load(Ordering::SeqCst),
+            0,
+            "Full Fake-IP pool must return SERVFAIL and never fall back to real DNS"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_profile_replacement_reapplies_interception_and_flushes_dns_cache_on_start_and_stop(
+    ) {
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        constants.network.default_relay_tcp_port = 0;
+        constants.network.default_transparent_tcp_port = 0;
+        constants.network.default_dns_listen_port = 0;
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.security_policy.kill_switch_enabled = false;
+
+        let controller = RouteWardController::new(constants, profile.clone(), "en");
+        controller.start_engine();
+        assert!(controller.is_running());
+
+        let mut updated_profile = profile;
+        updated_profile.security_policy.kill_switch_enabled = true;
+        updated_profile.security_policy.block_encrypted_dns_bypass = false;
+        controller.replace_profile(updated_profile);
+
+        let logs = controller.telemetry.list_logs();
+        assert!(
+            logs.iter().any(|l| l.level == LogLevel::Info
+                && l.component == COMPONENT_ENGINE
+                && l.message
+                    .contains("Reapplied active interception rules and proxy bootstrap")),
+            "Expected live interception reload INFO log, got: {:?}",
+            logs
+        );
+
+        controller.stop_engine();
+        assert!(!controller.is_running());
     }
 }

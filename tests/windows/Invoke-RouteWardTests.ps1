@@ -808,7 +808,15 @@ if ($DryRun.IsPresent) {
     if ($connsFakeIpProxied.Count -ne 1 -or $connsFakeIpProxied[0].resolvedDomain -ne "example.com") {
         throw "DryRun failed: unexpected connectionsFakeIpProxied payload."
     }
-    Write-Host "[DRYRUN-PASS] Verified Fake-IP CIDR pool helper and 'ctl fake-ips' / domain-routed connection fixtures for Scenarios (k)-(m)." -ForegroundColor Green
+    $logsDnsFlushDryRun = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.logsDnsCacheFlushed | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-logsDnsCacheFlushed" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("level", "component", "message")
+    if ($logsDnsFlushDryRun.Count -ne 1 -or $logsDnsFlushDryRun[0].component -ne "FakeIpDNS" -or $logsDnsFlushDryRun[0].message -notmatch "startup via (dnsapi\.dll!DnsFlushResolverCache|ipconfig /flushdns)") {
+        throw "DryRun failed: unexpected logsDnsCacheFlushed payload."
+    }
+    Write-Host "[DRYRUN-PASS] Verified Fake-IP CIDR pool helper, 'ctl fake-ips', domain-routed connection, and OS DNS cache flush fixtures for Scenarios (k)-(n)." -ForegroundColor Green
 
     $upsertAck = ConvertFrom-CtlResponseJson `
         -RawJson ($fixtures.upsertRuleOk | ConvertTo-Json -Depth 6) `
@@ -1661,6 +1669,53 @@ try {
         }
     } catch {
         Record-ScenarioResult -Id "m" -Status "FAIL" -Title "Post-stop direct DNS resolution outside Fake-IP pool" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (n): Starting the engine automatically flushes the OS DNS
+    #               resolver cache (DnsFlushResolverCache / ipconfig /flushdns)
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $false
+
+        # Pre-seed the Windows DNS Client cache while interception is stopped
+        $null = Resolve-DnsName -Name $PublicDnsTestDomain -Type A -ErrorAction SilentlyContinue
+
+        $startResN = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("start") -Label "Scenario-n-start"
+        $startDiagN = ConvertFrom-CtlResponseJson `
+            -RawJson $startResN.RawText `
+            -Context "Scenario-n-start" `
+            -RequiredResultProperties @("running")
+
+        $cachedAfterStart = @()
+        if (Get-Command -Name "Get-DnsClientCache" -ErrorAction SilentlyContinue) {
+            $cachedAfterStart = @(Get-DnsClientCache -Entry $PublicDnsTestDomain -ErrorAction SilentlyContinue)
+        }
+
+        $logsResN = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-n-logs"
+        $logsListN = ConvertFrom-CtlResponseJson `
+            -RawJson $logsResN.RawText `
+            -Context "Scenario-n-logs" `
+            -ExpectResultArray `
+            -RequiredArrayElementProperties @("level", "component", "message")
+
+        $sawStartupFlushLog = $false
+        $flushDetail = ""
+        foreach ($l in $logsListN) {
+            if ($l.component -eq "FakeIpDNS" -and ([string]$l.message) -match "startup via (dnsapi\.dll!DnsFlushResolverCache|ipconfig /flushdns)") {
+                $sawStartupFlushLog = $true
+                $flushDetail = [string]$l.message
+                break
+            }
+        }
+
+        if ($startResN.ExitCode -eq 0 -and $startDiagN.running -eq $true -and $sawStartupFlushLog -and $cachedAfterStart.Count -eq 0) {
+            Record-ScenarioResult -Id "n" -Status "PASS" -Title "OS DNS cache flushed on engine startup" -Detail "$flushDetail; Get-DnsClientCache entries for $PublicDnsTestDomain after start = $($cachedAfterStart.Count)"
+        } else {
+            Record-ScenarioResult -Id "n" -Status "FAIL" -Title "OS DNS cache flushed on engine startup" -Detail "running=$($startDiagN.running), sawStartupFlushLog=$sawStartupFlushLog, cachedAfterStartCount=$($cachedAfterStart.Count)"
+        }
+    } catch {
+        Record-ScenarioResult -Id "n" -Status "FAIL" -Title "OS DNS cache flushed on engine startup" -Detail $_.Exception.Message
     }
 } finally {
     # -----------------------------------------------------------------------

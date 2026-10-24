@@ -580,7 +580,9 @@
         "listening_transparent": "Transparent TCP relay (WinDivert reflect) listening",
         "interception_active": "Packet interception active via backend",
         "duration_limit": "Automatic shutdown scheduled after (seconds)",
-        "ready": "Interception engine active. Press Ctrl+C to stop."
+        "ready": "Interception engine active. Press Ctrl+C to stop.",
+        "dns_cache_flushed": "Flushed OS DNS resolver cache",
+        "reloaded_live": "Reapplied active interception rules and proxy bootstrap"
       },
       "check": {
         "testing": "Probing upstream proxy connectivity",
