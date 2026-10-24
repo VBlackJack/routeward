@@ -32,6 +32,7 @@ pub const ERR_KEY_INTERCEPTOR_OPEN: &str = "errors.interceptor.open_failed";
 pub const ERR_KEY_INTERCEPTOR_NOT_ROOT: &str = "errors.interceptor.not_root";
 pub const ERR_KEY_INTERCEPTOR_NFT_MISSING: &str = "errors.interceptor.nft_missing";
 pub const ERR_KEY_INTERCEPTOR_NFT_FAILED: &str = "errors.interceptor.nft_failed";
+pub const ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT: &str = "errors.interceptor.tproxy_conflict";
 pub const ERR_KEY_DAEMON_ALREADY_RUNNING: &str = "errors.daemon.already_running";
 pub const ERR_KEY_DAEMON_GROUP_MISSING: &str = "errors.daemon.group_missing";
 pub const ERR_KEY_DAEMON_NOT_ELEVATED: &str = "errors.daemon.not_elevated";

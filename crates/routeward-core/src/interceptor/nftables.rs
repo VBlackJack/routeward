@@ -20,6 +20,7 @@ use crate::error::{RouteWardError, RouteWardResult};
 #[cfg(target_os = "linux")]
 use crate::error::{
     ERR_KEY_INTERCEPTOR_NFT_FAILED, ERR_KEY_INTERCEPTOR_NFT_MISSING, ERR_KEY_INTERCEPTOR_NOT_ROOT,
+    ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT,
 };
 use crate::interceptor::backend::Interceptor;
 use crate::interceptor::RouteWardController;
@@ -33,10 +34,22 @@ use std::sync::Arc;
 const BACKEND_NAME: &str = "nftables";
 const COMPONENT_NFTABLES: &str = "NftablesInterceptor";
 const AF_INET_U16: u16 = 2;
+const DEFAULT_TPROXY_FWMARK: u32 = 21080;
+
+/// Policy routing and `TPROXY` parameters loaded from `SystemConstants.network`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TproxyRoutingSpec {
+    pub fwmark: u32,
+    pub route_table: u32,
+    pub rule_priority: u32,
+    pub tproxy_port: u16,
+}
 
 struct NftActiveState {
     nft_binary: String,
+    ip_binary: String,
     table_name: String,
+    tproxy_spec: TproxyRoutingSpec,
     watchdog_stdin: Option<ChildStdin>,
     watchdog_child: Option<Child>,
     telemetry: TelemetryHub,
@@ -119,7 +132,9 @@ impl NftablesInterceptor {
 
     /// Generates the dedicated IPv4 `nftables` ruleset including:
     /// - DNS port 53 (UDP and TCP) redirection to `dns_listen_port`
-    /// - mDNS (`5353`) and LLMNR (`5355`) UDP redirection to `local_name_inspect_port` (`10854`)
+    /// - Outbound UDP marking (`tproxy_fwmark`) in `route_output` and `TPROXY` interception in `prerouting`
+    ///   on `127.0.0.1:<local_name_inspect_port>` (`10854`), covering general UDP as well as mDNS (`5353`)
+    ///   and LLMNR (`5355`) without source port rewriting
     /// - optional DoT/DoQ (`UDP 853`) and QUIC (`UDP 443`) `reject` (ICMPv4 Port Unreachable)
     /// - NetBIOS-NS (`UDP 137`) drop toward non-local/public IPv4 addresses
     #[allow(clippy::too_many_arguments)]
@@ -140,7 +155,47 @@ impl NftablesInterceptor {
         block_quic_udp_443: bool,
         upstream_endpoints: &[(Ipv4Addr, u16)],
     ) -> String {
-        let mut script = String::with_capacity(1024);
+        Self::build_nft_table_ruleset_with_tproxy(
+            table_name,
+            chain_name,
+            fwmark,
+            DEFAULT_TPROXY_FWMARK,
+            relay_port,
+            dns_listen_port,
+            local_name_inspect_port,
+            dns_standard_port,
+            dot_port,
+            quic_port,
+            mdns_port,
+            llmnr_port,
+            netbios_ns_port,
+            block_encrypted_dns,
+            block_quic_udp_443,
+            upstream_endpoints,
+        )
+    }
+
+    /// Generates the dedicated IPv4 `nftables` ruleset with explicit `tproxy_fwmark`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_nft_table_ruleset_with_tproxy(
+        table_name: &str,
+        chain_name: &str,
+        fwmark: u32,
+        tproxy_fwmark: u32,
+        relay_port: u16,
+        dns_listen_port: u16,
+        local_name_inspect_port: u16,
+        dns_standard_port: u16,
+        dot_port: u16,
+        quic_port: u16,
+        mdns_port: u16,
+        llmnr_port: u16,
+        netbios_ns_port: u16,
+        block_encrypted_dns: bool,
+        block_quic_udp_443: bool,
+        upstream_endpoints: &[(Ipv4Addr, u16)],
+    ) -> String {
+        let mut script = String::with_capacity(1536);
         script.push_str(&format!("table ip {table_name} {{\n"));
         script.push_str(&format!("    chain {chain_name} {{\n"));
         script.push_str("        type nat hook output priority -100; policy accept;\n");
@@ -152,9 +207,6 @@ impl NftablesInterceptor {
         script.push_str(&format!(
             "        tcp dport {dns_standard_port} redirect to :{dns_listen_port}\n"
         ));
-        script.push_str(&format!(
-            "        udp dport {{ {mdns_port}, {llmnr_port} }} redirect to :{local_name_inspect_port}\n"
-        ));
         for (ip, port) in upstream_endpoints {
             if !ip.is_loopback() {
                 script.push_str(&format!("        ip daddr {ip} tcp dport {port} return\n"));
@@ -164,6 +216,39 @@ impl NftablesInterceptor {
             "        tcp dport 1-65535 redirect to :{relay_port}\n"
         ));
         script.push_str("    }\n");
+
+        script.push_str("    chain route_output {\n");
+        script.push_str("        type route hook output priority -150; policy accept;\n");
+        script.push_str(&format!("        meta mark {fwmark} return\n"));
+        script.push_str("        ip daddr 127.0.0.0/8 return\n");
+        script.push_str(&format!("        udp dport {dns_standard_port} return\n"));
+        if block_encrypted_dns {
+            script.push_str(&format!("        udp dport {dot_port} return\n"));
+        }
+        if block_quic_udp_443 {
+            script.push_str(&format!("        udp dport {quic_port} return\n"));
+        }
+        script.push_str(&format!("        udp dport {netbios_ns_port} return\n"));
+        for (ip, port) in upstream_endpoints {
+            if !ip.is_loopback() {
+                script.push_str(&format!("        ip daddr {ip} udp dport {port} return\n"));
+            }
+        }
+        script.push_str(&format!(
+            "        ip daddr {{ 224.0.0.0/4, 255.255.255.255 }} udp dport != {{ {mdns_port}, {llmnr_port} }} return\n"
+        ));
+        script.push_str(&format!(
+            "        meta l4proto udp meta mark set {tproxy_fwmark}\n"
+        ));
+        script.push_str("    }\n");
+
+        script.push_str("    chain prerouting {\n");
+        script.push_str("        type filter hook prerouting priority -150; policy accept;\n");
+        script.push_str(&format!(
+            "        meta mark {tproxy_fwmark} meta l4proto udp tproxy to 127.0.0.1:{local_name_inspect_port} accept\n"
+        ));
+        script.push_str("    }\n");
+
         script.push_str("    chain filter_output {\n");
         script.push_str("        type filter hook output priority 0; policy accept;\n");
         script.push_str(&format!("        meta mark {fwmark} return\n"));
@@ -269,13 +354,56 @@ impl NftablesInterceptor {
         block_quic_udp_443: bool,
         upstream_endpoints: &[(Ipv4Addr, u16)],
     ) -> String {
-        let mut batch = String::with_capacity(1536);
-        batch.push_str(&format!("table ip {table_name}\n"));
-        batch.push_str(&format!("delete table ip {table_name}\n"));
-        batch.push_str(&Self::build_nft_table_ruleset_full(
+        Self::build_atomic_replace_ruleset_with_tproxy(
             table_name,
             chain_name,
             fwmark,
+            DEFAULT_TPROXY_FWMARK,
+            relay_port,
+            dns_listen_port,
+            local_name_inspect_port,
+            dns_standard_port,
+            dot_port,
+            quic_port,
+            mdns_port,
+            llmnr_port,
+            netbios_ns_port,
+            kill_switch_enabled,
+            block_encrypted_dns,
+            block_quic_udp_443,
+            upstream_endpoints,
+        )
+    }
+
+    /// Builds a single atomic `nft -f -` transaction script with explicit `tproxy_fwmark`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_atomic_replace_ruleset_with_tproxy(
+        table_name: &str,
+        chain_name: &str,
+        fwmark: u32,
+        tproxy_fwmark: u32,
+        relay_port: u16,
+        dns_listen_port: u16,
+        local_name_inspect_port: u16,
+        dns_standard_port: u16,
+        dot_port: u16,
+        quic_port: u16,
+        mdns_port: u16,
+        llmnr_port: u16,
+        netbios_ns_port: u16,
+        kill_switch_enabled: bool,
+        block_encrypted_dns: bool,
+        block_quic_udp_443: bool,
+        upstream_endpoints: &[(Ipv4Addr, u16)],
+    ) -> String {
+        let mut batch = String::with_capacity(2048);
+        batch.push_str(&format!("table ip {table_name}\n"));
+        batch.push_str(&format!("delete table ip {table_name}\n"));
+        batch.push_str(&Self::build_nft_table_ruleset_with_tproxy(
+            table_name,
+            chain_name,
+            fwmark,
+            tproxy_fwmark,
             relay_port,
             dns_listen_port,
             local_name_inspect_port,
@@ -303,6 +431,350 @@ impl NftablesInterceptor {
             batch.push_str(&ip6_script);
         }
         batch
+    }
+
+    /// Parses a hexadecimal (`0x...`) or decimal `fwmark` token from `ip -4 rule show` output
+    /// (stripping any optional `/mask` suffix).
+    pub fn parse_fwmark_token(token: &str) -> Option<u32> {
+        let head = token.split('/').next()?.trim();
+        if let Some(hex) = head.strip_prefix("0x").or_else(|| head.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            head.parse::<u32>().ok()
+        }
+    }
+
+    /// Inspects `ip -4 rule show` output and returns a descriptive conflict error if `spec.rule_priority`,
+    /// `spec.fwmark`, or `spec.route_table` is already in use by any existing policy routing rule.
+    pub fn detect_ip_rule_conflict(
+        ip_rule_stdout: &str,
+        spec: TproxyRoutingSpec,
+    ) -> Option<String> {
+        for raw_line in ip_rule_stdout.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((prio_str, _rest)) = line.split_once(':') {
+                if let Ok(prio) = prio_str.trim().parse::<u32>() {
+                    if prio == spec.rule_priority {
+                        return Some(format!(
+                            "ip rule priority {} is already in use: \"{line}\"",
+                            spec.rule_priority
+                        ));
+                    }
+                }
+            }
+
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let mut idx = 0;
+            while idx + 1 < tokens.len() {
+                match tokens[idx] {
+                    "fwmark" => {
+                        if let Some(mark) = Self::parse_fwmark_token(tokens[idx + 1]) {
+                            if mark == spec.fwmark {
+                                return Some(format!(
+                                    "ip rule fwmark {:#x} ({}) is already in use: \"{line}\"",
+                                    spec.fwmark, spec.fwmark
+                                ));
+                            }
+                        }
+                        idx += 2;
+                    }
+                    "lookup" | "table" => {
+                        if let Ok(tbl) = tokens[idx + 1].parse::<u32>() {
+                            if tbl == spec.route_table {
+                                return Some(format!(
+                                    "ip rule routing table {} is already referenced: \"{line}\"",
+                                    spec.route_table
+                                ));
+                            }
+                        }
+                        idx += 2;
+                    }
+                    _ => {
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Inspects `ip -4 route show table <route_table>` output and returns a descriptive conflict error
+    /// if the table already contains any routes.
+    pub fn detect_ip_route_table_conflict(
+        ip_route_stdout: &str,
+        route_table: u32,
+    ) -> Option<String> {
+        for raw_line in ip_route_stdout.lines() {
+            let line = raw_line.trim();
+            if !line.is_empty() {
+                return Some(format!(
+                    "routing table {route_table} is not empty: \"{line}\""
+                ));
+            }
+        }
+        None
+    }
+
+    /// Builds the exact `ip` CLI arguments to install the `TPROXY` `ip rule`.
+    pub fn build_ip_rule_add_args(spec: TproxyRoutingSpec) -> [String; 9] {
+        [
+            "-4".to_string(),
+            "rule".to_string(),
+            "add".to_string(),
+            "fwmark".to_string(),
+            spec.fwmark.to_string(),
+            "lookup".to_string(),
+            spec.route_table.to_string(),
+            "priority".to_string(),
+            spec.rule_priority.to_string(),
+        ]
+    }
+
+    /// Builds the exact `ip` CLI arguments to remove the `TPROXY` `ip rule`.
+    pub fn build_ip_rule_del_args(spec: TproxyRoutingSpec) -> [String; 9] {
+        [
+            "-4".to_string(),
+            "rule".to_string(),
+            "del".to_string(),
+            "fwmark".to_string(),
+            spec.fwmark.to_string(),
+            "lookup".to_string(),
+            spec.route_table.to_string(),
+            "priority".to_string(),
+            spec.rule_priority.to_string(),
+        ]
+    }
+
+    /// Builds the exact `ip` CLI arguments to install the local `0.0.0.0/0 dev lo` route in `spec.route_table`.
+    pub fn build_ip_route_add_args(spec: TproxyRoutingSpec) -> [String; 9] {
+        [
+            "-4".to_string(),
+            "route".to_string(),
+            "add".to_string(),
+            "local".to_string(),
+            "0.0.0.0/0".to_string(),
+            "dev".to_string(),
+            "lo".to_string(),
+            "table".to_string(),
+            spec.route_table.to_string(),
+        ]
+    }
+
+    /// Builds the exact `ip` CLI arguments to remove the local `0.0.0.0/0 dev lo` route from `spec.route_table`.
+    pub fn build_ip_route_del_args(spec: TproxyRoutingSpec) -> [String; 9] {
+        [
+            "-4".to_string(),
+            "route".to_string(),
+            "del".to_string(),
+            "local".to_string(),
+            "0.0.0.0/0".to_string(),
+            "dev".to_string(),
+            "lo".to_string(),
+            "table".to_string(),
+            spec.route_table.to_string(),
+        ]
+    }
+
+    /// Builds the pipe-linked fail-open watchdog shell command that deletes `table ip/ip6 <table_name>`,
+    /// the exact `TPROXY` `ip rule`, and the exact local route on `lo` when the daemon process exits or crashes (`kill -9`).
+    pub fn build_watchdog_cleanup_script(
+        nft_bin: &str,
+        ip_bin: &str,
+        table_name: &str,
+        spec: TproxyRoutingSpec,
+    ) -> String {
+        format!(
+            "cat >/dev/null; {nft_bin} delete table ip {table_name} >/dev/null 2>&1; {nft_bin} delete table ip6 {table_name} >/dev/null 2>&1; {ip_bin} -4 rule del fwmark {} lookup {} priority {} >/dev/null 2>&1; {ip_bin} -4 route del local 0.0.0.0/0 dev lo table {} >/dev/null 2>&1",
+            spec.fwmark, spec.route_table, spec.rule_priority, spec.route_table
+        )
+    }
+
+    /// Removes the exact `TPROXY` `ip rule` and local route on `lo` installed by RouteWard.
+    pub fn delete_tproxy_routing(
+        ip_binary: &str,
+        spec: TproxyRoutingSpec,
+        telemetry: &TelemetryHub,
+    ) {
+        let rule_del_args = Self::build_ip_rule_del_args(spec);
+        if let Ok(out) = Command::new(ip_binary)
+            .args(&rule_del_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+        {
+            if out.status.success() {
+                telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_NFTABLES,
+                    format!(
+                        "Removed TPROXY ip rule (fwmark={:#x}, table={}, priority={})",
+                        spec.fwmark, spec.route_table, spec.rule_priority
+                    ),
+                );
+            }
+        }
+
+        let route_del_args = Self::build_ip_route_del_args(spec);
+        if let Ok(out) = Command::new(ip_binary)
+            .args(&route_del_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+        {
+            if out.status.success() {
+                telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_NFTABLES,
+                    format!(
+                        "Removed TPROXY local route (local 0.0.0.0/0 dev lo table {})",
+                        spec.route_table
+                    ),
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_and_install_tproxy_routing(
+        ip_binary: &str,
+        spec: TproxyRoutingSpec,
+        telemetry: &TelemetryHub,
+        i18n: &crate::i18n::I18nRegistry,
+    ) -> RouteWardResult<()> {
+        let rule_show = Command::new(ip_binary)
+            .args(["-4", "rule", "show"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|err| RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                detail: format!("Failed to execute {ip_binary} -4 rule show: {err}"),
+            })?;
+        if !rule_show.status.success() {
+            let stderr = String::from_utf8_lossy(&rule_show.stderr)
+                .trim()
+                .to_string();
+            return Err(RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                detail: format!("{ip_binary} -4 rule show failed: {stderr}"),
+            });
+        }
+        let rule_stdout = String::from_utf8_lossy(&rule_show.stdout);
+        if let Some(conflict) = Self::detect_ip_rule_conflict(&rule_stdout, spec) {
+            let detail = format!(
+                "{}: {conflict}",
+                i18n.t(ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT)
+            );
+            telemetry.push_log(LogLevel::Error, COMPONENT_NFTABLES, detail.clone());
+            return Err(RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT,
+                detail,
+            });
+        }
+
+        let route_show = Command::new(ip_binary)
+            .args([
+                "-4",
+                "route",
+                "show",
+                "table",
+                &spec.route_table.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|err| RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                detail: format!(
+                    "Failed to execute {ip_binary} -4 route show table {}: {err}",
+                    spec.route_table
+                ),
+            })?;
+        if route_show.status.success() {
+            let route_stdout = String::from_utf8_lossy(&route_show.stdout);
+            if let Some(conflict) =
+                Self::detect_ip_route_table_conflict(&route_stdout, spec.route_table)
+            {
+                let detail = format!(
+                    "{}: {conflict}",
+                    i18n.t(ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT)
+                );
+                telemetry.push_log(LogLevel::Error, COMPONENT_NFTABLES, detail.clone());
+                return Err(RouteWardError::InterceptorError {
+                    key: ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT,
+                    detail,
+                });
+            }
+        }
+
+        let rule_add_args = Self::build_ip_rule_add_args(spec);
+        let rule_add_out = Command::new(ip_binary)
+            .args(&rule_add_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|err| RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                detail: format!("Failed to execute {ip_binary} rule add: {err}"),
+            })?;
+        if !rule_add_out.status.success() {
+            let stderr = String::from_utf8_lossy(&rule_add_out.stderr)
+                .trim()
+                .to_string();
+            return Err(RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                detail: format!("{ip_binary} -4 rule add failed: {stderr}"),
+            });
+        }
+
+        let route_add_args = Self::build_ip_route_add_args(spec);
+        let route_add_out = Command::new(ip_binary)
+            .args(&route_add_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        match route_add_out {
+            Ok(out) if out.status.success() => {
+                telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_NFTABLES,
+                    format!(
+                        "Installed TPROXY policy routing (fwmark={:#x}, table={}, priority={}, tproxy_port={})",
+                        spec.fwmark, spec.route_table, spec.rule_priority, spec.tproxy_port
+                    ),
+                );
+                Ok(())
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let _ = Command::new(ip_binary)
+                    .args(Self::build_ip_rule_del_args(spec))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output();
+                Err(RouteWardError::InterceptorError {
+                    key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                    detail: format!(
+                        "{ip_binary} -4 route add local 0.0.0.0/0 dev lo table {} failed: {stderr}",
+                        spec.route_table
+                    ),
+                })
+            }
+            Err(err) => {
+                let _ = Command::new(ip_binary)
+                    .args(Self::build_ip_rule_del_args(spec))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output();
+                Err(RouteWardError::InterceptorError {
+                    key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                    detail: format!("Failed invoking {ip_binary} route add: {err}"),
+                })
+            }
+        }
     }
 
     /// Deletes the dedicated `nftables` tables (`ip` and `ip6`) if they exist.
@@ -613,6 +1085,233 @@ impl NftablesInterceptor {
     ) -> std::io::Result<usize> {
         sock.send_to(payload, peer).await
     }
+
+    /// Configures a Linux UDP listener socket with `IP_TRANSPARENT` and `IP_RECVORIGDSTADDR`
+    /// so it can receive `TPROXY`-intercepted datagrams and recover their original destination IPv4/port.
+    #[cfg(target_os = "linux")]
+    pub fn enable_udp_tproxy_options(sock: &tokio::net::UdpSocket) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let on: libc::c_int = 1;
+        unsafe {
+            if libc::setsockopt(
+                fd,
+                libc::SOL_IP,
+                libc::IP_TRANSPARENT,
+                &on as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setsockopt(
+                fd,
+                libc::SOL_IP,
+                libc::IP_RECVORIGDSTADDR,
+                &on as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn enable_udp_tproxy_options(_sock: &tokio::net::UdpSocket) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Receives a UDP datagram on a `TPROXY` listener socket and extracts `(len, client_addr, orig_dst)`
+    /// from the ancillary `IP_ORIGDSTADDR` control message.
+    #[cfg(target_os = "linux")]
+    pub async fn recv_udp_tproxy_orig_dst(
+        sock: &tokio::net::UdpSocket,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, SocketAddrV4, Option<SocketAddrV4>)> {
+        use std::os::fd::AsRawFd;
+        sock.async_io(tokio::io::Interest::READABLE, || {
+            let fd = sock.as_raw_fd();
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let mut src_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut cmsg_space = [0u8; 128];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = &mut src_addr as *mut libc::sockaddr_in as *mut libc::c_void;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_space.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = cmsg_space.len();
+
+            let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let peer_ip = Ipv4Addr::from(u32::from_be(src_addr.sin_addr.s_addr));
+            let peer_port = u16::from_be(src_addr.sin_port);
+            let client_addr = SocketAddrV4::new(peer_ip, peer_port);
+
+            let mut orig_dst: Option<SocketAddrV4> = None;
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                while !cmsg.is_null() {
+                    if (*cmsg).cmsg_level == libc::SOL_IP
+                        && (*cmsg).cmsg_type == libc::IP_ORIGDSTADDR
+                    {
+                        let data_ptr = libc::CMSG_DATA(cmsg);
+                        let data_slice = std::slice::from_raw_parts(
+                            data_ptr,
+                            std::mem::size_of::<libc::sockaddr_in>(),
+                        );
+                        orig_dst =
+                            crate::interceptor::nat::parse_ipv4_origdstaddr_bytes(data_slice);
+                        break;
+                    }
+                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                }
+            }
+
+            Ok((n as usize, client_addr, orig_dst))
+        })
+        .await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn recv_udp_tproxy_orig_dst(
+        sock: &tokio::net::UdpSocket,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, SocketAddrV4, Option<SocketAddrV4>)> {
+        let (len, peer) = sock.recv_from(buf).await?;
+        let client_v4 = match peer {
+            std::net::SocketAddr::V4(v4) => v4,
+            std::net::SocketAddr::V6(_) => SocketAddrV4::new(Ipv4Addr::LOCALHOST, peer.port()),
+        };
+        Ok((len, client_v4, None))
+    }
+
+    /// Emits a raw IPv4 + UDP datagram (`src -> dst`) using `SOCK_RAW` + `IP_HDRINCL` + `SO_MARK`
+    /// so replies to `TPROXY`-intercepted clients (and authorized local LLMNR/mDNS queries) preserve
+    /// the exact source IPv4 address and source port without re-triggering `TPROXY`.
+    #[cfg(target_os = "linux")]
+    pub fn send_raw_ipv4_udp_packet(
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        payload: &[u8],
+        fwmark: u32,
+    ) -> std::io::Result<usize> {
+        let raw_pkt = crate::interceptor::nat::build_forged_ipv4_udp_reply(
+            *src.ip(),
+            src.port(),
+            *dst.ip(),
+            dst.port(),
+            payload,
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UDP payload too large for IPv4 packet",
+            )
+        })?;
+
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_RAW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        struct RawFdGuard(libc::c_int);
+        impl Drop for RawFdGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = libc::close(self.0);
+                }
+            }
+        }
+        let _guard = RawFdGuard(fd);
+
+        let one: libc::c_int = 1;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_HDRINCL,
+                &one as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BROADCAST,
+                &one as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if fwmark != 0 {
+                let mark: libc::c_uint = fwmark;
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_MARK,
+                    &mark as *const libc::c_uint as *const libc::c_void,
+                    std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                );
+            }
+            if dst.ip().is_multicast() {
+                let zero: libc::c_uchar = 0;
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IP,
+                    libc::IP_MULTICAST_LOOP,
+                    &zero as *const libc::c_uchar as *const libc::c_void,
+                    std::mem::size_of::<libc::c_uchar>() as libc::socklen_t,
+                );
+            }
+        }
+
+        let mut dst_sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        dst_sin.sin_family = libc::AF_INET as libc::sa_family_t;
+        dst_sin.sin_port = dst.port().to_be();
+        dst_sin.sin_addr = libc::in_addr {
+            s_addr: u32::from(*dst.ip()).to_be(),
+        };
+
+        let sent = unsafe {
+            libc::sendto(
+                fd,
+                raw_pkt.as_ptr() as *const libc::c_void,
+                raw_pkt.len(),
+                0,
+                &dst_sin as *const libc::sockaddr_in as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(sent as usize)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn send_raw_ipv4_udp_packet(
+        _src: SocketAddrV4,
+        _dst: SocketAddrV4,
+        _payload: &[u8],
+        _fwmark: u32,
+    ) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "send_raw_ipv4_udp_packet is only supported on Linux",
+        ))
+    }
 }
 
 impl Interceptor for NftablesInterceptor {
@@ -645,10 +1344,17 @@ impl Interceptor for NftablesInterceptor {
 
         let net = &controller.constants.network;
         let nft_bin = net.linux_nft_binary.clone();
+        let ip_bin = net.linux_ip_binary.clone();
         let table_name = net.linux_nft_table_name.clone();
         let chain_name = net.linux_nft_chain_name.clone();
         let fwmark = net.linux_fwmark;
         let relay_port = net.default_transparent_tcp_port;
+        let tproxy_spec = TproxyRoutingSpec {
+            fwmark: net.linux_tproxy_fwmark,
+            route_table: net.linux_tproxy_route_table,
+            rule_priority: net.linux_tproxy_rule_priority,
+            tproxy_port: net.default_local_name_inspect_port,
+        };
 
         // 2. Verify nft binary is installed and reachable
         match Command::new(&nft_bin)
@@ -686,7 +1392,18 @@ impl Interceptor for NftablesInterceptor {
             }
         }
 
-        // 3. Remove any stale tables (`ip` and `ip6`) with the same name before installing fresh rules
+        // 3. Verify TPROXY ip rule priority, fwmark, and routing table are free, then install them
+        if let Err(err) = Self::check_and_install_tproxy_routing(
+            &ip_bin,
+            tproxy_spec,
+            &controller.telemetry,
+            &controller.i18n,
+        ) {
+            self.active.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+
+        // 4. Remove any stale tables (`ip` and `ip6`) with the same name before installing fresh rules
         for family in ["ip", "ip6"] {
             let _ = Command::new(&nft_bin)
                 .args(["delete", "table", family, &table_name])
@@ -695,7 +1412,7 @@ impl Interceptor for NftablesInterceptor {
                 .output();
         }
 
-        // 4. Build and load the dedicated nftables tables via `nft -f -`
+        // 5. Build and load the dedicated nftables tables via `nft -f -`
         let upstream_endpoints = controller.nat_table.upstream_endpoints();
         let dns_listen_port = net.default_dns_listen_port;
         let local_name_inspect_port = net.default_local_name_inspect_port;
@@ -756,12 +1473,11 @@ impl Interceptor for NftablesInterceptor {
             }
         }
 
-        // 5. Spawn pipe-linked fail-open watchdog in its own process group before installing `ip routeward`.
+        // 6. Spawn pipe-linked fail-open watchdog in its own process group before installing `ip routeward`.
         // If RouteWard dies with SIGKILL (kill -9), the kernel closes watchdog_stdin immediately,
-        // `cat` exits on EOF, and `nft delete table ip/ip6 <table_name>` cleans up automatically.
-        let watchdog_script = format!(
-            "cat >/dev/null; {nft_bin} delete table ip {table_name} >/dev/null 2>&1; {nft_bin} delete table ip6 {table_name} >/dev/null 2>&1"
-        );
+        // `cat` exits on EOF, and both `nft` tables + `ip rule` + `ip route` are cleaned up automatically.
+        let watchdog_script =
+            Self::build_watchdog_cleanup_script(&nft_bin, &ip_bin, &table_name, tproxy_spec);
         let mut watchdog_stdin = None;
         let mut watchdog_child = None;
 
@@ -781,7 +1497,7 @@ impl Interceptor for NftablesInterceptor {
                     LogLevel::Info,
                     COMPONENT_NFTABLES,
                     format!(
-                        "Started pipe-linked nftables fail-open watchdog (PID={wid}, table=\"ip {table_name}\")"
+                        "Started pipe-linked nftables/TPROXY fail-open watchdog (PID={wid}, table=\"ip {table_name}\")"
                     ),
                 );
             }
@@ -796,16 +1512,19 @@ impl Interceptor for NftablesInterceptor {
 
         *self.state.lock() = Some(NftActiveState {
             nft_binary: nft_bin.clone(),
+            ip_binary: ip_bin,
             table_name: table_name.clone(),
+            tproxy_spec,
             watchdog_stdin,
             watchdog_child,
             telemetry: controller.telemetry.clone(),
         });
 
-        let ruleset = Self::build_nft_table_ruleset_full(
+        let ruleset = Self::build_nft_table_ruleset_with_tproxy(
             &table_name,
             &chain_name,
             fwmark,
+            tproxy_spec.fwmark,
             relay_port,
             dns_listen_port,
             local_name_inspect_port,
@@ -892,9 +1611,16 @@ impl Interceptor for NftablesInterceptor {
 
         let net = &controller.constants.network;
         let nft_bin = net.linux_nft_binary.clone();
+        let ip_bin = net.linux_ip_binary.clone();
         let table_name = net.linux_nft_table_name.clone();
         let chain_name = net.linux_nft_chain_name.clone();
         let fwmark = net.linux_fwmark;
+        let tproxy_spec = TproxyRoutingSpec {
+            fwmark: net.linux_tproxy_fwmark,
+            route_table: net.linux_tproxy_route_table,
+            rule_priority: net.linux_tproxy_rule_priority,
+            tproxy_port: net.default_local_name_inspect_port,
+        };
         let relay_port = net.default_transparent_tcp_port;
         let dns_listen_port = net.default_dns_listen_port;
         let local_name_inspect_port = net.default_local_name_inspect_port;
@@ -914,10 +1640,27 @@ impl Interceptor for NftablesInterceptor {
             )
         };
 
-        let atomic_batch = Self::build_atomic_replace_ruleset_full(
+        let prev_spec = self.state.lock().as_ref().map(|s| s.tproxy_spec);
+        if let Some(old_spec) = prev_spec {
+            if old_spec != tproxy_spec {
+                Self::delete_tproxy_routing(&ip_bin, old_spec, &controller.telemetry);
+                Self::check_and_install_tproxy_routing(
+                    &ip_bin,
+                    tproxy_spec,
+                    &controller.telemetry,
+                    &controller.i18n,
+                )?;
+                if let Some(ref mut st) = *self.state.lock() {
+                    st.tproxy_spec = tproxy_spec;
+                }
+            }
+        }
+
+        let atomic_batch = Self::build_atomic_replace_ruleset_with_tproxy(
             &table_name,
             &chain_name,
             fwmark,
+            tproxy_spec.fwmark,
             relay_port,
             dns_listen_port,
             local_name_inspect_port,
@@ -985,6 +1728,7 @@ impl Interceptor for NftablesInterceptor {
             // Closing the pipe write-end lets the watchdog exit cleanly
             drop(state.watchdog_stdin.take());
             let _ = Self::delete_nft_table(&state.nft_binary, &state.table_name, &state.telemetry);
+            Self::delete_tproxy_routing(&state.ip_binary, state.tproxy_spec, &state.telemetry);
             if let Some(mut child) = state.watchdog_child.take() {
                 let _ = child.wait();
             }
@@ -1027,7 +1771,18 @@ mod tests {
         assert!(ruleset.contains("ip daddr 127.0.0.0/8 return"));
         assert!(ruleset.contains("udp dport 53 redirect to :10853"));
         assert!(ruleset.contains("tcp dport 53 redirect to :10853"));
-        assert!(ruleset.contains("udp dport { 5353, 5355 } redirect to :10854"));
+        assert!(!ruleset.contains("udp dport { 5353, 5355 } redirect to :10854"));
+        assert!(ruleset.contains("chain route_output {"));
+        assert!(ruleset.contains("type route hook output priority -150; policy accept;"));
+        assert!(ruleset.contains("ip daddr 192.168.31.10 udp dport 1080 return"));
+        assert!(ruleset.contains(
+            "ip daddr { 224.0.0.0/4, 255.255.255.255 } udp dport != { 5353, 5355 } return"
+        ));
+        assert!(ruleset.contains("meta l4proto udp meta mark set 21080"));
+        assert!(ruleset.contains("chain prerouting {"));
+        assert!(
+            ruleset.contains("meta mark 21080 meta l4proto udp tproxy to 127.0.0.1:10854 accept")
+        );
         assert!(ruleset.contains("ip daddr 192.168.31.10 tcp dport 1080 return"));
         assert!(ruleset.contains("tcp dport 1-65535 redirect to :10810"));
         assert!(ruleset.contains("udp dport 853 reject"));
@@ -1083,5 +1838,84 @@ mod tests {
             NftablesInterceptor::parse_sockaddr_in_fields(2, relay_port_be, loop_ip_be, 10810)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn detects_tproxy_ip_rule_and_route_table_conflicts_and_builds_cleanup_commands() {
+        let spec = TproxyRoutingSpec {
+            fwmark: 21080, // 0x5258
+            route_table: 100,
+            rule_priority: 10810,
+            tproxy_port: 10854,
+        };
+
+        let clean_ip_rules = "\
+0:\tfrom all lookup local
+32766:\tfrom all lookup main
+32767:\tfrom all lookup default
+";
+        assert!(NftablesInterceptor::detect_ip_rule_conflict(clean_ip_rules, spec).is_none());
+        assert!(NftablesInterceptor::detect_ip_route_table_conflict("", 100).is_none());
+
+        // Priority conflict
+        let prio_conflict = "\
+0:\tfrom all lookup local
+10810:\tfrom all fwmark 0x9999 lookup 200
+32766:\tfrom all lookup main
+";
+        let err_prio = NftablesInterceptor::detect_ip_rule_conflict(prio_conflict, spec)
+            .expect("detects priority conflict");
+        assert!(err_prio.contains("priority 10810"));
+
+        // Fwmark conflict (hex 0x5258/0xffffffff)
+        let fwmark_conflict = "\
+0:\tfrom all lookup local
+9000:\tfrom all fwmark 0x5258/0xffffffff lookup 250
+32766:\tfrom all lookup main
+";
+        let err_fwmark = NftablesInterceptor::detect_ip_rule_conflict(fwmark_conflict, spec)
+            .expect("detects fwmark conflict");
+        assert!(err_fwmark.contains("0x5258"));
+
+        // Table lookup conflict
+        let table_rule_conflict = "\
+0:\tfrom all lookup local
+9000:\tfrom all fwmark 0x1111 lookup 100
+32766:\tfrom all lookup main
+";
+        let err_tbl_rule = NftablesInterceptor::detect_ip_rule_conflict(table_rule_conflict, spec)
+            .expect("detects lookup table conflict");
+        assert!(err_tbl_rule.contains("table 100"));
+
+        // Route table non-empty conflict
+        let non_empty_route = "default via 10.0.0.1 dev eth0\n";
+        let err_route = NftablesInterceptor::detect_ip_route_table_conflict(non_empty_route, 100)
+            .expect("detects non-empty route table");
+        assert!(err_route.contains("table 100"));
+
+        // Exact add/del args and watchdog script
+        assert_eq!(
+            NftablesInterceptor::build_ip_rule_del_args(spec),
+            ["-4", "rule", "del", "fwmark", "21080", "lookup", "100", "priority", "10810"]
+        );
+        assert_eq!(
+            NftablesInterceptor::build_ip_route_del_args(spec),
+            [
+                "-4",
+                "route",
+                "del",
+                "local",
+                "0.0.0.0/0",
+                "dev",
+                "lo",
+                "table",
+                "100"
+            ]
+        );
+        let wd = NftablesInterceptor::build_watchdog_cleanup_script("nft", "ip", "routeward", spec);
+        assert!(wd.contains("nft delete table ip routeward"));
+        assert!(wd.contains("nft delete table ip6 routeward"));
+        assert!(wd.contains("ip -4 rule del fwmark 21080 lookup 100 priority 10810"));
+        assert!(wd.contains("ip -4 route del local 0.0.0.0/0 dev lo table 100"));
     }
 }

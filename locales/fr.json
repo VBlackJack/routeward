@@ -624,7 +624,8 @@
       "open_failed": "Impossible d'ouvrir le filtre noyau WinDivert (droits Administrateur requis)",
       "not_root": "Privilèges root requis sous Linux pour l'interception nftables (EUID != 0)",
       "nft_missing": "Binaire nftables (nft) introuvable sur le système",
-      "nft_failed": "Échec de l'exécution de la commande nftables"
+      "nft_failed": "Échec de l'exécution de la commande nftables",
+      "tproxy_conflict": "Refus de démarrer l'interception UDP TPROXY : la priorité ip rule, le fwmark ou la table de routage configurée est déjà utilisée"
     },
     "daemon": {
       "already_running": "Une autre instance du démon RouteWard est déjà en cours d'exécution",

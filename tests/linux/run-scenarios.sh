@@ -1083,7 +1083,322 @@ else
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Scenario (y): Ordinary UDP application (without SOCKS config) transparently
+#               routed via TPROXY through socks5_udp_test_server
+# ---------------------------------------------------------------------------
+rm -f /tmp/udp_srv_y.json /tmp/udp_direct_hits.log /run/routeward/routeward.sock
+
+"${UDP_TEST_SRV}" \
+    --bind 127.0.0.1:1084 \
+    --udp-echo-bind "${TARGET_IP}:19999" \
+    --echo-prefix "UDP_ECHO_OK:" \
+    --map-domain "udp-tproxy.routeward.test=${TARGET_IP}" \
+    --stats-file /tmp/udp_srv_y.json >/tmp/udp_srv_y.out 2>&1 &
+UDP_SRV_Y_PID=$!
+sleep 0.3
+
+cat > /tmp/profile_udp_tproxy.json <<EOF
+{
+  "profileId": "00000000-0000-4000-8000-000000000202",
+  "name": "LinuxTransparentUdpTproxyProfile",
+  "version": "2026.1022.00",
+  "enableLogging": true,
+  "interceptionMode": "hybrid",
+  "themeConfig": { "theme": "Drakul", "accent": "Default" },
+  "securityPolicy": {
+    "killSwitchEnabled": true,
+    "blockUdpOnTcpOnlyProxy": true,
+    "strictDnsNoLocalFallback": true,
+    "blockEncryptedDnsBypass": true,
+    "blockQuicUdp443": true,
+    "unknownProcessAction": { "type": "block" }
+  },
+  "defaultAction": { "type": "proxy", "targetId": "socks-udp-1084" },
+  "dnsConfig": {
+    "enableFakeIp": true,
+    "remoteDnsResolution": true,
+    "fakeIpCidr": "198.18.0.0/15",
+    "upstreamDns": "${TARGET_IP}:53",
+    "bypassDomains": ["corp.contoso.com", "localhost", "*.local"]
+  },
+  "proxies": [
+    {
+      "id": "socks-udp-1084",
+      "name": "SOCKS5 UDP Relay 1084",
+      "protocol": "socks5",
+      "host": "127.0.0.1",
+      "port": 1084,
+      "auth": null,
+      "udpEnabled": true,
+      "tls": false,
+      "sni": null,
+      "enabled": true,
+      "lastLatencyMs": null,
+      "exitIp": null
+    }
+  ],
+  "chains": [],
+  "rules": [
+    {
+      "id": "rule-udp-direct-19990",
+      "name": "Direct UDP Port 19990",
+      "enabled": true,
+      "priority": 1,
+      "processPatterns": [],
+      "domainPatterns": [],
+      "ipCidrs": [],
+      "portRanges": [{ "start": 19990, "end": 19990 }],
+      "protocol": "udp",
+      "action": { "type": "direct" }
+    }
+  ]
+}
+EOF
+
+cp /tmp/profile_udp_tproxy.json /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
+
+"${BIN}" daemon >/tmp/rw_daemon_y.out 2>&1 &
+DAEMON_Y_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+UDP_Y_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp-send "${TARGET_IP}" 19999 "transparent-y")
+STATS_Y=$(cat /tmp/udp_srv_y.json 2>/dev/null || echo "{}")
+
+if [[ "${UDP_Y_OUT}" == "TRANSPARENT_UDP_OK FROM=${TARGET_IP}:19999 BODY=UDP_ECHO_OK:transparent-y" ]] \
+    && echo "${STATS_Y}" | grep -q '"udp_associate_requests":1' \
+    && echo "${STATS_Y}" | grep -q '"udp_datagrams_relayed":1' \
+    && echo "${STATS_Y}" | grep -q '"udp_echo_received":1'; then
+    echo "[PASS] Scenario (y): Ordinary UDP application transparently routed via TPROXY through SOCKS5 UDP ASSOCIATE (${UDP_Y_OUT})"
+else
+    echo "[FAIL] Scenario (y)"
+    echo "UDP_Y_OUT=${UDP_Y_OUT}"
+    echo "STATS_Y=${STATS_Y}"
+    "${BIN}" ctl logs || true
+    kill -TERM "${DAEMON_Y_PID}" "${UDP_SRV_Y_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (z): Transparent UDP toward a Fake-IP destination transmits the
+#               domain name (ATYP=0x03) to the SOCKS5 proxy and replies from
+#               the Fake-IP
+# ---------------------------------------------------------------------------
+DNS_Z_OUT=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "udp-tproxy.routeward.test" 1)
+FAKE_IP_Z=$(echo "${DNS_Z_OUT}" | sed -n 's/.*IP=\([0-9.]*\) .*/\1/p')
+
+UDP_Z_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp-send "${FAKE_IP_Z}" 19999 "fakeip-tproxy-z")
+STATS_Z=$(cat /tmp/udp_srv_y.json 2>/dev/null || echo "{}")
+
+if [[ "${UDP_Z_OUT}" == "TRANSPARENT_UDP_OK FROM=${FAKE_IP_Z}:19999 BODY=UDP_ECHO_OK:fakeip-tproxy-z" ]] \
+    && echo "${STATS_Z}" | grep -q '"udp_datagrams_relayed":2' \
+    && echo "${STATS_Z}" | grep -q '"last_udp_target":"Domain(udp-tproxy.routeward.test:19999)"'; then
+    echo "[PASS] Scenario (z): Transparent UDP to Fake-IP ${FAKE_IP_Z}:19999 transmitted ATYP=0x03 Domain(udp-tproxy.routeward.test:19999) and replied from Fake-IP"
+else
+    echo "[FAIL] Scenario (z)"
+    echo "DNS_Z_OUT=${DNS_Z_OUT} FAKE_IP_Z=${FAKE_IP_Z}"
+    echo "UDP_Z_OUT=${UDP_Z_OUT}"
+    echo "STATS_Z=${STATS_Z}"
+    "${BIN}" ctl logs || true
+    kill -TERM "${DAEMON_Y_PID}" "${UDP_SRV_Y_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (aa): Single UDP socket sending to two destinations governed by
+#                two different rules (Proxy port 19999 vs Direct port 19990)
+# ---------------------------------------------------------------------------
+rm -f /tmp/udp_direct_hits.log
+DUAL_AA_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp-dual-send "${TARGET_IP}" 19999 "${TARGET_IP}" 19990 "dual-42b")
+STATS_AA=$(cat /tmp/udp_srv_y.json 2>/dev/null || echo "{}")
+
+if echo "${DUAL_AA_OUT}" | grep -q "R1=${TARGET_IP}:19999:UDP_ECHO_OK:dual-42b-via-proxy" \
+    && echo "${DUAL_AA_OUT}" | grep -q "R2=${TARGET_IP}:19990:DIRECT_ECHO_OK:dual-42b-via-direct" \
+    && echo "${STATS_AA}" | grep -q '"udp_datagrams_relayed":3' \
+    && grep -q "dual-42b-via-direct" /tmp/udp_direct_hits.log; then
+    echo "[PASS] Scenario (aa): Single UDP socket routed 1st datagram via Proxy and 2nd datagram via Direct (${DUAL_AA_OUT})"
+else
+    echo "[FAIL] Scenario (aa)"
+    echo "DUAL_AA_OUT=${DUAL_AA_OUT}"
+    echo "STATS_AA=${STATS_AA}"
+    cat /tmp/udp_direct_hits.log 2>/dev/null || true
+    "${BIN}" ctl logs || true
+    kill -TERM "${DAEMON_Y_PID}" "${UDP_SRV_Y_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (ab): Transparent Direct UDP with process attribution + LLMNR
+#                forwarded via TPROXY preserving client source port
+# ---------------------------------------------------------------------------
+rm -f /tmp/llmnr_5355_hits.log
+LLMNR_AB_OUT=$(python3 /workspace/tests/linux/mock_servers.py --llmnr-query "${TARGET_IP}" "fileserver")
+LLMNR_AB_PORT=$(echo "${LLMNR_AB_OUT}" | sed -n 's/.*SRC_PORT=\([0-9]*\).*/\1/p')
+sleep 0.2
+
+STATE_AB=$("${BIN}" ctl state)
+LOGS_AB=$("${BIN}" ctl logs)
+
+if echo "${LOGS_AB}" | grep -Eq 'Routed UDP .*python3(\.[0-9]+)?.*-> 10\.200\.1\.1:19990 via DIRECT' \
+    && echo "${STATE_AB}" | grep -q '"routeLabel": "DIRECT"' \
+    && grep -q "LLMNR_5355 .*:.*${LLMNR_AB_PORT} fileserver" /tmp/llmnr_5355_hits.log; then
+    echo "[PASS] Scenario (ab): Transparent Direct UDP attributed to python3 and TPROXY LLMNR preserved source port ${LLMNR_AB_PORT}"
+else
+    echo "[FAIL] Scenario (ab)"
+    echo "LLMNR_AB_OUT=${LLMNR_AB_OUT} LLMNR_AB_PORT=${LLMNR_AB_PORT}"
+    cat /tmp/llmnr_5355_hits.log 2>/dev/null || true
+    echo "LOGS_AB=${LOGS_AB}"
+    kill -TERM "${DAEMON_Y_PID}" "${UDP_SRV_Y_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+kill -TERM "${UDP_SRV_Y_PID}" 2>/dev/null || true
+wait "${UDP_SRV_Y_PID}" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Scenario (ac): Transparent UDP with proxy refusing UDP ASSOCIATE (REP=0x07)
+#                + Kill-Switch = blocked (0 target datagrams)
+# ---------------------------------------------------------------------------
+rm -f /tmp/udp_srv_ac.json
+"${UDP_TEST_SRV}" \
+    --bind 127.0.0.1:1085 \
+    --udp-echo-bind "${TARGET_IP}:19997" \
+    --disable-udp-associate \
+    --stats-file /tmp/udp_srv_ac.json >/tmp/udp_srv_ac.out 2>&1 &
+UDP_SRV_AC_PID=$!
+sleep 0.3
+
+sed -e 's/"socks-udp-1084"/"socks-no-udp-1085"/g' \
+    -e 's/"port": 1084/"port": 1085/' \
+    /tmp/profile_udp_tproxy.json > /tmp/profile_udp_ac.json
+
+"${BIN}" ctl replace-profile --json-file /tmp/profile_udp_ac.json >/dev/null
+sleep 0.2
+
+set +e
+UDP_AC_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp-send "${TARGET_IP}" 19997 "blocked-tproxy-ac")
+UDP_AC_EXIT=$?
+set -e
+
+STATS_AC=$(cat /tmp/udp_srv_ac.json 2>/dev/null || echo "{}")
+LOGS_AC=$("${BIN}" ctl logs)
+
+if [[ "${UDP_AC_EXIT}" -ne 0 ]] \
+    && [[ "${UDP_AC_OUT}" == "TRANSPARENT_UDP_TIMEOUT" ]] \
+    && echo "${STATS_AC}" | grep -q '"udp_associate_refused":1' \
+    && echo "${STATS_AC}" | grep -q '"udp_echo_received":0' \
+    && echo "${LOGS_AC}" | grep -Eq "Kill-Switch blocked UDP|Blocked UDP"; then
+    echo "[PASS] Scenario (ac): Transparent UDP with proxy refusing UDP ASSOCIATE (REP=0x07) + Kill-Switch blocked datagram (0 target datagrams)"
+else
+    echo "[FAIL] Scenario (ac)"
+    echo "UDP_AC_EXIT=${UDP_AC_EXIT} UDP_AC_OUT=${UDP_AC_OUT}"
+    echo "STATS_AC=${STATS_AC}"
+    echo "LOGS_AC=${LOGS_AC}"
+    kill -TERM "${DAEMON_Y_PID}" "${UDP_SRV_AC_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+kill -TERM "${UDP_SRV_AC_PID}" 2>/dev/null || true
+wait "${UDP_SRV_AC_PID}" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Scenario (ad): kill -9 of daemon — watchdog removes nftables tables,
+#                ip rule (priority 10810), and local route (table 100),
+#                restoring direct UDP immediately
+# ---------------------------------------------------------------------------
+kill -9 "${DAEMON_Y_PID}"
+wait "${DAEMON_Y_PID}" 2>/dev/null || true
+sleep 0.5
+
+RULE_AD=$(ip rule show | grep "10810:" || true)
+ROUTE_AD=$(ip route show table 100 2>/dev/null || true)
+UDP_AD_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp-send "${TARGET_IP}" 19990 "after-kill9-42b")
+
+if ! nft list table ip routeward >/dev/null 2>&1 \
+    && ! nft list table ip6 routeward >/dev/null 2>&1 \
+    && [[ -z "${RULE_AD}" ]] \
+    && [[ -z "${ROUTE_AD}" ]] \
+    && [[ "${UDP_AD_OUT}" == "TRANSPARENT_UDP_OK FROM=${TARGET_IP}:19990 BODY=DIRECT_ECHO_OK:after-kill9-42b" ]]; then
+    echo "[PASS] Scenario (ad): SIGKILL (kill -9) watchdog removed nft tables, ip rule 10810, and route table 100, restoring direct UDP (${UDP_AD_OUT})"
+else
+    echo "[FAIL] Scenario (ad)"
+    echo "RULE_AD=${RULE_AD}"
+    echo "ROUTE_AD=${ROUTE_AD}"
+    echo "UDP_AD_OUT=${UDP_AD_OUT}"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (ae): Orphaned ip rule and route table 100 removed by
+#                routeward cleanup when no daemon is active
+# ---------------------------------------------------------------------------
+rm -f /run/routeward/routeward.sock
+ip rule add fwmark 21080 lookup 100 priority 10810
+ip route add local 0.0.0.0/0 dev lo table 100
+nft add table ip routeward
+
+CLEANUP_AE_OUT=$("${BIN}" cleanup)
+RULE_AE=$(ip rule show | grep "10810:" || true)
+ROUTE_AE=$(ip route show table 100 2>/dev/null || true)
+
+if [[ -z "${RULE_AE}" ]] \
+    && [[ -z "${ROUTE_AE}" ]] \
+    && ! nft list table ip routeward >/dev/null 2>&1; then
+    echo "[PASS] Scenario (ae): routeward cleanup removed orphaned ip rule 10810, route table 100, and nft table (${CLEANUP_AE_OUT})"
+else
+    echo "[FAIL] Scenario (ae)"
+    echo "CLEANUP_AE_OUT=${CLEANUP_AE_OUT}"
+    echo "RULE_AE=${RULE_AE}"
+    echo "ROUTE_AE=${ROUTE_AE}"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (af): Pre-existing routing table or ip rule conflict detected at
+#                startup — refuses to start without overwriting third-party route
+# ---------------------------------------------------------------------------
+ip route add 198.51.100.0/24 dev lo table 100
+
+"${BIN}" daemon >/tmp/rw_daemon_af.out 2>&1 &
+DAEMON_AF_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+set +e
+START_AF_OUT=$("${BIN}" ctl start 2>&1)
+START_AF_EXIT=$?
+set -e
+
+ROUTE_AF_PRESERVED=$(ip route show table 100 2>/dev/null || true)
+ip route del 198.51.100.0/24 dev lo table 100 2>/dev/null || true
+kill -TERM "${DAEMON_AF_PID}" 2>/dev/null || true
+wait "${DAEMON_AF_PID}" 2>/dev/null || true
+
+if [[ "${START_AF_EXIT}" -ne 0 ]] \
+    && echo "${START_AF_OUT}" | grep -Eq "tproxy_conflict|TPROXY|table 100" \
+    && echo "${ROUTE_AF_PRESERVED}" | grep -q "198.51.100.0/24"; then
+    echo "[PASS] Scenario (af): Pre-existing route in table 100 detected at startup; engine refused to start and preserved third-party route"
+else
+    echo "[FAIL] Scenario (af)"
+    echo "START_AF_EXIT=${START_AF_EXIT} START_AF_OUT=${START_AF_OUT}"
+    echo "ROUTE_AF_PRESERVED=${ROUTE_AF_PRESERVED}"
+    exit 1
+fi
+
 cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
 kill "${MOCK_PID}" 2>/dev/null || true
 
-echo "=== ALL 24 LINUX CONTAINER SCENARIOS PASSED ==="
+echo "=== ALL 32 LINUX CONTAINER SCENARIOS PASSED ==="

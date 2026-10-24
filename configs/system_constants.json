@@ -23,6 +23,8 @@
     "pidFallbackRetries": 4,
     "pidFallbackDelayMs": 2,
     "pendingSynTimeoutMs": 40,
+    "pendingUdpTimeoutMs": 40,
+    "maxPendingUdpPackets": 256,
     "windivertPriority": 0,
     "windivertDllPaths": [
       "WinDivert.dll",
@@ -32,6 +34,7 @@
     "linuxTproxyFwmark": 21080,
     "linuxTproxyRouteTable": 100,
     "linuxTproxyRulePriority": 10810,
+    "linuxIpBinary": "ip",
     "linuxNftBinary": "nft",
     "linuxNftTableName": "routeward",
     "linuxNftChainName": "output",

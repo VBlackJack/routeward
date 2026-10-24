@@ -101,10 +101,26 @@ impl ProcessResolver {
         ProcessIdentity::default()
     }
 
-    /// Resolves the owning process(es) for `local_port`, distinguishing single-owner,
+    pub fn resolve_by_local_udp_port(&self, local_port: u16) -> ProcessIdentity {
+        if let Some(pid) = Self::find_pid_for_udp_port(local_port) {
+            return self.resolve_by_pid(pid);
+        }
+        ProcessIdentity::default()
+    }
+
+    /// Resolves the owning process(es) for `local_port` (TCP), distinguishing single-owner,
     /// multi-PID shared sockets (`fork`), and unknown/already-closed sockets.
     pub fn resolve_tcp_port_attribution(&self, local_port: u16) -> ProcessAttribution {
         match Self::find_all_pids_for_tcp_port(local_port) {
+            Ok(pids) => self.classify_pids_for_socket(pids, local_port),
+            Err(reason) => ProcessAttribution::Unknown { reason },
+        }
+    }
+
+    /// Resolves the owning process(es) for `local_port` (UDP), distinguishing single-owner,
+    /// multi-PID shared sockets (`fork`), and unknown/already-closed sockets.
+    pub fn resolve_udp_port_attribution(&self, local_port: u16) -> ProcessAttribution {
+        match Self::find_all_pids_for_udp_port(local_port) {
             Ok(pids) => self.classify_pids_for_socket(pids, local_port),
             Err(reason) => ProcessAttribution::Unknown { reason },
         }
@@ -157,6 +173,30 @@ impl ProcessResolver {
         }
         Err(format!(
             "local_port={local_port} not found in /proc/net/tcp"
+        ))
+    }
+
+    /// Parses `/proc/net/udp` text content and returns the non-zero socket inode for `local_port`.
+    pub fn parse_proc_net_udp_inode(content: &str, local_port: u16) -> Result<u64, String> {
+        let hex_port = format!("{local_port:04X}");
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() > 9 {
+                if let Some((_ip, port)) = fields[1].split_once(':') {
+                    if port.eq_ignore_ascii_case(&hex_port) {
+                        let inode = fields[9].parse::<u64>().unwrap_or(0);
+                        if inode == 0 {
+                            return Err(format!(
+                                "UDP socket for local_port={local_port} has inode=0 (closed)"
+                            ));
+                        }
+                        return Ok(inode);
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "local_port={local_port} not found in /proc/net/udp"
         ))
     }
 
@@ -280,6 +320,62 @@ impl ProcessResolver {
     }
 
     #[cfg(windows)]
+    pub fn find_pid_for_udp_port(local_port: u16) -> Option<u32> {
+        use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetExtendedUdpTable, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
+        };
+        use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+        let mut buffer_size: u32 = 0;
+        let initial_status = unsafe {
+            GetExtendedUdpTable(
+                std::ptr::null_mut(),
+                &mut buffer_size,
+                0,
+                AF_INET as u32,
+                UDP_TABLE_OWNER_PID,
+                0,
+            )
+        };
+
+        if initial_status != ERROR_INSUFFICIENT_BUFFER && initial_status != NO_ERROR {
+            return None;
+        }
+
+        let mut buffer = vec![0u8; buffer_size as usize];
+        let status = unsafe {
+            GetExtendedUdpTable(
+                buffer.as_mut_ptr() as *mut _,
+                &mut buffer_size,
+                0,
+                AF_INET as u32,
+                UDP_TABLE_OWNER_PID,
+                0,
+            )
+        };
+
+        if status != NO_ERROR {
+            return None;
+        }
+
+        let table_ptr = buffer.as_ptr() as *const MIB_UDPTABLE_OWNER_PID;
+        let num_entries = unsafe { (*table_ptr).dwNumEntries } as usize;
+        let first_row_ptr = unsafe { (*table_ptr).table.as_ptr() };
+        let rows: &[MIB_UDPROW_OWNER_PID] =
+            unsafe { std::slice::from_raw_parts(first_row_ptr, num_entries) };
+
+        for row in rows {
+            let port_net = (row.dwLocalPort & 0xFFFF) as u16;
+            let row_port = u16::from_be(port_net);
+            if row_port == local_port {
+                return Some(row.dwOwningPid);
+            }
+        }
+        None
+    }
+
+    #[cfg(windows)]
     fn enumerate_established_tcp_rows(max_entries: usize) -> Vec<(u32, u16, String, u16)> {
         use std::net::Ipv4Addr;
         use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
@@ -387,6 +483,16 @@ impl ProcessResolver {
         }
     }
 
+    #[cfg(windows)]
+    fn find_all_pids_for_udp_port(local_port: u16) -> Result<Vec<u32>, String> {
+        match Self::find_pid_for_udp_port(local_port) {
+            Some(pid) if pid != 0 => Ok(vec![pid]),
+            _ => Err(format!(
+                "local_port={local_port} not found in GetExtendedUdpTable"
+            )),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub fn find_pid_for_tcp_port(local_port: u16) -> Option<u32> {
         Self::find_all_pids_for_tcp_port(local_port)
@@ -395,11 +501,31 @@ impl ProcessResolver {
     }
 
     #[cfg(target_os = "linux")]
+    pub fn find_pid_for_udp_port(local_port: u16) -> Option<u32> {
+        Self::find_all_pids_for_udp_port(local_port)
+            .ok()
+            .and_then(|pids| pids.into_iter().last())
+    }
+
+    #[cfg(target_os = "linux")]
     fn find_all_pids_for_tcp_port(local_port: u16) -> Result<Vec<u32>, String> {
-        use std::fs;
-        let content = fs::read_to_string("/proc/net/tcp")
+        let content = std::fs::read_to_string("/proc/net/tcp")
             .map_err(|e| format!("failed reading /proc/net/tcp: {e}"))?;
         let inode = Self::parse_proc_net_tcp_inode(&content, local_port)?;
+        Self::find_all_pids_for_socket_inode(inode, local_port)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn find_all_pids_for_udp_port(local_port: u16) -> Result<Vec<u32>, String> {
+        let content = std::fs::read_to_string("/proc/net/udp")
+            .map_err(|e| format!("failed reading /proc/net/udp: {e}"))?;
+        let inode = Self::parse_proc_net_udp_inode(&content, local_port)?;
+        Self::find_all_pids_for_socket_inode(inode, local_port)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn find_all_pids_for_socket_inode(inode: u64, local_port: u16) -> Result<Vec<u32>, String> {
+        use std::fs;
         let socket_tag = format!("socket:[{inode}]");
         let self_pid = std::process::id();
         let mut matched_pids = Vec::new();
@@ -454,7 +580,17 @@ impl ProcessResolver {
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
+    pub fn find_pid_for_udp_port(_local_port: u16) -> Option<u32> {
+        None
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
     fn find_all_pids_for_tcp_port(local_port: u16) -> Result<Vec<u32>, String> {
+        Err(format!("unsupported platform for local_port={local_port}"))
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn find_all_pids_for_udp_port(local_port: u16) -> Result<Vec<u32>, String> {
         Err(format!("unsupported platform for local_port={local_port}"))
     }
 
@@ -491,6 +627,14 @@ mod tests {
         let err_missing = ProcessResolver::parse_proc_net_tcp_inode(SAMPLE_PROC_NET_TCP, 55555)
             .expect_err("missing port must return Err");
         assert!(err_missing.contains("not found"));
+
+        // UDP table parsing uses the same column layout
+        assert_eq!(
+            ProcessResolver::parse_proc_net_udp_inode(SAMPLE_PROC_NET_TCP, 50000),
+            Ok(49215)
+        );
+        assert!(ProcessResolver::parse_proc_net_udp_inode(SAMPLE_PROC_NET_TCP, 50001).is_err());
+        assert!(ProcessResolver::parse_proc_net_udp_inode(SAMPLE_PROC_NET_TCP, 55555).is_err());
     }
 
     #[test]

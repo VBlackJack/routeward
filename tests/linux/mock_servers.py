@@ -37,6 +37,8 @@ HTTPS_LOG_PATH = "/tmp/https_443_hits.log"
 DNS_LOG_PATH = "/tmp/dns_hits.log"
 UDP_443_LOG_PATH = "/tmp/udp_443_hits.log"
 LLMNR_LOG_PATH = "/tmp/llmnr_5355_hits.log"
+UDP_DIRECT_PORT = 19990
+UDP_DIRECT_LOG_PATH = "/tmp/udp_direct_hits.log"
 
 
 def parse_dns_question(data: bytes):
@@ -484,9 +486,76 @@ def perform_llmnr_query_cli(target_ip: str, qname: str) -> int:
     pkt.append(0)
     pkt.extend(struct.pack("!HH", 1, 1))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 0))
+    local_port = sock.getsockname()[1]
     sock.sendto(bytes(pkt), (target_ip, LLMNR_PORT))
     sock.close()
-    print(f"LLMNR_SENT QNAME={qname}")
+    print(f"LLMNR_SENT QNAME={qname} SRC_PORT={local_port}")
+    return 0
+
+
+def run_udp_direct_echo_server() -> None:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.setsockopt(socket.SOL_SOCKET, SO_MARK_OPTION, ROUTEWARD_FWMARK)
+    srv.bind((HTTP_HOST, UDP_DIRECT_PORT))
+    while True:
+        try:
+            data, addr = srv.recvfrom(4096)
+            body = data.decode("utf-8", errors="replace")
+            with open(UDP_DIRECT_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"UDP_DIRECT {addr[0]}:{addr[1]} {body}\n")
+            srv.sendto(("DIRECT_ECHO_OK:" + body).encode("utf-8"), addr)
+        except Exception:
+            pass
+
+
+def perform_transparent_udp_send_cli(
+    target_ip: str, target_port: int, payload_str: str
+) -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.5)
+    sock.sendto(payload_str.encode("utf-8"), (target_ip, target_port))
+    try:
+        resp, from_addr = sock.recvfrom(4096)
+    except socket.timeout:
+        print("TRANSPARENT_UDP_TIMEOUT")
+        sock.close()
+        return 2
+    except OSError as exc:
+        print(f"TRANSPARENT_UDP_ERR {type(exc).__name__}:{exc.errno}")
+        sock.close()
+        return 3
+    sock.close()
+    body = resp.decode("utf-8", errors="replace")
+    print(f"TRANSPARENT_UDP_OK FROM={from_addr[0]}:{from_addr[1]} BODY={body}")
+    return 0
+
+
+def perform_transparent_udp_dual_send_cli(
+    proxy_ip: str,
+    proxy_port: int,
+    direct_ip: str,
+    direct_port: int,
+    payload_str: str,
+) -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.5)
+    sock.bind(("0.0.0.0", 0))
+    local_port = sock.getsockname()[1]
+
+    sock.sendto((payload_str + "-via-proxy").encode("utf-8"), (proxy_ip, proxy_port))
+    resp1, from1 = sock.recvfrom(4096)
+
+    sock.sendto((payload_str + "-via-direct").encode("utf-8"), (direct_ip, direct_port))
+    resp2, from2 = sock.recvfrom(4096)
+
+    sock.close()
+    b1 = resp1.decode("utf-8", errors="replace")
+    b2 = resp2.decode("utf-8", errors="replace")
+    print(
+        f"DUAL_OK LOCAL_PORT={local_port} R1={from1[0]}:{from1[1]}:{b1} R2={from2[0]}:{from2[1]}:{b2}"
+    )
     return 0
 
 
@@ -513,6 +582,24 @@ if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "--llmnr-query":
         sys.exit(perform_llmnr_query_cli(sys.argv[2], sys.argv[3]))
 
+    if len(sys.argv) >= 5 and sys.argv[1] == "--transparent-udp-send":
+        sys.exit(
+            perform_transparent_udp_send_cli(
+                sys.argv[2], int(sys.argv[3]), sys.argv[4]
+            )
+        )
+
+    if len(sys.argv) >= 7 and sys.argv[1] == "--transparent-udp-dual-send":
+        sys.exit(
+            perform_transparent_udp_dual_send_cli(
+                sys.argv[2],
+                int(sys.argv[3]),
+                sys.argv[4],
+                int(sys.argv[5]),
+                sys.argv[6],
+            )
+        )
+
     http_only = "--http-only" in sys.argv
     t_http = threading.Thread(target=run_http_server, daemon=True)
     t_http.start()
@@ -522,6 +609,8 @@ if __name__ == "__main__":
     t_udp_443.start()
     t_llmnr = threading.Thread(target=run_llmnr_5355_server, daemon=True)
     t_llmnr.start()
+    t_udp_direct = threading.Thread(target=run_udp_direct_echo_server, daemon=True)
+    t_udp_direct.start()
     t_dns_udp = threading.Thread(target=run_dns_udp_server, daemon=True)
     t_dns_udp.start()
     t_dns_tcp = threading.Thread(target=run_dns_tcp_server, daemon=True)

@@ -33,13 +33,16 @@ use crate::dns::codec::{enforce_udp_truncation, parse_dns_query};
 use crate::dns::LocalNameQueryDecision;
 #[cfg(windows)]
 use crate::interceptor::nat::{
-    build_forged_ipv4_icmp_port_unreachable, build_forged_ipv4_udp_reply, is_private_or_local_ipv4,
-    parse_ipv4_tcp_meta, parse_ipv4_udp_meta, parse_ipv6_transport_meta,
-    reflect_outbound_to_local_relay, reflect_relay_reply_to_client, Ipv4TcpPacketMeta,
-    NatSessionEntry, PendingSynOutcome, PendingSynQueue, PidResolutionSource,
+    build_forged_ipv4_icmp_port_unreachable, build_forged_ipv4_udp_reply,
+    is_ipv4_packet_fragmented, is_private_or_local_ipv4, parse_ipv4_tcp_meta, parse_ipv4_udp_meta,
+    parse_ipv6_transport_meta, reflect_outbound_to_local_relay, reflect_relay_reply_to_client,
+    Ipv4TcpPacketMeta, Ipv4UdpPacketMeta, NatSessionEntry, PendingSynOutcome, PendingSynQueue,
+    PendingUdpOutcome, PendingUdpQueue, PidResolutionSource,
 };
 #[cfg(windows)]
 use crate::process::ProcessResolver;
+#[cfg(windows)]
+use crate::proxy::udp::Socks5UdpTarget;
 #[cfg(windows)]
 use crate::rules::ConnectionRequest;
 #[cfg(windows)]
@@ -78,29 +81,30 @@ const WINDIVERT_FLAG_RECV_ONLY: u64 = 0x0004;
 #[cfg(windows)]
 const WINDIVERT_SHUTDOWN_BOTH: u32 = 0x0003;
 #[cfg(windows)]
-const SOCKET_FILTER_TCP_OUTBOUND: &str = "outbound and !loopback and tcp";
+const SOCKET_FILTER_TCP_OUTBOUND: &str = "outbound and !loopback and (tcp or udp)";
 #[cfg(windows)]
 const PACKET_BUFFER_SIZE: usize = 65535;
 const BIT_OUTBOUND: u64 = 1 << 17;
 const BIT_IMPOSTOR: u64 = 1 << 19;
 
-/// Builds the `WINDIVERT_LAYER_NETWORK` filter string for outbound IPv4 TCP + UDP (53/853/443/5353/5355/137)
+/// Builds the `WINDIVERT_LAYER_NETWORK` filter string for outbound IPv4 TCP + UDP
 /// and IPv6 DNS/DoT/QUIC/mDNS/LLMNR packets.
 pub fn build_network_filter_string(dns_port: u16, dot_port: u16) -> String {
     build_network_filter_string_full(dns_port, dot_port, 443, 5353, 5355, 137)
 }
 
-/// Builds the full `WINDIVERT_LAYER_NETWORK` filter string using all configured DNS, QUIC, and local name ports.
+/// Builds the full `WINDIVERT_LAYER_NETWORK` filter string capturing all outbound non-loopback
+/// IPv4 TCP and UDP packets plus IPv6 DNS, DoT, QUIC, and local name ports.
 pub fn build_network_filter_string_full(
     dns_port: u16,
     dot_port: u16,
     quic_port: u16,
     mdns_port: u16,
     llmnr_port: u16,
-    netbios_ns_port: u16,
+    _netbios_ns_port: u16,
 ) -> String {
     format!(
-        "outbound and !loopback and ((ip and (tcp or udp.DstPort == {dns_port} or udp.DstPort == {dot_port} or udp.DstPort == {quic_port} or udp.DstPort == {mdns_port} or udp.DstPort == {llmnr_port} or udp.DstPort == {netbios_ns_port})) or (ipv6 and (tcp.DstPort == {dns_port} or udp.DstPort == {dns_port} or tcp.DstPort == {dot_port} or udp.DstPort == {dot_port} or udp.DstPort == {quic_port} or udp.DstPort == {mdns_port} or udp.DstPort == {llmnr_port})))"
+        "outbound and !loopback and ((ip and (tcp or udp)) or (ipv6 and (tcp.DstPort == {dns_port} or udp.DstPort == {dns_port} or tcp.DstPort == {dot_port} or udp.DstPort == {dot_port} or udp.DstPort == {quic_port} or udp.DstPort == {mdns_port} or udp.DstPort == {llmnr_port})))"
     )
 }
 
@@ -224,6 +228,7 @@ struct ActiveHandles {
     socket_handle: usize,
     network_handle: Arc<AtomicUsize>,
     pending_syn_queue: PendingSynQueue<(Vec<u8>, WinDivertAddress)>,
+    pending_udp_queue: PendingUdpQueue<(Vec<u8>, WinDivertAddress)>,
     firewall_rule_name: String,
     telemetry: TelemetryHub,
 }
@@ -650,6 +655,189 @@ impl WinDivertInterceptor {
     }
 
     #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_resolved_udp(
+        ctrl: &RouteWardController,
+        active: &Arc<AtomicBool>,
+        api: &WinDivertApi,
+        net_handle_usize: usize,
+        packet: &[u8],
+        addr: &WinDivertAddress,
+        meta: Ipv4UdpPacketMeta,
+        is_fragmented: bool,
+        resolved: Option<(u32, PidResolutionSource)>,
+    ) {
+        let net_handle = net_handle_usize as *mut c_void;
+        let pid_opt = resolved.map(|(p, _)| p);
+
+        if ctrl.nat_table.is_loop_or_excluded(
+            pid_opt,
+            meta.src_ip,
+            meta.src_port,
+            meta.dst_ip,
+            meta.dst_port,
+        ) {
+            let mut send_len: u32 = 0;
+            unsafe {
+                let _ = (api.send)(
+                    net_handle,
+                    packet.as_ptr() as *const c_void,
+                    packet.len() as u32,
+                    &mut send_len,
+                    addr as *const WinDivertAddress,
+                );
+            }
+            return;
+        }
+
+        let (pid, res_source) = resolved.unwrap_or((0, PidResolutionSource::TcpTableFallback));
+        let proc_id = ctrl.process_resolver.resolve_by_pid(pid);
+        let dst_ip_str = meta.dst_ip.to_string();
+
+        let eval = if proc_id.is_unattributed() {
+            let (unknown_action, rule_name) = ctrl.resolve_unknown_process_action(
+                COMPONENT_WINDIVERT,
+                meta.src_port,
+                &dst_ip_str,
+                meta.dst_port,
+                "process image unavailable",
+            );
+            let resolved_dom = ctrl.dns.resolve_fake_ip(&meta.dst_ip);
+            crate::rules::RuleEvaluationResult {
+                matched_rule_id: "security-policy-unknown-process".to_string(),
+                matched_rule_name: rule_name,
+                action: unknown_action,
+                effective_domain: resolved_dom.clone(),
+                resolved_from_fake_ip: resolved_dom.is_some(),
+            }
+        } else {
+            ctrl.evaluate_rule(&ConnectionRequest {
+                process_name: proc_id.name.clone(),
+                process_path: Some(proc_id.executable_path.clone()),
+                target_host: dst_ip_str.clone(),
+                target_ip: Some(dst_ip_str.clone()),
+                target_port: meta.dst_port,
+                protocol: TransportProtocol::Udp,
+            })
+        };
+
+        let is_fake_ip = ctrl.dns.is_in_fake_subnet(&meta.dst_ip);
+        if matches!(eval.action, RuleAction::Direct) && !is_fake_ip {
+            if !is_fragmented {
+                ctrl.telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_WINDIVERT,
+                    format!(
+                        "Routed UDP PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} via DIRECT [rule=\"{}\"]",
+                        proc_id.pid,
+                        proc_id.name,
+                        proc_id.executable_path,
+                        res_source.as_str(),
+                        meta.src_ip,
+                        meta.src_port,
+                        meta.dst_ip,
+                        meta.dst_port,
+                        eval.matched_rule_name
+                    ),
+                );
+                ctrl.telemetry.record_connection(
+                    TrackedConnection {
+                        id: Uuid::new_v4().to_string(),
+                        pid: proc_id.pid,
+                        process_name: proc_id.name,
+                        process_path: proc_id.executable_path,
+                        target_host: dst_ip_str,
+                        resolved_domain: eval.effective_domain,
+                        target_port: meta.dst_port,
+                        protocol: TransportProtocol::Udp,
+                        matched_rule: eval.matched_rule_name,
+                        route_label: "DIRECT".to_string(),
+                        latency_ms: 0,
+                        rx_bytes: 0,
+                        tx_bytes: meta.payload_len as u64,
+                        status: ConnectionStatus::Active,
+                        started_at: Utc::now(),
+                    },
+                    true,
+                );
+            }
+            let mut send_len: u32 = 0;
+            unsafe {
+                let _ = (api.send)(
+                    net_handle,
+                    packet.as_ptr() as *const c_void,
+                    packet.len() as u32,
+                    &mut send_len,
+                    addr as *const WinDivertAddress,
+                );
+            }
+            return;
+        }
+
+        let udp_payload =
+            packet[meta.payload_offset..meta.payload_offset + meta.payload_len].to_vec();
+        let ctrl_async = ctrl.clone();
+        let active_async = Arc::clone(active);
+        let mut reply_addr = *addr;
+        let api_copy = *api;
+        let proc_name = proc_id.name;
+        let proc_path = proc_id.executable_path;
+        let proc_pid = proc_id.pid;
+
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let client_addr = SocketAddr::new(IpAddr::V4(meta.src_ip), meta.src_port);
+            let target = Socks5UdpTarget::Ipv4(meta.dst_ip, meta.dst_port);
+            let Ok(reply_bytes) = rt.block_on(ctrl_async.forward_udp_datagram(
+                client_addr,
+                &proc_name,
+                Some(&proc_path),
+                proc_pid,
+                &target,
+                &udp_payload,
+                is_fragmented,
+            )) else {
+                return;
+            };
+            if !active_async.load(Ordering::Relaxed) || reply_bytes.is_empty() {
+                return;
+            }
+            if let Some(mut forged) = build_forged_ipv4_udp_reply(
+                meta.dst_ip,
+                meta.dst_port,
+                meta.src_ip,
+                meta.src_port,
+                &reply_bytes,
+            ) {
+                reply_addr.set_outbound(false);
+                reply_addr.clear_impostor();
+                let mut send_len: u32 = 0;
+                let h_ptr = net_handle_usize as *mut c_void;
+                unsafe {
+                    let _ = (api_copy.calc_checksums)(
+                        forged.as_mut_ptr() as *mut c_void,
+                        forged.len() as u32,
+                        &mut reply_addr as *mut WinDivertAddress,
+                        0,
+                    );
+                    let _ = (api_copy.send)(
+                        h_ptr,
+                        forged.as_ptr() as *const c_void,
+                        forged.len() as u32,
+                        &mut send_len,
+                        &reply_addr as *const WinDivertAddress,
+                    );
+                }
+            }
+        });
+    }
+
+    #[cfg(windows)]
     fn load_dynamic_api(search_paths: &[String]) -> RouteWardResult<WinDivertApi> {
         use windows_sys::Win32::System::LibraryLoader::{
             GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH,
@@ -831,12 +1019,15 @@ impl Interceptor for WinDivertInterceptor {
         let shared_net_handle = Arc::new(AtomicUsize::new(net_handle_usize));
         let pending_syn_queue: PendingSynQueue<(Vec<u8>, WinDivertAddress)> =
             PendingSynQueue::new();
+        let pending_udp_queue: PendingUdpQueue<(Vec<u8>, WinDivertAddress)> =
+            PendingUdpQueue::new(net_consts.max_pending_udp_packets);
 
         *self.handles.lock() = Some(ActiveHandles {
             api,
             socket_handle: sock_handle_usize,
             network_handle: Arc::clone(&shared_net_handle),
             pending_syn_queue: pending_syn_queue.clone(),
+            pending_udp_queue: pending_udp_queue.clone(),
             firewall_rule_name,
             telemetry: controller.telemetry.clone(),
         });
@@ -866,19 +1057,23 @@ impl Interceptor for WinDivertInterceptor {
             }
         });
 
-        // 2. Spawn dedicated Pending SYN worker thread (polls unresolved SYNs outside the receive loop)
+        // 2. Spawn dedicated Pending SYN + Pending UDP worker thread (polls unresolved packets outside the receive loop)
         let active_syn = Arc::clone(&self.active);
         let ctrl_syn = controller.clone();
         let syn_queue_worker = pending_syn_queue.clone();
+        let udp_queue_worker = pending_udp_queue.clone();
         let net_handle_for_syn = Arc::clone(&shared_net_handle);
         std::thread::spawn(move || {
             let poll_interval =
                 Duration::from_millis(ctrl_syn.constants.network.pid_fallback_delay_ms.max(1));
             let syn_timeout =
                 Duration::from_millis(ctrl_syn.constants.network.pending_syn_timeout_ms);
+            let udp_timeout =
+                Duration::from_millis(ctrl_syn.constants.network.pending_udp_timeout_ms);
 
             while active_syn.load(Ordering::Relaxed) {
-                let handle = net_handle_for_syn.load(Ordering::Acquire) as *mut c_void;
+                let handle_usize = net_handle_for_syn.load(Ordering::Acquire);
+                let handle = handle_usize as *mut c_void;
                 let outcomes = ctrl_syn.poll_pending_syns(
                     &syn_queue_worker,
                     syn_timeout,
@@ -924,6 +1119,54 @@ impl Interceptor for WinDivertInterceptor {
                     }
                 }
 
+                let udp_outcomes = ctrl_syn.poll_pending_udps(
+                    &udp_queue_worker,
+                    udp_timeout,
+                    ProcessResolver::find_pid_for_udp_port,
+                );
+
+                for outcome in udp_outcomes {
+                    match outcome {
+                        PendingUdpOutcome::Resolved {
+                            payload: (pkt, addr),
+                            meta,
+                            is_fragmented,
+                            pid,
+                            source,
+                        } => {
+                            Self::dispatch_resolved_udp(
+                                &ctrl_syn,
+                                &active_syn,
+                                &api,
+                                handle_usize,
+                                &pkt,
+                                &addr,
+                                meta,
+                                is_fragmented,
+                                Some((pid, source)),
+                            );
+                        }
+                        PendingUdpOutcome::TimedOutDropped { .. } => {
+                            // Datagram was dropped inside poll_pending_udps and logged at INFO with drop_count
+                        }
+                        PendingUdpOutcome::TimedOutReinject {
+                            payload: (pkt, addr),
+                            ..
+                        } => {
+                            let mut send_len: u32 = 0;
+                            unsafe {
+                                let _ = (api.send)(
+                                    handle,
+                                    pkt.as_ptr() as *const c_void,
+                                    pkt.len() as u32,
+                                    &mut send_len,
+                                    &addr as *const WinDivertAddress,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 std::thread::sleep(poll_interval);
             }
         });
@@ -935,6 +1178,7 @@ impl Interceptor for WinDivertInterceptor {
             api,
             net_handle_usize,
             pending_syn_queue,
+            pending_udp_queue,
         );
 
         Ok(())
@@ -956,7 +1200,7 @@ impl Interceptor for WinDivertInterceptor {
             return Ok(());
         }
 
-        let (api, shared_net_handle, pending_syn_queue) = {
+        let (api, shared_net_handle, pending_syn_queue, pending_udp_queue) = {
             let guard = self.handles.lock();
             let Some(ref handles) = *guard else {
                 return Ok(());
@@ -965,6 +1209,7 @@ impl Interceptor for WinDivertInterceptor {
                 handles.api,
                 Arc::clone(&handles.network_handle),
                 handles.pending_syn_queue.clone(),
+                handles.pending_udp_queue.clone(),
             )
         };
 
@@ -1008,6 +1253,7 @@ impl Interceptor for WinDivertInterceptor {
             api,
             new_net_usize,
             pending_syn_queue,
+            pending_udp_queue,
         );
 
         let old_net_usize = shared_net_handle.swap(new_net_usize, Ordering::SeqCst);
@@ -1058,6 +1304,7 @@ impl WinDivertInterceptor {
         api: WinDivertApi,
         net_handle_usize: usize,
         syn_queue_producer: PendingSynQueue<(Vec<u8>, WinDivertAddress)>,
+        udp_queue_producer: PendingUdpQueue<(Vec<u8>, WinDivertAddress)>,
     ) {
         let dns_port = ctrl_net.constants.dns.dns_standard_port;
         let dot_port = ctrl_net.constants.dns.dns_over_tls_port;
@@ -1294,7 +1541,17 @@ impl WinDivertInterceptor {
                                             udp_meta.dst_port, udp_meta.dst_ip, udp_meta.dst_port
                                         ),
                                     );
-                                    // Fall through to api.send to pass directly
+                                    let mut send_len: u32 = 0;
+                                    unsafe {
+                                        let _ = (api.send)(
+                                            handle,
+                                            packet.as_ptr() as *const c_void,
+                                            pkt_len as u32,
+                                            &mut send_len,
+                                            &addr as *const WinDivertAddress,
+                                        );
+                                    }
+                                    continue;
                                 }
                                 LocalNameQueryDecision::BlockPublicFqdn { qname } => {
                                     ctrl_net.push_rate_limited_warn(
@@ -1337,38 +1594,49 @@ impl WinDivertInterceptor {
                             }
                         }
 
-                        // NetBIOS-NS (137): block if targeting a non-local / public IPv4 address
-                        if udp_meta.dst_port == netbios_ns_port
-                            && !is_private_or_local_ipv4(udp_meta.dst_ip)
-                        {
-                            ctrl_net.push_rate_limited_warn(
-                                &format!("netbios:{}", udp_meta.dst_ip),
-                                COMPONENT_WINDIVERT,
-                                format!(
-                                    "Blocked NetBIOS-NS (UDP port {}) toward public IP {}:{}",
-                                    netbios_ns_port, udp_meta.dst_ip, udp_meta.dst_port
-                                ),
-                            );
-                            ctrl_net.telemetry.record_connection(
-                                TrackedConnection {
-                                    id: Uuid::new_v4().to_string(),
-                                    pid: 0,
-                                    process_name: "netbios-ns".to_string(),
-                                    process_path: "netbios-ns".to_string(),
-                                    target_host: udp_meta.dst_ip.to_string(),
-                                    resolved_domain: None,
-                                    target_port: udp_meta.dst_port,
-                                    protocol: TransportProtocol::Udp,
-                                    matched_rule: "LocalNameGuard:NetBIOS".to_string(),
-                                    route_label: "BLOCKED".to_string(),
-                                    latency_ms: 0,
-                                    rx_bytes: 0,
-                                    tx_bytes: 0,
-                                    status: ConnectionStatus::Blocked,
-                                    started_at: Utc::now(),
-                                },
-                                false,
-                            );
+                        // NetBIOS-NS (137): block if targeting a non-local / public IPv4 address, allow local directly
+                        if udp_meta.dst_port == netbios_ns_port {
+                            if !is_private_or_local_ipv4(udp_meta.dst_ip) {
+                                ctrl_net.push_rate_limited_warn(
+                                    &format!("netbios:{}", udp_meta.dst_ip),
+                                    COMPONENT_WINDIVERT,
+                                    format!(
+                                        "Blocked NetBIOS-NS (UDP port {}) toward public IP {}:{}",
+                                        netbios_ns_port, udp_meta.dst_ip, udp_meta.dst_port
+                                    ),
+                                );
+                                ctrl_net.telemetry.record_connection(
+                                    TrackedConnection {
+                                        id: Uuid::new_v4().to_string(),
+                                        pid: 0,
+                                        process_name: "netbios-ns".to_string(),
+                                        process_path: "netbios-ns".to_string(),
+                                        target_host: udp_meta.dst_ip.to_string(),
+                                        resolved_domain: None,
+                                        target_port: udp_meta.dst_port,
+                                        protocol: TransportProtocol::Udp,
+                                        matched_rule: "LocalNameGuard:NetBIOS".to_string(),
+                                        route_label: "BLOCKED".to_string(),
+                                        latency_ms: 0,
+                                        rx_bytes: 0,
+                                        tx_bytes: 0,
+                                        status: ConnectionStatus::Blocked,
+                                        started_at: Utc::now(),
+                                    },
+                                    false,
+                                );
+                                continue;
+                            }
+                            let mut send_len: u32 = 0;
+                            unsafe {
+                                let _ = (api.send)(
+                                    handle,
+                                    packet.as_ptr() as *const c_void,
+                                    pkt_len as u32,
+                                    &mut send_len,
+                                    &addr as *const WinDivertAddress,
+                                );
+                            }
                             continue;
                         }
 
@@ -1478,6 +1746,68 @@ impl WinDivertInterceptor {
                             });
                             continue;
                         }
+
+                        // General outbound IPv4 UDP interception (skipping multicast/broadcast/loopback and upstream proxy exclusions)
+                        if !udp_meta.dst_ip.is_multicast()
+                            && !udp_meta.dst_ip.is_broadcast()
+                            && !udp_meta.dst_ip.is_loopback()
+                            && !ctrl_net.nat_table.is_loop_or_excluded(
+                                None,
+                                udp_meta.src_ip,
+                                udp_meta.src_port,
+                                udp_meta.dst_ip,
+                                udp_meta.dst_port,
+                            )
+                        {
+                            let is_frag = is_ipv4_packet_fragmented(packet);
+                            let resolved = ctrl_net.nat_table.try_resolve_pid_nonblocking(
+                                udp_meta.src_port,
+                                ProcessResolver::find_pid_for_udp_port,
+                            );
+                            if resolved.is_some() {
+                                Self::dispatch_resolved_udp(
+                                    &ctrl_net,
+                                    &active_net,
+                                    &api,
+                                    net_handle_usize,
+                                    packet,
+                                    &addr,
+                                    udp_meta,
+                                    is_frag,
+                                    resolved,
+                                );
+                                continue;
+                            } else {
+                                let kill_switch_enabled =
+                                    ctrl_net.profile.read().security_policy.kill_switch_enabled;
+                                if let Some(evicted) = udp_queue_producer.enqueue(
+                                    &ctrl_net.nat_table,
+                                    (packet.to_vec(), addr),
+                                    udp_meta,
+                                    is_frag,
+                                    kill_switch_enabled,
+                                ) {
+                                    ctrl_net.log_pending_udp_outcome(&evicted);
+                                    if let PendingUdpOutcome::TimedOutReinject {
+                                        payload: (ev_pkt, ev_addr),
+                                        ..
+                                    } = evicted
+                                    {
+                                        let mut send_len: u32 = 0;
+                                        unsafe {
+                                            let _ = (api.send)(
+                                                handle,
+                                                ev_pkt.as_ptr() as *const c_void,
+                                                ev_pkt.len() as u32,
+                                                &mut send_len,
+                                                &ev_addr as *const WinDivertAddress,
+                                            );
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                     }
                 }
 
@@ -1586,12 +1916,7 @@ mod tests {
         assert!(!addr.is_outbound());
 
         let filter = build_network_filter_string(53, 853);
-        assert!(filter.contains("udp.DstPort == 53"));
-        assert!(filter.contains("udp.DstPort == 853"));
-        assert!(filter.contains("udp.DstPort == 443"));
-        assert!(filter.contains("udp.DstPort == 5353"));
-        assert!(filter.contains("udp.DstPort == 5355"));
-        assert!(filter.contains("udp.DstPort == 137"));
+        assert!(filter.contains("ip and (tcp or udp)"));
         assert!(filter.contains("ipv6 and (tcp.DstPort == 53 or udp.DstPort == 53"));
 
         // IPv6 ports 53 and 853 are blocked even when killSwitchEnabled=false

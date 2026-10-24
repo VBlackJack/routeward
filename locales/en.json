@@ -624,7 +624,8 @@
       "open_failed": "Failed to open WinDivert kernel filter (Administrator privileges required)",
       "not_root": "Root privileges required on Linux for nftables interception (EUID != 0)",
       "nft_missing": "nftables binary (nft) was not found on the system",
-      "nft_failed": "Failed to execute nftables command"
+      "nft_failed": "Failed to execute nftables command",
+      "tproxy_conflict": "Refusing to start UDP TPROXY interception: configured ip rule priority, fwmark, or routing table is already in use"
     },
     "daemon": {
       "already_running": "Another RouteWard daemon instance is already running",

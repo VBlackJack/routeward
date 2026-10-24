@@ -133,7 +133,22 @@ param(
     [string]$FakeIpCidr = "198.18.0.0/15",
 
     [Parameter(Mandatory = $false)]
-    [string]$PublicDnsTestDomain = ""
+    [string]$PublicDnsTestDomain = "",
+
+    [Parameter(Mandatory = $false)]
+    [string]$UdpTestServerExeName = "socks5_udp_test_server.exe",
+
+    [Parameter(Mandatory = $false)]
+    [int]$UdpTestProxyPort = 1082,
+
+    [Parameter(Mandatory = $false)]
+    [int]$UdpRefuseTestProxyPort = 1083,
+
+    [Parameter(Mandatory = $false)]
+    [string]$PublicNtpServer = "time.cloudflare.com",
+
+    [Parameter(Mandatory = $false)]
+    [int]$NtpPort = 123
 )
 
 Set-StrictMode -Version Latest
@@ -164,7 +179,10 @@ $script:ScenarioExecutionPlan = @(
     [PSCustomObject]@{ ExecutionOrder = 13; Id = "n"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "OS DNS cache flushed on engine startup" },
     [PSCustomObject]@{ ExecutionOrder = 14; Id = "o"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "QUIC (UDP 443) rejected with ICMP Port Unreachable" },
     [PSCustomObject]@{ ExecutionOrder = 15; Id = "p"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "LLMNR (UDP 5355) blocks public FQDNs and allows local names" },
-    [PSCustomObject]@{ ExecutionOrder = 16; Id = "j"; RequiresSocks5 = $true;  StopsSocks5 = $true;  Title = "Kill-Switch blocks curl when SOCKS5 proxy is stopped" }
+    [PSCustomObject]@{ ExecutionOrder = 16; Id = "q"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Transparent UDP proxy routing (NTP UDP 123) & profile restoration" },
+    [PSCustomObject]@{ ExecutionOrder = 17; Id = "r"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Transparent UDP with proxy refusing UDP ASSOCIATE + Kill-Switch" },
+    [PSCustomObject]@{ ExecutionOrder = 18; Id = "s"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Transparent Direct UDP with process attribution" },
+    [PSCustomObject]@{ ExecutionOrder = 19; Id = "j"; RequiresSocks5 = $true;  StopsSocks5 = $true;  Title = "Kill-Switch blocks curl when SOCKS5 proxy is stopped" }
 )
 
 function Get-ScenarioPlanEntry {
@@ -239,6 +257,59 @@ function New-DnsWireQueryPacket {
     return ,$bytes.ToArray()
 }
 
+function New-NtpClientRequestPacket {
+    $pkt = New-Object byte[] 48
+    # LI = 0 (no warning), VN = 4 (NTPv4), Mode = 3 (Client) -> 0x23
+    $pkt[0] = 0x23
+    return ,$pkt
+}
+
+function Invoke-UdpNtpExchange {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetHost,
+
+        [Parameter(Mandatory = $false)]
+        [int]$Port = 123,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ReceiveTimeoutMs = 3000
+    )
+    $udp = New-Object System.Net.Sockets.UdpClient
+    try {
+        $udp.Client.ReceiveTimeout = $ReceiveTimeoutMs
+        $reqPkt = New-NtpClientRequestPacket
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $null = $udp.Send($reqPkt, $reqPkt.Length, $TargetHost, $Port)
+        $remoteEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+        try {
+            $respBytes = $udp.Receive([ref]$remoteEp)
+            $sw.Stop()
+            $mode = if ($null -ne $respBytes -and $respBytes.Length -ge 48) { [int]($respBytes[0] -band 0x07) } else { 0 }
+            return [PSCustomObject]@{
+                ReplyReceived   = ($null -ne $respBytes -and $respBytes.Length -ge 48 -and ($mode -eq 4 -or $mode -eq 5))
+                ReplyLen        = $(if ($null -ne $respBytes) { $respBytes.Length } else { 0 })
+                ServerMode      = $mode
+                RemoteAddress   = $(if ($null -ne $remoteEp) { $remoteEp.Address.ToString() } else { "" })
+                SocketErrorCode = "None"
+                DelayMs         = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+            }
+        } catch [System.Net.Sockets.SocketException] {
+            $sw.Stop()
+            return [PSCustomObject]@{
+                ReplyReceived   = $false
+                ReplyLen        = 0
+                ServerMode      = 0
+                RemoteAddress   = ""
+                SocketErrorCode = $_.Exception.SocketErrorCode.ToString()
+                DelayMs         = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+            }
+        }
+    } finally {
+        $udp.Close()
+    }
+}
+
 function Invoke-QuicUdp443Probe {
     param(
         [Parameter(Mandatory = $true)]
@@ -253,6 +324,12 @@ function Invoke-QuicUdp443Probe {
     $udp = New-Object System.Net.Sockets.UdpClient
     try {
         $udp.Client.ReceiveTimeout = $ReceiveTimeoutMs
+        try {
+            # Arm Winsock SIO_UDP_CONNRESET (-1744830452) so inbound ICMP Port Unreachable surfaces WSAECONNRESET
+            $null = $udp.Client.IOControl(-1744830452, [byte[]]@(1, 0, 0, 0), $null)
+        } catch {
+            # Ignore if IOControl is unsupported on the socket
+        }
         $udp.Connect($TargetIp, $Port)
         $payload = [System.Text.Encoding]::ASCII.GetBytes("QUIC_INITIAL_PROBE_42A")
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -262,18 +339,22 @@ function Invoke-QuicUdp443Probe {
             $null = $udp.Receive([ref]$remoteEp)
             $sw.Stop()
             return [PSCustomObject]@{
-                ClientErrorReceived = $false
-                SocketErrorCode     = "None"
-                DelayMs             = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                UnexpectedReplyReceived = $true
+                FastRejection           = $false
+                ClientErrorReceived     = $false
+                SocketErrorCode         = "None"
+                DelayMs                 = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
             }
         } catch [System.Net.Sockets.SocketException] {
             $sw.Stop()
             $sockErr = $_.Exception.SocketErrorCode.ToString()
             $isIcmpReject = ($sockErr -eq "ConnectionReset" -or $sockErr -eq "ConnectionRefused")
             return [PSCustomObject]@{
-                ClientErrorReceived = $isIcmpReject
-                SocketErrorCode     = $sockErr
-                DelayMs             = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                UnexpectedReplyReceived = $false
+                FastRejection           = $isIcmpReject
+                ClientErrorReceived     = $isIcmpReject
+                SocketErrorCode         = $sockErr
+                DelayMs                 = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
             }
         }
     } finally {
@@ -968,12 +1049,12 @@ if ($DryRun.IsPresent) {
     if ($frExtractedMethod -ne "dnsapi.dll!DnsFlushResolverCache") {
         throw "DryRun failed: expected invariant English method from localized log, got '$frExtractedMethod'."
     }
-    if ($script:ScenarioExecutionPlan.Count -ne 16) {
-        throw "DryRun failed: expected 16 scenarios in ScenarioExecutionPlan, got $($script:ScenarioExecutionPlan.Count)."
+    if ($script:ScenarioExecutionPlan.Count -ne 19) {
+        throw "DryRun failed: expected 19 scenarios in ScenarioExecutionPlan, got $($script:ScenarioExecutionPlan.Count)."
     }
     $lastScenario = $script:ScenarioExecutionPlan[$script:ScenarioExecutionPlan.Count - 1]
-    if ($lastScenario.Id -ne "j" -or $lastScenario.ExecutionOrder -ne 16 -or (-not $lastScenario.StopsSocks5)) {
-        throw "DryRun failed: Scenario (j) must execute last (ExecutionOrder=16, StopsSocks5=true)."
+    if ($lastScenario.Id -ne "j" -or $lastScenario.ExecutionOrder -ne 19 -or (-not $lastScenario.StopsSocks5)) {
+        throw "DryRun failed: Scenario (j) must execute last (ExecutionOrder=19, StopsSocks5=true)."
     }
     foreach ($planItem in $script:ScenarioExecutionPlan) {
         if ($planItem.RequiresSocks5 -and $planItem.Id -ne "j" -and $planItem.ExecutionOrder -ge $lastScenario.ExecutionOrder) {
@@ -983,6 +1064,10 @@ if ($DryRun.IsPresent) {
     $llmnrTestPkt = New-DnsWireQueryPacket -QueryName "public-leak.routeward.test" -TransactionId 0x5355
     if ($llmnrTestPkt.Length -le 20 -or $llmnrTestPkt[0] -ne 0x53 -or $llmnrTestPkt[1] -ne 0x55) {
         throw "DryRun failed: New-DnsWireQueryPacket produced unexpected wire bytes."
+    }
+    $ntpTestPkt = New-NtpClientRequestPacket
+    if ($ntpTestPkt.Length -ne 48 -or $ntpTestPkt[0] -ne 0x23) {
+        throw "DryRun failed: New-NtpClientRequestPacket produced unexpected wire bytes."
     }
     $connsQuicLlmnrDryRun = ConvertFrom-CtlResponseJson `
         -RawJson ($fixtures.connectionsQuicAndLlmnrBlocked | ConvertTo-Json -Depth 6) `
@@ -995,10 +1080,39 @@ if ($DryRun.IsPresent) {
         -ExpectResultArray `
         -RequiredArrayElementProperties @("level", "component", "message")
     if ($connsQuicLlmnrDryRun.Count -ne 2 -or $logsQuicLlmnrDryRun.Count -ne 2) {
-        throw "DryRun failed: unexpected connectionsQuicAndLlmnrBlocked or logsQuicAndLlmnrBlocked count."
+        throw "DryRun failed: unexpected connectionsQuicAndLlmnrBlocked or logsQuicLlmnrBlocked count."
+    }
+    $upsertProxyAck = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.upsertProxyOk | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-upsertProxyOk" `
+        -RequiredResultProperties @("ok")
+    $removeProxyAck = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.removeProxyOk | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-removeProxyOk" `
+        -RequiredResultProperties @("ok")
+    if ($upsertProxyAck.ok -ne $true -or $removeProxyAck.ok -ne $true) {
+        throw "DryRun failed: unexpected upsert/remove proxy response."
+    }
+    $connsUdpNtpProxiedDryRun = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.connectionsUdpNtpProxied | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-connectionsUdpNtpProxied" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("processName", "targetPort", "protocol", "matchedRule", "routeLabel", "status")
+    $connsUdpRefusedDryRun = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.connectionsUdpRefusedBlocked | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-connectionsUdpRefusedBlocked" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("processName", "targetPort", "protocol", "matchedRule", "routeLabel", "status")
+    $connsUdpDirectDryRun = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.connectionsUdpDirectAttributed | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-connectionsUdpDirectAttributed" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("processName", "targetPort", "protocol", "matchedRule", "routeLabel", "status")
+    if ($connsUdpNtpProxiedDryRun.Count -ne 1 -or $connsUdpRefusedDryRun.Count -ne 1 -or $connsUdpDirectDryRun.Count -ne 1) {
+        throw "DryRun failed: unexpected 4.2.b UDP fixture counts."
     }
     $orderChain = ($script:ScenarioExecutionPlan | ForEach-Object { "{0:D2}:({1})" -f $_.ExecutionOrder, $_.Id }) -join " -> "
-    Write-Host "[DRYRUN-PASS] Verified Fake-IP CIDR pool helper, 'ctl fake-ips', QUIC/LLMNR fixtures, English-only OS DNS cache flush parser, and explicit execution order ($orderChain)." -ForegroundColor Green
+    Write-Host "[DRYRUN-PASS] Verified Fake-IP CIDR pool helper, 'ctl fake-ips', QUIC/LLMNR/UDP-4.2.b fixtures, English-only OS DNS cache flush parser, and explicit execution order ($orderChain)." -ForegroundColor Green
 
     $upsertAck = ConvertFrom-CtlResponseJson `
         -RawJson ($fixtures.upsertRuleOk | ConvertTo-Json -Depth 6) `
@@ -1080,6 +1194,26 @@ if (-not (Test-Path -LiteralPath $CurlExePath)) {
     exit 2
 }
 
+$udpTestServerExePath = $null
+$udpTestCandidates = @(
+    (Join-Path $resolvedBinDir $UdpTestServerExeName),
+    (Join-Path (Join-Path $resolvedBinDir "examples") $UdpTestServerExeName),
+    (Join-Path $PSScriptRoot $UdpTestServerExeName)
+)
+if (-not [string]::IsNullOrWhiteSpace($repoRootCandidate)) {
+    $udpTestCandidates += (Join-Path $repoRootCandidate "target\release\examples\$UdpTestServerExeName")
+}
+foreach ($udpCand in $udpTestCandidates) {
+    if (Test-Path -LiteralPath $udpCand) {
+        $udpTestServerExePath = $udpCand
+        break
+    }
+}
+if ([string]::IsNullOrWhiteSpace($udpTestServerExePath)) {
+    Write-Host "[ABORT] Pre-flight check failed: Missing SOCKS5 UDP test server binary '$UdpTestServerExeName' in '$resolvedBinDir' or '$resolvedBinDir\examples'." -ForegroundColor Red
+    exit 2
+}
+
 $resolvedWinDivertFiles = New-Object System.Collections.Generic.List[string]
 foreach ($wdFile in $WinDivertFileNames) {
     $directCandidate = Join-Path $resolvedBinDir $wdFile
@@ -1110,7 +1244,62 @@ if (-not (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs 
 # ---------------------------------------------------------------------------
 $script:RawCtlCapture = New-Object System.Collections.Generic.List[string]
 $script:StartedDaemonPids = New-Object System.Collections.Generic.HashSet[int]
+$script:StartedUdpTestServerPids = New-Object System.Collections.Generic.HashSet[int]
 $script:CurrentDaemonProc = $null
+
+function Start-TrackedUdpTestServer {
+    param(
+        [string]$ExePath,
+        [int]$Port,
+        [string]$StatsFilePath,
+        [switch]$DisableUdpAssociate
+    )
+    if (Test-Path -LiteralPath $StatsFilePath) {
+        Remove-Item -LiteralPath $StatsFilePath -Force -ErrorAction SilentlyContinue
+    }
+    $argsList = @("--bind", "127.0.0.1:$Port", "--stats-file", $StatsFilePath)
+    if ($DisableUdpAssociate.IsPresent) {
+        $argsList += "--disable-udp-associate"
+    }
+    $proc = Start-Process -FilePath $ExePath -ArgumentList $argsList -WindowStyle Hidden -PassThru
+    $null = $script:StartedUdpTestServerPids.Add([int]$proc.Id)
+    $readySw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($readySw.ElapsedMilliseconds -lt 3000) {
+        if (Test-TcpEndpoint -TargetHost "127.0.0.1" -Port $Port -TimeoutMs 250) {
+            return $proc
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Timed out waiting for socks5_udp_test_server on 127.0.0.1:$Port"
+}
+
+function Stop-AllTrackedUdpTestServers {
+    foreach ($udpPid in @($script:StartedUdpTestServerPids)) {
+        $up = Get-Process -Id $udpPid -ErrorAction SilentlyContinue
+        if ($null -ne $up) {
+            Stop-Process -Id $udpPid -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $udpPid -Timeout 5 -ErrorAction SilentlyContinue
+        }
+    }
+    $strayUdpServers = @(Get-Process -Name "socks5_udp_test_server" -ErrorAction SilentlyContinue)
+    foreach ($su in $strayUdpServers) {
+        Stop-Process -Id $su.Id -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $su.Id -Timeout 5 -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-NormalizedProfileSnapshotJson {
+    param(
+        [string]$ExePath,
+        [string]$Label
+    )
+    $stateRes = Invoke-RouteWardCtl -ExePath $ExePath -CtlArgs @("state") -Label $Label
+    $stateObj = ConvertFrom-CtlResponseJson `
+        -RawJson $stateRes.RawText `
+        -Context $Label `
+        -RequiredResultProperties @("diagnostics", "profile")
+    return ($stateObj.profile | ConvertTo-Json -Depth 10 -Compress)
+}
 
 function Invoke-RouteWardCtl {
     param(
@@ -1314,7 +1503,8 @@ try {
     # Scenario (a): Start daemon in background; Named Pipe appears
     # -----------------------------------------------------------------------
     try {
-        Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
+        Stop-AllTrackedUdpTestServers
+    Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
         $procA = Start-TrackedDaemon -ExePath $routeWardExePath -WorkDir $resolvedBinDir
         $pipeReady = Wait-ForNamedPipe -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs
         if ($pipeReady -and (-not $procA.HasExited)) {
@@ -1579,7 +1769,8 @@ try {
             Record-ScenarioResult -Id "g" -Status "FAIL" -Title "Daemon crash fail-open & orphaned rule" -Detail "Firewall rule '$FirewallRuleName' was not present after ctl start"
         } else {
             $killedPid = $script:CurrentDaemonProc.Id
-            Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
+            Stop-AllTrackedUdpTestServers
+    Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
             Start-Sleep -Milliseconds $PollIntervalMs
 
             $curlAfterCrash = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
@@ -1600,7 +1791,8 @@ try {
     #               (Self-contained: ensures daemon is stopped and orphaned rule exists first)
     # -----------------------------------------------------------------------
     try {
-        Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
+        Stop-AllTrackedUdpTestServers
+    Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
         Ensure-SyntheticFirewallRulePresent -RuleName $FirewallRuleName -ProgramPath $routeWardExePath -Port $TransparentRelayPort
 
         $daemonLogBeforeLines = 0
@@ -1860,10 +2052,10 @@ try {
             }
         }
 
-        if ($sawQuicBlockedConn -and $sawQuicWarnLog) {
-            Record-ScenarioResult -Id "o" -Status "PASS" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail "UDP 443 toward ${ExternalDnsServer}:443 rejected (clientError=$($quicProbe.SocketErrorCode), measuredDelay=$($quicProbe.DelayMs) ms, matchedRule=SecurityPolicy:blockQuicUdp443, status=blocked)"
+        if ($sawQuicBlockedConn -and $sawQuicWarnLog -and (-not $quicProbe.UnexpectedReplyReceived)) {
+            Record-ScenarioResult -Id "o" -Status "PASS" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail "UDP 443 toward ${ExternalDnsServer}:443 blocked=true, fastRejection=$($quicProbe.FastRejection) (clientError=$($quicProbe.SocketErrorCode), measuredDelay=$($quicProbe.DelayMs) ms, matchedRule=SecurityPolicy:blockQuicUdp443, status=blocked)"
         } else {
-            Record-ScenarioResult -Id "o" -Status "FAIL" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail "clientError=$($quicProbe.SocketErrorCode), delayMs=$($quicProbe.DelayMs), sawBlockedConn=$sawQuicBlockedConn, sawWarnLog=$sawQuicWarnLog"
+            Record-ScenarioResult -Id "o" -Status "FAIL" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail "blocked=$sawQuicBlockedConn, sawWarnLog=$sawQuicWarnLog, unexpectedReply=$($quicProbe.UnexpectedReplyReceived), fastRejection=$($quicProbe.FastRejection), clientError=$($quicProbe.SocketErrorCode), delayMs=$($quicProbe.DelayMs)"
         }
     } catch {
         Record-ScenarioResult -Id "o" -Status "FAIL" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail $_.Exception.Message
@@ -1935,7 +2127,294 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (j) [Order 16/16 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) —
+    # Scenario (q) [Order 16/19]: UDP routed through SOCKS5 UDP ASSOCIATE
+    #               (time.cloudflare.com:123 via socks5_udp_test_server.exe)
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+        $profileBeforeQ = Get-NormalizedProfileSnapshotJson -ExePath $routeWardExePath -Label "Scenario-q-state-before"
+        $statsFileQ = Join-Path ([System.IO.Path]::GetTempPath()) "routeward_udp_test_q_$PID.json"
+        $tempProxyFileQ = Join-Path ([System.IO.Path]::GetTempPath()) "routeward_temp_proxy_q_$PID.json"
+        $tempRuleFileQ = Join-Path ([System.IO.Path]::GetTempPath()) "routeward_temp_rule_q_$PID.json"
+        $tempProxyIdQ = "socks-win-udp-test-$UdpTestProxyPort"
+        $tempRuleIdQ = "rule-win-udp-ntp-proxy"
+        $tempRuleNameQ = "WinTest UDP NTP Proxy"
+        $udpServerProcQ = $null
+        $proxyAddedQ = $false
+        $ruleAddedQ = $false
+
+        try {
+            $udpServerProcQ = Start-TrackedUdpTestServer -ExePath $udpTestServerExePath -Port $UdpTestProxyPort -StatsFilePath $statsFileQ
+
+            $proxyObjQ = [ordered]@{
+                id            = $tempProxyIdQ
+                name          = "UDP Test SOCKS5 $UdpTestProxyPort"
+                protocol      = "socks5"
+                host          = "127.0.0.1"
+                port          = $UdpTestProxyPort
+                auth          = $null
+                udpEnabled    = $true
+                tls           = $false
+                sni           = $null
+                enabled       = $true
+                lastLatencyMs = $null
+                exitIp        = $null
+            }
+            $tempProxyFileQ = Write-Utf8NoBomJsonTempFile -JsonText ($proxyObjQ | ConvertTo-Json -Depth 5 -Compress)
+            $upProxyResQ = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("upsert-proxy", "--json-file", $tempProxyFileQ) -Label "Scenario-q-upsert-proxy"
+            $upProxyObjQ = ConvertFrom-CtlResponseJson -RawJson $upProxyResQ.RawText -Context "Scenario-q-upsert-proxy" -RequiredResultProperties @("ok")
+            if (-not $upProxyObjQ.ok) {
+                throw "Failed to upsert temporary UDP test proxy '$tempProxyIdQ'"
+            }
+            $proxyAddedQ = $true
+            $profileModifiedByScript = $true
+
+            $ruleObjQ = [ordered]@{
+                id              = $tempRuleIdQ
+                name            = $tempRuleNameQ
+                enabled         = $true
+                priority        = 1
+                processPatterns = @("powershell.exe")
+                domainPatterns  = @()
+                ipCidrs         = @()
+                portRanges      = @(@{ start = $NtpPort; end = $NtpPort })
+                protocol        = "udp"
+                action          = [ordered]@{
+                    type     = "proxy"
+                    targetId = $tempProxyIdQ
+                }
+            }
+            $tempRuleFileQ = Write-Utf8NoBomJsonTempFile -JsonText ($ruleObjQ | ConvertTo-Json -Depth 6 -Compress)
+            $upRuleResQ = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("upsert-rule", "--json-file", $tempRuleFileQ) -Label "Scenario-q-upsert-rule"
+            $upRuleObjQ = ConvertFrom-CtlResponseJson -RawJson $upRuleResQ.RawText -Context "Scenario-q-upsert-rule" -RequiredResultProperties @("ok")
+            if (-not $upRuleObjQ.ok) {
+                throw "Failed to upsert temporary UDP test rule '$tempRuleIdQ'"
+            }
+            $ruleAddedQ = $true
+
+            Start-Sleep -Milliseconds 250
+            $ntpExchQ = Invoke-UdpNtpExchange -TargetHost $PublicNtpServer -Port $NtpPort -ReceiveTimeoutMs 4000
+            Start-Sleep -Milliseconds $PollIntervalMs
+
+            $connsResQ = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-q-connections"
+            $connsListQ = ConvertFrom-CtlResponseJson `
+                -RawJson $connsResQ.RawText `
+                -Context "Scenario-q-connections" `
+                -ExpectResultArray `
+                -RequiredArrayElementProperties @("processName", "targetPort", "protocol", "matchedRule", "routeLabel", "status")
+
+            $sawProxiedNtpConn = $false
+            foreach ($c in $connsListQ) {
+                if ([int]$c.targetPort -eq $NtpPort -and $c.protocol -eq "udp" -and $c.matchedRule -eq $tempRuleNameQ -and $c.status -ne "blocked") {
+                    $sawProxiedNtpConn = $true
+                    break
+                }
+            }
+
+            $statsObjQ = $null
+            if (Test-Path -LiteralPath $statsFileQ) {
+                $statsObjQ = Get-Content -LiteralPath $statsFileQ -Raw -Encoding UTF8 | ConvertFrom-Json
+            }
+            $assocReqsQ = if ($null -ne $statsObjQ) { [int]$statsObjQ.udp_associate_requests } else { 0 }
+            $dgramsRelayedQ = if ($null -ne $statsObjQ) { [int]$statsObjQ.udp_datagrams_relayed } else { 0 }
+            $repliesRelayedQ = if ($null -ne $statsObjQ -and $statsObjQ.PSObject.Properties.Match("udp_replies_relayed").Count -gt 0) { [int]$statsObjQ.udp_replies_relayed } else { 0 }
+
+            if ($ntpExchQ.ReplyReceived -and $ntpExchQ.ReplyLength -ge 48 -and $sawProxiedNtpConn -and $assocReqsQ -ge 1 -and $dgramsRelayedQ -ge 1 -and $repliesRelayedQ -ge 1) {
+                Record-ScenarioResult -Id "q" -Status "PASS" -Title "UDP routed through SOCKS5 UDP ASSOCIATE (NTP via test server)" -Detail "NTP reply received ($($ntpExchQ.ReplyLength) bytes in $($ntpExchQ.DelayMs) ms via Fake-IP/Target $($ntpExchQ.TargetIp)); stats: associate=$assocReqsQ, relayedOut=$dgramsRelayedQ, relayedIn=$repliesRelayedQ"
+            } else {
+                Record-ScenarioResult -Id "q" -Status "FAIL" -Title "UDP routed through SOCKS5 UDP ASSOCIATE (NTP via test server)" -Detail "replyReceived=$($ntpExchQ.ReplyReceived) len=$($ntpExchQ.ReplyLength) err=$($ntpExchQ.ErrorMessage), sawConn=$sawProxiedNtpConn, associate=$assocReqsQ, relayedOut=$dgramsRelayedQ, relayedIn=$repliesRelayedQ"
+            }
+        } finally {
+            if ($ruleAddedQ) {
+                $null = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("remove-rule", "--id", $tempRuleIdQ) -Label "Scenario-q-remove-rule"
+            }
+            if ($proxyAddedQ) {
+                $null = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("remove-proxy", "--id", $tempProxyIdQ) -Label "Scenario-q-remove-proxy"
+            }
+            if ($null -ne $udpServerProcQ -and (-not $udpServerProcQ.HasExited)) {
+                Stop-Process -Id $udpServerProcQ.Id -Force -ErrorAction SilentlyContinue
+                Wait-Process -Id $udpServerProcQ.Id -Timeout 5 -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath $tempProxyFileQ, $tempRuleFileQ, $statsFileQ -Force -ErrorAction SilentlyContinue
+            $profileAfterQ = Get-NormalizedProfileSnapshotJson -ExePath $routeWardExePath -Label "Scenario-q-state-after"
+            if ($profileBeforeQ -ne $profileAfterQ) {
+                throw "Scenario (q) cleanup check failed: profile state after cleanup does not match profile state before Scenario (q)."
+            }
+        }
+    } catch {
+        Record-ScenarioResult -Id "q" -Status "FAIL" -Title "UDP routed through SOCKS5 UDP ASSOCIATE (NTP via test server)" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (r) [Order 17/19]: Proxy refusing UDP ASSOCIATE (--disable-udp-associate)
+    #               blocks UDP with Kill-Switch and never leaks Direct
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+        $profileBeforeR = Get-NormalizedProfileSnapshotJson -ExePath $routeWardExePath -Label "Scenario-r-state-before"
+        $statsFileR = Join-Path ([System.IO.Path]::GetTempPath()) "routeward_udp_test_r_$PID.json"
+        $tempProxyFileR = Join-Path ([System.IO.Path]::GetTempPath()) "routeward_temp_proxy_r_$PID.json"
+        $tempRuleFileR = Join-Path ([System.IO.Path]::GetTempPath()) "routeward_temp_rule_r_$PID.json"
+        $tempProxyIdR = "socks-win-udp-refuse-$UdpRefuseTestProxyPort"
+        $tempRuleIdR = "rule-win-udp-ntp-refuse"
+        $tempRuleNameR = "WinTest UDP NTP Refuse"
+        $udpServerProcR = $null
+        $proxyAddedR = $false
+        $ruleAddedR = $false
+
+        try {
+            $udpServerProcR = Start-TrackedUdpTestServer -ExePath $udpTestServerExePath -Port $UdpRefuseTestProxyPort -StatsFilePath $statsFileR -DisableUdpAssociate
+
+            $proxyObjR = [ordered]@{
+                id            = $tempProxyIdR
+                name          = "UDP Refuse SOCKS5 $UdpRefuseTestProxyPort"
+                protocol      = "socks5"
+                host          = "127.0.0.1"
+                port          = $UdpRefuseTestProxyPort
+                auth          = $null
+                udpEnabled    = $true
+                tls           = $false
+                sni           = $null
+                enabled       = $true
+                lastLatencyMs = $null
+                exitIp        = $null
+            }
+            $tempProxyFileR = Write-Utf8NoBomJsonTempFile -JsonText ($proxyObjR | ConvertTo-Json -Depth 5 -Compress)
+            $upProxyResR = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("upsert-proxy", "--json-file", $tempProxyFileR) -Label "Scenario-r-upsert-proxy"
+            $upProxyObjR = ConvertFrom-CtlResponseJson -RawJson $upProxyResR.RawText -Context "Scenario-r-upsert-proxy" -RequiredResultProperties @("ok")
+            if (-not $upProxyObjR.ok) {
+                throw "Failed to upsert temporary UDP refuse proxy '$tempProxyIdR'"
+            }
+            $proxyAddedR = $true
+            $profileModifiedByScript = $true
+
+            $ruleObjR = [ordered]@{
+                id              = $tempRuleIdR
+                name            = $tempRuleNameR
+                enabled         = $true
+                priority        = 1
+                processPatterns = @("powershell.exe")
+                domainPatterns  = @()
+                ipCidrs         = @()
+                portRanges      = @(@{ start = $NtpPort; end = $NtpPort })
+                protocol        = "udp"
+                action          = [ordered]@{
+                    type     = "proxy"
+                    targetId = $tempProxyIdR
+                }
+            }
+            $tempRuleFileR = Write-Utf8NoBomJsonTempFile -JsonText ($ruleObjR | ConvertTo-Json -Depth 6 -Compress)
+            $upRuleResR = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("upsert-rule", "--json-file", $tempRuleFileR) -Label "Scenario-r-upsert-rule"
+            $upRuleObjR = ConvertFrom-CtlResponseJson -RawJson $upRuleResR.RawText -Context "Scenario-r-upsert-rule" -RequiredResultProperties @("ok")
+            if (-not $upRuleObjR.ok) {
+                throw "Failed to upsert temporary UDP refuse rule '$tempRuleIdR'"
+            }
+            $ruleAddedR = $true
+
+            Start-Sleep -Milliseconds 250
+            $ntpExchR = Invoke-UdpNtpExchange -TargetHost $PublicNtpServer -Port $NtpPort -ReceiveTimeoutMs 2000
+            Start-Sleep -Milliseconds $PollIntervalMs
+
+            $connsResR = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-r-connections"
+            $connsListR = ConvertFrom-CtlResponseJson `
+                -RawJson $connsResR.RawText `
+                -Context "Scenario-r-connections" `
+                -ExpectResultArray `
+                -RequiredArrayElementProperties @("processName", "targetPort", "protocol", "matchedRule", "routeLabel", "status")
+
+            $sawBlockedRefuseConn = $false
+            foreach ($c in $connsListR) {
+                if ([int]$c.targetPort -eq $NtpPort -and $c.protocol -eq "udp" -and $c.matchedRule -eq $tempRuleNameR -and $c.status -eq "blocked" -and $c.routeLabel -eq "BLOCKED") {
+                    $sawBlockedRefuseConn = $true
+                    break
+                }
+            }
+
+            $statsObjR = $null
+            if (Test-Path -LiteralPath $statsFileR) {
+                $statsObjR = Get-Content -LiteralPath $statsFileR -Raw -Encoding UTF8 | ConvertFrom-Json
+            }
+            $assocRefusedR = if ($null -ne $statsObjR) { [int]$statsObjR.udp_associate_refused } else { 0 }
+
+            if ((-not $ntpExchR.ReplyReceived) -and $sawBlockedRefuseConn -and $assocRefusedR -ge 1) {
+                Record-ScenarioResult -Id "r" -Status "PASS" -Title "Proxy refusing UDP ASSOCIATE blocks UDP with Kill-Switch" -Detail "UDP ASSOCIATE refused with REP=0x07 (udp_associate_refused=$assocRefusedR); no Direct leak (replyReceived=false); connection recorded as status=blocked/routeLabel=BLOCKED"
+            } else {
+                Record-ScenarioResult -Id "r" -Status "FAIL" -Title "Proxy refusing UDP ASSOCIATE blocks UDP with Kill-Switch" -Detail "replyReceived=$($ntpExchR.ReplyReceived), sawBlockedConn=$sawBlockedRefuseConn, udp_associate_refused=$assocRefusedR"
+            }
+        } finally {
+            if ($ruleAddedR) {
+                $null = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("remove-rule", "--id", $tempRuleIdR) -Label "Scenario-r-remove-rule"
+            }
+            if ($proxyAddedR) {
+                $null = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("remove-proxy", "--id", $tempProxyIdR) -Label "Scenario-r-remove-proxy"
+            }
+            if ($null -ne $udpServerProcR -and (-not $udpServerProcR.HasExited)) {
+                Stop-Process -Id $udpServerProcR.Id -Force -ErrorAction SilentlyContinue
+                Wait-Process -Id $udpServerProcR.Id -Timeout 5 -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath $tempProxyFileR, $tempRuleFileR, $statsFileR -Force -ErrorAction SilentlyContinue
+            $profileAfterR = Get-NormalizedProfileSnapshotJson -ExePath $routeWardExePath -Label "Scenario-r-state-after"
+            if ($profileBeforeR -ne $profileAfterR) {
+                throw "Scenario (r) cleanup check failed: profile state after cleanup does not match profile state before Scenario (r)."
+            }
+        }
+    } catch {
+        Record-ScenarioResult -Id "r" -Status "FAIL" -Title "Proxy refusing UDP ASSOCIATE blocks UDP with Kill-Switch" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (s) [Order 18/19]: Direct UDP flow attributed to process in
+    #               ctl connections / ctl logs
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+        $ntpExchS = Invoke-UdpNtpExchange -TargetHost $PublicNtpServer -Port $NtpPort -ReceiveTimeoutMs 4000
+        Start-Sleep -Milliseconds $PollIntervalMs
+
+        $connsResS = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-s-connections"
+        $connsListS = ConvertFrom-CtlResponseJson `
+            -RawJson $connsResS.RawText `
+            -Context "Scenario-s-connections" `
+            -ExpectResultArray `
+            -RequiredArrayElementProperties @("processName", "targetPort", "protocol", "matchedRule", "routeLabel", "status")
+
+        $logsResS = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-s-logs"
+        $logsListS = ConvertFrom-CtlResponseJson `
+            -RawJson $logsResS.RawText `
+            -Context "Scenario-s-logs" `
+            -ExpectResultArray `
+            -RequiredArrayElementProperties @("level", "component", "message")
+
+        $matchedDirectUdpConn = $null
+        foreach ($c in $connsListS) {
+            if ([int]$c.targetPort -eq $NtpPort -and $c.protocol -eq "udp" -and $c.routeLabel -eq "DIRECT" -and $c.processName -ieq "powershell.exe") {
+                $matchedDirectUdpConn = $c
+                break
+            }
+        }
+
+        $sawDirectUdpLog = $false
+        foreach ($l in $logsListS) {
+            if ($l.component -eq "Interceptor" -and ([string]$l.message).Contains("powershell.exe") -and ([string]$l.message).Contains(":$NtpPort") -and ([string]$l.message).Contains("DIRECT")) {
+                $sawDirectUdpLog = $true
+                break
+            }
+        }
+
+        if ($ntpExchS.ReplyReceived -and $ntpExchS.ReplyLength -ge 48 -and $null -ne $matchedDirectUdpConn -and $sawDirectUdpLog) {
+            Record-ScenarioResult -Id "s" -Status "PASS" -Title "Direct UDP flow attributed to process in ctl connections" -Detail "Direct NTP reply received ($($ntpExchS.ReplyLength) bytes in $($ntpExchS.DelayMs) ms); attributed to processName=$($matchedDirectUdpConn.processName), protocol=udp, routeLabel=DIRECT, matchedRule=$($matchedDirectUdpConn.matchedRule)"
+        } else {
+            Record-ScenarioResult -Id "s" -Status "FAIL" -Title "Direct UDP flow attributed to process in ctl connections" -Detail "replyReceived=$($ntpExchS.ReplyReceived) len=$($ntpExchS.ReplyLength), hasAttributedConn=$($null -ne $matchedDirectUdpConn), sawDirectUdpLog=$sawDirectUdpLog"
+        }
+    } catch {
+        Record-ScenarioResult -Id "s" -Status "FAIL" -Title "Direct UDP flow attributed to process in ctl connections" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (j) [Order 19/19 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) —
     #               SOCKS5 proxy stopped during test, curl.exe matched by Proxy rule
     #               fails without falling back to Direct, and ctl connections reports Blocked
     # -----------------------------------------------------------------------
@@ -2054,6 +2533,7 @@ try {
     # 4. Restore profile if modified
     # 5. Verify outbound curl connectivity and record it in the report
     # -----------------------------------------------------------------------
+    Stop-AllTrackedUdpTestServers
     Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName
 
     $survivingProcs = @(Get-Process -Name "routeward" -ErrorAction SilentlyContinue)
@@ -2145,7 +2625,7 @@ foreach ($r in $scenarioResults) {
 
 $reportLines.Add("")
 $reportLines.Add("## 2. Binary & Driver Inventory")
-$binaryTargets = @($routeWardExePath, $desktopExePath) + $resolvedWinDivertFiles
+$binaryTargets = @($routeWardExePath, $desktopExePath, $udpTestServerExePath) + $resolvedWinDivertFiles
 foreach ($binPath in $binaryTargets) {
     if (Test-Path -LiteralPath $binPath) {
         $item = Get-Item -LiteralPath $binPath

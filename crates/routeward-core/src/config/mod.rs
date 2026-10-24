@@ -149,6 +149,10 @@ pub struct NetworkConstants {
     pub pid_fallback_retries: u32,
     pub pid_fallback_delay_ms: u64,
     pub pending_syn_timeout_ms: u64,
+    #[serde(default = "default_pending_udp_timeout_ms")]
+    pub pending_udp_timeout_ms: u64,
+    #[serde(default = "default_max_pending_udp_packets")]
+    pub max_pending_udp_packets: usize,
     pub windivert_priority: i16,
     pub windivert_dll_paths: Vec<String>,
     #[serde(default = "default_linux_fwmark")]
@@ -159,6 +163,8 @@ pub struct NetworkConstants {
     pub linux_tproxy_route_table: u32,
     #[serde(default = "default_linux_tproxy_rule_priority")]
     pub linux_tproxy_rule_priority: u32,
+    #[serde(default = "default_linux_ip_binary")]
+    pub linux_ip_binary: String,
     #[serde(default = "default_linux_nft_binary")]
     pub linux_nft_binary: String,
     #[serde(default = "default_linux_nft_table_name")]
@@ -223,6 +229,18 @@ fn default_linux_tproxy_route_table() -> u32 {
 
 fn default_linux_tproxy_rule_priority() -> u32 {
     10810
+}
+
+fn default_pending_udp_timeout_ms() -> u64 {
+    40
+}
+
+fn default_max_pending_udp_packets() -> usize {
+    256
+}
+
+fn default_linux_ip_binary() -> String {
+    "ip".to_string()
 }
 
 fn default_linux_nft_binary() -> String {

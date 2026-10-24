@@ -41,6 +41,30 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncTunnelStream for T {}
 pub struct ProxyConnector;
 
 impl ProxyConnector {
+    /// Applies `SO_MARK` (`fwmark`) to an existing `UdpSocket` on Linux (no-op on other platforms)
+    /// so RouteWard's own UDP sockets bypass transparent `nftables` interception.
+    pub fn apply_platform_mark_udp(socket: &tokio::net::UdpSocket, fwmark: u32) {
+        #[cfg(target_os = "linux")]
+        if fwmark != 0 {
+            use std::os::fd::AsRawFd;
+            let mark: libc::c_uint = fwmark;
+            unsafe {
+                let _ = libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_MARK,
+                    &mark as *const libc::c_uint as *const libc::c_void,
+                    std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = socket;
+            let _ = fwmark;
+        }
+    }
+
     /// Opens an outbound TCP stream, setting `SO_MARK` (`fwmark`) prior to `connect()` on Linux
     /// so RouteWard's own outbound traffic bypasses the `nftables` `output` NAT hook.
     pub async fn connect_tcp_marked(addr: &str, fwmark: u32) -> std::io::Result<TcpStream> {

@@ -16,7 +16,9 @@
 
 use clap::{Parser, Subcommand};
 use routeward_core::config::security::load_or_init_secure_daemon_profile;
-use routeward_core::config::{ProfileConfig, RoutingRule, SystemConstants, TransportProtocol};
+use routeward_core::config::{
+    ProfileConfig, ProxyNode, RoutingRule, SystemConstants, TransportProtocol,
+};
 use routeward_core::error::{
     RouteWardError, RouteWardResult, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_LOAD,
     ERR_KEY_DAEMON_NOT_ELEVATED,
@@ -135,6 +137,29 @@ enum CtlCommands {
         #[arg(long)]
         id: String,
     },
+    /// Insert or update a proxy node (via inline JSON string or UTF-8 JSON file) on the daemon
+    UpsertProxy {
+        /// Inline JSON string describing the proxy node
+        #[arg(
+            long,
+            required_unless_present = "json_file",
+            conflicts_with = "json_file"
+        )]
+        json: Option<String>,
+        /// Path to a UTF-8 JSON file describing the proxy node
+        #[arg(
+            long = "json-file",
+            value_name = "PATH",
+            required_unless_present = "json",
+            conflicts_with = "json"
+        )]
+        json_file: Option<PathBuf>,
+    },
+    /// Remove a proxy node by its identifier on the daemon
+    RemoveProxy {
+        #[arg(long)]
+        id: String,
+    },
     /// Actively terminate an open connection by its identifier
     TerminateConnection {
         #[arg(long)]
@@ -226,6 +251,35 @@ fn parse_routing_rule_payload(
     }
 }
 
+fn parse_proxy_node_payload(
+    json: Option<String>,
+    json_file: Option<PathBuf>,
+) -> RouteWardResult<ProxyNode> {
+    if let Some(path) = json_file {
+        let raw_content =
+            std::fs::read_to_string(&path).map_err(|err| RouteWardError::ConfigError {
+                key: ERR_KEY_CONFIG_LOAD,
+                detail: format!("Cannot read proxy JSON file '{}': {err}", path.display()),
+            })?;
+        let without_bom = raw_content.strip_prefix('\u{feff}').unwrap_or(&raw_content);
+        serde_json::from_str::<ProxyNode>(without_bom).map_err(|err| RouteWardError::ConfigError {
+            key: ERR_KEY_CONFIG_JSON,
+            detail: format!("Invalid proxy JSON in file '{}': {err}", path.display()),
+        })
+    } else if let Some(raw_inline) = json {
+        let without_bom = raw_inline.strip_prefix('\u{feff}').unwrap_or(&raw_inline);
+        serde_json::from_str::<ProxyNode>(without_bom).map_err(|err| RouteWardError::ConfigError {
+            key: ERR_KEY_CONFIG_JSON,
+            detail: format!("Invalid inline proxy JSON: {err}"),
+        })
+    } else {
+        Err(RouteWardError::ConfigError {
+            key: ERR_KEY_CONFIG_JSON,
+            detail: "Either --json or --json-file must be provided".to_string(),
+        })
+    }
+}
+
 fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, IpcCommand)> {
     match action {
         CtlCommands::Status => Ok(("status", IpcCommand::GetDiagnostics)),
@@ -242,6 +296,13 @@ fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, Ip
         }
         CtlCommands::RemoveRule { id } => {
             Ok(("remove-rule", IpcCommand::RemoveRule { rule_id: id }))
+        }
+        CtlCommands::UpsertProxy { json, json_file } => {
+            let node = parse_proxy_node_payload(json, json_file)?;
+            Ok(("upsert-proxy", IpcCommand::UpsertProxy { node }))
+        }
+        CtlCommands::RemoveProxy { id } => {
+            Ok(("remove-proxy", IpcCommand::RemoveProxy { proxy_id: id }))
         }
         CtlCommands::TerminateConnection { id } => Ok((
             "terminate-connection",

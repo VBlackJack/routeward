@@ -38,8 +38,12 @@ use crate::error::{
 };
 use crate::i18n::I18nRegistry;
 use crate::interceptor::backend::Interceptor;
-use crate::interceptor::nat::{PendingSynOutcome, PendingSynQueue, TransparentNatTable};
+use crate::interceptor::nat::{
+    PendingSynOutcome, PendingSynQueue, PendingUdpOutcome, PendingUdpQueue, TransparentNatTable,
+};
 use crate::interceptor::nftables::NftablesInterceptor;
+#[cfg(target_os = "linux")]
+use crate::interceptor::nftables::TproxyRoutingSpec;
 #[cfg(windows)]
 use crate::interceptor::windivert::WinDivertInterceptor;
 use crate::process::{ProcessAttribution, ProcessResolver};
@@ -336,6 +340,10 @@ impl RouteWardController {
                 dns_udp_ctrl.constants.network.default_dns_listen_port
             );
             if let Ok(socket) = UdpSocket::bind(&bind_addr).await {
+                ProxyConnector::apply_platform_mark_udp(
+                    &socket,
+                    dns_udp_ctrl.constants.network.linux_fwmark,
+                );
                 NftablesInterceptor::enable_udp_pktinfo(&socket);
                 let socket = Arc::new(socket);
                 dns_udp_ctrl.telemetry.push_log(
@@ -414,27 +422,38 @@ impl RouteWardController {
                 local_name_ctrl.constants.network.transparent_bind_host, inspect_port
             );
             if let Ok(socket) = UdpSocket::bind(&bind_addr).await {
+                ProxyConnector::apply_platform_mark_udp(
+                    &socket,
+                    local_name_ctrl.constants.network.linux_fwmark,
+                );
+                if let Err(err) = NftablesInterceptor::enable_udp_tproxy_options(&socket) {
+                    local_name_ctrl.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_ENGINE,
+                        format!("Could not enable IP_TRANSPARENT/IP_RECVORIGDSTADDR on {bind_addr}: {err}"),
+                    );
+                }
                 NftablesInterceptor::enable_udp_pktinfo(&socket);
                 let socket = Arc::new(socket);
                 local_name_ctrl.telemetry.push_log(
                     LogLevel::Info,
                     COMPONENT_ENGINE,
-                    format!("Listening for redirected LLMNR/mDNS UDP inspection on {bind_addr}"),
+                    format!("Listening for TPROXY UDP and LLMNR/mDNS inspection on {bind_addr}"),
                 );
-                let mut buf = vec![0u8; 4096];
+                let mut buf = vec![0u8; 65535];
                 while local_name_ctrl.is_running() {
-                    if let Ok((len, peer_addr, local_dst_ip)) =
-                        NftablesInterceptor::recv_udp_with_local_ip(&socket, &mut buf).await
+                    if let Ok((len, client_addr, orig_dst)) =
+                        NftablesInterceptor::recv_udp_tproxy_orig_dst(&socket, &mut buf).await
                     {
                         let pkt_bytes = buf[..len].to_vec();
                         let sock_reply = Arc::clone(&socket);
                         let ctrl_inspect = local_name_ctrl.clone();
                         tokio::spawn(async move {
                             ctrl_inspect
-                                .handle_local_name_udp_datagram(
+                                .handle_tproxy_udp_datagram(
                                     &pkt_bytes,
-                                    peer_addr,
-                                    local_dst_ip,
+                                    client_addr,
+                                    orig_dst,
                                     &sock_reply,
                                 )
                                 .await;
@@ -558,11 +577,19 @@ impl RouteWardController {
         }
         #[cfg(not(windows))]
         {
+            let net = &self.constants.network;
+            let spec = TproxyRoutingSpec {
+                fwmark: net.linux_tproxy_fwmark,
+                route_table: net.linux_tproxy_route_table,
+                rule_priority: net.linux_tproxy_rule_priority,
+                tproxy_port: net.default_local_name_inspect_port,
+            };
             NftablesInterceptor::delete_nft_table(
-                &self.constants.network.linux_nft_binary,
-                &self.constants.network.linux_nft_table_name,
+                &net.linux_nft_binary,
+                &net.linux_nft_table_name,
                 &self.telemetry,
             )?;
+            NftablesInterceptor::delete_tproxy_routing(&net.linux_ip_binary, spec, &self.telemetry);
         }
         self.telemetry.flush_file_logger();
         Ok(())
@@ -674,6 +701,62 @@ impl RouteWardController {
         outcomes
     }
 
+    /// Logs a timed-out or capacity-evicted `PendingUdpOutcome` (`INFO` when dropped with `killSwitchEnabled=true`,
+    /// `WARN` when reinjected with `killSwitchEnabled=false`).
+    pub fn log_pending_udp_outcome<T>(&self, outcome: &PendingUdpOutcome<T>) {
+        match outcome {
+            PendingUdpOutcome::Resolved { .. } => {}
+            PendingUdpOutcome::TimedOutDropped {
+                meta,
+                elapsed_ms,
+                drop_count,
+            } => {
+                self.telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_WINDIVERT,
+                    format!(
+                        "Dropped unattributed Pending UDP datagram #{} after {}ms for {}:{} -> {}:{} (killSwitchEnabled=true)",
+                        drop_count, elapsed_ms, meta.src_ip, meta.src_port, meta.dst_ip, meta.dst_port
+                    ),
+                );
+            }
+            PendingUdpOutcome::TimedOutReinject {
+                meta,
+                elapsed_ms,
+                reinject_count,
+                ..
+            } => {
+                self.telemetry.push_log(
+                    LogLevel::Warn,
+                    COMPONENT_WINDIVERT,
+                    format!(
+                        "Released unattributed Pending UDP datagram #{} after {}ms for {}:{} -> {}:{} (killSwitchEnabled=false; reinjecting unmodified fail-open)",
+                        reinject_count, elapsed_ms, meta.src_ip, meta.src_port, meta.dst_ip, meta.dst_port
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Polls `PendingUdpQueue` using the active `securityPolicy.killSwitchEnabled` setting and logs
+    /// timed-out unattributed UDP datagrams (`INFO` when dropped, `WARN` when released).
+    pub fn poll_pending_udps<T, F>(
+        &self,
+        queue: &PendingUdpQueue<T>,
+        timeout: Duration,
+        fallback_fn: F,
+    ) -> Vec<PendingUdpOutcome<T>>
+    where
+        F: Fn(u16) -> Option<u32>,
+    {
+        let kill_switch_enabled = self.profile.read().security_policy.kill_switch_enabled;
+        let outcomes = queue.poll_ready(&self.nat_table, timeout, kill_switch_enabled, fallback_fn);
+        for outcome in &outcomes {
+            self.log_pending_udp_outcome(outcome);
+        }
+        outcomes
+    }
+
     /// Resolves the effective `RuleAction` for an unattributed socket (`ProcessAttribution::Unknown`
     /// or unreadable process image), enforcing `RuleAction::Block` and logging `WARN` when
     /// `securityPolicy.killSwitchEnabled` is `true` and `unknownProcessAction` is `Direct`.
@@ -740,6 +823,36 @@ impl RouteWardController {
         Option<String>,
         &'static str,
     ) {
+        self.attribute_or_apply_unknown_policy_with_proto(
+            attribution,
+            client_port,
+            target_host,
+            target_port,
+            orig_dst_ip,
+            TransportProtocol::Tcp,
+        )
+    }
+
+    /// Evaluates process attribution for a transparent TCP or UDP connection, applying
+    /// `resolve_unknown_process_action` whenever the socket is `ProcessAttribution::Unknown`
+    /// or its executable image could not be resolved.
+    pub fn attribute_or_apply_unknown_policy_with_proto(
+        &self,
+        attribution: ProcessAttribution,
+        client_port: u16,
+        target_host: &str,
+        target_port: u16,
+        orig_dst_ip: Option<&Ipv4Addr>,
+        protocol: TransportProtocol,
+    ) -> (
+        u32,
+        String,
+        String,
+        RuleAction,
+        String,
+        Option<String>,
+        &'static str,
+    ) {
         match attribution {
             ProcessAttribution::Single(identity) if !identity.is_unattributed() => {
                 let eval = self.evaluate_rule(&ConnectionRequest {
@@ -748,7 +861,7 @@ impl RouteWardController {
                     target_host: target_host.to_string(),
                     target_ip: Some(target_host.to_string()),
                     target_port,
-                    protocol: TransportProtocol::Tcp,
+                    protocol,
                 });
                 (
                     identity.pid,
@@ -782,7 +895,7 @@ impl RouteWardController {
                     target_host: target_host.to_string(),
                     target_ip: Some(target_host.to_string()),
                     target_port,
-                    protocol: TransportProtocol::Tcp,
+                    protocol,
                 });
                 (
                     primary.pid,
@@ -1438,12 +1551,26 @@ impl RouteWardController {
                     self.constants
                         .network
                         .tcp_connect_timeout_ms
-                        .clamp(500, 3500),
+                        .clamp(300, 1500),
                 );
                 let resp = self
-                    .query_dns_udp_direct_protected(payload, dst_addr, timeout_dur)
+                    .send_and_optional_recv_udp_direct_protected(payload, dst_addr, timeout_dur)
                     .await
                     .map_err(RouteWardError::Io)?;
+                self.telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_TRANSPARENT,
+                    format!(
+                        "Routed UDP PID={} process=\"{}\" exe=\"{}\" -> {}:{} via {} [rule=\"{}\"]",
+                        pid,
+                        proc_basename,
+                        proc_path_str,
+                        raw_host,
+                        target_port,
+                        ROUTE_DIRECT_LABEL,
+                        eval.matched_rule_name
+                    ),
+                );
                 self.telemetry.record_connection(
                     TrackedConnection {
                         id: Uuid::new_v4().to_string(),
@@ -1510,6 +1637,22 @@ impl RouteWardController {
 
                 match res {
                     Ok(reply) => {
+                        let route_label = format!("{} (SOCKS5 UDP)", reply.proxy_name);
+                        self.telemetry.push_log(
+                            LogLevel::Info,
+                            COMPONENT_TRANSPARENT,
+                            format!(
+                                "Routed UDP PID={} process=\"{}\" exe=\"{}\" -> {}:{} (domain={:?}) via {} [rule=\"{}\"]",
+                                pid,
+                                proc_basename,
+                                proc_path_str,
+                                raw_host,
+                                target_port,
+                                eval.effective_domain,
+                                route_label,
+                                eval.matched_rule_name
+                            ),
+                        );
                         self.telemetry.record_connection(
                             TrackedConnection {
                                 id: Uuid::new_v4().to_string(),
@@ -1521,7 +1664,7 @@ impl RouteWardController {
                                 target_port,
                                 protocol: TransportProtocol::Udp,
                                 matched_rule: eval.matched_rule_name,
-                                route_label: format!("{} (SOCKS5 UDP)", reply.proxy_name),
+                                route_label,
                                 latency_ms: 8,
                                 rx_bytes: reply.payload.len() as u64,
                                 tx_bytes: payload.len() as u64,
@@ -1695,78 +1838,172 @@ impl RouteWardController {
         }
     }
 
-    async fn handle_local_name_udp_datagram(
+    async fn handle_tproxy_udp_datagram(
         &self,
         payload: &[u8],
-        peer_addr: SocketAddr,
-        local_dst_ip: Option<Ipv4Addr>,
+        client_addr: std::net::SocketAddrV4,
+        orig_dst_opt: Option<std::net::SocketAddrV4>,
         reply_sock: &UdpSocket,
     ) {
-        match self.dns.classify_local_name_query(payload) {
-            LocalNameQueryDecision::BlockPublicFqdn { qname } => {
-                self.push_rate_limited_warn(
-                    "local_name_public_fqdn",
-                    COMPONENT_DNS,
-                    format!(
-                        "Blocked public FQDN \"{qname}\" on local name resolution protocol (LLMNR/mDNS) from {peer_addr}"
-                    ),
-                );
-                self.telemetry.record_connection(
-                    TrackedConnection {
-                        id: Uuid::new_v4().to_string(),
-                        pid: 0,
-                        process_name: "local-name-proto".to_string(),
-                        process_path: "local-name-proto".to_string(),
-                        target_host: qname.clone(),
-                        resolved_domain: Some(qname),
-                        target_port: self.constants.network.llmnr_standard_port,
-                        protocol: TransportProtocol::Udp,
-                        matched_rule: "SecurityPolicy:LocalNamePublicFqdnBlocked".to_string(),
-                        route_label: ROUTE_BLOCK_LABEL.to_string(),
-                        latency_ms: 0,
-                        rx_bytes: 0,
-                        tx_bytes: 0,
-                        status: ConnectionStatus::Blocked,
-                        started_at: Utc::now(),
-                    },
-                    false,
-                );
-            }
-            LocalNameQueryDecision::BlockMalformed => {}
-            LocalNameQueryDecision::AllowLocal { qname } => {
-                let candidate_ports = [
-                    self.constants.network.llmnr_standard_port,
-                    self.constants.network.mdns_standard_port,
-                ];
-                if let Some(orig_dst) =
-                    self.lookup_udp_conntrack_orig_dst(peer_addr, &candidate_ports)
-                {
+        let peer_addr = SocketAddr::V4(client_addr);
+        let llmnr_port = self.constants.network.llmnr_standard_port;
+        let mdns_port = self.constants.network.mdns_standard_port;
+        let fwmark = self.constants.network.linux_fwmark;
+
+        let resolved_orig_dst = orig_dst_opt.or_else(|| {
+            self.lookup_udp_conntrack_orig_dst(peer_addr, &[llmnr_port, mdns_port])
+                .and_then(|sa| match sa {
+                    SocketAddr::V4(v4) => Some(v4),
+                    SocketAddr::V6(_) => None,
+                })
+        });
+
+        let Some(orig_dst) = resolved_orig_dst else {
+            return;
+        };
+
+        // Priority 1: Local name resolution protocols (LLMNR 5355 and mDNS 5353)
+        // Forwarded via raw socket preserving the client's original IP and source port (Point 4 / Leak #7 fix).
+        if orig_dst.port() == llmnr_port || orig_dst.port() == mdns_port {
+            match self.dns.classify_local_name_query(payload) {
+                LocalNameQueryDecision::BlockPublicFqdn { qname } => {
+                    self.push_rate_limited_warn(
+                        "local_name_public_fqdn",
+                        COMPONENT_DNS,
+                        format!(
+                            "Blocked public FQDN \"{qname}\" on local name resolution protocol (LLMNR/mDNS) from {peer_addr}"
+                        ),
+                    );
+                    self.telemetry.record_connection(
+                        TrackedConnection {
+                            id: Uuid::new_v4().to_string(),
+                            pid: 0,
+                            process_name: "local-name-proto".to_string(),
+                            process_path: "local-name-proto".to_string(),
+                            target_host: qname.clone(),
+                            resolved_domain: Some(qname),
+                            target_port: orig_dst.port(),
+                            protocol: TransportProtocol::Udp,
+                            matched_rule: "SecurityPolicy:LocalNamePublicFqdnBlocked".to_string(),
+                            route_label: ROUTE_BLOCK_LABEL.to_string(),
+                            latency_ms: 0,
+                            rx_bytes: 0,
+                            tx_bytes: 0,
+                            status: ConnectionStatus::Blocked,
+                            started_at: Utc::now(),
+                        },
+                        false,
+                    );
+                }
+                LocalNameQueryDecision::BlockMalformed => {}
+                LocalNameQueryDecision::AllowLocal { qname } => {
                     self.telemetry.push_log(
                         LogLevel::Debug,
                         COMPONENT_DNS,
                         format!(
-                            "Forwarding allowed local name query \"{qname}\" from {peer_addr} directly to {orig_dst}"
+                            "Forwarding allowed local name query \"{qname}\" from {client_addr} directly to {orig_dst} (preserving source port {})",
+                            client_addr.port()
                         ),
                     );
-                    if let Ok(resp) = self
-                        .query_dns_udp_direct_protected(
-                            payload,
-                            orig_dst,
-                            Duration::from_millis(300),
-                        )
-                        .await
+                    if NftablesInterceptor::send_raw_ipv4_udp_packet(
+                        client_addr,
+                        orig_dst,
+                        payload,
+                        fwmark,
+                    )
+                    .is_err()
                     {
-                        if !resp.is_empty() {
-                            let _ = NftablesInterceptor::send_udp_from_local_ip(
-                                reply_sock,
-                                &resp,
-                                peer_addr,
-                                local_dst_ip,
+                        if let Ok(resp) = self
+                            .query_dns_udp_direct_protected(
+                                payload,
+                                SocketAddr::V4(orig_dst),
+                                Duration::from_millis(300),
                             )
-                            .await;
+                            .await
+                        {
+                            if !resp.is_empty() {
+                                let _ = NftablesInterceptor::send_udp_from_local_ip(
+                                    reply_sock,
+                                    &resp,
+                                    peer_addr,
+                                    Some(*orig_dst.ip()),
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
+            }
+            return;
+        }
+
+        // Priority 2: General transparent UDP interception via TPROXY
+        let target_host = orig_dst.ip().to_string();
+        let target_port = orig_dst.port();
+        let attribution = self
+            .process_resolver
+            .resolve_udp_port_attribution(client_addr.port());
+        let (
+            pid,
+            proc_name,
+            proc_path,
+            eval_action,
+            matched_rule_name,
+            effective_domain,
+            _res_source,
+        ) = self.attribute_or_apply_unknown_policy_with_proto(
+            attribution,
+            client_addr.port(),
+            &target_host,
+            target_port,
+            Some(orig_dst.ip()),
+            TransportProtocol::Udp,
+        );
+
+        if proc_name == "unknown" && eval_action == RuleAction::Block {
+            self.telemetry.record_connection(
+                TrackedConnection {
+                    id: Uuid::new_v4().to_string(),
+                    pid,
+                    process_name: proc_name,
+                    process_path: proc_path,
+                    target_host,
+                    resolved_domain: effective_domain,
+                    target_port,
+                    protocol: TransportProtocol::Udp,
+                    matched_rule: matched_rule_name,
+                    route_label: ROUTE_BLOCK_LABEL.to_string(),
+                    latency_ms: 0,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    status: ConnectionStatus::Blocked,
+                    started_at: Utc::now(),
+                },
+                false,
+            );
+            return;
+        }
+
+        let target = Socks5UdpTarget::Ipv4(*orig_dst.ip(), target_port);
+        if let Ok(reply_payload) = self
+            .forward_udp_datagram(
+                peer_addr,
+                &proc_name,
+                Some(&proc_path),
+                pid,
+                &target,
+                payload,
+                false,
+            )
+            .await
+        {
+            if !reply_payload.is_empty() {
+                let _ = NftablesInterceptor::send_raw_ipv4_udp_packet(
+                    orig_dst,
+                    client_addr,
+                    &reply_payload,
+                    fwmark,
+                );
             }
         }
     }
@@ -3438,6 +3675,51 @@ impl RouteWardController {
             })??;
         buf.truncate(len);
         Ok(buf)
+    }
+
+    async fn send_and_optional_recv_udp_direct_protected(
+        &self,
+        payload: &[u8],
+        target_addr: SocketAddr,
+        recv_timeout: Duration,
+    ) -> std::io::Result<Vec<u8>> {
+        let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        std_sock.set_nonblocking(true)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let fwmark = self.constants.network.linux_fwmark;
+            if fwmark != 0 {
+                let fd = std_sock.as_raw_fd();
+                let _ = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_MARK,
+                        &fwmark as *const u32 as *const libc::c_void,
+                        std::mem::size_of::<u32>() as libc::socklen_t,
+                    )
+                };
+            }
+        }
+
+        let local_port = std_sock.local_addr()?.port();
+        let _port_guard = self.nat_table.register_self_udp_port(local_port);
+
+        let sock = UdpSocket::from_std(std_sock)?;
+        tokio::time::timeout(recv_timeout, sock.send_to(payload, target_addr))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP send timeout"))??;
+
+        let mut buf = vec![0u8; 65535];
+        match tokio::time::timeout(recv_timeout, sock.recv_from(&mut buf)).await {
+            Ok(Ok((len, _))) => {
+                buf.truncate(len);
+                Ok(buf)
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     async fn query_dns_tcp_direct_protected(

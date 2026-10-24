@@ -297,6 +297,7 @@ pub struct UdpAssociationSession {
     pub proxy_name: String,
     pub relay_udp_addr: SocketAddr,
     pub udp_socket: Arc<UdpSocket>,
+    io_lock: tokio::sync::Mutex<()>,
     control_alive: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     last_activity_ms: AtomicU64,
@@ -631,6 +632,7 @@ impl UdpAssociationManager {
             proxy_name: node.name.clone(),
             relay_udp_addr,
             udp_socket: Arc::new(udp_socket),
+            io_lock: tokio::sync::Mutex::new(()),
             control_alive,
             shutdown_notify,
             last_activity_ms: AtomicU64::new(self.now_ms()),
@@ -651,6 +653,7 @@ impl UdpAssociationManager {
         read_timeout: Duration,
         proto: &ProtocolConstants,
     ) -> RouteWardResult<UdpProxiedDatagramReply> {
+        let _io_guard = session.io_lock.lock().await;
         if !session.is_control_alive() {
             self.sessions.remove(&session.key);
             return Err(RouteWardError::ProtocolHandshake {
@@ -1037,6 +1040,7 @@ mod tests {
                 last_activity_ms: AtomicU64::new(now_ms),
                 _udp_port_guard: None,
                 _tcp_port_guard: None,
+                io_lock: tokio::sync::Mutex::new(()),
             })
         };
 

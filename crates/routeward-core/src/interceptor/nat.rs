@@ -19,7 +19,7 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -306,6 +306,178 @@ impl<T> PendingSynQueue<T> {
     }
 }
 
+/// Queued outbound UDP packet awaiting asynchronous PID resolution outside the network receive loop.
+#[derive(Debug, Clone)]
+pub struct PendingUdpEntry<T> {
+    pub payload: T,
+    pub meta: Ipv4UdpPacketMeta,
+    pub is_fragmented: bool,
+    pub enqueued_at: Instant,
+}
+
+/// Outcome of polling or evicting a queued UDP packet in [`PendingUdpQueue`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingUdpOutcome<T> {
+    /// PID was resolved before timeout via `SocketLayer` or `GetExtendedUdpTable` (`TcpTableFallback`).
+    Resolved {
+        payload: T,
+        meta: Ipv4UdpPacketMeta,
+        is_fragmented: bool,
+        pid: u32,
+        source: PidResolutionSource,
+    },
+    /// Timeout expired or bounded queue overflowed while `killSwitchEnabled=true`; datagram is dropped.
+    TimedOutDropped {
+        meta: Ipv4UdpPacketMeta,
+        elapsed_ms: u64,
+        drop_count: u64,
+    },
+    /// Timeout expired or bounded queue overflowed while `killSwitchEnabled=false`; caller reinjects datagram unmodified.
+    TimedOutReinject {
+        payload: T,
+        meta: Ipv4UdpPacketMeta,
+        elapsed_ms: u64,
+        reinject_count: u64,
+    },
+}
+
+/// Bounded non-blocking queue holding unresolved first outbound UDP datagrams so the main `NETWORK` receive loop never sleeps.
+#[derive(Clone)]
+pub struct PendingUdpQueue<T> {
+    inner: Arc<Mutex<VecDeque<PendingUdpEntry<T>>>>,
+    max_capacity: usize,
+}
+
+impl<T> Default for PendingUdpQueue<T> {
+    fn default() -> Self {
+        Self::new(256)
+    }
+}
+
+impl<T> PendingUdpQueue<T> {
+    /// Creates an empty `PendingUdpQueue` bounded to `max_capacity` entries.
+    pub fn new(max_capacity: usize) -> Self {
+        let cap = max_capacity.max(1);
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::with_capacity(cap))),
+            max_capacity: cap,
+        }
+    }
+
+    /// Enqueues an unresolved UDP packet. If the queue is at `max_capacity`, evicts the oldest entry
+    /// and returns its drop/reinject outcome according to `kill_switch_enabled`.
+    pub fn enqueue(
+        &self,
+        nat: &TransparentNatTable,
+        payload: T,
+        meta: Ipv4UdpPacketMeta,
+        is_fragmented: bool,
+        kill_switch_enabled: bool,
+    ) -> Option<PendingUdpOutcome<T>> {
+        let mut queue = self.inner.lock();
+        let evicted = if queue.len() >= self.max_capacity {
+            queue.pop_front().map(|oldest| {
+                let elapsed_ms = oldest.enqueued_at.elapsed().as_millis() as u64;
+                if kill_switch_enabled {
+                    let drop_count = nat.record_dropped_unattributed_udp();
+                    PendingUdpOutcome::TimedOutDropped {
+                        meta: oldest.meta,
+                        elapsed_ms,
+                        drop_count,
+                    }
+                } else {
+                    let reinject_count = nat.record_reinjected_unattributed_udp();
+                    PendingUdpOutcome::TimedOutReinject {
+                        payload: oldest.payload,
+                        meta: oldest.meta,
+                        elapsed_ms,
+                        reinject_count,
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
+        queue.push_back(PendingUdpEntry {
+            payload,
+            meta,
+            is_fragmented,
+            enqueued_at: Instant::now(),
+        });
+        evicted
+    }
+
+    /// Returns the number of currently queued UDP datagrams.
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+
+    /// Returns `true` if no UDP datagrams are waiting in the queue.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+
+    /// Polls all queued UDP datagrams without sleeping, returning resolved, dropped (`killSwitchEnabled=true`),
+    /// or reinjected (`killSwitchEnabled=false`) outcomes and keeping still-pending entries in the queue.
+    pub fn poll_ready<F>(
+        &self,
+        nat: &TransparentNatTable,
+        timeout: Duration,
+        kill_switch_enabled: bool,
+        fallback_fn: F,
+    ) -> Vec<PendingUdpOutcome<T>>
+    where
+        F: Fn(u16) -> Option<u32>,
+    {
+        let mut queue = self.inner.lock();
+        let count = queue.len();
+        let mut outcomes = Vec::new();
+
+        for _ in 0..count {
+            let Some(entry) = queue.pop_front() else {
+                break;
+            };
+            if let Some((pid, source)) =
+                nat.try_resolve_pid_nonblocking(entry.meta.src_port, &fallback_fn)
+            {
+                outcomes.push(PendingUdpOutcome::Resolved {
+                    payload: entry.payload,
+                    meta: entry.meta,
+                    is_fragmented: entry.is_fragmented,
+                    pid,
+                    source,
+                });
+            } else {
+                let elapsed = entry.enqueued_at.elapsed();
+                if elapsed >= timeout {
+                    let elapsed_ms = elapsed.as_millis() as u64;
+                    if kill_switch_enabled {
+                        let drop_count = nat.record_dropped_unattributed_udp();
+                        outcomes.push(PendingUdpOutcome::TimedOutDropped {
+                            meta: entry.meta,
+                            elapsed_ms,
+                            drop_count,
+                        });
+                    } else {
+                        let reinject_count = nat.record_reinjected_unattributed_udp();
+                        outcomes.push(PendingUdpOutcome::TimedOutReinject {
+                            payload: entry.payload,
+                            meta: entry.meta,
+                            elapsed_ms,
+                            reinject_count,
+                        });
+                    }
+                } else {
+                    queue.push_back(entry);
+                }
+            }
+        }
+
+        outcomes
+    }
+}
+
 /// Thread-safe NAT state table and loop-prevention registry for transparent TCP redirection.
 #[derive(Clone)]
 pub struct TransparentNatTable {
@@ -321,6 +493,8 @@ pub struct TransparentNatTable {
     upstream_endpoints: Arc<RwLock<Vec<(Ipv4Addr, u16)>>>,
     dropped_unattributed_syn_count: Arc<AtomicU64>,
     reinjected_unattributed_syn_count: Arc<AtomicU64>,
+    dropped_unattributed_udp_count: Arc<AtomicU64>,
+    reinjected_unattributed_udp_count: Arc<AtomicU64>,
 }
 
 impl TransparentNatTable {
@@ -344,12 +518,16 @@ impl TransparentNatTable {
             upstream_endpoints: Arc::new(RwLock::new(Vec::new())),
             dropped_unattributed_syn_count: Arc::new(AtomicU64::new(0)),
             reinjected_unattributed_syn_count: Arc::new(AtomicU64::new(0)),
+            dropped_unattributed_udp_count: Arc::new(AtomicU64::new(0)),
+            reinjected_unattributed_udp_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Registers a local UDP port bound by RouteWard itself so `WinDivert` passes its packets through without interception.
     pub fn register_self_udp_port(&self, port: u16) -> SelfPortGuard {
-        self.self_udp_ports.insert(port, Instant::now());
+        let now = Instant::now();
+        self.self_udp_ports.insert(port, now);
+        self.socket_pid_cache.insert(port, (self.self_pid, now));
         SelfPortGuard {
             map: Arc::clone(&self.self_udp_ports),
             port,
@@ -399,6 +577,31 @@ impl TransparentNatTable {
     /// Returns the total number of timed-out Pending SYNs reinjected while `killSwitchEnabled=false`.
     pub fn reinjected_unattributed_syn_count(&self) -> u64 {
         self.reinjected_unattributed_syn_count
+            .load(Ordering::SeqCst)
+    }
+
+    /// Increments and returns the 1-based counter of timed-out Pending UDP datagrams dropped while `killSwitchEnabled=true`.
+    pub fn record_dropped_unattributed_udp(&self) -> u64 {
+        self.dropped_unattributed_udp_count
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    /// Returns the total number of timed-out Pending UDP datagrams dropped while `killSwitchEnabled=true`.
+    pub fn dropped_unattributed_udp_count(&self) -> u64 {
+        self.dropped_unattributed_udp_count.load(Ordering::SeqCst)
+    }
+
+    /// Increments and returns the 1-based counter of timed-out Pending UDP datagrams reinjected while `killSwitchEnabled=false`.
+    pub fn record_reinjected_unattributed_udp(&self) -> u64 {
+        self.reinjected_unattributed_udp_count
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    /// Returns the total number of timed-out Pending UDP datagrams reinjected while `killSwitchEnabled=false`.
+    pub fn reinjected_unattributed_udp_count(&self) -> u64 {
+        self.reinjected_unattributed_udp_count
             .load(Ordering::SeqCst)
     }
 
@@ -456,7 +659,10 @@ impl TransparentNatTable {
         dst_ip: Ipv4Addr,
         dst_port: u16,
     ) -> bool {
-        if pid == Some(self.self_pid) || self.is_self_tcp_port(src_port) {
+        if pid == Some(self.self_pid)
+            || self.is_self_tcp_port(src_port)
+            || self.is_self_udp_port(src_port)
+        {
             return true;
         }
         if src_ip.is_loopback()
@@ -825,6 +1031,24 @@ pub fn is_private_or_local_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_broadcast()
 }
 
+/// Parses a raw 8-byte (or 16-byte) `sockaddr_in` payload from a Linux `IP_ORIGDSTADDR` (`SOL_IP`, `20`)
+/// ancillary control message (`CMSG_DATA`) into `SocketAddrV4`.
+pub fn parse_ipv4_origdstaddr_bytes(cmsg_data: &[u8]) -> Option<SocketAddrV4> {
+    if cmsg_data.len() < 8 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([cmsg_data[0], cmsg_data[1]]);
+    if family != 2 {
+        return None;
+    }
+    let port = u16::from_be_bytes([cmsg_data[2], cmsg_data[3]]);
+    if port == 0 {
+        return None;
+    }
+    let ip = Ipv4Addr::new(cmsg_data[4], cmsg_data[5], cmsg_data[6], cmsg_data[7]);
+    Some(SocketAddrV4::new(ip, port))
+}
+
 /// Builds a forged RFC 792 ICMPv4 Destination Unreachable / Port Unreachable (`Type = 3`, `Code = 3`)
 /// packet in response to `original_ipv4_packet`, swapping source and destination IPv4 addresses and
 /// embedding the original IPv4 header plus the first 8 bytes of the transport header.
@@ -879,7 +1103,26 @@ pub fn build_forged_ipv4_icmp_port_unreachable(original_ipv4_packet: &[u8]) -> O
     pkt[icmp_offset] = ICMPV4_TYPE_DEST_UNREACHABLE;
     pkt[icmp_offset + 1] = ICMPV4_CODE_PORT_UNREACHABLE;
     // Bytes 2..4 = checksum (0 initially), Bytes 4..8 = unused (0)
-    pkt[icmp_offset + ICMPV4_HEADER_LEN..].copy_from_slice(&original_ipv4_packet[..quoted_len]);
+    let inner_ip_start = icmp_offset + ICMPV4_HEADER_LEN;
+    pkt[inner_ip_start..].copy_from_slice(&original_ipv4_packet[..quoted_len]);
+
+    // Ensure the quoted inner IPv4 header (and UDP checksum if TX checksum offload left a pseudo-header seed)
+    // has valid RFC 1071 checksums before computing the outer ICMPv4 checksum.
+    pkt[inner_ip_start + 10] = 0;
+    pkt[inner_ip_start + 11] = 0;
+    let inner_ip_csum =
+        ones_complement_checksum(&pkt[inner_ip_start..inner_ip_start + orig_ihl], 0);
+    pkt[inner_ip_start + 10..inner_ip_start + 12].copy_from_slice(&inner_ip_csum.to_be_bytes());
+    if original_ipv4_packet[9] == IPPROTO_UDP {
+        let orig_total_len =
+            u16::from_be_bytes([original_ipv4_packet[2], original_ipv4_packet[3]]) as usize;
+        if orig_total_len >= quoted_len && original_ipv4_packet.len() >= orig_total_len {
+            let mut full_copy = original_ipv4_packet[..orig_total_len].to_vec();
+            recompute_ipv4_and_udp_checksums(&mut full_copy, orig_ihl);
+            pkt[inner_ip_start + orig_ihl..inner_ip_start + quoted_len]
+                .copy_from_slice(&full_copy[orig_ihl..quoted_len]);
+        }
+    }
 
     let icmp_csum = ones_complement_checksum(&pkt[icmp_offset..], 0);
     pkt[icmp_offset + 2..icmp_offset + 4].copy_from_slice(&icmp_csum.to_be_bytes());
@@ -1236,5 +1479,123 @@ mod tests {
         assert!(is_private_or_local_ipv4(Ipv4Addr::new(169, 254, 10, 20)));
         assert!(is_private_or_local_ipv4(Ipv4Addr::new(255, 255, 255, 255)));
         assert!(!is_private_or_local_ipv4(target_ip));
+    }
+
+    #[test]
+    fn parses_ip_origdstaddr_cmsg_bytes_and_verifies_raw_udp_checksum() {
+        let mut raw_sockaddr_in = [0u8; 16];
+        raw_sockaddr_in[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+        raw_sockaddr_in[2..4].copy_from_slice(&8853u16.to_be_bytes());
+        raw_sockaddr_in[4..8].copy_from_slice(&[198, 18, 0, 42]);
+
+        let parsed = parse_ipv4_origdstaddr_bytes(&raw_sockaddr_in).expect("valid IP_ORIGDSTADDR");
+        assert_eq!(parsed.ip(), &Ipv4Addr::new(198, 18, 0, 42));
+        assert_eq!(parsed.port(), 8853);
+
+        // Wrong family (AF_INET6 = 10) or port 0 or truncated slice must return None
+        let mut bad_family = raw_sockaddr_in;
+        bad_family[0..2].copy_from_slice(&10u16.to_ne_bytes());
+        assert!(parse_ipv4_origdstaddr_bytes(&bad_family).is_none());
+        assert!(parse_ipv4_origdstaddr_bytes(&raw_sockaddr_in[..4]).is_none());
+
+        // Verify RFC 768 UDP pseudo-header + payload checksum on raw forged IPv4+UDP reply
+        let src_ip = Ipv4Addr::new(198, 18, 0, 42);
+        let dst_ip = Ipv4Addr::new(10, 200, 1, 2);
+        let payload = b"TPROXY-RAW-REPLY-PAYLOAD-42";
+        let raw_pkt =
+            build_forged_ipv4_udp_reply(src_ip, 8853, dst_ip, 54321, payload).expect("raw pkt");
+        assert_eq!(ones_complement_checksum(&raw_pkt[..20], 0), 0);
+        let udp_len = (raw_pkt.len() - 20) as u32;
+        let mut pseudo_sum: u32 = 0;
+        let mut addr_idx = 12;
+        while addr_idx < 20 {
+            pseudo_sum += u16::from_be_bytes([raw_pkt[addr_idx], raw_pkt[addr_idx + 1]]) as u32;
+            addr_idx += 2;
+        }
+        pseudo_sum += (IPPROTO_UDP as u32) + udp_len;
+        assert_eq!(ones_complement_checksum(&raw_pkt[20..], pseudo_sum), 0);
+    }
+
+    #[test]
+    fn bounded_pending_udp_queue_resolves_evicts_and_times_out_per_killswitch() {
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        let queue: PendingUdpQueue<Vec<u8>> = PendingUdpQueue::new(2);
+
+        let client_ip = Ipv4Addr::new(192, 168, 31, 136);
+        let dst_ip = Ipv4Addr::new(162, 159, 200, 1);
+
+        let pkt1 = build_forged_ipv4_udp_reply(client_ip, 52001, dst_ip, 123, b"ntp1").unwrap();
+        let meta1 = parse_ipv4_udp_meta(&pkt1).unwrap();
+        let pkt2 = build_forged_ipv4_udp_reply(client_ip, 52002, dst_ip, 123, b"ntp2").unwrap();
+        let meta2 = parse_ipv4_udp_meta(&pkt2).unwrap();
+        let pkt3 = build_forged_ipv4_udp_reply(client_ip, 52003, dst_ip, 123, b"ntp3").unwrap();
+        let meta3 = parse_ipv4_udp_meta(&pkt3).unwrap();
+
+        assert!(queue
+            .enqueue(&nat, pkt1.clone(), meta1, false, true)
+            .is_none());
+        assert!(queue
+            .enqueue(&nat, pkt2.clone(), meta2, false, true)
+            .is_none());
+        assert_eq!(queue.len(), 2);
+
+        // Enqueuing a 3rd packet into a capacity-2 queue evicts the oldest packet (52001)
+        let evicted = queue
+            .enqueue(&nat, pkt3.clone(), meta3, false, true)
+            .expect("oldest packet evicted when capacity exceeded");
+        match evicted {
+            PendingUdpOutcome::TimedOutDropped {
+                meta, drop_count, ..
+            } => {
+                assert_eq!(meta.src_port, 52001);
+                assert_eq!(drop_count, 1);
+            }
+            other => panic!("Expected TimedOutDropped on overflow, got {other:?}"),
+        }
+        assert_eq!(queue.len(), 2);
+
+        // Late SOCKET event resolves 52002
+        nat.record_socket_event(52002, 7744);
+        let outcomes = queue.poll_ready(&nat, Duration::from_millis(50), true, |_| None);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0],
+            PendingUdpOutcome::Resolved {
+                payload: pkt2,
+                meta: meta2,
+                is_fragmented: false,
+                pid: 7744,
+                source: PidResolutionSource::SocketLayer,
+            }
+        );
+        assert_eq!(queue.len(), 1);
+
+        // Remaining packet (52003) expires: with killSwitchEnabled=true it is dropped
+        let expired_drop = queue.poll_ready(&nat, Duration::ZERO, true, |_| None);
+        assert_eq!(expired_drop.len(), 1);
+        assert!(matches!(
+            expired_drop[0],
+            PendingUdpOutcome::TimedOutDropped { drop_count: 2, .. }
+        ));
+        assert_eq!(nat.dropped_unattributed_udp_count(), 2);
+
+        // With killSwitchEnabled=false, expired packet is returned for reinjection
+        queue.enqueue(&nat, pkt3.clone(), meta3, false, false);
+        let expired_reinject = queue.poll_ready(&nat, Duration::ZERO, false, |_| None);
+        assert_eq!(expired_reinject.len(), 1);
+        match &expired_reinject[0] {
+            PendingUdpOutcome::TimedOutReinject {
+                payload,
+                meta,
+                reinject_count,
+                ..
+            } => {
+                assert_eq!(payload, &pkt3);
+                assert_eq!(meta.src_port, 52003);
+                assert_eq!(*reinject_count, 1);
+            }
+            other => panic!("Expected TimedOutReinject, got {other:?}"),
+        }
+        assert_eq!(nat.reinjected_unattributed_udp_count(), 1);
     }
 }
