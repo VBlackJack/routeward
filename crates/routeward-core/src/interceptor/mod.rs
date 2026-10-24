@@ -760,7 +760,7 @@ impl RouteWardController {
             .unwrap_or_else(|| target_host.clone());
 
         if eval.action == RuleAction::Block {
-            let mut blocked_conn = TrackedConnection {
+            let blocked_conn = TrackedConnection {
                 id: Uuid::new_v4().to_string(),
                 pid: proc_id.pid,
                 process_name: proc_id.name,
@@ -777,14 +777,90 @@ impl RouteWardController {
                 status: ConnectionStatus::Blocked,
                 started_at: Utc::now(),
             };
-            blocked_conn.status = ConnectionStatus::Blocked;
             self.telemetry.record_connection(blocked_conn, false);
+            Self::send_socks5_failure_and_close(&mut client, proto).await;
             return Ok(());
         }
 
-        let mut outbound = self
+        let is_proxied_rule = matches!(
+            eval.action,
+            RuleAction::Proxy { .. } | RuleAction::Chain { .. }
+        );
+        let kill_switch_enabled = self.profile.read().security_policy.kill_switch_enabled;
+
+        let (mut outbound, effective_action) = match self
             .open_outbound_stream(&eval.action, &effective_host, target_port)
-            .await?;
+            .await
+        {
+            Ok(stream) => (stream, eval.action.clone()),
+            Err(err) => {
+                if is_proxied_rule && kill_switch_enabled {
+                    self.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_ENGINE,
+                        format!(
+                            "Kill-Switch blocked local SOCKS5 connection PID={} process=\"{}\" exe=\"{}\" -> {}:{} [rule=\"{}\", killSwitchEnabled=true]: {}",
+                            proc_id.pid,
+                            proc_id.name,
+                            proc_id.executable_path,
+                            effective_host,
+                            target_port,
+                            eval.matched_rule_name,
+                            err
+                        ),
+                    );
+                    self.telemetry.record_connection(
+                        TrackedConnection {
+                            id: Uuid::new_v4().to_string(),
+                            pid: proc_id.pid,
+                            process_name: proc_id.name,
+                            process_path: proc_id.executable_path,
+                            target_host,
+                            resolved_domain: eval.effective_domain,
+                            target_port,
+                            protocol: TransportProtocol::Tcp,
+                            matched_rule: eval.matched_rule_name,
+                            route_label: ROUTE_BLOCK_LABEL.to_string(),
+                            latency_ms: 0,
+                            rx_bytes: 0,
+                            tx_bytes: 0,
+                            status: ConnectionStatus::Blocked,
+                            started_at: Utc::now(),
+                        },
+                        false,
+                    );
+                    Self::send_socks5_failure_and_close(&mut client, proto).await;
+                    return Err(err);
+                } else if is_proxied_rule {
+                    self.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_ENGINE,
+                        format!(
+                            "Upstream proxy failed for local SOCKS5 connection PID={} process=\"{}\" exe=\"{}\" -> {}:{} ({}); falling back to DIRECT because killSwitchEnabled=false",
+                            proc_id.pid,
+                            proc_id.name,
+                            proc_id.executable_path,
+                            effective_host,
+                            target_port,
+                            err
+                        ),
+                    );
+                    match self
+                        .open_outbound_stream(&RuleAction::Direct, &effective_host, target_port)
+                        .await
+                    {
+                        Ok(direct_stream) => (direct_stream, RuleAction::Direct),
+                        Err(direct_err) => {
+                            Self::send_socks5_failure_and_close(&mut client, proto).await;
+                            return Err(direct_err);
+                        }
+                    }
+                } else {
+                    Self::send_socks5_failure_and_close(&mut client, proto).await;
+                    return Err(err);
+                }
+            }
+        };
 
         let success_reply = [
             proto.socks5_version,
@@ -801,7 +877,7 @@ impl RouteWardController {
         client.write_all(&success_reply).await?;
 
         let conn_id = Uuid::new_v4().to_string();
-        let is_proxied = !matches!(eval.action, RuleAction::Direct);
+        let is_proxied = !matches!(effective_action, RuleAction::Direct);
         let tracked = TrackedConnection {
             id: conn_id.clone(),
             pid: proc_id.pid,
@@ -812,7 +888,7 @@ impl RouteWardController {
             target_port,
             protocol: TransportProtocol::Tcp,
             matched_rule: eval.matched_rule_name,
-            route_label: self.format_action_label(&eval.action),
+            route_label: self.format_action_label(&effective_action),
             latency_ms: 12,
             rx_bytes: 0,
             tx_bytes: 0,
@@ -828,7 +904,27 @@ impl RouteWardController {
         Ok(())
     }
 
-    async fn handle_transparent_tcp_client(
+    async fn send_socks5_failure_and_close(
+        client: &mut TcpStream,
+        proto: &crate::config::ProtocolConstants,
+    ) {
+        let failure_reply = [
+            proto.socks5_version,
+            proto.socks5_reply_general_failure,
+            0x00,
+            proto.socks5_atyp_ipv4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let _ = client.write_all(&failure_reply).await;
+        let _ = client.shutdown().await;
+    }
+
+    pub async fn handle_transparent_tcp_client(
         &self,
         mut client: TcpStream,
         peer_addr: SocketAddr,
@@ -836,33 +932,113 @@ impl RouteWardController {
         if let Some(session) = self.nat_table.validate_relay_peer_addr(peer_addr) {
             let target_host = session.orig_dst_ip.to_string();
             let target_port = session.orig_dst_port;
-            let route_label = self.format_action_label(&session.action);
+            let resolved_domain = self.dns.resolve_fake_ip(&session.orig_dst_ip);
+            let effective_host = resolved_domain
+                .clone()
+                .unwrap_or_else(|| target_host.clone());
+            let is_proxied_rule = matches!(
+                session.action,
+                RuleAction::Proxy { .. } | RuleAction::Chain { .. }
+            );
+            let kill_switch_enabled = self.profile.read().security_policy.kill_switch_enabled;
 
-            let mut outbound = match self
-                .open_outbound_stream(&session.action, &target_host, target_port)
+            let (mut outbound, effective_action) = match self
+                .open_outbound_stream(&session.action, &effective_host, target_port)
                 .await
             {
-                Ok(stream) => stream,
+                Ok(stream) => (stream, session.action.clone()),
                 Err(err) => {
-                    self.telemetry.push_log(
-                        LogLevel::Error,
-                        COMPONENT_TRANSPARENT,
-                        format!(
-                            "Failed upstream connect for PID={} process=\"{}\" exe=\"{}\" -> {}:{}: {}",
-                            session.pid,
-                            session.process_name,
-                            session.process_path,
-                            target_host,
-                            target_port,
-                            err
-                        ),
-                    );
-                    self.nat_table
-                        .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
-                    return Err(err);
+                    if is_proxied_rule && kill_switch_enabled {
+                        self.telemetry.push_log(
+                            LogLevel::Warn,
+                            COMPONENT_TRANSPARENT,
+                            format!(
+                                "Kill-Switch blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\", killSwitchEnabled=true]: {}",
+                                session.pid,
+                                session.process_name,
+                                session.process_path,
+                                session.resolution_source.as_str(),
+                                target_host,
+                                target_port,
+                                session.matched_rule_name,
+                                err
+                            ),
+                        );
+                        self.telemetry.record_connection(
+                            TrackedConnection {
+                                id: Uuid::new_v4().to_string(),
+                                pid: session.pid,
+                                process_name: session.process_name.clone(),
+                                process_path: session.process_path.clone(),
+                                target_host,
+                                resolved_domain,
+                                target_port,
+                                protocol: TransportProtocol::Tcp,
+                                matched_rule: session.matched_rule_name.clone(),
+                                route_label: ROUTE_BLOCK_LABEL.to_string(),
+                                latency_ms: 0,
+                                rx_bytes: 0,
+                                tx_bytes: 0,
+                                status: ConnectionStatus::Blocked,
+                                started_at: Utc::now(),
+                            },
+                            false,
+                        );
+                        let _ = client.shutdown().await;
+                        self.nat_table
+                            .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
+                        return Err(err);
+                    } else if is_proxied_rule {
+                        self.telemetry.push_log(
+                            LogLevel::Warn,
+                            COMPONENT_TRANSPARENT,
+                            format!(
+                                "Upstream proxy failed for PID={} process=\"{}\" exe=\"{}\" -> {}:{} ({}); falling back to DIRECT because killSwitchEnabled=false",
+                                session.pid,
+                                session.process_name,
+                                session.process_path,
+                                target_host,
+                                target_port,
+                                err
+                            ),
+                        );
+                        match self
+                            .open_outbound_stream(&RuleAction::Direct, &effective_host, target_port)
+                            .await
+                        {
+                            Ok(direct_stream) => (direct_stream, RuleAction::Direct),
+                            Err(direct_err) => {
+                                let _ = client.shutdown().await;
+                                self.nat_table.remove_session_by_relay_peer(
+                                    session.orig_dst_ip,
+                                    session.client_port,
+                                );
+                                return Err(direct_err);
+                            }
+                        }
+                    } else {
+                        self.telemetry.push_log(
+                            LogLevel::Error,
+                            COMPONENT_TRANSPARENT,
+                            format!(
+                                "Failed upstream connect for PID={} process=\"{}\" exe=\"{}\" -> {}:{}: {}",
+                                session.pid,
+                                session.process_name,
+                                session.process_path,
+                                target_host,
+                                target_port,
+                                err
+                            ),
+                        );
+                        let _ = client.shutdown().await;
+                        self.nat_table
+                            .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
+                        return Err(err);
+                    }
                 }
             };
 
+            let route_label = self.format_action_label(&effective_action);
             self.telemetry.push_log(
                 LogLevel::Info,
                 COMPONENT_TRANSPARENT,
@@ -880,13 +1056,14 @@ impl RouteWardController {
             );
 
             let conn_id = Uuid::new_v4().to_string();
+            let is_proxied = !matches!(effective_action, RuleAction::Direct);
             let tracked = TrackedConnection {
                 id: conn_id.clone(),
                 pid: session.pid,
                 process_name: session.process_name,
                 process_path: session.process_path,
                 target_host,
-                resolved_domain: None,
+                resolved_domain,
                 target_port,
                 protocol: TransportProtocol::Tcp,
                 matched_rule: session.matched_rule_name,
@@ -897,7 +1074,7 @@ impl RouteWardController {
                 status: ConnectionStatus::Active,
                 started_at: Utc::now(),
             };
-            self.telemetry.record_connection(tracked, true);
+            self.telemetry.record_connection(tracked, is_proxied);
 
             let _ = self
                 .telemetry
@@ -921,84 +1098,99 @@ impl RouteWardController {
                     .process_resolver
                     .resolve_tcp_port_attribution(client_port);
 
-                let (pid, proc_name, proc_path, eval_action, matched_rule_name, res_source) =
-                    match attribution {
-                        ProcessAttribution::Single(identity) => {
-                            let eval = self.evaluate_rule(&ConnectionRequest {
-                                process_name: identity.name.clone(),
-                                process_path: Some(identity.executable_path.clone()),
-                                target_host: target_host.clone(),
-                                target_ip: Some(target_host.clone()),
-                                target_port,
-                                protocol: TransportProtocol::Tcp,
-                            });
-                            (
-                                identity.pid,
-                                identity.name,
-                                identity.executable_path,
-                                eval.action,
-                                eval.matched_rule_name,
-                                "procfs_single",
-                            )
-                        }
-                        ProcessAttribution::Shared {
-                            primary,
-                            candidate_pids,
-                        } => {
-                            self.telemetry.push_log(
-                                LogLevel::Warn,
-                                COMPONENT_TRANSPARENT,
-                                format!(
-                                    "Shared socket across forked PIDs {:?} on client port {}; attributing to primary PID={} process=\"{}\" exe=\"{}\"",
-                                    candidate_pids,
-                                    client_port,
-                                    primary.pid,
-                                    primary.name,
-                                    primary.executable_path
-                                ),
-                            );
-                            let eval = self.evaluate_rule(&ConnectionRequest {
-                                process_name: primary.name.clone(),
-                                process_path: Some(primary.executable_path.clone()),
-                                target_host: target_host.clone(),
-                                target_ip: Some(target_host.clone()),
-                                target_port,
-                                protocol: TransportProtocol::Tcp,
-                            });
-                            (
+                let (
+                    pid,
+                    proc_name,
+                    proc_path,
+                    eval_action,
+                    matched_rule_name,
+                    effective_domain,
+                    res_source,
+                ) = match attribution {
+                    ProcessAttribution::Single(identity) => {
+                        let eval = self.evaluate_rule(&ConnectionRequest {
+                            process_name: identity.name.clone(),
+                            process_path: Some(identity.executable_path.clone()),
+                            target_host: target_host.clone(),
+                            target_ip: Some(target_host.clone()),
+                            target_port,
+                            protocol: TransportProtocol::Tcp,
+                        });
+                        (
+                            identity.pid,
+                            identity.name,
+                            identity.executable_path,
+                            eval.action,
+                            eval.matched_rule_name,
+                            eval.effective_domain,
+                            "procfs_single",
+                        )
+                    }
+                    ProcessAttribution::Shared {
+                        primary,
+                        candidate_pids,
+                    } => {
+                        self.telemetry.push_log(
+                            LogLevel::Warn,
+                            COMPONENT_TRANSPARENT,
+                            format!(
+                                "Shared socket across forked PIDs {:?} on client port {}; attributing to primary PID={} process=\"{}\" exe=\"{}\"",
+                                candidate_pids,
+                                client_port,
                                 primary.pid,
                                 primary.name,
-                                primary.executable_path,
-                                eval.action,
-                                eval.matched_rule_name,
-                                "procfs_shared_fork",
-                            )
-                        }
-                        ProcessAttribution::Unknown { reason } => {
-                            let unknown_action = self
-                                .profile
-                                .read()
-                                .security_policy
-                                .unknown_process_action
-                                .clone();
-                            self.telemetry.push_log(
-                                LogLevel::Warn,
-                                COMPONENT_TRANSPARENT,
-                                format!(
-                                    "Unattributed socket on client port {} -> {}:{} (reason={}); applying unknownProcessAction={:?}",
-                                    client_port, target_host, target_port, reason, unknown_action
-                                ),
-                            );
-                            (
-                                0,
-                                "unknown".to_string(),
-                                "unknown".to_string(),
-                                unknown_action,
-                                "SecurityPolicy:unknownProcessAction".to_string(),
-                                "procfs_unknown",
-                            )
-                        }
-                    };
+                                primary.executable_path
+                            ),
+                        );
+                        let eval = self.evaluate_rule(&ConnectionRequest {
+                            process_name: primary.name.clone(),
+                            process_path: Some(primary.executable_path.clone()),
+                            target_host: target_host.clone(),
+                            target_ip: Some(target_host.clone()),
+                            target_port,
+                            protocol: TransportProtocol::Tcp,
+                        });
+                        (
+                            primary.pid,
+                            primary.name,
+                            primary.executable_path,
+                            eval.action,
+                            eval.matched_rule_name,
+                            eval.effective_domain,
+                            "procfs_shared_fork",
+                        )
+                    }
+                    ProcessAttribution::Unknown { reason } => {
+                        let unknown_action = self
+                            .profile
+                            .read()
+                            .security_policy
+                            .unknown_process_action
+                            .clone();
+                        let resolved_dom = self.dns.resolve_fake_ip(orig_dst.ip());
+                        self.telemetry.push_log(
+                            LogLevel::Warn,
+                            COMPONENT_TRANSPARENT,
+                            format!(
+                                "Unattributed socket on client port {} -> {}:{} (reason={}); applying unknownProcessAction={:?}",
+                                client_port, target_host, target_port, reason, unknown_action
+                            ),
+                        );
+                        (
+                            0,
+                            "unknown".to_string(),
+                            "unknown".to_string(),
+                            unknown_action,
+                            "SecurityPolicy:unknownProcessAction".to_string(),
+                            resolved_dom,
+                            "procfs_unknown",
+                        )
+                    }
+                };
+
+                let effective_host = effective_domain
+                    .clone()
+                    .unwrap_or_else(|| target_host.clone());
 
                 if eval_action == RuleAction::Block {
                     self.telemetry.push_log(
@@ -1022,7 +1214,7 @@ impl RouteWardController {
                             process_name: proc_name,
                             process_path: proc_path,
                             target_host,
-                            resolved_domain: None,
+                            resolved_domain: effective_domain,
                             target_port,
                             protocol: TransportProtocol::Tcp,
                             matched_rule: matched_rule_name,
@@ -1039,25 +1231,95 @@ impl RouteWardController {
                     return Ok(());
                 }
 
-                let route_label = self.format_action_label(&eval_action);
-                let mut outbound = match self
-                    .open_outbound_stream(&eval_action, &target_host, target_port)
+                let is_proxied_rule = matches!(
+                    eval_action,
+                    RuleAction::Proxy { .. } | RuleAction::Chain { .. }
+                );
+                let kill_switch_enabled = self.profile.read().security_policy.kill_switch_enabled;
+
+                let (mut outbound, effective_action) = match self
+                    .open_outbound_stream(&eval_action, &effective_host, target_port)
                     .await
                 {
-                    Ok(stream) => stream,
+                    Ok(stream) => (stream, eval_action.clone()),
                     Err(err) => {
-                        self.telemetry.push_log(
-                            LogLevel::Error,
-                            COMPONENT_TRANSPARENT,
-                            format!(
-                                "Failed upstream connect for PID={} process=\"{}\" exe=\"{}\" -> {}:{}: {}",
-                                pid, proc_name, proc_path, target_host, target_port, err
-                            ),
-                        );
-                        return Err(err);
+                        if is_proxied_rule && kill_switch_enabled {
+                            self.telemetry.push_log(
+                                LogLevel::Warn,
+                                COMPONENT_TRANSPARENT,
+                                format!(
+                                    "Kill-Switch blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\", killSwitchEnabled=true]: {}",
+                                    pid,
+                                    proc_name,
+                                    proc_path,
+                                    res_source,
+                                    target_host,
+                                    target_port,
+                                    matched_rule_name,
+                                    err
+                                ),
+                            );
+                            self.telemetry.record_connection(
+                                TrackedConnection {
+                                    id: Uuid::new_v4().to_string(),
+                                    pid,
+                                    process_name: proc_name,
+                                    process_path: proc_path,
+                                    target_host,
+                                    resolved_domain: effective_domain,
+                                    target_port,
+                                    protocol: TransportProtocol::Tcp,
+                                    matched_rule: matched_rule_name,
+                                    route_label: ROUTE_BLOCK_LABEL.to_string(),
+                                    latency_ms: 0,
+                                    rx_bytes: 0,
+                                    tx_bytes: 0,
+                                    status: ConnectionStatus::Blocked,
+                                    started_at: Utc::now(),
+                                },
+                                false,
+                            );
+                            NftablesInterceptor::reset_and_close_tcp_stream(client);
+                            return Err(err);
+                        } else if is_proxied_rule {
+                            self.telemetry.push_log(
+                                LogLevel::Warn,
+                                COMPONENT_TRANSPARENT,
+                                format!(
+                                    "Upstream proxy failed for PID={} process=\"{}\" exe=\"{}\" -> {}:{} ({}); falling back to DIRECT because killSwitchEnabled=false",
+                                    pid, proc_name, proc_path, target_host, target_port, err
+                                ),
+                            );
+                            match self
+                                .open_outbound_stream(
+                                    &RuleAction::Direct,
+                                    &effective_host,
+                                    target_port,
+                                )
+                                .await
+                            {
+                                Ok(direct_stream) => (direct_stream, RuleAction::Direct),
+                                Err(direct_err) => {
+                                    NftablesInterceptor::reset_and_close_tcp_stream(client);
+                                    return Err(direct_err);
+                                }
+                            }
+                        } else {
+                            self.telemetry.push_log(
+                                LogLevel::Error,
+                                COMPONENT_TRANSPARENT,
+                                format!(
+                                    "Failed upstream connect for PID={} process=\"{}\" exe=\"{}\" -> {}:{}: {}",
+                                    pid, proc_name, proc_path, target_host, target_port, err
+                                ),
+                            );
+                            NftablesInterceptor::reset_and_close_tcp_stream(client);
+                            return Err(err);
+                        }
                     }
                 };
 
+                let route_label = self.format_action_label(&effective_action);
                 self.telemetry.push_log(
                     LogLevel::Info,
                     COMPONENT_TRANSPARENT,
@@ -1075,14 +1337,14 @@ impl RouteWardController {
                 );
 
                 let conn_id = Uuid::new_v4().to_string();
-                let is_proxied = !matches!(eval_action, RuleAction::Direct);
+                let is_proxied = !matches!(effective_action, RuleAction::Direct);
                 let tracked = TrackedConnection {
                     id: conn_id.clone(),
                     pid,
                     process_name: proc_name,
                     process_path: proc_path,
                     target_host,
-                    resolved_domain: None,
+                    resolved_domain: effective_domain,
                     target_port,
                     protocol: TransportProtocol::Tcp,
                     matched_rule: matched_rule_name,
@@ -1239,6 +1501,86 @@ impl RouteWardController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ChainStrategy, ProxyChain, ProxyCredentials, ProxyNode, ProxyProtocol};
+    use crate::interceptor::nat::{NatSessionEntry, PidResolutionSource};
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    fn allocate_closed_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        listener.local_addr().expect("local_addr").port()
+    }
+
+    fn make_proxy_node(
+        id: &str,
+        port: u16,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> ProxyNode {
+        let auth = match (username, password) {
+            (Some(u), Some(p)) => Some(ProxyCredentials::new(u, p)),
+            _ => None,
+        };
+        ProxyNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".to_string(),
+            port,
+            auth,
+            udp_enabled: false,
+            tls: false,
+            sni: None,
+            enabled: true,
+            last_latency_ms: Some(15),
+            exit_ip: None,
+        }
+    }
+
+    async fn run_transparent_session(
+        controller: &Arc<RouteWardController>,
+        target_port: u16,
+        action: RuleAction,
+        rule_name: &str,
+    ) -> (RouteWardResult<()>, Vec<u8>) {
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+        let relay_addr = relay_listener.local_addr().expect("relay_addr");
+
+        let client_stream = TcpStream::connect(relay_addr)
+            .await
+            .expect("client connect");
+        let peer_addr = client_stream.local_addr().expect("client local_addr");
+        let (server_stream, accepted_peer) = relay_listener.accept().await.expect("accept");
+        assert_eq!(peer_addr, accepted_peer);
+
+        controller.nat_table.insert_session(NatSessionEntry {
+            client_ip: Ipv4Addr::LOCALHOST,
+            client_port: peer_addr.port(),
+            orig_dst_ip: Ipv4Addr::LOCALHOST,
+            orig_dst_port: target_port,
+            pid: 4242,
+            process_name: "curl.exe".to_string(),
+            process_path: "C:\\Windows\\System32\\curl.exe".to_string(),
+            resolution_source: PidResolutionSource::SocketLayer,
+            action,
+            matched_rule_name: rule_name.to_string(),
+            created_at: Instant::now(),
+        });
+
+        let client_task = tokio::spawn(async move {
+            let mut client = client_stream;
+            let mut buf = Vec::new();
+            let _ = client.read_to_end(&mut buf).await;
+            buf
+        });
+
+        let res = controller
+            .handle_transparent_tcp_client(server_stream, accepted_peer)
+            .await;
+        let received = client_task.await.expect("client_task join");
+        (res, received)
+    }
 
     #[tokio::test]
     async fn transparent_relay_rejects_and_logs_unknown_peer_connection() {
@@ -1269,6 +1611,413 @@ mod tests {
         assert!(logs.iter().any(|l| l.level == LogLevel::Warn
             && l.component == COMPONENT_TRANSPARENT
             && l.message.contains("Rejected unauthorized connection")));
+    }
+
+    #[tokio::test]
+    async fn kill_switch_blocks_transparent_and_socks5_when_upstream_proxy_refused() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+        let target_port = target_listener.local_addr().expect("target_addr").port();
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_hits_bg = direct_hits.clone();
+        let _target_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = target_listener.accept().await {
+                direct_hits_bg.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.write_all(b"DIRECT_HIT").await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let dead_port = allocate_closed_port();
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.security_policy.kill_switch_enabled = true;
+        profile.proxies = vec![make_proxy_node("proxy-dead", dead_port, None, None)];
+        profile.rules.clear();
+        profile.default_action = RuleAction::Proxy {
+            target_id: "proxy-dead".to_string(),
+        };
+
+        let controller = Arc::new(RouteWardController::new(constants, profile, "en"));
+
+        // 1. Transparent TCP relay: connection refused must be blocked, never direct
+        let (res, client_bytes) = run_transparent_session(
+            &controller,
+            target_port,
+            RuleAction::Proxy {
+                target_id: "proxy-dead".to_string(),
+            },
+            "Rule-Proxy-Dead",
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(client_bytes.is_empty());
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+
+        let conns = controller.telemetry.list_connections();
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].status, ConnectionStatus::Blocked);
+        assert_eq!(conns[0].route_label, ROUTE_BLOCK_LABEL);
+        assert_eq!(conns[0].matched_rule, "Rule-Proxy-Dead");
+
+        let logs = controller.telemetry.list_logs();
+        assert!(logs.iter().any(|l| l.level == LogLevel::Warn
+            && l.component == COMPONENT_TRANSPARENT
+            && l.message.contains("Kill-Switch blocked connection")));
+
+        // 2. Local SOCKS5 relay: connection refused must receive SOCKS5 general failure reply and be blocked
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind socks");
+        let socks_addr = socks_listener.local_addr().expect("socks_addr");
+
+        let client_task = tokio::spawn(async move {
+            let mut s = TcpStream::connect(socks_addr).await.expect("connect socks");
+            s.write_all(&[0x05, 0x01, 0x00]).await.expect("greeting");
+            let mut method_reply = [0u8; 2];
+            s.read_exact(&mut method_reply).await.expect("method reply");
+            assert_eq!(method_reply, [0x05, 0x00]);
+
+            let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+            req.extend_from_slice(&target_port.to_be_bytes());
+            s.write_all(&req).await.expect("connect req");
+
+            let mut reply = [0u8; 10];
+            s.read_exact(&mut reply).await.expect("failure reply");
+            reply
+        });
+
+        let (socks_server_stream, socks_peer) = socks_listener.accept().await.expect("accept");
+        let socks_res = controller
+            .handle_local_socks5_client(socks_server_stream, socks_peer.port())
+            .await;
+        assert!(socks_res.is_err());
+
+        let reply = client_task.await.expect("socks client join");
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x01); // general SOCKS server failure
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+
+        let conns = controller.telemetry.list_connections();
+        assert_eq!(conns.len(), 2);
+        assert!(conns
+            .iter()
+            .all(|c| c.status == ConnectionStatus::Blocked && c.route_label == ROUTE_BLOCK_LABEL));
+        let logs = controller.telemetry.list_logs();
+        assert!(logs.iter().any(|l| l.level == LogLevel::Warn
+            && l.component == COMPONENT_ENGINE
+            && l.message
+                .contains("Kill-Switch blocked local SOCKS5 connection")));
+    }
+
+    #[tokio::test]
+    async fn kill_switch_blocks_on_upstream_timeout_and_auth_failure() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+        let target_port = target_listener.local_addr().expect("target_addr").port();
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_hits_bg = direct_hits.clone();
+        let _target_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = target_listener.accept().await {
+                direct_hits_bg.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        // Hanging proxy that accepts TCP but never responds to SOCKS5 greeting
+        let hanging_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging");
+        let hanging_port = hanging_listener.local_addr().expect("hanging_addr").port();
+        let _hanging_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = hanging_listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        // Auth-rejecting SOCKS5 proxy
+        let auth_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind auth");
+        let auth_port = auth_listener.local_addr().expect("auth_addr").port();
+        let _auth_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = auth_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.write_all(&[0x05, 0x02]).await;
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.write_all(&[0x01, 0x01]).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        constants.network.proxy_handshake_timeout_ms = 120;
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.security_policy.kill_switch_enabled = true;
+        profile.proxies = vec![
+            make_proxy_node("proxy-timeout", hanging_port, None, None),
+            make_proxy_node("proxy-bad-auth", auth_port, Some("user"), Some("wrong")),
+        ];
+
+        let controller = Arc::new(RouteWardController::new(constants, profile, "en"));
+
+        let (timeout_res, _) = run_transparent_session(
+            &controller,
+            target_port,
+            RuleAction::Proxy {
+                target_id: "proxy-timeout".to_string(),
+            },
+            "Rule-Proxy-Timeout",
+        )
+        .await;
+        assert!(timeout_res.is_err());
+
+        let (auth_res, _) = run_transparent_session(
+            &controller,
+            target_port,
+            RuleAction::Proxy {
+                target_id: "proxy-bad-auth".to_string(),
+            },
+            "Rule-Proxy-Auth",
+        )
+        .await;
+        assert!(auth_res.is_err());
+
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+        let conns = controller.telemetry.list_connections();
+        assert_eq!(conns.len(), 2);
+        assert!(conns
+            .iter()
+            .all(|c| c.status == ConnectionStatus::Blocked && c.route_label == ROUTE_BLOCK_LABEL));
+    }
+
+    #[tokio::test]
+    async fn kill_switch_blocks_broken_chain_and_all_down_groups_but_allows_healthy_group_failover()
+    {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+        let target_port = target_listener.local_addr().expect("target_addr").port();
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_hits_bg = direct_hits.clone();
+        let _target_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = target_listener.accept().await {
+                direct_hits_bg.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.write_all(b"DIRECT_LEAK").await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        // Healthy SOCKS5 proxy that replies with "PROXIED_OK" when connecting to target_port,
+        // or fails SOCKS5 CONNECT if asked to chain to a dead hop.
+        let healthy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind healthy");
+        let healthy_port = healthy_listener.local_addr().expect("healthy_addr").port();
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_hits_bg = proxy_hits.clone();
+        let _healthy_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = healthy_listener.accept().await {
+                let proxy_hits_inner = proxy_hits_bg.clone();
+                tokio::spawn(async move {
+                    let mut greet = [0u8; 3];
+                    if stream.read_exact(&mut greet).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&[0x05, 0x00]).await;
+
+                    let mut hdr = [0u8; 4];
+                    if stream.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let dst_port = match hdr[3] {
+                        0x01 => {
+                            let mut addr_port = [0u8; 6];
+                            let _ = stream.read_exact(&mut addr_port).await;
+                            u16::from_be_bytes([addr_port[4], addr_port[5]])
+                        }
+                        0x03 => {
+                            let mut len = [0u8; 1];
+                            let _ = stream.read_exact(&mut len).await;
+                            let mut dom_port = vec![0u8; (len[0] as usize) + 2];
+                            let _ = stream.read_exact(&mut dom_port).await;
+                            u16::from_be_bytes([
+                                dom_port[dom_port.len() - 2],
+                                dom_port[dom_port.len() - 1],
+                            ])
+                        }
+                        _ => return,
+                    };
+
+                    if dst_port == target_port {
+                        proxy_hits_inner.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream
+                            .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                            .await;
+                        let _ = stream.write_all(b"PROXIED_OK").await;
+                        let _ = stream.shutdown().await;
+                    } else {
+                        // Next hop in chain is unreachable
+                        let _ = stream
+                            .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                            .await;
+                        let _ = stream.shutdown().await;
+                    }
+                });
+            }
+        });
+
+        let dead_port_1 = allocate_closed_port();
+        let dead_port_2 = allocate_closed_port();
+
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.security_policy.kill_switch_enabled = true;
+        profile.proxies = vec![
+            make_proxy_node("proxy-dead-1", dead_port_1, None, None),
+            make_proxy_node("proxy-dead-2", dead_port_2, None, None),
+            make_proxy_node("proxy-healthy", healthy_port, None, None),
+        ];
+        profile.chains = vec![
+            ProxyChain {
+                id: "chain-seq-broken".to_string(),
+                name: "Broken Sequence Chain".to_string(),
+                strategy: ChainStrategy::Sequence,
+                proxy_ids: vec!["proxy-healthy".to_string(), "proxy-dead-1".to_string()],
+                enabled: true,
+            },
+            ProxyChain {
+                id: "group-failover-recover".to_string(),
+                name: "Failover Group With Healthy Secondary".to_string(),
+                strategy: ChainStrategy::Failover,
+                proxy_ids: vec!["proxy-dead-1".to_string(), "proxy-healthy".to_string()],
+                enabled: true,
+            },
+            ProxyChain {
+                id: "group-failover-all-down".to_string(),
+                name: "Failover Group All Down".to_string(),
+                strategy: ChainStrategy::Failover,
+                proxy_ids: vec!["proxy-dead-1".to_string(), "proxy-dead-2".to_string()],
+                enabled: true,
+            },
+            ProxyChain {
+                id: "group-lowest-latency-all-down".to_string(),
+                name: "LowestLatency Group All Down".to_string(),
+                strategy: ChainStrategy::LowestLatency,
+                proxy_ids: vec!["proxy-dead-1".to_string(), "proxy-dead-2".to_string()],
+                enabled: true,
+            },
+        ];
+
+        let controller = Arc::new(RouteWardController::new(constants, profile, "en"));
+
+        // 1. Sequence chain where hop 2 is down -> Blocked, 0 direct hits
+        let (seq_res, seq_bytes) = run_transparent_session(
+            &controller,
+            target_port,
+            RuleAction::Chain {
+                target_id: "chain-seq-broken".to_string(),
+            },
+            "Rule-Broken-Seq",
+        )
+        .await;
+        assert!(seq_res.is_err());
+        assert!(seq_bytes.is_empty());
+
+        // 2. Failover group where node 1 is down and node 2 is healthy -> Succeeds via node 2, 0 direct hits
+        let (fo_ok_res, fo_ok_bytes) = run_transparent_session(
+            &controller,
+            target_port,
+            RuleAction::Chain {
+                target_id: "group-failover-recover".to_string(),
+            },
+            "Rule-Failover-Recover",
+        )
+        .await;
+        assert!(fo_ok_res.is_ok());
+        assert_eq!(fo_ok_bytes, b"PROXIED_OK");
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
+
+        // 3. Failover group where all nodes are down -> Blocked, 0 direct hits
+        let (fo_down_res, fo_down_bytes) = run_transparent_session(
+            &controller,
+            target_port,
+            RuleAction::Chain {
+                target_id: "group-failover-all-down".to_string(),
+            },
+            "Rule-Failover-All-Down",
+        )
+        .await;
+        assert!(fo_down_res.is_err());
+        assert!(fo_down_bytes.is_empty());
+
+        // 4. LowestLatency group where all nodes are down -> Blocked, 0 direct hits
+        let (ll_down_res, ll_down_bytes) = run_transparent_session(
+            &controller,
+            target_port,
+            RuleAction::Chain {
+                target_id: "group-lowest-latency-all-down".to_string(),
+            },
+            "Rule-LowestLatency-All-Down",
+        )
+        .await;
+        assert!(ll_down_res.is_err());
+        assert!(ll_down_bytes.is_empty());
+
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+
+        let conns = controller.telemetry.list_connections();
+        let blocked: Vec<_> = conns
+            .iter()
+            .filter(|c| c.status == ConnectionStatus::Blocked)
+            .collect();
+        assert_eq!(blocked.len(), 3);
+        assert!(blocked.iter().all(|c| c.route_label == ROUTE_BLOCK_LABEL));
+    }
+
+    #[tokio::test]
+    async fn kill_switch_disabled_explicitly_falls_back_to_direct_with_warning() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+        let target_port = target_listener.local_addr().expect("target_addr").port();
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_hits_bg = direct_hits.clone();
+        let _target_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = target_listener.accept().await {
+                direct_hits_bg.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.write_all(b"DIRECT_FALLBACK_OK").await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let dead_port = allocate_closed_port();
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.security_policy.kill_switch_enabled = false;
+        profile.proxies = vec![make_proxy_node("proxy-dead", dead_port, None, None)];
+
+        let controller = Arc::new(RouteWardController::new(constants, profile, "en"));
+
+        let (res, received) = run_transparent_session(
+            &controller,
+            target_port,
+            RuleAction::Proxy {
+                target_id: "proxy-dead".to_string(),
+            },
+            "Rule-Proxy-Fallback",
+        )
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(received, b"DIRECT_FALLBACK_OK");
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 1);
+
+        let conns = controller.telemetry.list_connections();
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].route_label, ROUTE_DIRECT_LABEL);
+
+        let logs = controller.telemetry.list_logs();
+        assert!(logs.iter().any(|l| l.level == LogLevel::Warn
+            && l.message
+                .contains("falling back to DIRECT because killSwitchEnabled=false")));
     }
 
     #[test]

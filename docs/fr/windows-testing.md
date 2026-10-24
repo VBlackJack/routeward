@@ -1,6 +1,6 @@
 # Suite de Tests de Non-Regression Windows
 
-Le script `tests/windows/Invoke-RouteWardTests.ps1` (et son lanceur `tests/windows/Run-RouteWardTests.bat`) execute une suite automatisee de 9 scenarios de non-regression pour RouteWard dans une VM de test Windows dediee.
+Le script `tests/windows/Invoke-RouteWardTests.ps1` (et son lanceur `tests/windows/Run-RouteWardTests.bat`) execute une suite automatisee de 10 scenarios de non-regression pour RouteWard dans une VM de test Windows dediee.
 
 ## Prerequis
 
@@ -44,6 +44,7 @@ Chaque scenario etablit lui-meme son etat de depart de maniere independante :
 - **`(g)`** : Demarre l'interception, tue brutalement le daemon (`Stop-Process -Force`), verifie que `curl.exe` repond `200` (fail-open) et que la regle de pare-feu orpheline est toujours presente.
 - **`(h)`** : S'assure que le daemon est arrete et que la regle de pare-feu orpheline est presente, redemarre `routeward.exe daemon`, et verifie que la regle orpheline est supprimee automatiquement au demarrage et mentionnee dans le journal du daemon.
 - **`(i)`** : Verifie que le journal daemon (`%ProgramData%\RouteWard\logs`) et le journal utilisateur (`%LOCALAPPDATA%\RouteWard\logs`, alimente en `INFO` a chaque appel `ctl`) ont ete modifies pendant le test, et qu'aucun dossier `logs` n'a ete cree dans le repertoire courant.
+- **`(j)`** : Arrete le processus SOCKS5 local en ecoute sur `-Socks5Port` pendant que l'interception est active (`securityPolicy.killSwitchEnabled = true`), execute `curl.exe`, verifie que `curl.exe` echoue sans repli en `Direct`, controle que `ctl connections` enregistre la connexion `curl.exe` avec `status="blocked"` et `routeLabel="BLOCKED"` et que `ctl logs` contient un `WARN` (`Kill-Switch blocked connection`), puis relance automatiquement le processus SOCKS5 dans le bloc `finally` (ou affiche un avertissement explicite s'il necessite une relance manuelle).
 
 ## Lecture du Rapport Genere
 

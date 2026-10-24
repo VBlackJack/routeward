@@ -81,6 +81,7 @@
     "socks5AtypDomain": 3,
     "socks5AtypIpv6": 4,
     "socks5ReplySucceeded": 0,
+    "socks5ReplyGeneralFailure": 1,
     "httpSuccessStatusPrefix": "HTTP/1.1 200",
     "httpAltSuccessStatusPrefix": "HTTP/1.0 200"
   },

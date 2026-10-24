@@ -432,5 +432,64 @@ fi
 kill -TERM "${DAEMON_K_PID}" 2>/dev/null || true
 wait "${DAEMON_K_PID}" 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# Scenario (l): Kill-Switch (killSwitchEnabled=true) — SOCKS5 server stopped,
+#               curl matched by Proxy rule fails, target HTTP server receives
+#               zero direct connections, and ctl connections reports Blocked
+# ---------------------------------------------------------------------------
 kill "${MOCK_PID}" 2>/dev/null || true
-echo "=== ALL 11 LINUX CONTAINER SCENARIOS PASSED ==="
+wait "${MOCK_PID}" 2>/dev/null || true
+rm -f "${SOCKS_LOG}" /tmp/http_target_hits.log /run/routeward/routeward.sock
+
+# Restart only the HTTP target server so the SOCKS5 proxy (127.0.0.1:1080) is stopped
+python3 /workspace/tests/linux/mock_servers.py --http-only &
+MOCK_HTTP_PID=$!
+sleep 0.3
+
+cp /tmp/profile_proxy.json /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
+
+"${BIN}" daemon >/tmp/rw_daemon_l.out 2>&1 &
+DAEMON_L_PID=$!
+
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+set +e
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+    curl --noproxy "" -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/scenario-l" >/tmp/curl_l.out 2>&1
+CURL_EXIT_L=$?
+set -e
+
+sleep 0.2
+CONNS_L=$("${BIN}" ctl connections)
+LOGS_L=$("${BIN}" ctl logs)
+
+kill -TERM "${DAEMON_L_PID}" 2>/dev/null || true
+wait "${DAEMON_L_PID}" 2>/dev/null || true
+kill "${MOCK_HTTP_PID}" 2>/dev/null || true
+
+if [[ "${CURL_EXIT_L}" -ne 0 ]] \
+    && [[ ! -s /tmp/http_target_hits.log ]] \
+    && echo "${CONNS_L}" | grep -q '"processName": "curl"' \
+    && echo "${CONNS_L}" | grep -q '"status": "blocked"' \
+    && echo "${CONNS_L}" | grep -q '"routeLabel": "BLOCKED"' \
+    && echo "${LOGS_L}" | grep -q "Kill-Switch blocked connection"; then
+    echo "[PASS] Scenario (l): Kill-Switch blocked curl when SOCKS5 proxy stopped (curl exit=${CURL_EXIT_L}, 0 target hits, status=blocked)"
+else
+    echo "[FAIL] Scenario (l): expected curl failure, 0 target hits, and status=blocked (curl exit=${CURL_EXIT_L})"
+    echo "HTTP_TARGET_HITS:"
+    cat /tmp/http_target_hits.log 2>/dev/null || true
+    echo "CONNS_L=${CONNS_L}"
+    echo "LOGS_L=${LOGS_L}"
+    exit 1
+fi
+
+echo "=== ALL 12 LINUX CONTAINER SCENARIOS PASSED ==="

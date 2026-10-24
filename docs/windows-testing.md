@@ -1,6 +1,6 @@
 # Windows Non-Regression Test Suite
 
-`tests/windows/Invoke-RouteWardTests.ps1` (and its batch wrapper `tests/windows/Run-RouteWardTests.bat`) runs an automated 9-scenario non-regression test suite for RouteWard on a dedicated Windows test VM.
+`tests/windows/Invoke-RouteWardTests.ps1` (and its batch wrapper `tests/windows/Run-RouteWardTests.bat`) runs an automated 10-scenario non-regression test suite for RouteWard on a dedicated Windows test VM.
 
 ## Prerequisites
 
@@ -44,6 +44,7 @@ Each scenario establishes its own starting state independently:
 - **`(g)`**: Starts interception, force-kills the daemon (`Stop-Process -Force`), verifies fail-open `curl.exe` HTTP `200`, and confirms the orphaned firewall rule remains present.
 - **`(h)`**: Ensures the orphaned firewall rule is present with the daemon stopped, restarts `routeward.exe daemon`, and verifies automatic removal of the orphaned firewall rule at startup along with its daemon log entry.
 - **`(i)`**: Verifies that daemon logs (`%ProgramData%\RouteWard\logs`) and user logs (`%LOCALAPPDATA%\RouteWard\logs`, written at `INFO` level on every `ctl` invocation) were updated during the run and that no `logs` directory was created in the current working directory.
+- **`(j)`**: Stops the local SOCKS5 listener on `-Socks5Port` while interception is active (`securityPolicy.killSwitchEnabled = true`), runs `curl.exe`, verifies `curl.exe` fails without falling back to `Direct`, checks that `ctl connections` records the `curl.exe` connection with `status="blocked"` and `routeLabel="BLOCKED"` and `ctl logs` records a `WARN` entry (`Kill-Switch blocked connection`), and in `finally` automatically restarts the SOCKS5 listener process (or logs an explicit notice if it requires manual restart).
 
 ## Reading the Generated Report
 

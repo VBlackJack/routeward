@@ -329,8 +329,14 @@ pub struct ProtocolConstants {
     pub socks5_atyp_domain: u8,
     pub socks5_atyp_ipv6: u8,
     pub socks5_reply_succeeded: u8,
+    #[serde(default = "default_socks5_reply_general_failure")]
+    pub socks5_reply_general_failure: u8,
     pub http_success_status_prefix: String,
     pub http_alt_success_status_prefix: String,
+}
+
+fn default_socks5_reply_general_failure() -> u8 {
+    1
 }
 
 impl SystemConstants {

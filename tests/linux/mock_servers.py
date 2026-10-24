@@ -16,6 +16,7 @@
 import select
 import socket
 import struct
+import sys
 import threading
 
 HTTP_HOST = "0.0.0.0"
@@ -25,11 +26,15 @@ SOCKS_PORT = 1080
 SO_MARK_OPTION = 36
 ROUTEWARD_FWMARK = 21079
 SOCKS_LOG_PATH = "/tmp/socks5_hits.log"
+HTTP_LOG_PATH = "/tmp/http_target_hits.log"
 
 
 def handle_http_client(conn: socket.socket) -> None:
     try:
-        conn.recv(1024)
+        raw = conn.recv(1024)
+        first_line = raw.decode("utf-8", errors="replace").splitlines()[0] if raw else "EMPTY"
+        with open(HTTP_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{first_line}\n")
         body = b"ROUTEWARD_OK"
         resp = (
             b"HTTP/1.1 200 OK\r\n"
@@ -127,8 +132,10 @@ def run_socks5_server() -> None:
 
 
 if __name__ == "__main__":
+    http_only = "--http-only" in sys.argv
     t_http = threading.Thread(target=run_http_server, daemon=True)
-    t_socks = threading.Thread(target=run_socks5_server, daemon=True)
     t_http.start()
-    t_socks.start()
+    if not http_only:
+        t_socks = threading.Thread(target=run_socks5_server, daemon=True)
+        t_socks.start()
     t_http.join()

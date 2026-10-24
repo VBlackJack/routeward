@@ -462,6 +462,57 @@ function Write-Utf8NoBomJsonTempFile {
     return $tempFilePath
 }
 
+function Split-ProcessCommandLineArgs {
+    param(
+        [string]$ExecutablePath,
+        [string]$CommandLine
+    )
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return ""
+    }
+    $trimmed = $CommandLine.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {
+        $quotedExe = "`"$ExecutablePath`""
+        if ($trimmed.StartsWith($quotedExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $trimmed.Substring($quotedExe.Length).Trim()
+        }
+        if ($trimmed.StartsWith($ExecutablePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $trimmed.Substring($ExecutablePath.Length).Trim()
+        }
+    }
+    if ($trimmed.StartsWith('"')) {
+        $endQuote = $trimmed.IndexOf('"', 1)
+        if ($endQuote -gt 0) {
+            return $trimmed.Substring($endQuote + 1).Trim()
+        }
+    } else {
+        $firstSpace = $trimmed.IndexOf(' ')
+        if ($firstSpace -gt 0) {
+            return $trimmed.Substring($firstSpace + 1).Trim()
+        }
+    }
+    return ""
+}
+
+function Get-LocalPortListenerProcessInfo {
+    param([int]$Port)
+    $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    foreach ($l in $listeners) {
+        $ownerPid = [int]$l.OwningProcess
+        if ($ownerPid -gt 0) {
+            $wmiProc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ownerPid" -ErrorAction SilentlyContinue
+            $exePath = if ($null -ne $wmiProc -and $wmiProc.ExecutablePath) { [string]$wmiProc.ExecutablePath } else { "" }
+            $cmdLine = if ($null -ne $wmiProc -and $wmiProc.CommandLine) { [string]$wmiProc.CommandLine } else { "" }
+            return [PSCustomObject]@{
+                Pid            = $ownerPid
+                ExecutablePath = $exePath
+                CommandLine    = $cmdLine
+            }
+        }
+    }
+    return $null
+}
+
 # ---------------------------------------------------------------------------
 # DryRun Mode: Validate out-of-repo path resolution, curl command construction,
 #              --json-file UTF-8 no-BOM temp file flow, and IPC response parser
@@ -582,6 +633,30 @@ if ($DryRun.IsPresent) {
         throw "DryRun failed: unexpected connectionsBlocked payload."
     }
     Write-Host "[DRYRUN-PASS] Parsed 'ctl connections' (blocked curl.exe) array schema." -ForegroundColor Green
+
+    $connsKillSwitch = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.connectionsKillSwitchBlocked | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-connectionsKillSwitchBlocked" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("processName", "matchedRule", "routeLabel", "status")
+    if ($connsKillSwitch.Count -ne 1 -or $connsKillSwitch[0].status -ne "blocked" -or $connsKillSwitch[0].routeLabel -ne "BLOCKED" -or $connsKillSwitch[0].matchedRule -ne $ExpectedProxyRuleName) {
+        throw "DryRun failed: unexpected connectionsKillSwitchBlocked payload."
+    }
+    $logsKillSwitch = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.logsKillSwitchBlocked | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-logsKillSwitchBlocked" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("level", "component", "message")
+    if ($logsKillSwitch.Count -ne 1 -or $logsKillSwitch[0].level -ne "WARN" -or $logsKillSwitch[0].message -notmatch "Kill-Switch blocked connection") {
+        throw "DryRun failed: unexpected logsKillSwitchBlocked payload."
+    }
+    $parsedSshArgs = Split-ProcessCommandLineArgs `
+        -ExecutablePath "C:\Windows\System32\OpenSSH\ssh.exe" `
+        -CommandLine "`"C:\Windows\System32\OpenSSH\ssh.exe`" -N -D 127.0.0.1:1080 user@10.0.2.2"
+    if ($parsedSshArgs -ne "-N -D 127.0.0.1:1080 user@10.0.2.2") {
+        throw "DryRun failed: Split-ProcessCommandLineArgs returned '$parsedSshArgs'."
+    }
+    Write-Host "[DRYRUN-PASS] Parsed Scenario (j) Kill-Switch connections/logs fixtures and SOCKS5 restart command-line parser." -ForegroundColor Green
 
     $upsertAck = ConvertFrom-CtlResponseJson `
         -RawJson ($fixtures.upsertRuleOk | ConvertTo-Json -Depth 6) `
@@ -1213,6 +1288,116 @@ try {
         }
     } catch {
         Record-ScenarioResult -Id "i" -Status "FAIL" -Title "Daemon & user log paths and CWD cleanliness" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (j): Kill-Switch (killSwitchEnabled=true) — SOCKS5 proxy stopped
+    #               during test, curl.exe matched by Proxy rule fails without
+    #               falling back to Direct, and ctl connections reports Blocked
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+        $socksListenerInfo = Get-LocalPortListenerProcessInfo -Port $Socks5Port
+        $socksStoppedByScript = $false
+
+        try {
+            if ($null -ne $socksListenerInfo -and $socksListenerInfo.Pid -gt 0) {
+                Stop-Process -Id $socksListenerInfo.Pid -Force -ErrorAction SilentlyContinue
+                Wait-Process -Id $socksListenerInfo.Pid -Timeout 5 -ErrorAction SilentlyContinue
+                $socksStoppedByScript = $true
+            }
+
+            $stopWaitSw = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($stopWaitSw.ElapsedMilliseconds -lt 3000) {
+                if (-not (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs 250)) {
+                    break
+                }
+                Start-Sleep -Milliseconds 100
+            }
+
+            $socksStillUp = Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs 300
+            if ($socksStillUp) {
+                Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail "Could not stop SOCKS5 listener on ${Socks5Host}:${Socks5Port}"
+            } else {
+                $curlKillSwitch = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec 5
+                Start-Sleep -Milliseconds $PollIntervalMs
+
+                $connsKsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-j-connections"
+                $connsKsList = ConvertFrom-CtlResponseJson `
+                    -RawJson $connsKsRes.RawText `
+                    -Context "Scenario-j-connections" `
+                    -ExpectResultArray `
+                    -RequiredArrayElementProperties @("processName", "matchedRule", "routeLabel", "status")
+
+                $logsKsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-j-logs"
+                $logsKsList = ConvertFrom-CtlResponseJson `
+                    -RawJson $logsKsRes.RawText `
+                    -Context "Scenario-j-logs" `
+                    -ExpectResultArray `
+                    -RequiredArrayElementProperties @("level", "component", "message")
+
+                $sawKillSwitchBlockedConn = $false
+                foreach ($c in $connsKsList) {
+                    if ($c.processName -ieq "curl.exe" -and $c.matchedRule -eq $ExpectedProxyRuleName -and $c.status -eq "blocked" -and $c.routeLabel -eq "BLOCKED") {
+                        $sawKillSwitchBlockedConn = $true
+                        break
+                    }
+                }
+
+                $sawKillSwitchWarnLog = $false
+                foreach ($l in $logsKsList) {
+                    if ($l.level -eq "WARN" -and ([string]$l.message).Contains("Kill-Switch blocked connection")) {
+                        $sawKillSwitchWarnLog = $true
+                        break
+                    }
+                }
+
+                if ($curlKillSwitch.ExitCode -ne 0 -and $curlKillSwitch.HttpCode -ne $ExpectedHttpStatus -and $sawKillSwitchBlockedConn -and $sawKillSwitchWarnLog) {
+                    Record-ScenarioResult -Id "j" -Status "PASS" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail "curl failed as expected (exit=$($curlKillSwitch.ExitCode) http=$($curlKillSwitch.HttpCode), no Direct leak), connection recorded with status=blocked/routeLabel=BLOCKED, WARN logged"
+                } else {
+                    Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail "curlExit=$($curlKillSwitch.ExitCode) http=$($curlKillSwitch.HttpCode), sawBlockedConn=$sawKillSwitchBlockedConn, sawWarnLog=$sawKillSwitchWarnLog"
+                }
+            }
+        } finally {
+            if ($socksStoppedByScript) {
+                $restartedOk = $false
+                if ($null -ne $socksListenerInfo -and (-not [string]::IsNullOrWhiteSpace($socksListenerInfo.ExecutablePath)) -and (Test-Path -LiteralPath $socksListenerInfo.ExecutablePath)) {
+                    try {
+                        $restartArgs = Split-ProcessCommandLineArgs -ExecutablePath $socksListenerInfo.ExecutablePath -CommandLine $socksListenerInfo.CommandLine
+                        $restartedProc = if ([string]::IsNullOrWhiteSpace($restartArgs)) {
+                            Start-Process -FilePath $socksListenerInfo.ExecutablePath -WindowStyle Hidden -PassThru
+                        } else {
+                            Start-Process -FilePath $socksListenerInfo.ExecutablePath -ArgumentList $restartArgs -WindowStyle Hidden -PassThru
+                        }
+                        $restartSw = [System.Diagnostics.Stopwatch]::StartNew()
+                        while ($restartSw.ElapsedMilliseconds -lt 3000) {
+                            if (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs 250) {
+                                $restartedOk = $true
+                                break
+                            }
+                            Start-Sleep -Milliseconds 150
+                        }
+                        if ($restartedOk) {
+                            $msg = "SOCKS5 listener on ${Socks5Host}:${Socks5Port} was automatically restarted after Scenario (j) (PID=$($restartedProc.Id))."
+                            $auditNotes.Add($msg)
+                            Write-Host "[INFO] $msg" -ForegroundColor Cyan
+                        } elseif ($null -ne $restartedProc -and (-not $restartedProc.HasExited)) {
+                            Stop-Process -Id $restartedProc.Id -Force -ErrorAction SilentlyContinue
+                        }
+                    } catch {
+                        # Will report manual restart notice below
+                    }
+                }
+                if (-not $restartedOk) {
+                    $noticeMsg = "SOCKS5 listener on ${Socks5Host}:${Socks5Port} (original PID=$($socksListenerInfo.Pid)) was stopped for Scenario (j) and requires manual restart before the next test run."
+                    $auditNotes.Add("NOTICE: $noticeMsg")
+                    Write-Host "[NOTICE] $noticeMsg" -ForegroundColor Yellow
+                }
+            }
+        }
+    } catch {
+        Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail $_.Exception.Message
     }
 } finally {
     # -----------------------------------------------------------------------
