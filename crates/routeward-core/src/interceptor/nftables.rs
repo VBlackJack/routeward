@@ -251,6 +251,9 @@ impl NftablesInterceptor {
 
         script.push_str("    chain filter_output {\n");
         script.push_str("        type filter hook output priority 0; policy accept;\n");
+        script.push_str(&format!(
+            "        meta mark {fwmark} ip daddr 198.18.0.0/15 drop\n"
+        ));
         script.push_str(&format!("        meta mark {fwmark} return\n"));
         script.push_str("        ip daddr 127.0.0.0/8 return\n");
         if block_encrypted_dns {
@@ -261,6 +264,9 @@ impl NftablesInterceptor {
         }
         script.push_str(&format!(
             "        udp dport {netbios_ns_port} ip daddr != {{ 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }} drop\n"
+        ));
+        script.push_str(&format!(
+            "        meta mark != {tproxy_fwmark} ip daddr 198.18.0.0/15 drop\n"
         ));
         script.push_str("    }\n");
         script.push_str("}\n");
@@ -1194,6 +1200,12 @@ impl NftablesInterceptor {
         Ok((len, client_v4, None))
     }
 
+    /// Returns `true` if `ip` belongs to the RFC 2544 Fake-IP pool (`198.18.0.0/15`).
+    pub fn is_rfc2544_fake_ip(ip: Ipv4Addr) -> bool {
+        let octets = ip.octets();
+        octets[0] == 198 && (octets[1] & 0xfe) == 18
+    }
+
     /// Emits a raw IPv4 + UDP datagram (`src -> dst`) using `SOCK_RAW` + `IP_HDRINCL` + `SO_MARK`
     /// so replies to `TPROXY`-intercepted clients (and authorized local LLMNR/mDNS queries) preserve
     /// the exact source IPv4 address and source port without re-triggering `TPROXY`.
@@ -1204,6 +1216,15 @@ impl NftablesInterceptor {
         payload: &[u8],
         fwmark: u32,
     ) -> std::io::Result<usize> {
+        if Self::is_rfc2544_fake_ip(*dst.ip()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Final Fake-IP egress guard blocked raw UDP packet to untranslated Fake-IP destination {dst}"
+                ),
+            ));
+        }
+
         let raw_pkt = crate::interceptor::nat::build_forged_ipv4_udp_reply(
             *src.ip(),
             src.port(),
@@ -1303,10 +1324,18 @@ impl NftablesInterceptor {
     #[cfg(not(target_os = "linux"))]
     pub fn send_raw_ipv4_udp_packet(
         _src: SocketAddrV4,
-        _dst: SocketAddrV4,
+        dst: SocketAddrV4,
         _payload: &[u8],
         _fwmark: u32,
     ) -> std::io::Result<usize> {
+        if Self::is_rfc2544_fake_ip(*dst.ip()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Final Fake-IP egress guard blocked raw UDP packet to untranslated Fake-IP destination {dst}"
+                ),
+            ));
+        }
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "send_raw_ipv4_udp_packet is only supported on Linux",

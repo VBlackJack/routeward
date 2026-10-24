@@ -276,38 +276,83 @@ function Invoke-UdpNtpExchange {
         [int]$ReceiveTimeoutMs = 3000
     )
     $udp = New-Object System.Net.Sockets.UdpClient
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $udp.Client.ReceiveTimeout = $ReceiveTimeoutMs
         $reqPkt = New-NtpClientRequestPacket
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $null = $udp.Send($reqPkt, $reqPkt.Length, $TargetHost, $Port)
         $remoteEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
         try {
             $respBytes = $udp.Receive([ref]$remoteEp)
             $sw.Stop()
-            $mode = if ($null -ne $respBytes -and $respBytes.Length -ge 48) { [int]($respBytes[0] -band 0x07) } else { 0 }
+            $replyLen = if ($null -ne $respBytes) { [int]$respBytes.Length } else { 0 }
+            $mode = if ($replyLen -ge 48) { [int]($respBytes[0] -band 0x07) } else { 0 }
+            $remoteIpStr = if ($null -ne $remoteEp -and $null -ne $remoteEp.Address) { $remoteEp.Address.ToString() } else { $TargetHost }
+            $validReply = ($replyLen -ge 48 -and ($mode -eq 4 -or $mode -eq 5))
+            $errMsg = if ($validReply) { "" } else { "invalid NTP reply payload ($replyLen bytes, mode=$mode) within $ReceiveTimeoutMs ms" }
             return [PSCustomObject]@{
-                ReplyReceived   = ($null -ne $respBytes -and $respBytes.Length -ge 48 -and ($mode -eq 4 -or $mode -eq 5))
-                ReplyLen        = $(if ($null -ne $respBytes) { $respBytes.Length } else { 0 })
+                ReplyReceived   = $validReply
+                ReplyLength     = $replyLen
+                ReplyLen        = $replyLen
                 ServerMode      = $mode
-                RemoteAddress   = $(if ($null -ne $remoteEp) { $remoteEp.Address.ToString() } else { "" })
+                TargetIp        = $remoteIpStr
+                RemoteAddress   = $remoteIpStr
                 SocketErrorCode = "None"
                 DelayMs         = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                ErrorMessage    = $errMsg
             }
         } catch [System.Net.Sockets.SocketException] {
             $sw.Stop()
+            $sockCode = $_.Exception.SocketErrorCode.ToString()
             return [PSCustomObject]@{
                 ReplyReceived   = $false
+                ReplyLength     = 0
                 ReplyLen        = 0
                 ServerMode      = 0
+                TargetIp        = $TargetHost
                 RemoteAddress   = ""
-                SocketErrorCode = $_.Exception.SocketErrorCode.ToString()
+                SocketErrorCode = $sockCode
                 DelayMs         = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                ErrorMessage    = "no UDP reply within $ReceiveTimeoutMs ms (socketError=$sockCode)"
             }
+        }
+    } catch {
+        $sw.Stop()
+        return [PSCustomObject]@{
+            ReplyReceived   = $false
+            ReplyLength     = 0
+            ReplyLen        = 0
+            ServerMode      = 0
+            TargetIp        = $TargetHost
+            RemoteAddress   = ""
+            SocketErrorCode = "SendError"
+            DelayMs         = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+            ErrorMessage    = "no UDP reply within $ReceiveTimeoutMs ms ($($_.Exception.Message))"
         }
     } finally {
         $udp.Close()
     }
+}
+
+function Get-RoutedUdpLogLines {
+    param(
+        [Parameter(Mandatory = $false)]
+        [object[]]$CtlLogItems = @()
+    )
+    $lines = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $CtlLogItems) {
+        return ,$lines.ToArray()
+    }
+    foreach ($item in $CtlLogItems) {
+        if ($null -eq $item) {
+            continue
+        }
+        $msg = [string]$item.message
+        if ($msg.Contains("Routed UDP") -or $msg.Contains("Kill-Switch blocked") -or $msg.Contains("Fake-IP egress guard")) {
+            $lines.Add("[$($item.level)][$($item.component)] $msg")
+        }
+    }
+    return ,$lines.ToArray()
 }
 
 function Invoke-QuicUdp443Probe {
@@ -1068,6 +1113,21 @@ if ($DryRun.IsPresent) {
     $ntpTestPkt = New-NtpClientRequestPacket
     if ($ntpTestPkt.Length -ne 48 -or $ntpTestPkt[0] -ne 0x23) {
         throw "DryRun failed: New-NtpClientRequestPacket produced unexpected wire bytes."
+    }
+    $dryRunUdpTimeout = Invoke-UdpNtpExchange -TargetHost "127.0.0.1" -Port 1 -ReceiveTimeoutMs 100
+    if ($dryRunUdpTimeout.ReplyReceived -ne $false -or $dryRunUdpTimeout.ReplyLength -ne 0 -or $dryRunUdpTimeout.TargetIp -ne "127.0.0.1" -or $dryRunUdpTimeout.ErrorMessage -notmatch '^no UDP reply within 100 ms') {
+        throw "DryRun failed: Invoke-UdpNtpExchange timeout returned unexpected fields: $($dryRunUdpTimeout | ConvertTo-Json -Compress)"
+    }
+    $sampleUdpLogs = @(
+        [PSCustomObject]@{
+            level     = "INFO"
+            component = "TransparentRelay"
+            message   = 'Routed UDP PID=4016 process="powershell.exe" exe="powershell.exe" -> 198.18.0.2:123 (domain=Some("time.cloudflare.com"), realIp=162.159.200.1) via DIRECT [rule="Default Profile Policy"]'
+        }
+    )
+    $extractedUdpLogLines = @(Get-RoutedUdpLogLines -CtlLogItems $sampleUdpLogs)
+    if ($extractedUdpLogLines.Count -ne 1 -or $extractedUdpLogLines[0] -notmatch 'realIp=162\.159\.200\.1') {
+        throw "DryRun failed: Get-RoutedUdpLogLines did not extract expected Routed UDP line."
     }
     $connsQuicLlmnrDryRun = ConvertFrom-CtlResponseJson `
         -RawJson ($fixtures.connectionsQuicAndLlmnrBlocked | ConvertTo-Json -Depth 6) `
@@ -2204,6 +2264,15 @@ try {
                 -ExpectResultArray `
                 -RequiredArrayElementProperties @("processName", "targetPort", "protocol", "matchedRule", "routeLabel", "status")
 
+            $logsResQ = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-q-logs"
+            $logsListQ = ConvertFrom-CtlResponseJson `
+                -RawJson $logsResQ.RawText `
+                -Context "Scenario-q-logs" `
+                -ExpectResultArray `
+                -RequiredArrayElementProperties @("level", "component", "message")
+            $routedUdpLogsQ = @(Get-RoutedUdpLogLines -CtlLogItems $logsListQ)
+            $routedUdpLogSummaryQ = if ($routedUdpLogsQ.Count -gt 0) { $routedUdpLogsQ -join " | " } else { "none" }
+
             $sawProxiedNtpConn = $false
             foreach ($c in $connsListQ) {
                 if ([int]$c.targetPort -eq $NtpPort -and $c.protocol -eq "udp" -and $c.matchedRule -eq $tempRuleNameQ -and $c.status -ne "blocked") {
@@ -2219,11 +2288,15 @@ try {
             $assocReqsQ = if ($null -ne $statsObjQ) { [int]$statsObjQ.udp_associate_requests } else { 0 }
             $dgramsRelayedQ = if ($null -ne $statsObjQ) { [int]$statsObjQ.udp_datagrams_relayed } else { 0 }
             $repliesRelayedQ = if ($null -ne $statsObjQ -and $statsObjQ.PSObject.Properties.Match("udp_replies_relayed").Count -gt 0) { [int]$statsObjQ.udp_replies_relayed } else { 0 }
+            $assocRefusedQ = if ($null -ne $statsObjQ -and $statsObjQ.PSObject.Properties.Match("udp_associate_refused").Count -gt 0) { [int]$statsObjQ.udp_associate_refused } else { 0 }
+            $statsSummaryQ = "stats-file(udp_associate_requests=$assocReqsQ, udp_datagrams_relayed=$dgramsRelayedQ, udp_replies_relayed=$repliesRelayedQ, udp_associate_refused=$assocRefusedQ)"
+            $auditNotes.Add("Scenario (q) diagnostics: $statsSummaryQ; daemon Routed UDP logs: [$routedUdpLogSummaryQ]")
 
             if ($ntpExchQ.ReplyReceived -and $ntpExchQ.ReplyLength -ge 48 -and $sawProxiedNtpConn -and $assocReqsQ -ge 1 -and $dgramsRelayedQ -ge 1 -and $repliesRelayedQ -ge 1) {
-                Record-ScenarioResult -Id "q" -Status "PASS" -Title "UDP routed through SOCKS5 UDP ASSOCIATE (NTP via test server)" -Detail "NTP reply received ($($ntpExchQ.ReplyLength) bytes in $($ntpExchQ.DelayMs) ms via Fake-IP/Target $($ntpExchQ.TargetIp)); stats: associate=$assocReqsQ, relayedOut=$dgramsRelayedQ, relayedIn=$repliesRelayedQ"
+                Record-ScenarioResult -Id "q" -Status "PASS" -Title "UDP routed through SOCKS5 UDP ASSOCIATE (NTP via test server)" -Detail "NTP reply received ($($ntpExchQ.ReplyLength) bytes in $($ntpExchQ.DelayMs) ms via Fake-IP/Target $($ntpExchQ.TargetIp)); $statsSummaryQ; routedUdpLogs=[$routedUdpLogSummaryQ]"
             } else {
-                Record-ScenarioResult -Id "q" -Status "FAIL" -Title "UDP routed through SOCKS5 UDP ASSOCIATE (NTP via test server)" -Detail "replyReceived=$($ntpExchQ.ReplyReceived) len=$($ntpExchQ.ReplyLength) err=$($ntpExchQ.ErrorMessage), sawConn=$sawProxiedNtpConn, associate=$assocReqsQ, relayedOut=$dgramsRelayedQ, relayedIn=$repliesRelayedQ"
+                $failPrefixQ = if (-not [string]::IsNullOrWhiteSpace($ntpExchQ.ErrorMessage)) { "$($ntpExchQ.ErrorMessage); " } else { "" }
+                Record-ScenarioResult -Id "q" -Status "FAIL" -Title "UDP routed through SOCKS5 UDP ASSOCIATE (NTP via test server)" -Detail "${failPrefixQ}replyReceived=$($ntpExchQ.ReplyReceived) len=$($ntpExchQ.ReplyLength), sawConn=$sawProxiedNtpConn, $statsSummaryQ, routedUdpLogs=[$routedUdpLogSummaryQ]"
             }
         } finally {
             if ($ruleAddedQ) {
@@ -2398,16 +2471,22 @@ try {
 
         $sawDirectUdpLog = $false
         foreach ($l in $logsListS) {
-            if ($l.component -eq "Interceptor" -and ([string]$l.message).Contains("powershell.exe") -and ([string]$l.message).Contains(":$NtpPort") -and ([string]$l.message).Contains("DIRECT")) {
+            $msgS = [string]$l.message
+            if (($l.component -eq "TransparentRelay" -or $l.component -eq "WinDivert" -or $l.component -eq "Interceptor") -and $msgS.Contains("Routed UDP") -and $msgS.Contains("powershell.exe") -and $msgS.Contains(":$NtpPort") -and $msgS.Contains("DIRECT")) {
                 $sawDirectUdpLog = $true
                 break
             }
         }
+        $routedUdpLogsS = @(Get-RoutedUdpLogLines -CtlLogItems $logsListS)
+        $routedUdpLogSummaryS = if ($routedUdpLogsS.Count -gt 0) { $routedUdpLogsS -join " | " } else { "none" }
+        $statsSummaryS = "stats-file=none(direct-udp)"
+        $auditNotes.Add("Scenario (s) diagnostics: $statsSummaryS; daemon Routed UDP logs: [$routedUdpLogSummaryS]")
 
         if ($ntpExchS.ReplyReceived -and $ntpExchS.ReplyLength -ge 48 -and $null -ne $matchedDirectUdpConn -and $sawDirectUdpLog) {
-            Record-ScenarioResult -Id "s" -Status "PASS" -Title "Direct UDP flow attributed to process in ctl connections" -Detail "Direct NTP reply received ($($ntpExchS.ReplyLength) bytes in $($ntpExchS.DelayMs) ms); attributed to processName=$($matchedDirectUdpConn.processName), protocol=udp, routeLabel=DIRECT, matchedRule=$($matchedDirectUdpConn.matchedRule)"
+            Record-ScenarioResult -Id "s" -Status "PASS" -Title "Direct UDP flow attributed to process in ctl connections" -Detail "Direct NTP reply received ($($ntpExchS.ReplyLength) bytes in $($ntpExchS.DelayMs) ms from $($ntpExchS.TargetIp)); attributed to processName=$($matchedDirectUdpConn.processName), protocol=udp, routeLabel=DIRECT, matchedRule=$($matchedDirectUdpConn.matchedRule); $statsSummaryS; routedUdpLogs=[$routedUdpLogSummaryS]"
         } else {
-            Record-ScenarioResult -Id "s" -Status "FAIL" -Title "Direct UDP flow attributed to process in ctl connections" -Detail "replyReceived=$($ntpExchS.ReplyReceived) len=$($ntpExchS.ReplyLength), hasAttributedConn=$($null -ne $matchedDirectUdpConn), sawDirectUdpLog=$sawDirectUdpLog"
+            $failPrefixS = if (-not [string]::IsNullOrWhiteSpace($ntpExchS.ErrorMessage)) { "$($ntpExchS.ErrorMessage); " } else { "" }
+            Record-ScenarioResult -Id "s" -Status "FAIL" -Title "Direct UDP flow attributed to process in ctl connections" -Detail "${failPrefixS}replyReceived=$($ntpExchS.ReplyReceived) len=$($ntpExchS.ReplyLength), hasAttributedConn=$($null -ne $matchedDirectUdpConn), sawDirectUdpLog=$sawDirectUdpLog, $statsSummaryS, routedUdpLogs=[$routedUdpLogSummaryS]"
         }
     } catch {
         Record-ScenarioResult -Id "s" -Status "FAIL" -Title "Direct UDP flow attributed to process in ctl connections" -Detail $_.Exception.Message

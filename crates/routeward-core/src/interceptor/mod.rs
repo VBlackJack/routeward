@@ -526,6 +526,11 @@ impl RouteWardController {
 
     /// Records the most recently observed non-loopback (or non-53/10853 safe loopback) original DNS resolver targeted by the OS.
     pub fn record_orig_dns_resolver(&self, addr: SocketAddr) {
+        if let IpAddr::V4(v4) = addr.ip() {
+            if self.dns.is_in_fake_subnet(&v4) {
+                return;
+            }
+        }
         let dns_port = self.constants.dns.dns_standard_port;
         let local_dns_listen_port = self.constants.network.default_dns_listen_port;
         let is_safe_loopback = addr.ip().is_loopback()
@@ -534,6 +539,116 @@ impl RouteWardController {
         if (!addr.ip().is_loopback() || is_safe_loopback) && !addr.ip().is_unspecified() {
             *self.last_seen_orig_resolver.write() = Some(addr);
         }
+    }
+
+    /// Final egress guard ensuring no outbound TCP or UDP connection or datagram is ever emitted
+    /// toward an untranslated IPv4 address belonging to the configured Fake-IP pool (`198.18.0.0/15`).
+    /// Logs a rate-limited `WARN` and records a `Blocked` `TrackedConnection` when triggered.
+    pub fn ensure_not_fake_ip_egress(
+        &self,
+        target_ip: IpAddr,
+        target_port: u16,
+        protocol: TransportProtocol,
+        context: &str,
+    ) -> RouteWardResult<()> {
+        if let IpAddr::V4(v4) = target_ip {
+            if self.dns.is_in_fake_subnet(&v4) {
+                let mapped_domain = self.dns.resolve_fake_ip(&v4);
+                self.push_rate_limited_warn(
+                    "fake_ip_egress_guard",
+                    COMPONENT_ENGINE,
+                    format!(
+                        "Final Fake-IP egress guard blocked untranslated {:?} destination {}:{} (domain={:?}, context={})",
+                        protocol, v4, target_port, mapped_domain, context
+                    ),
+                );
+                self.telemetry.record_connection(
+                    TrackedConnection {
+                        id: Uuid::new_v4().to_string(),
+                        pid: 0,
+                        process_name: "fake-ip-guard".to_string(),
+                        process_path: context.to_string(),
+                        target_host: v4.to_string(),
+                        resolved_domain: mapped_domain,
+                        target_port,
+                        protocol,
+                        matched_rule: "SecurityPolicy:FakeIpEgressGuard".to_string(),
+                        route_label: ROUTE_BLOCK_LABEL.to_string(),
+                        latency_ms: 0,
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        status: ConnectionStatus::Blocked,
+                        started_at: Utc::now(),
+                    },
+                    false,
+                );
+                return Err(RouteWardError::BlockedByPolicy {
+                    key: ERR_KEY_RULE_BLOCKED,
+                    rule_name: "SecurityPolicy:FakeIpEgressGuard".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Inspects a raw IPv4 packet before outbound driver reinjection (`WinDivert`) and blocks it
+    /// with a `WARN` log and `Blocked` connection record if `is_outbound` is `true` and its destination
+    /// IPv4 address belongs to the Fake-IP pool (`198.18.0.0/15`).
+    pub fn check_and_block_outbound_fake_ip_packet(
+        &self,
+        packet: &[u8],
+        is_outbound: bool,
+        component: &str,
+    ) -> bool {
+        if !is_outbound || packet.len() < 20 || (packet[0] >> 4) != 4 {
+            return false;
+        }
+        let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+        if !self.dns.is_in_fake_subnet(&dst_ip) {
+            return false;
+        }
+        let proto_byte = packet[9];
+        let protocol = match proto_byte {
+            6 => TransportProtocol::Tcp,
+            17 => TransportProtocol::Udp,
+            _ => TransportProtocol::Any,
+        };
+        let ihl = ((packet[0] & 0x0f) as usize) * 4;
+        let dst_port = if packet.len() >= ihl + 4 {
+            u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]])
+        } else {
+            0
+        };
+        let mapped_domain = self.dns.resolve_fake_ip(&dst_ip);
+        self.push_rate_limited_warn(
+            "fake_ip_packet_egress_guard",
+            component,
+            format!(
+                "Final Fake-IP egress guard dropped outbound {:?} packet to untranslated Fake-IP {}:{} (domain={:?})",
+                protocol, dst_ip, dst_port, mapped_domain
+            ),
+        );
+        self.telemetry.record_connection(
+            TrackedConnection {
+                id: Uuid::new_v4().to_string(),
+                pid: 0,
+                process_name: "fake-ip-guard".to_string(),
+                process_path: component.to_string(),
+                target_host: dst_ip.to_string(),
+                resolved_domain: mapped_domain,
+                target_port: dst_port,
+                protocol,
+                matched_rule: "SecurityPolicy:FakeIpEgressGuard".to_string(),
+                route_label: ROUTE_BLOCK_LABEL.to_string(),
+                latency_ms: 0,
+                rx_bytes: 0,
+                tx_bytes: packet.len() as u64,
+                status: ConnectionStatus::Blocked,
+                started_at: Utc::now(),
+            },
+            false,
+        );
+        true
     }
 
     /// Returns `true` if the active profile has at least one enabled rule with non-empty `domainPatterns`.
@@ -1539,14 +1654,86 @@ impl RouteWardController {
                 })
             }
             RuleAction::Direct => {
-                let dst_addr: SocketAddr = match &effective_target {
-                    Socks5UdpTarget::Ipv4(ip, port) => SocketAddr::new(IpAddr::V4(*ip), *port),
-                    Socks5UdpTarget::Ipv6(ip, port) => SocketAddr::new(IpAddr::V6(*ip), *port),
-                    Socks5UdpTarget::Domain(dom, port) => {
-                        let ip = self.resolve_host_direct_ipv4(dom).await?;
-                        SocketAddr::new(IpAddr::V4(ip), *port)
+                let target_is_fake_ip = match target {
+                    Socks5UdpTarget::Ipv4(ip, _) => self.dns.is_in_fake_subnet(ip),
+                    _ => false,
+                };
+                let dst_addr_res: RouteWardResult<SocketAddr> = match &effective_target {
+                    Socks5UdpTarget::Ipv4(ip, port) => {
+                        if self.dns.is_in_fake_subnet(ip) {
+                            if let Some(dom) = self.dns.resolve_fake_ip(ip) {
+                                self.resolve_host_direct_ipv4(&dom)
+                                    .await
+                                    .map(|real_ip| SocketAddr::new(IpAddr::V4(real_ip), *port))
+                            } else {
+                                Err(RouteWardError::BlockedByPolicy {
+                                    key: ERR_KEY_RULE_BLOCKED,
+                                    rule_name: "SecurityPolicy:FakeIpEgressGuard".to_string(),
+                                })
+                            }
+                        } else {
+                            Ok(SocketAddr::new(IpAddr::V4(*ip), *port))
+                        }
+                    }
+                    Socks5UdpTarget::Ipv6(ip, port) => Ok(SocketAddr::new(IpAddr::V6(*ip), *port)),
+                    Socks5UdpTarget::Domain(dom, port) => self
+                        .resolve_host_direct_ipv4(dom)
+                        .await
+                        .map(|real_ip| SocketAddr::new(IpAddr::V4(real_ip), *port)),
+                };
+
+                let dst_addr = match dst_addr_res {
+                    Ok(addr) => {
+                        self.ensure_not_fake_ip_egress(
+                            addr.ip(),
+                            addr.port(),
+                            TransportProtocol::Udp,
+                            "forward_udp_datagram:Direct",
+                        )?;
+                        addr
+                    }
+                    Err(err) => {
+                        if kill_switch_enabled || target_is_fake_ip {
+                            self.push_rate_limited_warn(
+                                "udp_direct_fakeip_killswitch",
+                                COMPONENT_ENGINE,
+                                format!(
+                                    "Kill-Switch blocked Direct UDP datagram PID={} process=\"{}\" -> {}:{} (domain={:?}, killSwitchEnabled={}) [rule=\"{}\"]: {}",
+                                    pid,
+                                    proc_basename,
+                                    raw_host,
+                                    target_port,
+                                    eval.effective_domain,
+                                    kill_switch_enabled,
+                                    eval.matched_rule_name,
+                                    err
+                                ),
+                            );
+                            self.telemetry.record_connection(
+                                TrackedConnection {
+                                    id: Uuid::new_v4().to_string(),
+                                    pid,
+                                    process_name: proc_basename,
+                                    process_path: proc_path_str,
+                                    target_host: raw_host,
+                                    resolved_domain: eval.effective_domain,
+                                    target_port,
+                                    protocol: TransportProtocol::Udp,
+                                    matched_rule: eval.matched_rule_name,
+                                    route_label: ROUTE_BLOCK_LABEL.to_string(),
+                                    latency_ms: 0,
+                                    rx_bytes: 0,
+                                    tx_bytes: 0,
+                                    status: ConnectionStatus::Blocked,
+                                    started_at: Utc::now(),
+                                },
+                                false,
+                            );
+                        }
+                        return Err(err);
                     }
                 };
+
                 let timeout_dur = Duration::from_millis(
                     self.constants
                         .network
@@ -1561,12 +1748,14 @@ impl RouteWardController {
                     LogLevel::Info,
                     COMPONENT_TRANSPARENT,
                     format!(
-                        "Routed UDP PID={} process=\"{}\" exe=\"{}\" -> {}:{} via {} [rule=\"{}\"]",
+                        "Routed UDP PID={} process=\"{}\" exe=\"{}\" -> {}:{} (domain={:?}, realIp={}) via {} [rule=\"{}\"]",
                         pid,
                         proc_basename,
                         proc_path_str,
                         raw_host,
                         target_port,
+                        eval.effective_domain,
+                        dst_addr.ip(),
                         ROUTE_DIRECT_LABEL,
                         eval.matched_rule_name
                     ),
@@ -1594,6 +1783,14 @@ impl RouteWardController {
                 Ok(resp)
             }
             RuleAction::Proxy { target_id } => {
+                if let Socks5UdpTarget::Ipv4(ip, port) = &effective_target {
+                    self.ensure_not_fake_ip_egress(
+                        IpAddr::V4(*ip),
+                        *port,
+                        TransportProtocol::Udp,
+                        "forward_udp_datagram:Proxy",
+                    )?;
+                }
                 let node = {
                     let prof = self.profile.read();
                     prof.proxies
@@ -1715,6 +1912,14 @@ impl RouteWardController {
                 }
             }
             RuleAction::Chain { target_id } => {
+                if let Socks5UdpTarget::Ipv4(ip, port) = &effective_target {
+                    self.ensure_not_fake_ip_egress(
+                        IpAddr::V4(*ip),
+                        *port,
+                        TransportProtocol::Udp,
+                        "forward_udp_datagram:Chain",
+                    )?;
+                }
                 let (strategy, hops) = {
                     let prof = self.profile.read();
                     let chain =
@@ -1897,6 +2102,17 @@ impl RouteWardController {
                 }
                 LocalNameQueryDecision::BlockMalformed => {}
                 LocalNameQueryDecision::AllowLocal { qname } => {
+                    if self
+                        .ensure_not_fake_ip_egress(
+                            IpAddr::V4(*orig_dst.ip()),
+                            orig_dst.port(),
+                            TransportProtocol::Udp,
+                            "handle_tproxy_udp_datagram:AllowLocal",
+                        )
+                        .is_err()
+                    {
+                        return;
+                    }
                     self.telemetry.push_log(
                         LogLevel::Debug,
                         COMPONENT_DNS,
@@ -2907,14 +3123,46 @@ impl RouteWardController {
         target_host: &str,
         target_port: u16,
     ) -> RouteWardResult<TcpStream> {
+        let effective_host = if let Ok(IpAddr::V4(v4)) = target_host.parse::<IpAddr>() {
+            if self.dns.is_in_fake_subnet(&v4) {
+                if let Some(dom) = self.dns.resolve_fake_ip(&v4) {
+                    dom
+                } else {
+                    self.ensure_not_fake_ip_egress(
+                        IpAddr::V4(v4),
+                        target_port,
+                        TransportProtocol::Tcp,
+                        "open_outbound_stream",
+                    )?;
+                    target_host.to_string()
+                }
+            } else {
+                target_host.to_string()
+            }
+        } else {
+            target_host.to_string()
+        };
+
         match action {
             RuleAction::Direct => {
-                if let Ok(ip) = target_host.parse::<IpAddr>() {
+                if let Ok(ip) = effective_host.parse::<IpAddr>() {
+                    self.ensure_not_fake_ip_egress(
+                        ip,
+                        target_port,
+                        TransportProtocol::Tcp,
+                        "open_outbound_stream:Direct",
+                    )?;
                     self.connect_direct_tcp_protected(SocketAddr::new(ip, target_port))
                         .await
                         .map_err(RouteWardError::Io)
                 } else {
-                    let resolved_ip = self.resolve_host_direct_ipv4(target_host).await?;
+                    let resolved_ip = self.resolve_host_direct_ipv4(&effective_host).await?;
+                    self.ensure_not_fake_ip_egress(
+                        IpAddr::V4(resolved_ip),
+                        target_port,
+                        TransportProtocol::Tcp,
+                        "open_outbound_stream:Direct",
+                    )?;
                     self.connect_direct_tcp_protected(SocketAddr::new(
                         IpAddr::V4(resolved_ip),
                         target_port,
@@ -2939,7 +3187,7 @@ impl RouteWardController {
                 let _self_guard = self.register_self_proxy_connect_hint(&resolved_node);
                 ProxyConnector::connect_single(
                     &resolved_node,
-                    target_host,
+                    &effective_host,
                     target_port,
                     &self.constants,
                 )
@@ -2975,7 +3223,7 @@ impl RouteWardController {
                     strategy,
                     &resolved_hops,
                     0,
-                    target_host,
+                    &effective_host,
                     target_port,
                     &self.constants,
                 )
@@ -3440,9 +3688,6 @@ impl RouteWardController {
 
     /// Resolves a domain name directly to its real IPv4 address (bypassing Fake-IP and the OS stub resolver).
     pub async fn resolve_host_direct_ipv4(&self, domain: &str) -> RouteWardResult<Ipv4Addr> {
-        if let Ok(ip) = domain.parse::<Ipv4Addr>() {
-            return Ok(ip);
-        }
         let ips = self.resolve_host_direct_ipv4_all(domain).await?;
         ips.into_iter()
             .next()
@@ -3457,10 +3702,27 @@ impl RouteWardController {
         &self,
         domain: &str,
     ) -> RouteWardResult<Vec<Ipv4Addr>> {
-        if let Ok(ip) = domain.parse::<Ipv4Addr>() {
-            return Ok(vec![ip]);
-        }
-        let trimmed = domain.trim().trim_end_matches('.');
+        let resolved_domain_storage;
+        let target_domain = if let Ok(ip) = domain.parse::<Ipv4Addr>() {
+            if self.dns.is_in_fake_subnet(&ip) {
+                if let Some(mapped) = self.dns.resolve_fake_ip(&ip) {
+                    resolved_domain_storage = mapped;
+                    resolved_domain_storage.as_str()
+                } else {
+                    return Err(RouteWardError::ProtocolHandshake {
+                        key: ERR_KEY_HANDSHAKE_FAILED,
+                        detail: format!(
+                            "Cannot resolve unmapped Fake-IP {ip} to a real IPv4 address"
+                        ),
+                    });
+                }
+            } else {
+                return Ok(vec![ip]);
+            }
+        } else {
+            domain
+        };
+        let trimmed = target_domain.trim().trim_end_matches('.');
         if trimmed.eq_ignore_ascii_case("localhost") {
             return Ok(vec![Ipv4Addr::LOCALHOST]);
         }
@@ -3482,7 +3744,18 @@ impl RouteWardController {
         } else {
             DnsResolverMode::DirectPreferSystem
         };
-        let resolvers = self.candidate_dns_resolvers(None, resolver_mode);
+        let mut resolvers = self.candidate_dns_resolvers(None, resolver_mode);
+        if resolver_mode == DnsResolverMode::DirectPreferSystem
+            && self.system_resolvers_override.read().is_none()
+        {
+            for fallback_sa in
+                self.candidate_dns_resolvers_with_system(None, DnsResolverMode::RemoteViaProxy, &[])
+            {
+                if !resolvers.contains(&fallback_sa) {
+                    resolvers.push(fallback_sa);
+                }
+            }
+        }
         let mut last_err = String::from("no direct DNS resolver reachable");
         for resolver_addr in resolvers {
             match self
@@ -3491,11 +3764,18 @@ impl RouteWardController {
             {
                 Ok(resp_wire) => {
                     if let Ok(addrs) = extract_ipv4_answers(&resp_wire) {
-                        if !addrs.is_empty() {
-                            return Ok(addrs);
+                        let real_addrs: Vec<Ipv4Addr> = addrs
+                            .into_iter()
+                            .filter(|ip| !self.dns.is_in_fake_subnet(ip))
+                            .collect();
+                        if !real_addrs.is_empty() {
+                            return Ok(real_addrs);
                         }
+                        last_err =
+                            format!("no non-Fake-IP A records in response from {resolver_addr}");
+                    } else {
+                        last_err = format!("no A records in response from {resolver_addr}");
                     }
-                    last_err = format!("no A records in response from {resolver_addr}");
                 }
                 Err(err) => {
                     last_err = err.to_string();
@@ -3636,6 +3916,16 @@ impl RouteWardController {
         resolver_addr: SocketAddr,
         timeout_dur: Duration,
     ) -> std::io::Result<Vec<u8>> {
+        self.ensure_not_fake_ip_egress(
+            resolver_addr.ip(),
+            resolver_addr.port(),
+            TransportProtocol::Udp,
+            "query_dns_udp_direct_protected",
+        )
+        .map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, err.to_string())
+        })?;
+
         let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
         std_sock.set_nonblocking(true)?;
 
@@ -3683,6 +3973,16 @@ impl RouteWardController {
         target_addr: SocketAddr,
         recv_timeout: Duration,
     ) -> std::io::Result<Vec<u8>> {
+        self.ensure_not_fake_ip_egress(
+            target_addr.ip(),
+            target_addr.port(),
+            TransportProtocol::Udp,
+            "send_and_optional_recv_udp_direct_protected",
+        )
+        .map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, err.to_string())
+        })?;
+
         let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
         std_sock.set_nonblocking(true)?;
 
@@ -3770,6 +4070,16 @@ impl RouteWardController {
     }
 
     async fn connect_direct_tcp_protected(&self, target: SocketAddr) -> std::io::Result<TcpStream> {
+        self.ensure_not_fake_ip_egress(
+            target.ip(),
+            target.port(),
+            TransportProtocol::Tcp,
+            "connect_direct_tcp_protected",
+        )
+        .map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, err.to_string())
+        })?;
+
         #[cfg(target_os = "linux")]
         {
             ProxyConnector::connect_tcp_marked(
@@ -3861,6 +4171,11 @@ impl RouteWardController {
         let default_upstream = &self.constants.dns.upstream_dns_server;
 
         let push_unique = |out: &mut Vec<SocketAddr>, addr: SocketAddr| {
+            if let IpAddr::V4(v4) = addr.ip() {
+                if self.dns.is_in_fake_subnet(&v4) {
+                    return;
+                }
+            }
             let is_safe_loopback = addr.ip().is_loopback()
                 && addr.port() != dns_port
                 && addr.port() != local_dns_listen_port;
@@ -5560,5 +5875,321 @@ mod tests {
             .await
             .expect("fragmented direct datagram should pass");
         assert_eq!(frag_direct_reply, b"DIRECT:frag-direct");
+    }
+
+    #[tokio::test]
+    async fn udp_direct_fake_ip_resolves_real_ip_and_reinjects_reply_from_fake_ip() {
+        use crate::dns::codec::{build_a_response, parse_dns_query};
+        use crate::interceptor::nat::{build_forged_ipv4_udp_reply, parse_ipv4_udp_meta};
+
+        // 1. Poisoned DNS resolver returning a cached Fake-IP (simulating local Windows AD dns.exe cache)
+        let poisoned_dns = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind poisoned dns");
+        let poisoned_dns_addr = poisoned_dns.local_addr().expect("poisoned dns addr");
+        let _poisoned_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = poisoned_dns.recv_from(&mut buf).await {
+                if let Ok(q) = parse_dns_query(&buf[..n]) {
+                    let resp = build_a_response(&q, Ipv4Addr::new(198, 18, 99, 99), 60);
+                    let _ = poisoned_dns.send_to(&resp, peer).await;
+                }
+            }
+        });
+
+        // 2. Clean upstream DNS resolver returning the real IPv4 address (127.0.0.1)
+        let real_dns = UdpSocket::bind("127.0.0.1:0").await.expect("bind real dns");
+        let real_dns_addr = real_dns.local_addr().expect("real dns addr");
+        let _real_dns_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = real_dns.recv_from(&mut buf).await {
+                if let Ok(q) = parse_dns_query(&buf[..n]) {
+                    let resp = build_a_response(&q, Ipv4Addr::LOCALHOST, 60);
+                    let _ = real_dns.send_to(&resp, peer).await;
+                }
+            }
+        });
+
+        // 3. Real UDP target server on 127.0.0.1:<port>
+        let real_udp_server = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind real udp server");
+        let real_udp_addr = real_udp_server.local_addr().expect("real udp addr");
+        let server_received = Arc::new(AtomicUsize::new(0));
+        let server_received_bg = server_received.clone();
+        let _udp_srv_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, peer)) = real_udp_server.recv_from(&mut buf).await {
+                server_received_bg.fetch_add(1, Ordering::SeqCst);
+                let mut reply = b"NTP_REAL_OK:".to_vec();
+                reply.extend_from_slice(&buf[..n]);
+                let _ = real_udp_server.send_to(&reply, peer).await;
+            }
+        });
+
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.default_action = RuleAction::Direct;
+        profile.rules.clear();
+
+        let controller = RouteWardController::new(constants, profile, "en");
+        *controller.system_resolvers_override.write() =
+            Some(vec![poisoned_dns_addr, real_dns_addr]);
+
+        let fake_ip = controller
+            .dns
+            .allocate_or_get("time.cloudflare.com")
+            .expect("allocate fake_ip");
+        assert!(controller.dns.is_in_fake_subnet(&fake_ip));
+
+        let client_ip = Ipv4Addr::new(10, 0, 2, 15);
+        let client_port = 55123u16;
+        let client_sock = SocketAddr::new(IpAddr::V4(client_ip), client_port);
+        let target = Socks5UdpTarget::Ipv4(fake_ip, real_udp_addr.port());
+
+        let reply_payload = controller
+            .forward_udp_datagram(
+                client_sock,
+                "powershell.exe",
+                Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+                4016,
+                &target,
+                b"ntp-probe",
+                false,
+            )
+            .await
+            .expect("Direct UDP toward Fake-IP must resolve real IP and return reply");
+
+        assert_eq!(reply_payload, b"NTP_REAL_OK:ntp-probe");
+        assert_eq!(
+            server_received.load(Ordering::SeqCst),
+            1,
+            "Real UDP server must receive the datagram on its real IPv4 address"
+        );
+
+        // Verify reply reinjection packet preserves Fake-IP as source so the client recognizes it
+        let forged_reply = build_forged_ipv4_udp_reply(
+            fake_ip,
+            real_udp_addr.port(),
+            client_ip,
+            client_port,
+            &reply_payload,
+        )
+        .expect("build_forged_ipv4_udp_reply");
+        let reply_meta = parse_ipv4_udp_meta(&forged_reply).expect("parse reply meta");
+        assert_eq!(reply_meta.src_ip, fake_ip);
+        assert_eq!(reply_meta.src_port, real_udp_addr.port());
+        assert_eq!(reply_meta.dst_ip, client_ip);
+        assert_eq!(reply_meta.dst_port, client_port);
+
+        // Verify Direct UDP log contains domain and realIp
+        let logs = controller.telemetry.list_logs();
+        assert!(
+            logs.iter().any(|l| l.level == LogLevel::Info
+                && l.component == COMPONENT_TRANSPARENT
+                && l.message.contains("Routed UDP PID=4016")
+                && l.message
+                    .contains("domain=Some(\"time.cloudflare.com\"), realIp=127.0.0.1")
+                && l.message.contains("via DIRECT")),
+            "Expected Direct UDP log with domain and realIp, got: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_direct_fake_ip_resolution_failure_with_killswitch_blocks_and_never_sends_to_fake_ip(
+    ) {
+        use crate::dns::codec::{build_rcode_response, parse_dns_query, RCODE_SERVFAIL};
+
+        // Mock DNS resolver that always returns SERVFAIL (impossible direct resolution)
+        let servfail_dns = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind servfail dns");
+        let servfail_dns_addr = servfail_dns.local_addr().expect("servfail dns addr");
+        let _servfail_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = servfail_dns.recv_from(&mut buf).await {
+                if let Ok(q) = parse_dns_query(&buf[..n]) {
+                    let resp = build_rcode_response(&q, RCODE_SERVFAIL);
+                    let _ = servfail_dns.send_to(&resp, peer).await;
+                }
+            }
+        });
+
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        constants.network.tcp_connect_timeout_ms = 200;
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.default_action = RuleAction::Direct;
+        profile.security_policy.kill_switch_enabled = true;
+        profile.rules.clear();
+
+        let controller = RouteWardController::new(constants, profile, "en");
+        *controller.system_resolvers_override.write() = Some(vec![servfail_dns_addr]);
+
+        let fake_ip = controller
+            .dns
+            .allocate_or_get("unresolvable-direct.routeward.test")
+            .expect("allocate fake_ip");
+
+        let client_sock: SocketAddr = "10.0.2.15:55124".parse().expect("client_sock");
+        let target = Socks5UdpTarget::Ipv4(fake_ip, 123);
+
+        let res = controller
+            .forward_udp_datagram(
+                client_sock,
+                "powershell.exe",
+                Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+                4016,
+                &target,
+                b"ntp-probe",
+                false,
+            )
+            .await;
+
+        assert!(
+            res.is_err(),
+            "Direct UDP toward Fake-IP with impossible resolution must fail and never send to Fake-IP"
+        );
+
+        let conns = controller.telemetry.list_connections();
+        assert!(
+            conns.iter().any(|c| {
+                c.protocol == TransportProtocol::Udp
+                    && c.target_port == 123
+                    && c.status == ConnectionStatus::Blocked
+                    && c.route_label == ROUTE_BLOCK_LABEL
+                    && c.resolved_domain.as_deref() == Some("unresolvable-direct.routeward.test")
+            }),
+            "Blocked connection must be recorded when Direct Fake-IP resolution fails: {:?}",
+            conns
+        );
+
+        let logs = controller.telemetry.list_logs();
+        assert!(
+            logs.iter().any(|l| l.level == LogLevel::Warn
+                && l.message
+                    .contains("Kill-Switch blocked Direct UDP datagram")),
+            "Expected Kill-Switch WARN log on Direct Fake-IP resolution failure, got: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn final_anti_fake_ip_egress_guard_blocks_tcp_and_udp_on_both_backends() {
+        use crate::interceptor::nat::build_forged_ipv4_udp_reply;
+
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.default_action = RuleAction::Direct;
+        profile.rules.clear();
+
+        let controller = RouteWardController::new(constants, profile, "en");
+
+        // 1. User-space TCP guard (open_outbound_stream & connect_direct_tcp_protected)
+        let unmapped_fake_tcp = Ipv4Addr::new(198, 18, 200, 10);
+        let tcp_res = controller
+            .open_outbound_stream(&RuleAction::Direct, &unmapped_fake_tcp.to_string(), 443)
+            .await;
+        assert!(
+            matches!(tcp_res, Err(RouteWardError::BlockedByPolicy { .. })),
+            "TCP Direct to unmapped Fake-IP must be blocked by final egress guard"
+        );
+        let raw_tcp_res = controller
+            .connect_direct_tcp_protected(SocketAddr::new(IpAddr::V4(unmapped_fake_tcp), 80))
+            .await;
+        assert_eq!(
+            raw_tcp_res.expect_err("must reject").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        // 2. User-space UDP guard (send_and_optional_recv_udp_direct_protected & forward_udp_datagram)
+        let unmapped_fake_udp = Ipv4Addr::new(198, 18, 200, 11);
+        let raw_udp_res = controller
+            .send_and_optional_recv_udp_direct_protected(
+                b"probe",
+                SocketAddr::new(IpAddr::V4(unmapped_fake_udp), 123),
+                Duration::from_millis(100),
+            )
+            .await;
+        assert_eq!(
+            raw_udp_res.expect_err("must reject").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let fwd_udp_res = controller
+            .forward_udp_datagram(
+                "10.0.2.15:54321".parse().unwrap(),
+                "test-app",
+                None,
+                1234,
+                &Socks5UdpTarget::Ipv4(unmapped_fake_udp, 123),
+                b"probe",
+                false,
+            )
+            .await;
+        assert!(
+            matches!(fwd_udp_res, Err(RouteWardError::BlockedByPolicy { .. })),
+            "UDP Direct to unmapped Fake-IP must be blocked by final egress guard"
+        );
+
+        // 3. WinDivert raw packet guard (TCP and UDP outbound packets targeting 198.18.0.0/15)
+        let outbound_fake_udp_pkt = build_forged_ipv4_udp_reply(
+            Ipv4Addr::new(10, 0, 2, 15),
+            54000,
+            Ipv4Addr::new(198, 18, 0, 42),
+            123,
+            b"leak",
+        )
+        .expect("build udp pkt");
+        assert!(
+            controller.check_and_block_outbound_fake_ip_packet(
+                &outbound_fake_udp_pkt,
+                true,
+                "WinDivert"
+            ),
+            "WinDivert outbound packet targeting 198.18.0.42 must be blocked"
+        );
+        // Inbound reply from Fake-IP to client (is_outbound = false, dst = 10.0.2.15) must NOT be blocked
+        let inbound_fake_reply_pkt = build_forged_ipv4_udp_reply(
+            Ipv4Addr::new(198, 18, 0, 42),
+            123,
+            Ipv4Addr::new(10, 0, 2, 15),
+            54000,
+            b"reply",
+        )
+        .expect("build reply pkt");
+        assert!(
+            !controller.check_and_block_outbound_fake_ip_packet(
+                &inbound_fake_reply_pkt,
+                false,
+                "WinDivert"
+            ),
+            "Inbound reply from Fake-IP to client must be allowed"
+        );
+
+        // 4. Nftables raw UDP guard and nftables filter_output ruleset guard
+        let nft_raw_err = NftablesInterceptor::send_raw_ipv4_udp_packet(
+            std::net::SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 54000),
+            std::net::SocketAddrV4::new(Ipv4Addr::new(198, 19, 1, 2), 5355),
+            b"probe",
+            0x5257,
+        )
+        .expect_err("Nftables send_raw_ipv4_udp_packet must reject Fake-IP destination");
+        assert_eq!(nft_raw_err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let nft_ruleset =
+            NftablesInterceptor::build_nft_table_ruleset("routeward", "output", 21079, 10810, &[]);
+        assert!(nft_ruleset.contains("meta mark 21079 ip daddr 198.18.0.0/15 drop"));
+        assert!(nft_ruleset.contains("meta mark != 21080 ip daddr 198.18.0.0/15 drop"));
+
+        let logs = controller.telemetry.list_logs();
+        assert!(
+            logs.iter()
+                .any(|l| l.level == LogLevel::Warn && l.message.contains("Fake-IP egress guard")),
+            "Expected WARN log from final Fake-IP egress guard, got: {:?}",
+            logs
+        );
     }
 }

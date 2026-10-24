@@ -1248,7 +1248,7 @@ sleep 0.2
 STATE_AB=$("${BIN}" ctl state)
 LOGS_AB=$("${BIN}" ctl logs)
 
-if echo "${LOGS_AB}" | grep -Eq 'Routed UDP .*python3(\.[0-9]+)?.*-> 10\.200\.1\.1:19990 via DIRECT' \
+if echo "${LOGS_AB}" | grep -Eq 'Routed UDP .*python3(\.[0-9]+)?.*-> 10\.200\.1\.1:19990 .*via DIRECT' \
     && echo "${STATE_AB}" | grep -q '"routeLabel": "DIRECT"' \
     && grep -q "LLMNR_5355 .*:.*${LLMNR_AB_PORT} fileserver" /tmp/llmnr_5355_hits.log; then
     echo "[PASS] Scenario (ab): Transparent Direct UDP attributed to python3 and TPROXY LLMNR preserved source port ${LLMNR_AB_PORT}"
@@ -1398,7 +1398,52 @@ else
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Scenario (ag): Transparent Direct UDP toward a Fake-IP destination resolves
+#                the real IPv4 address (10.200.1.1), delivers the datagram to
+#                the real server, and reinjects the reply from the Fake-IP
+# ---------------------------------------------------------------------------
+rm -f /run/routeward/routeward.sock /tmp/udp_direct_hits.log
+cp /tmp/profile_udp_tproxy.json /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
+
+"${BIN}" daemon >/tmp/rw_daemon_ag.out 2>&1 &
+DAEMON_AG_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+DNS_AG_OUT=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "direct-fakeip-udp.routeward.test" 1)
+FAKE_IP_AG=$(echo "${DNS_AG_OUT}" | sed -n 's/.*IP=\([0-9.]*\) .*/\1/p')
+
+UDP_AG_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp-send "${FAKE_IP_AG}" 19990 "direct-fakeip-42b1")
+sleep 0.2
+LOGS_AG=$("${BIN}" ctl logs)
+
+kill -TERM "${DAEMON_AG_PID}" 2>/dev/null || true
+wait "${DAEMON_AG_PID}" 2>/dev/null || true
+
+if [[ "${FAKE_IP_AG}" == 198.18.* || "${FAKE_IP_AG}" == 198.19.* ]] \
+    && [[ "${UDP_AG_OUT}" == "TRANSPARENT_UDP_OK FROM=${FAKE_IP_AG}:19990 BODY=DIRECT_ECHO_OK:direct-fakeip-42b1" ]] \
+    && grep -q "direct-fakeip-42b1" /tmp/udp_direct_hits.log \
+    && echo "${LOGS_AG}" | grep -Eq -- "-> ${FAKE_IP_AG}:19990 \(domain=Some\(.*direct-fakeip-udp\.routeward\.test.*\), realIp=${TARGET_IP}\) via DIRECT"; then
+    echo "[PASS] Scenario (ag): Transparent Direct UDP to Fake-IP ${FAKE_IP_AG}:19990 delivered to real IP ${TARGET_IP}:19990 and replied from ${FAKE_IP_AG}:19990"
+else
+    echo "[FAIL] Scenario (ag)"
+    echo "DNS_AG_OUT=${DNS_AG_OUT} FAKE_IP_AG=${FAKE_IP_AG}"
+    echo "UDP_AG_OUT=${UDP_AG_OUT}"
+    cat /tmp/udp_direct_hits.log 2>/dev/null || true
+    echo "LOGS_AG=${LOGS_AG}"
+    exit 1
+fi
+
 cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
 kill "${MOCK_PID}" 2>/dev/null || true
 
-echo "=== ALL 32 LINUX CONTAINER SCENARIOS PASSED ==="
+echo "=== ALL 33 LINUX CONTAINER SCENARIOS PASSED ==="

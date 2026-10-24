@@ -387,6 +387,33 @@ impl WinDivertInterceptor {
     }
 
     #[cfg(windows)]
+    fn send_packet_guarded(
+        ctrl: &RouteWardController,
+        api: &WinDivertApi,
+        net_handle: *mut c_void,
+        packet: &[u8],
+        addr: &WinDivertAddress,
+    ) {
+        if ctrl.check_and_block_outbound_fake_ip_packet(
+            packet,
+            addr.is_outbound(),
+            COMPONENT_WINDIVERT,
+        ) {
+            return;
+        }
+        let mut send_len: u32 = 0;
+        unsafe {
+            let _ = (api.send)(
+                net_handle,
+                packet.as_ptr() as *const c_void,
+                packet.len() as u32,
+                &mut send_len,
+                addr as *const WinDivertAddress,
+            );
+        }
+    }
+
+    #[cfg(windows)]
     fn dispatch_resolved_syn(
         ctrl: &RouteWardController,
         api: &WinDivertApi,
@@ -439,16 +466,7 @@ impl WinDivertInterceptor {
                         );
                     }
                 }
-                let mut send_len: u32 = 0;
-                unsafe {
-                    let _ = (api.send)(
-                        net_handle,
-                        packet.as_ptr() as *const c_void,
-                        packet.len() as u32,
-                        &mut send_len,
-                        addr as *const WinDivertAddress,
-                    );
-                }
+                Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
                 return;
             }
 
@@ -642,16 +660,7 @@ impl WinDivertInterceptor {
             }
         }
 
-        let mut send_len: u32 = 0;
-        unsafe {
-            let _ = (api.send)(
-                net_handle,
-                packet.as_ptr() as *const c_void,
-                packet.len() as u32,
-                &mut send_len,
-                addr as *const WinDivertAddress,
-            );
-        }
+        Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
     }
 
     #[cfg(windows)]
@@ -677,16 +686,7 @@ impl WinDivertInterceptor {
             meta.dst_ip,
             meta.dst_port,
         ) {
-            let mut send_len: u32 = 0;
-            unsafe {
-                let _ = (api.send)(
-                    net_handle,
-                    packet.as_ptr() as *const c_void,
-                    packet.len() as u32,
-                    &mut send_len,
-                    addr as *const WinDivertAddress,
-                );
-            }
+            Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
             return;
         }
 
@@ -728,7 +728,7 @@ impl WinDivertInterceptor {
                     LogLevel::Info,
                     COMPONENT_WINDIVERT,
                     format!(
-                        "Routed UDP PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} via DIRECT [rule=\"{}\"]",
+                        "Routed UDP PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} (domain={:?}, realIp={}) via DIRECT [rule=\"{}\"]",
                         proc_id.pid,
                         proc_id.name,
                         proc_id.executable_path,
@@ -737,6 +737,8 @@ impl WinDivertInterceptor {
                         meta.src_port,
                         meta.dst_ip,
                         meta.dst_port,
+                        eval.effective_domain,
+                        meta.dst_ip,
                         eval.matched_rule_name
                     ),
                 );
@@ -761,16 +763,7 @@ impl WinDivertInterceptor {
                     true,
                 );
             }
-            let mut send_len: u32 = 0;
-            unsafe {
-                let _ = (api.send)(
-                    net_handle,
-                    packet.as_ptr() as *const c_void,
-                    packet.len() as u32,
-                    &mut send_len,
-                    addr as *const WinDivertAddress,
-                );
-            }
+            Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
             return;
         }
 
@@ -1105,16 +1098,7 @@ impl Interceptor for WinDivertInterceptor {
                             payload: (pkt, addr),
                             ..
                         } => {
-                            let mut send_len: u32 = 0;
-                            unsafe {
-                                let _ = (api.send)(
-                                    handle,
-                                    pkt.as_ptr() as *const c_void,
-                                    pkt.len() as u32,
-                                    &mut send_len,
-                                    &addr as *const WinDivertAddress,
-                                );
-                            }
+                            Self::send_packet_guarded(&ctrl_syn, &api, handle, &pkt, &addr);
                         }
                     }
                 }
@@ -1153,16 +1137,7 @@ impl Interceptor for WinDivertInterceptor {
                             payload: (pkt, addr),
                             ..
                         } => {
-                            let mut send_len: u32 = 0;
-                            unsafe {
-                                let _ = (api.send)(
-                                    handle,
-                                    pkt.as_ptr() as *const c_void,
-                                    pkt.len() as u32,
-                                    &mut send_len,
-                                    &addr as *const WinDivertAddress,
-                                );
-                            }
+                            Self::send_packet_guarded(&ctrl_syn, &api, handle, &pkt, &addr);
                         }
                     }
                 }
@@ -1541,16 +1516,13 @@ impl WinDivertInterceptor {
                                             udp_meta.dst_port, udp_meta.dst_ip, udp_meta.dst_port
                                         ),
                                     );
-                                    let mut send_len: u32 = 0;
-                                    unsafe {
-                                        let _ = (api.send)(
-                                            handle,
-                                            packet.as_ptr() as *const c_void,
-                                            pkt_len as u32,
-                                            &mut send_len,
-                                            &addr as *const WinDivertAddress,
-                                        );
-                                    }
+                                    Self::send_packet_guarded(
+                                        &ctrl_net,
+                                        &api,
+                                        handle,
+                                        &packet[..pkt_len],
+                                        &addr,
+                                    );
                                     continue;
                                 }
                                 LocalNameQueryDecision::BlockPublicFqdn { qname } => {
@@ -1627,16 +1599,13 @@ impl WinDivertInterceptor {
                                 );
                                 continue;
                             }
-                            let mut send_len: u32 = 0;
-                            unsafe {
-                                let _ = (api.send)(
-                                    handle,
-                                    packet.as_ptr() as *const c_void,
-                                    pkt_len as u32,
-                                    &mut send_len,
-                                    &addr as *const WinDivertAddress,
-                                );
-                            }
+                            Self::send_packet_guarded(
+                                &ctrl_net,
+                                &api,
+                                handle,
+                                &packet[..pkt_len],
+                                &addr,
+                            );
                             continue;
                         }
 
@@ -1793,16 +1762,9 @@ impl WinDivertInterceptor {
                                         ..
                                     } = evicted
                                     {
-                                        let mut send_len: u32 = 0;
-                                        unsafe {
-                                            let _ = (api.send)(
-                                                handle,
-                                                ev_pkt.as_ptr() as *const c_void,
-                                                ev_pkt.len() as u32,
-                                                &mut send_len,
-                                                &ev_addr as *const WinDivertAddress,
-                                            );
-                                        }
+                                        Self::send_packet_guarded(
+                                            &ctrl_net, &api, handle, &ev_pkt, &ev_addr,
+                                        );
                                     }
                                 }
                                 continue;
@@ -1879,16 +1841,7 @@ impl WinDivertInterceptor {
                     }
                 }
 
-                let mut send_len: u32 = 0;
-                unsafe {
-                    let _ = (api.send)(
-                        handle,
-                        packet.as_ptr() as *const c_void,
-                        pkt_len as u32,
-                        &mut send_len,
-                        &addr as *const WinDivertAddress,
-                    );
-                }
+                Self::send_packet_guarded(&ctrl_net, &api, handle, &packet[..pkt_len], &addr);
             }
         });
     }
