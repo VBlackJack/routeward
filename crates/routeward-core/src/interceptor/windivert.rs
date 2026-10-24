@@ -26,8 +26,11 @@ use std::sync::Arc;
 #[cfg(windows)]
 use crate::config::{RuleAction, TransportProtocol};
 #[cfg(windows)]
+use crate::dns::codec::{enforce_udp_truncation, parse_dns_query};
+#[cfg(windows)]
 use crate::interceptor::nat::{
-    parse_ipv4_tcp_meta, reflect_outbound_to_local_relay, reflect_relay_reply_to_client,
+    build_forged_ipv4_udp_reply, parse_ipv4_tcp_meta, parse_ipv4_udp_meta,
+    parse_ipv6_transport_meta, reflect_outbound_to_local_relay, reflect_relay_reply_to_client,
     Ipv4TcpPacketMeta, NatSessionEntry, PendingSynOutcome, PendingSynQueue, PidResolutionSource,
 };
 #[cfg(windows)]
@@ -40,6 +43,8 @@ use crate::telemetry::{ConnectionStatus, LogLevel, TelemetryHub, TrackedConnecti
 use chrono::Utc;
 #[cfg(windows)]
 use std::ffi::{c_char, c_void, CString};
+#[cfg(windows)]
+use std::net::{IpAddr, SocketAddr};
 #[cfg(windows)]
 use std::path::Path;
 #[cfg(windows)]
@@ -70,11 +75,17 @@ const WINDIVERT_SHUTDOWN_BOTH: u32 = 0x0003;
 #[cfg(windows)]
 const SOCKET_FILTER_TCP_OUTBOUND: &str = "outbound and !loopback and tcp";
 #[cfg(windows)]
-const NETWORK_FILTER_IPV4_TCP_OUTBOUND: &str = "outbound and !loopback and ip and tcp";
-#[cfg(windows)]
 const PACKET_BUFFER_SIZE: usize = 65535;
 const BIT_OUTBOUND: u64 = 1 << 17;
 const BIT_IMPOSTOR: u64 = 1 << 19;
+
+/// Builds the `WINDIVERT_LAYER_NETWORK` filter string for outbound IPv4 TCP + UDP (53/853)
+/// and IPv6 DNS/DoT (53/853) packets.
+pub fn build_network_filter_string(dns_port: u16, dot_port: u16) -> String {
+    format!(
+        "outbound and !loopback and ((ip and (tcp or udp.DstPort == {dns_port} or udp.DstPort == {dot_port})) or (ipv6 and (tcp.DstPort == {dns_port} or udp.DstPort == {dns_port} or tcp.DstPort == {dot_port} or udp.DstPort == {dot_port})))"
+    )
+}
 
 /// Binary-compatible representation of WinDivert 2.2 `WINDIVERT_ADDRESS` (80 bytes).
 #[repr(C)]
@@ -352,6 +363,8 @@ impl WinDivertInterceptor {
         resolved: Option<(u32, PidResolutionSource)>,
     ) {
         let relay_port = ctrl.nat_table.transparent_relay_port();
+        let dns_port = ctrl.constants.dns.dns_standard_port;
+        let dot_port = ctrl.constants.dns.dns_over_tls_port;
         let pid_opt = resolved.map(|(p, _)| p);
 
         if !ctrl.nat_table.is_loop_or_excluded(
@@ -365,7 +378,47 @@ impl WinDivertInterceptor {
             let proc_id = ctrl.process_resolver.resolve_by_pid(pid);
             let dst_ip_str = meta.dst_ip.to_string();
 
-            let eval = if proc_id.is_unattributed() {
+            // 1. Outbound TCP port 53 (DNS-over-TCP from OS DNS client/server): always reflect to local relay
+            if meta.dst_port == dns_port {
+                ctrl.nat_table.insert_session(NatSessionEntry {
+                    client_ip: meta.src_ip,
+                    client_port: meta.src_port,
+                    orig_dst_ip: meta.dst_ip,
+                    orig_dst_port: meta.dst_port,
+                    pid: proc_id.pid,
+                    process_name: proc_id.name,
+                    process_path: proc_id.executable_path,
+                    resolution_source: res_source,
+                    action: RuleAction::Direct,
+                    matched_rule_name: "DNS:LocalResolver".to_string(),
+                    created_at: Instant::now(),
+                });
+                if reflect_outbound_to_local_relay(packet, relay_port) {
+                    addr.set_outbound(false);
+                    addr.clear_impostor();
+                    unsafe {
+                        let _ = (api.calc_checksums)(
+                            packet.as_mut_ptr() as *mut c_void,
+                            packet.len() as u32,
+                            addr as *mut WinDivertAddress,
+                            0,
+                        );
+                    }
+                }
+                let mut send_len: u32 = 0;
+                unsafe {
+                    let _ = (api.send)(
+                        net_handle,
+                        packet.as_ptr() as *const c_void,
+                        packet.len() as u32,
+                        &mut send_len,
+                        addr as *const WinDivertAddress,
+                    );
+                }
+                return;
+            }
+
+            let mut eval = if proc_id.is_unattributed() {
                 let (unknown_action, rule_name) = ctrl.resolve_unknown_process_action(
                     COMPONENT_WINDIVERT,
                     meta.src_port,
@@ -391,6 +444,17 @@ impl WinDivertInterceptor {
                     protocol: TransportProtocol::Tcp,
                 })
             };
+
+            if meta.dst_port == dot_port
+                && ctrl
+                    .profile
+                    .read()
+                    .security_policy
+                    .block_encrypted_dns_bypass
+            {
+                eval.action = RuleAction::Block;
+                eval.matched_rule_name = "SecurityPolicy:blockEncryptedDnsBypass".to_string();
+            }
 
             match &eval.action {
                 RuleAction::Proxy { .. } | RuleAction::Chain { .. } => {
@@ -477,19 +541,63 @@ impl WinDivertInterceptor {
                     return;
                 }
                 RuleAction::Direct => {
-                    ctrl.telemetry.push_log(
-                        LogLevel::Info,
-                        COMPONENT_WINDIVERT,
-                        format!(
-                            "Direct pass-through SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{}",
-                            proc_id.pid,
-                            proc_id.name,
-                            proc_id.executable_path,
-                            res_source.as_str(),
-                            meta.dst_ip,
-                            meta.dst_port
-                        ),
-                    );
+                    if ctrl.dns.is_in_fake_subnet(&meta.dst_ip) {
+                        ctrl.telemetry.push_log(
+                            LogLevel::Info,
+                            COMPONENT_WINDIVERT,
+                            format!(
+                                "Reflecting Direct Fake-IP SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} [rule=\"{}\"]",
+                                proc_id.pid,
+                                proc_id.name,
+                                proc_id.executable_path,
+                                res_source.as_str(),
+                                meta.src_ip,
+                                meta.src_port,
+                                meta.dst_ip,
+                                meta.dst_port,
+                                eval.matched_rule_name
+                            ),
+                        );
+                        ctrl.nat_table.insert_session(NatSessionEntry {
+                            client_ip: meta.src_ip,
+                            client_port: meta.src_port,
+                            orig_dst_ip: meta.dst_ip,
+                            orig_dst_port: meta.dst_port,
+                            pid: proc_id.pid,
+                            process_name: proc_id.name,
+                            process_path: proc_id.executable_path,
+                            resolution_source: res_source,
+                            action: RuleAction::Direct,
+                            matched_rule_name: eval.matched_rule_name,
+                            created_at: Instant::now(),
+                        });
+                        if reflect_outbound_to_local_relay(packet, relay_port) {
+                            addr.set_outbound(false);
+                            addr.clear_impostor();
+                            unsafe {
+                                let _ = (api.calc_checksums)(
+                                    packet.as_mut_ptr() as *mut c_void,
+                                    packet.len() as u32,
+                                    addr as *mut WinDivertAddress,
+                                    0,
+                                );
+                            }
+                        }
+                    } else {
+                        ctrl.telemetry.push_log(
+                            LogLevel::Info,
+                            COMPONENT_WINDIVERT,
+                            format!(
+                                "Direct pass-through SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{}",
+                                proc_id.pid,
+                                proc_id.name,
+                                proc_id.executable_path,
+                                res_source.as_str(),
+                                meta.dst_ip,
+                                meta.dst_port
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -628,10 +736,13 @@ impl Interceptor for WinDivertInterceptor {
         }
 
         let net_consts = &controller.constants.network;
+        let dns_port = controller.constants.dns.dns_standard_port;
+        let dot_port = controller.constants.dns.dns_over_tls_port;
         let api = Self::load_dynamic_api(&net_consts.windivert_dll_paths)?;
 
         let sock_filter = CString::new(SOCKET_FILTER_TCP_OUTBOUND).expect("valid CString");
-        let net_filter = CString::new(NETWORK_FILTER_IPV4_TCP_OUTBOUND).expect("valid CString");
+        let net_filter_str = build_network_filter_string(dns_port, dot_port);
+        let net_filter = CString::new(net_filter_str).expect("valid CString");
 
         let socket_handle = unsafe {
             (api.open)(
@@ -801,6 +912,210 @@ impl Interceptor for WinDivertInterceptor {
                 let pkt_len = recv_len as usize;
                 let packet = &mut packet_buf[..pkt_len];
 
+                // Case 0: Outbound IPv6 DNS (port 53) or DoT (port 853)
+                if let Some(v6_meta) = parse_ipv6_transport_meta(packet) {
+                    let (kill_switch_enabled, block_encrypted_dns) = {
+                        let prof = ctrl_net.profile.read();
+                        (
+                            prof.security_policy.kill_switch_enabled,
+                            prof.security_policy.block_encrypted_dns_bypass,
+                        )
+                    };
+                    if v6_meta.dst_port == dot_port && (block_encrypted_dns || kill_switch_enabled)
+                    {
+                        ctrl_net.telemetry.push_log(
+                            LogLevel::Warn,
+                            COMPONENT_WINDIVERT,
+                            format!(
+                                "Blocked outbound IPv6 DoT packet [{}]:{} -> [{}]:{}",
+                                v6_meta.src_ip, v6_meta.src_port, v6_meta.dst_ip, v6_meta.dst_port
+                            ),
+                        );
+                        ctrl_net.telemetry.record_connection(
+                            TrackedConnection {
+                                id: Uuid::new_v4().to_string(),
+                                pid: 0,
+                                process_name: "ipv6-dns".to_string(),
+                                process_path: "ipv6-dns".to_string(),
+                                target_host: v6_meta.dst_ip.to_string(),
+                                resolved_domain: None,
+                                target_port: v6_meta.dst_port,
+                                protocol: if v6_meta.next_header
+                                    == crate::interceptor::nat::IPPROTO_TCP
+                                {
+                                    TransportProtocol::Tcp
+                                } else {
+                                    TransportProtocol::Udp
+                                },
+                                matched_rule: "SecurityPolicy:blockEncryptedDnsBypass".to_string(),
+                                route_label: "BLOCKED".to_string(),
+                                latency_ms: 0,
+                                rx_bytes: 0,
+                                tx_bytes: 0,
+                                status: ConnectionStatus::Blocked,
+                                started_at: Utc::now(),
+                            },
+                            false,
+                        );
+                        continue;
+                    }
+                    if v6_meta.dst_port == dns_port && kill_switch_enabled {
+                        // Drop outbound IPv6 DNS so Windows falls back to IPv4 DNS immediately
+                        continue;
+                    }
+                }
+
+                // Case 1: Outbound IPv4 UDP DNS (port 53) or DoT/DoQ (port 853)
+                if let Some(udp_meta) = parse_ipv4_udp_meta(packet) {
+                    if !ctrl_net.nat_table.is_self_udp_port(udp_meta.src_port) {
+                        if udp_meta.dst_port == dot_port
+                            && ctrl_net
+                                .profile
+                                .read()
+                                .security_policy
+                                .block_encrypted_dns_bypass
+                        {
+                            ctrl_net.telemetry.push_log(
+                                LogLevel::Warn,
+                                COMPONENT_WINDIVERT,
+                                format!(
+                                    "Blocked encrypted DNS bypass (UDP port {}) {}:{} -> {}:{}",
+                                    dot_port,
+                                    udp_meta.src_ip,
+                                    udp_meta.src_port,
+                                    udp_meta.dst_ip,
+                                    udp_meta.dst_port
+                                ),
+                            );
+                            ctrl_net.telemetry.record_connection(
+                                TrackedConnection {
+                                    id: Uuid::new_v4().to_string(),
+                                    pid: 0,
+                                    process_name: "udp-853".to_string(),
+                                    process_path: "udp-853".to_string(),
+                                    target_host: udp_meta.dst_ip.to_string(),
+                                    resolved_domain: None,
+                                    target_port: udp_meta.dst_port,
+                                    protocol: TransportProtocol::Udp,
+                                    matched_rule: "SecurityPolicy:blockEncryptedDnsBypass"
+                                        .to_string(),
+                                    route_label: "BLOCKED".to_string(),
+                                    latency_ms: 0,
+                                    rx_bytes: 0,
+                                    tx_bytes: 0,
+                                    status: ConnectionStatus::Blocked,
+                                    started_at: Utc::now(),
+                                },
+                                false,
+                            );
+                            continue;
+                        }
+
+                        if udp_meta.dst_port == dns_port {
+                            let dns_payload = &packet[udp_meta.payload_offset
+                                ..udp_meta.payload_offset + udp_meta.payload_len];
+                            if let Some(fast_resp) = ctrl_net.resolve_dns_query_fast(dns_payload) {
+                                let final_resp = if let Ok(parsed_q) = parse_dns_query(dns_payload)
+                                {
+                                    enforce_udp_truncation(
+                                        &fast_resp,
+                                        &parsed_q,
+                                        parsed_q.max_udp_payload_bytes,
+                                    )
+                                } else {
+                                    fast_resp
+                                };
+                                if let Some(mut forged) = build_forged_ipv4_udp_reply(
+                                    udp_meta.dst_ip,
+                                    udp_meta.dst_port,
+                                    udp_meta.src_ip,
+                                    udp_meta.src_port,
+                                    &final_resp,
+                                ) {
+                                    let mut reply_addr = addr;
+                                    reply_addr.set_outbound(false);
+                                    reply_addr.clear_impostor();
+                                    let mut send_len: u32 = 0;
+                                    unsafe {
+                                        let _ = (api.calc_checksums)(
+                                            forged.as_mut_ptr() as *mut c_void,
+                                            forged.len() as u32,
+                                            &mut reply_addr as *mut WinDivertAddress,
+                                            0,
+                                        );
+                                        let _ = (api.send)(
+                                            handle,
+                                            forged.as_ptr() as *const c_void,
+                                            forged.len() as u32,
+                                            &mut send_len,
+                                            &reply_addr as *const WinDivertAddress,
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // Slow async path (bypassed AD domain or enableFakeIp=false real DNS-over-TCP)
+                            let query_vec = dns_payload.to_vec();
+                            let ctrl_async = ctrl_net.clone();
+                            let active_async = Arc::clone(&active_net);
+                            let mut reply_addr = addr;
+                            let src_ip = udp_meta.src_ip;
+                            let src_port = udp_meta.src_port;
+                            let dst_ip = udp_meta.dst_ip;
+                            let dst_port = udp_meta.dst_port;
+                            let api_copy = api;
+                            let handle_usize = net_handle_usize;
+                            std::thread::spawn(move || {
+                                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                else {
+                                    return;
+                                };
+                                let orig_resolver =
+                                    Some(SocketAddr::new(IpAddr::V4(dst_ip), dst_port));
+                                let resp_bytes = rt.block_on(ctrl_async.resolve_dns_query_async(
+                                    &query_vec,
+                                    orig_resolver,
+                                    true,
+                                ));
+                                if !active_async.load(Ordering::Relaxed) || resp_bytes.is_empty() {
+                                    return;
+                                }
+                                if let Some(mut forged) = build_forged_ipv4_udp_reply(
+                                    dst_ip,
+                                    dst_port,
+                                    src_ip,
+                                    src_port,
+                                    &resp_bytes,
+                                ) {
+                                    reply_addr.set_outbound(false);
+                                    reply_addr.clear_impostor();
+                                    let mut send_len: u32 = 0;
+                                    let h_ptr = handle_usize as *mut c_void;
+                                    unsafe {
+                                        let _ = (api_copy.calc_checksums)(
+                                            forged.as_mut_ptr() as *mut c_void,
+                                            forged.len() as u32,
+                                            &mut reply_addr as *mut WinDivertAddress,
+                                            0,
+                                        );
+                                        let _ = (api_copy.send)(
+                                            h_ptr,
+                                            forged.as_ptr() as *const c_void,
+                                            forged.len() as u32,
+                                            &mut send_len,
+                                            &reply_addr as *const WinDivertAddress,
+                                        );
+                                    }
+                                }
+                            });
+                            continue;
+                        }
+                    }
+                }
+
                 if let Some(meta) = parse_ipv4_tcp_meta(packet) {
                     // Case A: Outbound reply from our local transparent relay back to the client
                     if meta.src_port == relay_port {
@@ -831,7 +1146,9 @@ impl Interceptor for WinDivertInterceptor {
                         // Case B: Subsequent packets of an already-redirected 4-tuple flow
                         if matches!(
                             existing_session.action,
-                            RuleAction::Proxy { .. } | RuleAction::Chain { .. }
+                            RuleAction::Proxy { .. }
+                                | RuleAction::Chain { .. }
+                                | RuleAction::Direct
                         ) && reflect_outbound_to_local_relay(packet, relay_port)
                         {
                             addr.set_outbound(false);
@@ -847,18 +1164,16 @@ impl Interceptor for WinDivertInterceptor {
                         }
                     } else if meta.is_syn_only() {
                         // Case C: New outbound TCP SYN -> try immediate non-blocking PID lookup
-                        if let Some(resolved) = ctrl_net.nat_table.try_resolve_pid_nonblocking(
+                        let resolved = ctrl_net.nat_table.try_resolve_pid_nonblocking(
                             meta.src_port,
                             ProcessResolver::find_pid_for_tcp_port,
-                        ) {
+                        );
+                        if resolved.is_some()
+                            || (meta.dst_port == dns_port
+                                && !ctrl_net.nat_table.is_self_tcp_port(meta.src_port))
+                        {
                             Self::dispatch_resolved_syn(
-                                &ctrl_net,
-                                &api,
-                                handle,
-                                packet,
-                                &mut addr,
-                                meta,
-                                Some(resolved),
+                                &ctrl_net, &api, handle, packet, &mut addr, meta, resolved,
                             );
                             continue;
                         } else {
@@ -936,5 +1251,10 @@ mod tests {
         assert!(addr.is_outbound());
         addr.set_outbound(false);
         assert!(!addr.is_outbound());
+
+        let filter = build_network_filter_string(53, 853);
+        assert!(filter.contains("udp.DstPort == 53"));
+        assert!(filter.contains("udp.DstPort == 853"));
+        assert!(filter.contains("ipv6 and (tcp.DstPort == 53 or udp.DstPort == 53"));
     }
 }

@@ -113,6 +113,42 @@
       }
     ]
   },
+  "fakeIpsSample": {
+    "id": "11111111-1111-4000-8000-000000000010",
+    "ok": true,
+    "result": [
+      {
+        "fakeIp": "198.18.0.10",
+        "domain": "example.com",
+        "hits": 2,
+        "expiresAt": "2026-10-24T12:05:00Z",
+        "ttlRemainingSeconds": 298
+      }
+    ]
+  },
+  "connectionsFakeIpProxied": {
+    "id": "11111111-1111-4000-8000-000000000011",
+    "ok": true,
+    "result": [
+      {
+        "id": "conn-sample-4",
+        "pid": 6120,
+        "processName": "curl.exe",
+        "processPath": "C:\\Windows\\System32\\curl.exe",
+        "targetHost": "example.com",
+        "resolvedDomain": "example.com",
+        "targetPort": 80,
+        "protocol": "tcp",
+        "matchedRule": "CLI Tools via SOCKS5 Proxy",
+        "routeLabel": "Local SOCKS5 Gateway (Socks5)",
+        "latencyMs": 14,
+        "rxBytes": 1256,
+        "txBytes": 85,
+        "status": "closed",
+        "startedAt": "2026-10-24T12:01:00Z"
+      }
+    ]
+  },
   "upsertRuleOk": {
     "id": "11111111-1111-4000-8000-000000000005",
     "ok": true,

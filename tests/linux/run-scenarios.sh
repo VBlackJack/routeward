@@ -492,4 +492,290 @@ else
     exit 1
 fi
 
-echo "=== ALL 12 LINUX CONTAINER SCENARIOS PASSED ==="
+# Restart full mock servers (HTTP + SOCKS5 + DNS UDP/TCP on :53) for DNS scenarios (m)-(q)
+rm -f "${SOCKS_LOG}" /tmp/http_target_hits.log /tmp/dns_hits.log /run/routeward/routeward.sock
+python3 /workspace/tests/linux/mock_servers.py &
+MOCK_PID=$!
+sleep 0.4
+
+cp /etc/resolv.conf /tmp/resolv.conf.bak
+echo "nameserver ${TARGET_IP}" > /etc/resolv.conf
+
+cat > /tmp/profile_dns_fakeip.json <<EOF
+{
+  "profileId": "00000000-0000-4000-8000-000000000101",
+  "name": "LinuxDnsFakeIpProfile",
+  "version": "2026.1022.00",
+  "enableLogging": true,
+  "interceptionMode": "hybrid",
+  "themeConfig": {
+    "theme": "Drakul",
+    "accent": "Default"
+  },
+  "securityPolicy": {
+    "killSwitchEnabled": true,
+    "blockUdpOnTcpOnlyProxy": true,
+    "strictDnsNoLocalFallback": true,
+    "blockEncryptedDnsBypass": true,
+    "unknownProcessAction": { "type": "block" }
+  },
+  "defaultAction": { "type": "direct" },
+  "dnsConfig": {
+    "enableFakeIp": true,
+    "remoteDnsResolution": true,
+    "fakeIpCidr": "198.18.0.0/15",
+    "upstreamDns": "${TARGET_IP}:53",
+    "bypassDomains": ["corp.contoso.com", "localhost", "*.local"]
+  },
+  "proxies": [
+    {
+      "id": "socks-local",
+      "name": "Local SOCKS5 Gateway",
+      "protocol": "socks5",
+      "host": "127.0.0.1",
+      "port": 1080,
+      "auth": null,
+      "udpEnabled": true,
+      "tls": false,
+      "sni": null,
+      "enabled": true,
+      "lastLatencyMs": null,
+      "exitIp": null
+    }
+  ],
+  "chains": [],
+  "rules": [
+    {
+      "id": "rule-domain-routeward",
+      "name": "RouteWard Domain Rule",
+      "enabled": true,
+      "priority": 1,
+      "processPatterns": [],
+      "domainPatterns": ["*.routeward.test"],
+      "ipCidrs": [],
+      "portRanges": [],
+      "protocol": "tcp",
+      "action": { "type": "proxy", "targetId": "socks-local" }
+    }
+  ]
+}
+EOF
+
+cat > /tmp/profile_dns_real.json <<EOF
+{
+  "profileId": "00000000-0000-4000-8000-000000000102",
+  "name": "LinuxDnsRealProfile",
+  "version": "2026.1022.00",
+  "enableLogging": true,
+  "interceptionMode": "hybrid",
+  "themeConfig": {
+    "theme": "Drakul",
+    "accent": "Default"
+  },
+  "securityPolicy": {
+    "killSwitchEnabled": true,
+    "blockUdpOnTcpOnlyProxy": true,
+    "strictDnsNoLocalFallback": true,
+    "blockEncryptedDnsBypass": true,
+    "unknownProcessAction": { "type": "block" }
+  },
+  "defaultAction": { "type": "proxy", "targetId": "socks-local" },
+  "dnsConfig": {
+    "enableFakeIp": false,
+    "remoteDnsResolution": true,
+    "fakeIpCidr": "198.18.0.0/15",
+    "upstreamDns": "${TARGET_IP}:53",
+    "bypassDomains": ["corp.contoso.com", "localhost", "*.local"]
+  },
+  "proxies": [
+    {
+      "id": "socks-local",
+      "name": "Local SOCKS5 Gateway",
+      "protocol": "socks5",
+      "host": "127.0.0.1",
+      "port": 1080,
+      "auth": null,
+      "udpEnabled": true,
+      "tls": false,
+      "sni": null,
+      "enabled": true,
+      "lastLatencyMs": null,
+      "exitIp": null
+    }
+  ],
+  "chains": [],
+  "rules": []
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Scenario (m): Fake-IP end-to-end — DNS query returns IP in 198.18.0.0/15
+#               with 5s TTL (AAAA -> NODATA), curl to domain matches domain
+#               rule and sends domain name to SOCKS5, 0 INFO DNS logs
+# ---------------------------------------------------------------------------
+rm -f "${SOCKS_LOG}" /tmp/dns_hits.log /run/routeward/routeward.sock
+cp /tmp/profile_dns_fakeip.json /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
+
+"${BIN}" daemon >/tmp/rw_daemon_m.out 2>&1 &
+DAEMON_M_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+DNS_M_A=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "app.routeward.test" 1)
+DNS_M_AAAA=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "app.routeward.test" 28)
+
+RESP_M=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+    curl --noproxy "" -sS --max-time 5 "http://app.routeward.test:${TARGET_PORT}/scenario-m")
+sleep 0.2
+FAKE_IPS_M=$("${BIN}" ctl fake-ips)
+LOGS_M=$("${BIN}" ctl logs)
+
+if echo "${DNS_M_A}" | grep -Eq "RCODE=0 ANCOUNT=1 IP=198\.1[89]\.[0-9]+\.[0-9]+ TTL=5" \
+    && echo "${DNS_M_AAAA}" | grep -q "RCODE=0 ANCOUNT=0" \
+    && [[ "${RESP_M}" == "ROUTEWARD_OK" ]] \
+    && grep -q "CONNECT app.routeward.test:${TARGET_PORT}" "${SOCKS_LOG}" \
+    && echo "${FAKE_IPS_M}" | grep -q '"domain": "app.routeward.test"' \
+    && ! echo "${LOGS_M}" | grep -q '"component": "FakeIpDNS"'; then
+    echo "[PASS] Scenario (m): Fake-IP end-to-end (${DNS_M_A}; AAAA NODATA; curl routed via SOCKS5 with ATYP=domain; 0 INFO DNS logs)"
+else
+    echo "[FAIL] Scenario (m)"
+    echo "DNS_M_A=${DNS_M_A}"
+    echo "DNS_M_AAAA=${DNS_M_AAAA}"
+    echo "RESP_M=${RESP_M}"
+    cat "${SOCKS_LOG}" 2>/dev/null || true
+    echo "FAKE_IPS_M=${FAKE_IPS_M}"
+    echo "LOGS_M=${LOGS_M}"
+    kill -TERM "${DAEMON_M_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (o): Bypassed domain (corp.contoso.com) resolved directly against
+#               target DNS server without Fake-IP and without hitting SOCKS5
+# ---------------------------------------------------------------------------
+rm -f "${SOCKS_LOG}" /tmp/dns_hits.log
+DNS_O=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "dc01.corp.contoso.com" 1)
+
+if echo "${DNS_O}" | grep -q "RCODE=0 ANCOUNT=1 IP=${TARGET_IP}" \
+    && grep -q "dc01.corp.contoso.com 1" /tmp/dns_hits.log \
+    && [[ ! -s "${SOCKS_LOG}" ]]; then
+    echo "[PASS] Scenario (o): Bypassed AD domain dc01.corp.contoso.com resolved directly (${DNS_O}) without Fake-IP or SOCKS5"
+else
+    echo "[FAIL] Scenario (o)"
+    echo "DNS_O=${DNS_O}"
+    cat /tmp/dns_hits.log 2>/dev/null || true
+    cat "${SOCKS_LOG}" 2>/dev/null || true
+    kill -TERM "${DAEMON_M_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (p): blockEncryptedDnsBypass=true — DoH canary returns NXDOMAIN,
+#               outbound port 853 (TCP & UDP) and IPv6 53/853 are blocked
+# ---------------------------------------------------------------------------
+DNS_P_CANARY=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "use-application-dns.net" 1)
+NFT_IP4_P=$(nft list table ip routeward)
+NFT_IP6_P=$(nft list table ip6 routeward)
+
+set +e
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+    curl --noproxy "" -sS --max-time 3 "http://${TARGET_IP}:853/dot" >/tmp/curl_p.out 2>&1
+DOT_TCP_EXIT=$?
+set -e
+
+sleep 0.2
+LOGS_P=$("${BIN}" ctl logs)
+
+if echo "${DNS_P_CANARY}" | grep -q "RCODE=3 ANCOUNT=0" \
+    && [[ "${DOT_TCP_EXIT}" -ne 0 ]] \
+    && echo "${NFT_IP4_P}" | grep -q "udp dport 853 reject" \
+    && echo "${NFT_IP6_P}" | grep -q "udp dport 53 reject" \
+    && echo "${NFT_IP6_P}" | grep -q "tcp dport 853 reject with tcp reset" \
+    && echo "${LOGS_P}" | grep -q "Blocked DoH canary DNS query" \
+    && echo "${LOGS_P}" | grep -q "Blocked encrypted DNS bypass (DoT TCP port 853)"; then
+    echo "[PASS] Scenario (p): DoH canary returned NXDOMAIN, DoT 853 TCP/UDP and IPv6 53/853 blocked"
+else
+    echo "[FAIL] Scenario (p)"
+    echo "DNS_P_CANARY=${DNS_P_CANARY}"
+    echo "DOT_TCP_EXIT=${DOT_TCP_EXIT}"
+    echo "NFT_IP4_P=${NFT_IP4_P}"
+    echo "NFT_IP6_P=${NFT_IP6_P}"
+    echo "LOGS_P=${LOGS_P}"
+    kill -TERM "${DAEMON_M_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+kill -TERM "${DAEMON_M_PID}" 2>/dev/null || true
+wait "${DAEMON_M_PID}" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Scenario (n): enableFakeIp=false — DNS query resolved via DNS-over-TCP
+#               through SOCKS5 proxy, 0 direct UDP DNS packets
+# ---------------------------------------------------------------------------
+rm -f "${SOCKS_LOG}" /tmp/dns_hits.log /run/routeward/routeward.sock
+cp /tmp/profile_dns_real.json /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
+
+"${BIN}" daemon >/tmp/rw_daemon_n.out 2>&1 &
+DAEMON_N_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+DNS_N=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "real.routeward.test" 1)
+
+if echo "${DNS_N}" | grep -q "RCODE=0 ANCOUNT=1 IP=${TARGET_IP}" \
+    && grep -q "CONNECT ${TARGET_IP}:53" "${SOCKS_LOG}" \
+    && grep -q "^TCP .* real.routeward.test 1" /tmp/dns_hits.log \
+    && ! grep -q "^UDP " /tmp/dns_hits.log; then
+    echo "[PASS] Scenario (n): enableFakeIp=false resolved real.routeward.test (${DNS_N}) via DNS-over-TCP through SOCKS5 with 0 direct UDP hits"
+else
+    echo "[FAIL] Scenario (n)"
+    echo "DNS_N=${DNS_N}"
+    cat "${SOCKS_LOG}" 2>/dev/null || true
+    cat /tmp/dns_hits.log 2>/dev/null || true
+    kill -TERM "${DAEMON_N_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario (q): kill -9 of daemon removes both ip and ip6 routeward tables
+#               and restores direct DNS resolution immediately
+# ---------------------------------------------------------------------------
+kill -9 "${DAEMON_N_PID}"
+wait "${DAEMON_N_PID}" 2>/dev/null || true
+sleep 0.5
+
+rm -f /tmp/dns_hits.log
+DNS_Q=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "after-kill9.routeward.test" 1)
+
+if ! nft list table ip routeward >/dev/null 2>&1 \
+    && ! nft list table ip6 routeward >/dev/null 2>&1 \
+    && echo "${DNS_Q}" | grep -q "RCODE=0 ANCOUNT=1 IP=${TARGET_IP}" \
+    && grep -q "^UDP " /tmp/dns_hits.log; then
+    echo "[PASS] Scenario (q): SIGKILL (kill -9) removed ip and ip6 routeward tables and restored direct UDP DNS resolution (${DNS_Q})"
+else
+    echo "[FAIL] Scenario (q)"
+    echo "DNS_Q=${DNS_Q}"
+    cat /tmp/dns_hits.log 2>/dev/null || true
+    exit 1
+fi
+
+cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
+kill "${MOCK_PID}" 2>/dev/null || true
+
+echo "=== ALL 17 LINUX CONTAINER SCENARIOS PASSED ==="

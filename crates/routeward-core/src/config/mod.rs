@@ -164,10 +164,66 @@ fn default_linux_nft_chain_name() -> String {
 pub struct DnsConstants {
     pub fake_ip_cidr: String,
     pub default_ttl_seconds: u64,
+    #[serde(default = "default_os_response_ttl_seconds")]
+    pub os_response_ttl_seconds: u32,
     pub max_cache_entries: usize,
     pub upstream_dns_server: String,
     pub fallback_dns_server: String,
     pub dns_query_packet_max_bytes: usize,
+    #[serde(default = "default_dns_standard_port")]
+    pub dns_standard_port: u16,
+    #[serde(default = "default_dns_over_tls_port")]
+    pub dns_over_tls_port: u16,
+    #[serde(default = "default_doh_canary_domains")]
+    pub doh_canary_domains: Vec<String>,
+    #[serde(default = "default_bypass_suffixes")]
+    pub default_bypass_suffixes: Vec<String>,
+    #[serde(default = "default_private_reverse_zones")]
+    pub default_private_reverse_zones: Vec<String>,
+}
+
+fn default_os_response_ttl_seconds() -> u32 {
+    5
+}
+
+fn default_dns_standard_port() -> u16 {
+    53
+}
+
+fn default_dns_over_tls_port() -> u16 {
+    853
+}
+
+fn default_doh_canary_domains() -> Vec<String> {
+    vec!["use-application-dns.net".to_string()]
+}
+
+fn default_bypass_suffixes() -> Vec<String> {
+    vec![
+        "localhost".to_string(),
+        ".localhost".to_string(),
+        ".local".to_string(),
+        ".home.arpa".to_string(),
+    ]
+}
+
+fn default_private_reverse_zones() -> Vec<String> {
+    let mut zones = vec![
+        "10.in-addr.arpa".to_string(),
+        "168.192.in-addr.arpa".to_string(),
+        "127.in-addr.arpa".to_string(),
+        "254.169.in-addr.arpa".to_string(),
+        "c.f.ip6.arpa".to_string(),
+        "d.f.ip6.arpa".to_string(),
+        "8.e.f.ip6.arpa".to_string(),
+        "9.e.f.ip6.arpa".to_string(),
+        "a.e.f.ip6.arpa".to_string(),
+        "b.e.f.ip6.arpa".to_string(),
+    ];
+    for octet in 16..=31 {
+        zones.push(format!("{octet}.172.in-addr.arpa"));
+    }
+    zones
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,8 +529,14 @@ pub struct SecurityPolicyConfig {
     pub kill_switch_enabled: bool,
     pub block_udp_on_tcp_only_proxy: bool,
     pub strict_dns_no_local_fallback: bool,
+    #[serde(default = "default_block_encrypted_dns_bypass")]
+    pub block_encrypted_dns_bypass: bool,
     #[serde(default = "default_unknown_process_action")]
     pub unknown_process_action: RuleAction,
+}
+
+fn default_block_encrypted_dns_bypass() -> bool {
+    true
 }
 
 fn default_unknown_process_action() -> RuleAction {
@@ -487,6 +549,7 @@ impl Default for SecurityPolicyConfig {
             kill_switch_enabled: true,
             block_udp_on_tcp_only_proxy: true,
             strict_dns_no_local_fallback: true,
+            block_encrypted_dns_bypass: true,
             unknown_process_action: RuleAction::Block,
         }
     }

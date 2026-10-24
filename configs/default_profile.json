@@ -12,6 +12,7 @@
     "killSwitchEnabled": true,
     "blockUdpOnTcpOnlyProxy": true,
     "strictDnsNoLocalFallback": true,
+    "blockEncryptedDnsBypass": true,
     "unknownProcessAction": {
       "type": "block"
     }

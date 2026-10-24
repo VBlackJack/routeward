@@ -19,7 +19,7 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +27,11 @@ use std::time::{Duration, Instant};
 const IPV4_VERSION: u8 = 4;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const TCP_MIN_HEADER_LEN: usize = 20;
-const IPPROTO_TCP: u8 = 6;
+const UDP_HEADER_LEN: usize = 8;
+const IPV6_VERSION: u8 = 6;
+const IPV6_HEADER_LEN: usize = 40;
+pub const IPPROTO_TCP: u8 = 6;
+pub const IPPROTO_UDP: u8 = 17;
 const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_RST: u8 = 0x04;
@@ -127,6 +131,41 @@ impl Ipv4TcpPacketMeta {
     /// Returns `true` if the FIN or RST flag is set.
     pub fn is_fin_or_rst(&self) -> bool {
         (self.tcp_flags & (TCP_FLAG_FIN | TCP_FLAG_RST)) != 0
+    }
+}
+
+/// Parsed IPv4 + UDP packet header and payload slice metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv4UdpPacketMeta {
+    pub ip_header_len: usize,
+    pub total_len: usize,
+    pub src_ip: Ipv4Addr,
+    pub dst_ip: Ipv4Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload_offset: usize,
+    pub payload_len: usize,
+}
+
+/// Parsed IPv6 + TCP/UDP packet header metadata (used for DNS/DoT IPv6 leak prevention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6TransportPacketMeta {
+    pub next_header: u8,
+    pub src_ip: Ipv6Addr,
+    pub dst_ip: Ipv6Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+}
+
+/// RAII guard that unregisters a self-owned local UDP or TCP port from [`TransparentNatTable`] when dropped.
+pub struct SelfPortGuard {
+    map: Arc<DashMap<u16, Instant>>,
+    port: u16,
+}
+
+impl Drop for SelfPortGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.port);
     }
 }
 
@@ -266,6 +305,8 @@ impl<T> PendingSynQueue<T> {
 #[derive(Clone)]
 pub struct TransparentNatTable {
     socket_pid_cache: Arc<DashMap<u16, (u32, Instant)>>,
+    self_udp_ports: Arc<DashMap<u16, Instant>>,
+    self_tcp_ports: Arc<DashMap<u16, Instant>>,
     sessions_by_flow: Arc<DashMap<OutboundFlowKey, NatSessionEntry>>,
     peer_to_flow: Arc<DashMap<(Ipv4Addr, u16), OutboundFlowKey>>,
     self_pid: u32,
@@ -287,6 +328,8 @@ impl TransparentNatTable {
     ) -> Self {
         Self {
             socket_pid_cache: Arc::new(DashMap::new()),
+            self_udp_ports: Arc::new(DashMap::new()),
+            self_tcp_ports: Arc::new(DashMap::new()),
             sessions_by_flow: Arc::new(DashMap::new()),
             peer_to_flow: Arc::new(DashMap::new()),
             self_pid,
@@ -297,6 +340,36 @@ impl TransparentNatTable {
             dropped_unattributed_syn_count: Arc::new(AtomicU64::new(0)),
             reinjected_unattributed_syn_count: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Registers a local UDP port bound by RouteWard itself so `WinDivert` passes its packets through without interception.
+    pub fn register_self_udp_port(&self, port: u16) -> SelfPortGuard {
+        self.self_udp_ports.insert(port, Instant::now());
+        SelfPortGuard {
+            map: Arc::clone(&self.self_udp_ports),
+            port,
+        }
+    }
+
+    /// Returns `true` if `port` is currently registered as a RouteWard-owned local UDP socket port.
+    pub fn is_self_udp_port(&self, port: u16) -> bool {
+        self.self_udp_ports.contains_key(&port)
+    }
+
+    /// Registers a local TCP port bound by RouteWard itself so `WinDivert` passes its packets through without interception.
+    pub fn register_self_tcp_port(&self, port: u16) -> SelfPortGuard {
+        let now = Instant::now();
+        self.self_tcp_ports.insert(port, now);
+        self.socket_pid_cache.insert(port, (self.self_pid, now));
+        SelfPortGuard {
+            map: Arc::clone(&self.self_tcp_ports),
+            port,
+        }
+    }
+
+    /// Returns `true` if `port` is currently registered as a RouteWard-owned local TCP socket port.
+    pub fn is_self_tcp_port(&self, port: u16) -> bool {
+        self.self_tcp_ports.contains_key(&port)
     }
 
     /// Increments and returns the 1-based counter of timed-out Pending SYNs dropped while `killSwitchEnabled=true`.
@@ -327,6 +400,11 @@ impl TransparentNatTable {
     /// Updates the list of upstream proxy IPv4 endpoints excluded from interception to avoid loops.
     pub fn set_upstream_endpoints(&self, endpoints: Vec<(Ipv4Addr, u16)>) {
         *self.upstream_endpoints.write() = endpoints;
+    }
+
+    /// Returns a snapshot of the upstream proxy IPv4 endpoints excluded from interception.
+    pub fn upstream_endpoints(&self) -> Vec<(Ipv4Addr, u16)> {
+        self.upstream_endpoints.read().clone()
     }
 
     /// Records a `(local_port -> pid)` mapping observed on `WINDIVERT_LAYER_SOCKET`.
@@ -373,7 +451,7 @@ impl TransparentNatTable {
         dst_ip: Ipv4Addr,
         dst_port: u16,
     ) -> bool {
-        if pid == Some(self.self_pid) {
+        if pid == Some(self.self_pid) || self.is_self_tcp_port(src_port) {
             return true;
         }
         if src_ip.is_loopback()
@@ -483,6 +561,175 @@ pub fn parse_ipv4_tcp_meta(packet: &[u8]) -> Option<Ipv4TcpPacketMeta> {
         dst_port,
         tcp_flags,
     })
+}
+
+/// Parses an IPv4 + UDP packet buffer and returns its 5-tuple and UDP payload slice bounds.
+pub fn parse_ipv4_udp_meta(packet: &[u8]) -> Option<Ipv4UdpPacketMeta> {
+    if packet.len() < IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    if version != IPV4_VERSION {
+        return None;
+    }
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if ihl < IPV4_MIN_HEADER_LEN || packet.len() < ihl + UDP_HEADER_LEN {
+        return None;
+    }
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if total_len < ihl + UDP_HEADER_LEN || total_len > packet.len() {
+        return None;
+    }
+    if packet[9] != IPPROTO_UDP {
+        return None;
+    }
+
+    let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+    let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+    let udp_len = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]) as usize;
+    if udp_len < UDP_HEADER_LEN || ihl + udp_len > total_len {
+        return None;
+    }
+
+    Some(Ipv4UdpPacketMeta {
+        ip_header_len: ihl,
+        total_len,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        payload_offset: ihl + UDP_HEADER_LEN,
+        payload_len: udp_len - UDP_HEADER_LEN,
+    })
+}
+
+/// Parses an IPv6 packet with a TCP or UDP transport header, skipping standard IPv6 extension headers.
+pub fn parse_ipv6_transport_meta(packet: &[u8]) -> Option<Ipv6TransportPacketMeta> {
+    if packet.len() < IPV6_HEADER_LEN + UDP_HEADER_LEN {
+        return None;
+    }
+    if (packet[0] >> 4) != IPV6_VERSION {
+        return None;
+    }
+
+    let mut src_octets = [0u8; 16];
+    src_octets.copy_from_slice(&packet[8..24]);
+    let mut dst_octets = [0u8; 16];
+    dst_octets.copy_from_slice(&packet[24..40]);
+
+    let mut next_header = packet[6];
+    let mut offset = IPV6_HEADER_LEN;
+
+    // Walk up to 6 standard IPv6 extension headers (Hop-by-Hop=0, Routing=43, Fragment=44, DestOpts=60)
+    for _ in 0..6 {
+        match next_header {
+            IPPROTO_TCP => {
+                if packet.len() < offset + TCP_MIN_HEADER_LEN {
+                    return None;
+                }
+                let src_port = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+                let dst_port = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+                return Some(Ipv6TransportPacketMeta {
+                    next_header,
+                    src_ip: Ipv6Addr::from(src_octets),
+                    dst_ip: Ipv6Addr::from(dst_octets),
+                    src_port,
+                    dst_port,
+                });
+            }
+            IPPROTO_UDP => {
+                if packet.len() < offset + UDP_HEADER_LEN {
+                    return None;
+                }
+                let src_port = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+                let dst_port = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+                return Some(Ipv6TransportPacketMeta {
+                    next_header,
+                    src_ip: Ipv6Addr::from(src_octets),
+                    dst_ip: Ipv6Addr::from(dst_octets),
+                    src_port,
+                    dst_port,
+                });
+            }
+            0 | 43 | 60 => {
+                let hdr = packet.get(offset..offset + 2)?;
+                let ext_len = ((hdr[1] as usize) + 1) * 8;
+                next_header = hdr[0];
+                offset = offset.checked_add(ext_len)?;
+            }
+            44 => {
+                let hdr = packet.get(offset..offset + 8)?;
+                next_header = hdr[0];
+                offset = offset.checked_add(8)?;
+            }
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+/// Builds a complete IPv4 + UDP reply packet (`src_ip:src_port -> dst_ip:dst_port`) with valid
+/// RFC 1071 IPv4 header and UDP checksums for inbound injection via `WinDivertSend`.
+pub fn build_forged_ipv4_udp_reply(
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+    udp_payload: &[u8],
+) -> Option<Vec<u8>> {
+    let udp_len = UDP_HEADER_LEN.checked_add(udp_payload.len())?;
+    let total_len = IPV4_MIN_HEADER_LEN.checked_add(udp_len)?;
+    if total_len > u16::MAX as usize {
+        return None;
+    }
+
+    let mut pkt = vec![0u8; total_len];
+    pkt[0] = 0x45; // IPv4, IHL = 5 (20 bytes)
+    pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    pkt[6..8].copy_from_slice(&[0x40, 0x00]); // Don't Fragment
+    pkt[8] = 64; // TTL
+    pkt[9] = IPPROTO_UDP;
+    pkt[12..16].copy_from_slice(&src_ip.octets());
+    pkt[16..20].copy_from_slice(&dst_ip.octets());
+
+    let ihl = IPV4_MIN_HEADER_LEN;
+    pkt[ihl..ihl + 2].copy_from_slice(&src_port.to_be_bytes());
+    pkt[ihl + 2..ihl + 4].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[ihl + 4..ihl + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt[ihl + UDP_HEADER_LEN..].copy_from_slice(udp_payload);
+
+    recompute_ipv4_and_udp_checksums(&mut pkt, ihl);
+    Some(pkt)
+}
+
+/// Computes and writes RFC 1071 IPv4 header and UDP datagram checksums in place.
+pub fn recompute_ipv4_and_udp_checksums(packet: &mut [u8], ihl: usize) {
+    packet[10] = 0;
+    packet[11] = 0;
+    let ip_csum = ones_complement_checksum(&packet[..ihl], 0);
+    packet[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    let udp_len = packet.len() - ihl;
+    packet[ihl + 6] = 0;
+    packet[ihl + 7] = 0;
+
+    let mut sum: u32 = 0;
+    let mut addr_idx = 12;
+    while addr_idx < 20 {
+        sum += u16::from_be_bytes([packet[addr_idx], packet[addr_idx + 1]]) as u32;
+        addr_idx += 2;
+    }
+    sum += IPPROTO_UDP as u32;
+    sum += udp_len as u32;
+
+    let mut udp_csum = ones_complement_checksum(&packet[ihl..], sum);
+    if udp_csum == 0 {
+        udp_csum = 0xFFFF;
+    }
+    packet[ihl + 6..ihl + 8].copy_from_slice(&udp_csum.to_be_bytes());
 }
 
 /// Rewrites an outbound client TCP packet (`A:C -> B:D`) using the WinDivert `streamdump`
@@ -810,5 +1057,51 @@ mod tests {
         assert_eq!(meta_restored.src_port, orig_dst_port);
         assert_eq!(meta_restored.dst_port, client_port);
         assert_eq!(ones_complement_checksum(&reply_pkt[..20], 0), 0);
+    }
+
+    #[test]
+    fn builds_and_parses_forged_ipv4_udp_dns_reply_and_ipv6_meta() {
+        let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+        let client_ip = Ipv4Addr::new(10, 0, 0, 15);
+        let payload = b"\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00";
+
+        let pkt = build_forged_ipv4_udp_reply(server_ip, 53, client_ip, 53111, payload)
+            .expect("build forged UDP packet");
+        let meta = parse_ipv4_udp_meta(&pkt).expect("parse forged UDP packet");
+        assert_eq!(meta.src_ip, server_ip);
+        assert_eq!(meta.dst_ip, client_ip);
+        assert_eq!(meta.src_port, 53);
+        assert_eq!(meta.dst_port, 53111);
+        assert_eq!(
+            &pkt[meta.payload_offset..meta.payload_offset + meta.payload_len],
+            payload
+        );
+        assert_eq!(ones_complement_checksum(&pkt[..20], 0), 0);
+
+        // SelfPortGuard registration and drop cleanup
+        let nat = TransparentNatTable::new(1234, 10810, 10808, 10809);
+        {
+            let _udp_guard = nat.register_self_udp_port(61234);
+            assert!(nat.is_self_udp_port(61234));
+            let _tcp_guard = nat.register_self_tcp_port(61235);
+            assert!(nat.is_self_tcp_port(61235));
+            assert!(nat.is_loop_or_excluded(None, client_ip, 61235, server_ip, 53));
+        }
+        assert!(!nat.is_self_udp_port(61234));
+        assert!(!nat.is_self_tcp_port(61235));
+
+        // IPv6 UDP 53 packet parsing
+        let mut v6_pkt = vec![0u8; 48];
+        v6_pkt[0] = 0x60;
+        v6_pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        v6_pkt[6] = IPPROTO_UDP;
+        v6_pkt[7] = 64;
+        v6_pkt[40..42].copy_from_slice(&54321u16.to_be_bytes());
+        v6_pkt[42..44].copy_from_slice(&53u16.to_be_bytes());
+        v6_pkt[44..46].copy_from_slice(&8u16.to_be_bytes());
+        let v6_meta = parse_ipv6_transport_meta(&v6_pkt).expect("parse IPv6 UDP meta");
+        assert_eq!(v6_meta.next_header, IPPROTO_UDP);
+        assert_eq!(v6_meta.src_port, 54321);
+        assert_eq!(v6_meta.dst_port, 53);
     }
 }

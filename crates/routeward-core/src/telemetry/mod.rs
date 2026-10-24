@@ -42,6 +42,7 @@ pub enum ConnectionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum LogLevel {
+    Debug,
     Info,
     Warn,
     Error,
@@ -491,6 +492,10 @@ impl TelemetryHub {
 
     pub fn push_log(&self, level: LogLevel, component: &str, message: impl Into<String>) {
         let msg = message.into();
+        if level == LogLevel::Debug {
+            tracing::debug!(component = component, "{}", msg);
+            return;
+        }
         self.file_logger.log(level, component, &msg);
         let entry = LogEntry {
             id: Uuid::new_v4().to_string(),

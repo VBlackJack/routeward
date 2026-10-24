@@ -124,7 +124,16 @@ param(
     [int]$ReportLogTailLines = 30,
 
     [Parameter(Mandatory = $false)]
-    [string]$ReportFilePrefix = "RouteWard_TestReport_"
+    [string]$ReportFilePrefix = "RouteWard_TestReport_",
+
+    [Parameter(Mandatory = $false)]
+    [string]$ExternalDnsServer = "9.9.9.9",
+
+    [Parameter(Mandatory = $false)]
+    [string]$FakeIpCidr = "198.18.0.0/15",
+
+    [Parameter(Mandatory = $false)]
+    [string]$PublicDnsTestDomain = ""
 )
 
 Set-StrictMode -Version Latest
@@ -181,6 +190,26 @@ if (-not [string]::IsNullOrWhiteSpace($SystemConstantsJsonPath) -and (Test-Path 
     }
     if (-not $PSBoundParameters.ContainsKey("LogFilePrefix") -and $sysConsts.telemetry.logAppName) {
         $LogFilePrefix = [string]$sysConsts.telemetry.logAppName
+    }
+    if (-not $PSBoundParameters.ContainsKey("FakeIpCidr") -and $sysConsts.dns.fakeIpCidr) {
+        $FakeIpCidr = [string]$sysConsts.dns.fakeIpCidr
+    }
+    if (-not $PSBoundParameters.ContainsKey("ExternalDnsServer") -and $sysConsts.dns.upstreamDnsServer) {
+        $rawUpstreamDns = [string]$sysConsts.dns.upstreamDnsServer
+        $ExternalDnsServer = ($rawUpstreamDns -replace ':\d+$', '')
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($PublicDnsTestDomain)) {
+    try {
+        $parsedTestUri = [System.Uri]$TestUrl
+        if (-not [string]::IsNullOrWhiteSpace($parsedTestUri.Host)) {
+            $PublicDnsTestDomain = $parsedTestUri.Host
+        } else {
+            $PublicDnsTestDomain = "example.com"
+        }
+    } catch {
+        $PublicDnsTestDomain = "example.com"
     }
 }
 
@@ -513,6 +542,105 @@ function Get-LocalPortListenerProcessInfo {
     return $null
 }
 
+function Test-IpInFakePool {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$IpAddressString,
+
+        [Parameter(Mandatory = $false)]
+        [string]$PoolCidr = "198.18.0.0/15"
+    )
+    if ([string]::IsNullOrWhiteSpace($IpAddressString)) {
+        return $false
+    }
+    $ipObj = $null
+    if (-not [System.Net.IPAddress]::TryParse($IpAddressString.Trim(), [ref]$ipObj)) {
+        return $false
+    }
+    if ($ipObj.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        return $false
+    }
+    $ipBytes = $ipObj.GetAddressBytes()
+    $ipU32 = ([uint32]$ipBytes[0] -shl 24) -bor ([uint32]$ipBytes[1] -shl 16) -bor ([uint32]$ipBytes[2] -shl 8) -bor ([uint32]$ipBytes[3])
+
+    $cidrParts = $PoolCidr -split '/'
+    $netIpObj = $null
+    if ($cidrParts.Count -ne 2 -or (-not [System.Net.IPAddress]::TryParse($cidrParts[0].Trim(), [ref]$netIpObj))) {
+        return (($ipBytes[0] -eq 198) -and (($ipBytes[1] -band 0xFE) -eq 18))
+    }
+    $prefixLen = [int]$cidrParts[1]
+    $netBytes = $netIpObj.GetAddressBytes()
+    $netU32 = ([uint32]$netBytes[0] -shl 24) -bor ([uint32]$netBytes[1] -shl 16) -bor ([uint32]$netBytes[2] -shl 8) -bor ([uint32]$netBytes[3])
+    $maskU32 = if ($prefixLen -le 0) { [uint32]0 } elseif ($prefixLen -ge 32) { [uint32]::MaxValue } else { ([uint32]::MaxValue -shl (32 - $prefixLen)) }
+    return (($ipU32 -band $maskU32) -eq ($netU32 -band $maskU32))
+}
+
+function Get-MachineActiveDirectoryOrPrimaryDnsSuffix {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($env:USERDNSDOMAIN)) {
+        $candidates.Add($env:USERDNSDOMAIN.Trim().Trim('.'))
+    }
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+        if ($null -ne $cs -and $cs.PartOfDomain -and (-not [string]::IsNullOrWhiteSpace($cs.Domain))) {
+            $candidates.Add(([string]$cs.Domain).Trim().Trim('.'))
+        }
+    } catch {
+        # Ignore WMI error
+    }
+    try {
+        $tcpParams = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -ErrorAction SilentlyContinue
+        if ($null -ne $tcpParams) {
+            foreach ($propName in @("Domain", "NV Domain")) {
+                $val = $tcpParams.$propName
+                if (-not [string]::IsNullOrWhiteSpace($val)) {
+                    $candidates.Add(([string]$val).Trim().Trim('.'))
+                }
+            }
+        }
+    } catch {
+        # Ignore registry error
+    }
+    foreach ($c in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($c) -and $c.Contains(".")) {
+            return $c
+        }
+    }
+    return ""
+}
+
+function Clear-AllWindowsDnsCaches {
+    $notes = New-Object System.Collections.Generic.List[string]
+    try {
+        if (Get-Command -Name "Clear-DnsClientCache" -ErrorAction SilentlyContinue) {
+            Clear-DnsClientCache -ErrorAction SilentlyContinue
+            $notes.Add("Cleared Windows DNS Client cache via Clear-DnsClientCache.")
+        } else {
+            $null = & ipconfig.exe /flushdns 2>&1
+            $notes.Add("Cleared Windows DNS Client cache via ipconfig /flushdns.")
+        }
+    } catch {
+        $notes.Add("WARNING: Failed to clear DNS Client cache: $($_.Exception.Message)")
+    }
+
+    try {
+        $dnsSvc = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
+        if ($null -ne $dnsSvc -and $dnsSvc.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) {
+            if (Get-Command -Name "Clear-DnsServerCache" -ErrorAction SilentlyContinue) {
+                Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+                $notes.Add("Cleared Windows DNS Server cache (service 'DNS' running) via Clear-DnsServerCache -Force.")
+            } elseif (Get-Command -Name "dnscmd.exe" -ErrorAction SilentlyContinue) {
+                $null = & dnscmd.exe /clearcache 2>&1
+                $notes.Add("Cleared Windows DNS Server cache (service 'DNS' running) via dnscmd /clearcache.")
+            }
+        }
+    } catch {
+        $notes.Add("WARNING: Failed to clear Windows DNS Server cache: $($_.Exception.Message)")
+    }
+    return ,$notes.ToArray()
+}
+
 # ---------------------------------------------------------------------------
 # DryRun Mode: Validate out-of-repo path resolution, curl command construction,
 #              --json-file UTF-8 no-BOM temp file flow, and IPC response parser
@@ -657,6 +785,30 @@ if ($DryRun.IsPresent) {
         throw "DryRun failed: Split-ProcessCommandLineArgs returned '$parsedSshArgs'."
     }
     Write-Host "[DRYRUN-PASS] Parsed Scenario (j) Kill-Switch connections/logs fixtures and SOCKS5 restart command-line parser." -ForegroundColor Green
+
+    if (-not (Test-IpInFakePool -IpAddressString "198.18.0.10" -PoolCidr $FakeIpCidr) -or (-not (Test-IpInFakePool -IpAddressString "198.19.255.254" -PoolCidr $FakeIpCidr))) {
+        throw "DryRun failed: Test-IpInFakePool returned false for address inside $FakeIpCidr."
+    }
+    if ((Test-IpInFakePool -IpAddressString "93.184.216.34" -PoolCidr $FakeIpCidr) -or (Test-IpInFakePool -IpAddressString "10.0.0.1" -PoolCidr $FakeIpCidr)) {
+        throw "DryRun failed: Test-IpInFakePool returned true for address outside $FakeIpCidr."
+    }
+    $fakeIpsDryRun = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.fakeIpsSample | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-fakeIpsSample" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("fakeIp", "domain", "ttlRemainingSeconds")
+    if ($fakeIpsDryRun.Count -ne 1 -or $fakeIpsDryRun[0].domain -ne "example.com" -or (-not (Test-IpInFakePool -IpAddressString ([string]$fakeIpsDryRun[0].fakeIp) -PoolCidr $FakeIpCidr))) {
+        throw "DryRun failed: unexpected fakeIpsSample payload."
+    }
+    $connsFakeIpProxied = ConvertFrom-CtlResponseJson `
+        -RawJson ($fixtures.connectionsFakeIpProxied | ConvertTo-Json -Depth 6) `
+        -Context "DryRun-connectionsFakeIpProxied" `
+        -ExpectResultArray `
+        -RequiredArrayElementProperties @("processName", "targetHost", "resolvedDomain", "matchedRule", "rxBytes")
+    if ($connsFakeIpProxied.Count -ne 1 -or $connsFakeIpProxied[0].resolvedDomain -ne "example.com") {
+        throw "DryRun failed: unexpected connectionsFakeIpProxied payload."
+    }
+    Write-Host "[DRYRUN-PASS] Verified Fake-IP CIDR pool helper and 'ctl fake-ips' / domain-routed connection fixtures for Scenarios (k)-(m)." -ForegroundColor Green
 
     $upsertAck = ConvertFrom-CtlResponseJson `
         -RawJson ($fixtures.upsertRuleOk | ConvertTo-Json -Depth 6) `
@@ -1399,6 +1551,117 @@ try {
     } catch {
         Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail $_.Exception.Message
     }
+
+    # -----------------------------------------------------------------------
+    # Scenario (k): Resolve-DnsName on a public domain toward an explicit external
+    #               resolver returns a Fake-IP (198.18.0.0/15), and curl.exe to
+    #               that domain is routed via the SOCKS5 proxy with its domain name
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+        $null = Clear-AllWindowsDnsCaches
+
+        $dnsResK = @(Resolve-DnsName -Name $PublicDnsTestDomain -Type A -Server $ExternalDnsServer -DnsOnly -NoHostsFile -ErrorAction Stop | Where-Object { $null -ne $_.IPAddress })
+        $resolvedIpK = if ($dnsResK.Count -gt 0) { [string]$dnsResK[0].IPAddress } else { "" }
+        $isFakeIpK = Test-IpInFakePool -IpAddressString $resolvedIpK -PoolCidr $FakeIpCidr
+
+        $fakeIpsResK = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("fake-ips") -Label "Scenario-k-fake-ips"
+        $fakeIpsListK = ConvertFrom-CtlResponseJson `
+            -RawJson $fakeIpsResK.RawText `
+            -Context "Scenario-k-fake-ips" `
+            -ExpectResultArray `
+            -RequiredArrayElementProperties @("fakeIp", "domain", "ttlRemainingSeconds")
+
+        $sawFakeIpEntryK = $false
+        foreach ($entry in $fakeIpsListK) {
+            if ($entry.domain -ieq $PublicDnsTestDomain -and (Test-IpInFakePool -IpAddressString ([string]$entry.fakeIp) -PoolCidr $FakeIpCidr)) {
+                $sawFakeIpEntryK = $true
+                break
+            }
+        }
+
+        $curlResK = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
+        Start-Sleep -Milliseconds $PollIntervalMs
+
+        $connsResK = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-k-connections"
+        $connsListK = ConvertFrom-CtlResponseJson `
+            -RawJson $connsResK.RawText `
+            -Context "Scenario-k-connections" `
+            -ExpectResultArray `
+            -RequiredArrayElementProperties @("processName", "targetHost", "matchedRule", "rxBytes", "status")
+
+        $matchingDomainConnK = $null
+        foreach ($c in $connsListK) {
+            $domMatch = ($c.targetHost -ieq $PublicDnsTestDomain) -or ($null -ne $c.resolvedDomain -and $c.resolvedDomain -ieq $PublicDnsTestDomain)
+            if ($c.processName -ieq "curl.exe" -and $domMatch -and $c.matchedRule -eq $ExpectedProxyRuleName -and ([int64]$c.rxBytes) -gt 0) {
+                $matchingDomainConnK = $c
+                break
+            }
+        }
+
+        if ($isFakeIpK -and $sawFakeIpEntryK -and $curlResK.ExitCode -eq 0 -and $curlResK.HttpCode -eq $ExpectedHttpStatus -and $null -ne $matchingDomainConnK) {
+            Record-ScenarioResult -Id "k" -Status "PASS" -Title "Fake-IP DNS interception & domain routing via SOCKS5" -Detail "$PublicDnsTestDomain -> $resolvedIpK (in $FakeIpCidr), curl HTTP $($curlResK.HttpCode) routed with domain '$($matchingDomainConnK.targetHost)'"
+        } else {
+            Record-ScenarioResult -Id "k" -Status "FAIL" -Title "Fake-IP DNS interception & domain routing via SOCKS5" -Detail "resolvedIp='$resolvedIpK' (isFakeIp=$isFakeIpK), inCtlTable=$sawFakeIpEntryK, curlHttp=$($curlResK.HttpCode), domainConnFound=$($null -ne $matchingDomainConnK)"
+        }
+    } catch {
+        Record-ScenarioResult -Id "k" -Status "FAIL" -Title "Fake-IP DNS interception & domain routing via SOCKS5" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (l): Resolve-DnsName on the VM's Active Directory / primary DNS
+    #               suffix continues to resolve normally and directly (outside Fake-IP)
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+        $adDomain = Get-MachineActiveDirectoryOrPrimaryDnsSuffix
+        if ([string]::IsNullOrWhiteSpace($adDomain)) {
+            Record-ScenarioResult -Id "l" -Status "SKIP" -Title "Active Directory domain direct DNS bypass" -Detail "No Active Directory domain or primary DNS suffix configured on this machine"
+        } else {
+            $adRecords = @(Resolve-DnsName -Name $adDomain -Type A -DnsOnly -NoHostsFile -ErrorAction Stop | Where-Object { $null -ne $_.IPAddress })
+            $adIps = @($adRecords | ForEach-Object { [string]$_.IPAddress })
+            $anyInFakePool = $false
+            foreach ($ipStr in $adIps) {
+                if (Test-IpInFakePool -IpAddressString $ipStr -PoolCidr $FakeIpCidr) {
+                    $anyInFakePool = $true
+                    break
+                }
+            }
+            if ($adIps.Count -gt 0 -and (-not $anyInFakePool)) {
+                Record-ScenarioResult -Id "l" -Status "PASS" -Title "Active Directory domain direct DNS bypass" -Detail "AD domain '$adDomain' resolved directly to $($adIps -join ', ') (outside $FakeIpCidr)"
+            } else {
+                Record-ScenarioResult -Id "l" -Status "FAIL" -Title "Active Directory domain direct DNS bypass" -Detail "AD domain '$adDomain' returned IPs=[$($adIps -join ', ')], anyInFakePool=$anyInFakePool"
+            }
+        }
+    } catch {
+        Record-ScenarioResult -Id "l" -Status "FAIL" -Title "Active Directory domain direct DNS bypass" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (m): After ctl stop and Clear-DnsClientCache, normal DNS resolution
+    #               returns a real IP outside the Fake-IP pool
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+        $stopResM = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("stop") -Label "Scenario-m-stop"
+        $stopDiagM = ConvertFrom-CtlResponseJson `
+            -RawJson $stopResM.RawText `
+            -Context "Scenario-m-stop" `
+            -RequiredResultProperties @("running")
+        $null = Clear-AllWindowsDnsCaches
+
+        $dnsResM = @(Resolve-DnsName -Name $PublicDnsTestDomain -Type A -Server $ExternalDnsServer -DnsOnly -NoHostsFile -ErrorAction Stop | Where-Object { $null -ne $_.IPAddress })
+        $resolvedIpM = if ($dnsResM.Count -gt 0) { [string]$dnsResM[0].IPAddress } else { "" }
+        $isFakeIpM = Test-IpInFakePool -IpAddressString $resolvedIpM -PoolCidr $FakeIpCidr
+
+        if ($stopResM.ExitCode -eq 0 -and $stopDiagM.running -eq $false -and (-not [string]::IsNullOrWhiteSpace($resolvedIpM)) -and (-not $isFakeIpM)) {
+            Record-ScenarioResult -Id "m" -Status "PASS" -Title "Post-stop direct DNS resolution outside Fake-IP pool" -Detail "After ctl stop + cache flush, $PublicDnsTestDomain resolved to real IP $resolvedIpM (outside $FakeIpCidr)"
+        } else {
+            Record-ScenarioResult -Id "m" -Status "FAIL" -Title "Post-stop direct DNS resolution outside Fake-IP pool" -Detail "running=$($stopDiagM.running), resolvedIp='$resolvedIpM', isFakeIp=$isFakeIpM"
+        }
+    } catch {
+        Record-ScenarioResult -Id "m" -Status "FAIL" -Title "Post-stop direct DNS resolution outside Fake-IP pool" -Detail $_.Exception.Message
+    }
 } finally {
     # -----------------------------------------------------------------------
     # Guardrail 4 (Bug 4 fix):
@@ -1448,6 +1711,11 @@ try {
         } catch {
             $auditNotes.Add("WARNING: Failed to restore original profile at '$activeProfilePath': $($_.Exception.Message)")
         }
+    }
+
+    $dnsFlushNotes = Clear-AllWindowsDnsCaches
+    foreach ($fn in $dnsFlushNotes) {
+        $auditNotes.Add($fn)
     }
 
     try {

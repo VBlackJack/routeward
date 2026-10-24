@@ -63,7 +63,7 @@ impl NftablesInterceptor {
         }
     }
 
-    /// Generates the dedicated `nftables` ruleset for `nft -f -`.
+    /// Generates the dedicated IPv4 `nftables` ruleset for `nft -f -`.
     pub fn build_nft_table_ruleset(
         table_name: &str,
         chain_name: &str,
@@ -71,12 +71,45 @@ impl NftablesInterceptor {
         relay_port: u16,
         upstream_endpoints: &[(Ipv4Addr, u16)],
     ) -> String {
-        let mut script = String::with_capacity(512);
+        Self::build_nft_table_ruleset_with_dns(
+            table_name,
+            chain_name,
+            fwmark,
+            relay_port,
+            10853,
+            53,
+            853,
+            true,
+            upstream_endpoints,
+        )
+    }
+
+    /// Generates the dedicated IPv4 `nftables` ruleset including DNS port 53 redirection
+    /// to `dns_listen_port` and optional encrypted DNS bypass (port 853) blocking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_nft_table_ruleset_with_dns(
+        table_name: &str,
+        chain_name: &str,
+        fwmark: u32,
+        relay_port: u16,
+        dns_listen_port: u16,
+        dns_standard_port: u16,
+        dot_port: u16,
+        block_encrypted_dns: bool,
+        upstream_endpoints: &[(Ipv4Addr, u16)],
+    ) -> String {
+        let mut script = String::with_capacity(768);
         script.push_str(&format!("table ip {table_name} {{\n"));
         script.push_str(&format!("    chain {chain_name} {{\n"));
         script.push_str("        type nat hook output priority -100; policy accept;\n");
         script.push_str(&format!("        meta mark {fwmark} return\n"));
         script.push_str("        ip daddr 127.0.0.0/8 return\n");
+        script.push_str(&format!(
+            "        udp dport {dns_standard_port} redirect to :{dns_listen_port}\n"
+        ));
+        script.push_str(&format!(
+            "        tcp dport {dns_standard_port} redirect to :{dns_listen_port}\n"
+        ));
         for (ip, port) in upstream_endpoints {
             if !ip.is_loopback() {
                 script.push_str(&format!("        ip daddr {ip} tcp dport {port} return\n"));
@@ -86,68 +119,112 @@ impl NftablesInterceptor {
             "        tcp dport 1-65535 redirect to :{relay_port}\n"
         ));
         script.push_str("    }\n");
+        if block_encrypted_dns {
+            script.push_str("    chain filter_output {\n");
+            script.push_str("        type filter hook output priority 0; policy accept;\n");
+            script.push_str(&format!("        meta mark {fwmark} return\n"));
+            script.push_str("        ip daddr 127.0.0.0/8 return\n");
+            script.push_str(&format!("        udp dport {dot_port} reject\n"));
+            script.push_str("    }\n");
+        }
         script.push_str("}\n");
         script
     }
 
-    /// Deletes the dedicated `nftables` table if it exists.
+    /// Generates the dedicated IPv6 `nftables` ruleset (`table ip6 <table_name>`) to block
+    /// outbound IPv6 DNS (port 53) and DoT (port 853) when the kill switch or encrypted DNS guard is active,
+    /// forcing the OS to fall back to IPv4 DNS resolvers until full IPv6 interception in Batch 4.3.
+    pub fn build_nft_ip6_table_ruleset(
+        table_name: &str,
+        chain_name: &str,
+        fwmark: u32,
+        dns_standard_port: u16,
+        dot_port: u16,
+        kill_switch_enabled: bool,
+        block_encrypted_dns: bool,
+    ) -> Option<String> {
+        if !kill_switch_enabled && !block_encrypted_dns {
+            return None;
+        }
+        let mut script = String::with_capacity(512);
+        script.push_str(&format!("table ip6 {table_name} {{\n"));
+        script.push_str(&format!("    chain {chain_name} {{\n"));
+        script.push_str("        type filter hook output priority 0; policy accept;\n");
+        script.push_str(&format!("        meta mark {fwmark} return\n"));
+        script.push_str("        ip6 daddr ::1 return\n");
+        if kill_switch_enabled {
+            script.push_str(&format!("        udp dport {dns_standard_port} reject\n"));
+            script.push_str(&format!(
+                "        tcp dport {dns_standard_port} reject with tcp reset\n"
+            ));
+        }
+        if block_encrypted_dns || kill_switch_enabled {
+            script.push_str(&format!("        udp dport {dot_port} reject\n"));
+            script.push_str(&format!(
+                "        tcp dport {dot_port} reject with tcp reset\n"
+            ));
+        }
+        script.push_str("    }\n");
+        script.push_str("}\n");
+        Some(script)
+    }
+
+    /// Deletes the dedicated `nftables` tables (`ip` and `ip6`) if they exist.
     pub fn delete_nft_table(
         nft_binary: &str,
         table_name: &str,
         telemetry: &TelemetryHub,
     ) -> RouteWardResult<()> {
-        match Command::new(nft_binary)
-            .args(["delete", "table", "ip", table_name])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-        {
-            Ok(out) if out.status.success() => {
-                telemetry.push_log(
-                    LogLevel::Info,
-                    COMPONENT_NFTABLES,
-                    format!("Removed nftables table \"ip {table_name}\""),
-                );
-                Ok(())
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let trimmed = stderr.trim();
-                // If table does not exist ("No such file or directory"), treat cleanup as idempotent success.
-                if trimmed.contains("No such file or directory")
-                    || trimmed.contains("does not exist")
-                {
+        for family in ["ip", "ip6"] {
+            match Command::new(nft_binary)
+                .args(["delete", "table", family, table_name])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+            {
+                Ok(out) if out.status.success() => {
                     telemetry.push_log(
                         LogLevel::Info,
                         COMPONENT_NFTABLES,
-                        format!(
-                            "nftables table \"ip {table_name}\" was already absent during cleanup"
-                        ),
+                        format!("Removed nftables table \"{family} {table_name}\""),
                     );
-                    Ok(())
-                } else {
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let trimmed = stderr.trim();
+                    if trimmed.contains("No such file or directory")
+                        || trimmed.contains("does not exist")
+                    {
+                        telemetry.push_log(
+                            LogLevel::Info,
+                            COMPONENT_NFTABLES,
+                            format!(
+                                "nftables table \"{family} {table_name}\" was already absent during cleanup"
+                            ),
+                        );
+                    } else {
+                        telemetry.push_log(
+                            LogLevel::Warn,
+                            COMPONENT_NFTABLES,
+                            format!(
+                                "Could not delete nftables table \"{family} {table_name}\" (exit={:?}): {trimmed}",
+                                out.status.code()
+                            ),
+                        );
+                    }
+                }
+                Err(err) => {
                     telemetry.push_log(
                         LogLevel::Warn,
                         COMPONENT_NFTABLES,
                         format!(
-                            "Could not delete nftables table \"ip {table_name}\" (exit={:?}): {trimmed}",
-                            out.status.code()
+                            "Failed invoking {nft_binary} to delete table \"{family} {table_name}\": {err}"
                         ),
                     );
-                    Ok(())
                 }
             }
-            Err(err) => {
-                telemetry.push_log(
-                    LogLevel::Warn,
-                    COMPONENT_NFTABLES,
-                    format!(
-                        "Failed invoking {nft_binary} to delete table \"ip {table_name}\": {err}"
-                    ),
-                );
-                Ok(())
-            }
         }
+        Ok(())
     }
 
     /// Pure parser converting raw `sockaddr_in` fields (network byte order) into `SocketAddrV4`.
@@ -240,6 +317,166 @@ impl NftablesInterceptor {
     pub fn reset_and_close_tcp_stream(stream: tokio::net::TcpStream) {
         drop(stream);
     }
+
+    #[cfg(target_os = "linux")]
+    pub fn enable_udp_pktinfo(sock: &tokio::net::UdpSocket) {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let on: libc::c_int = 1;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_PKTINFO,
+                &on as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn enable_udp_pktinfo(_sock: &tokio::net::UdpSocket) {}
+
+    #[cfg(target_os = "linux")]
+    pub async fn recv_udp_with_local_ip(
+        sock: &tokio::net::UdpSocket,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, std::net::SocketAddr, Option<Ipv4Addr>)> {
+        use std::os::fd::AsRawFd;
+        sock.async_io(tokio::io::Interest::READABLE, || {
+            let fd = sock.as_raw_fd();
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let mut src_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut cmsg_space = [0u8; 64];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = &mut src_addr as *mut libc::sockaddr_in as *mut libc::c_void;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_space.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = cmsg_space.len();
+
+            let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let peer_ip = Ipv4Addr::from(u32::from_be(src_addr.sin_addr.s_addr));
+            let peer_port = u16::from_be(src_addr.sin_port);
+            let peer = std::net::SocketAddr::V4(SocketAddrV4::new(peer_ip, peer_port));
+
+            let mut local_dst_ip: Option<Ipv4Addr> = None;
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                while !cmsg.is_null() {
+                    if (*cmsg).cmsg_level == libc::IPPROTO_IP
+                        && (*cmsg).cmsg_type == libc::IP_PKTINFO
+                    {
+                        let pktinfo_ptr = libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo;
+                        let pktinfo = std::ptr::read_unaligned(pktinfo_ptr);
+                        local_dst_ip = Some(Ipv4Addr::from(u32::from_be(pktinfo.ipi_addr.s_addr)));
+                        break;
+                    }
+                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                }
+            }
+
+            Ok((n as usize, peer, local_dst_ip))
+        })
+        .await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn recv_udp_with_local_ip(
+        sock: &tokio::net::UdpSocket,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, std::net::SocketAddr, Option<Ipv4Addr>)> {
+        let (len, peer) = sock.recv_from(buf).await?;
+        Ok((len, peer, None))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn send_udp_from_local_ip(
+        sock: &tokio::net::UdpSocket,
+        payload: &[u8],
+        peer: std::net::SocketAddr,
+        local_src_ip: Option<Ipv4Addr>,
+    ) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let std::net::SocketAddr::V4(peer_v4) = peer else {
+            return sock.send_to(payload, peer).await;
+        };
+        let Some(src_ip) = local_src_ip else {
+            return sock.send_to(payload, peer).await;
+        };
+
+        sock.async_io(tokio::io::Interest::WRITABLE, || {
+            let fd = sock.as_raw_fd();
+            let mut iov = libc::iovec {
+                iov_base: payload.as_ptr() as *mut libc::c_void,
+                iov_len: payload.len(),
+            };
+            let mut dst_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            dst_addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            dst_addr.sin_port = peer_v4.port().to_be();
+            dst_addr.sin_addr = libc::in_addr {
+                s_addr: u32::from(*peer_v4.ip()).to_be(),
+            };
+
+            let cmsg_len =
+                unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) }
+                    as usize;
+            let mut cmsg_space = vec![0u8; cmsg_len];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = &mut dst_addr as *mut libc::sockaddr_in as *mut libc::c_void;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_space.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = cmsg_len;
+
+            unsafe {
+                let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                if !cmsg.is_null() {
+                    (*cmsg).cmsg_level = libc::IPPROTO_IP;
+                    (*cmsg).cmsg_type = libc::IP_PKTINFO;
+                    (*cmsg).cmsg_len =
+                        libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+                    let pktinfo = libc::in_pktinfo {
+                        ipi_ifindex: 0,
+                        ipi_spec_dst: libc::in_addr {
+                            s_addr: u32::from(src_ip).to_be(),
+                        },
+                        ipi_addr: libc::in_addr { s_addr: 0 },
+                    };
+                    std::ptr::write_unaligned(
+                        libc::CMSG_DATA(cmsg) as *mut libc::in_pktinfo,
+                        pktinfo,
+                    );
+                }
+            }
+
+            let n = unsafe { libc::sendmsg(fd, &msg, 0) };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(n as usize)
+        })
+        .await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn send_udp_from_local_ip(
+        sock: &tokio::net::UdpSocket,
+        payload: &[u8],
+        peer: std::net::SocketAddr,
+        _local_src_ip: Option<Ipv4Addr>,
+    ) -> std::io::Result<usize> {
+        sock.send_to(payload, peer).await
+    }
 }
 
 impl Interceptor for NftablesInterceptor {
@@ -313,80 +550,76 @@ impl Interceptor for NftablesInterceptor {
             }
         }
 
-        // 3. Remove any stale table with the same name before installing fresh rules
-        let _ = Command::new(&nft_bin)
-            .args(["delete", "table", "ip", &table_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
+        // 3. Remove any stale tables (`ip` and `ip6`) with the same name before installing fresh rules
+        for family in ["ip", "ip6"] {
+            let _ = Command::new(&nft_bin)
+                .args(["delete", "table", family, &table_name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+        }
 
-        // 4. Build and load the dedicated nftables table via `nft -f -`
-        let upstream_endpoints: Vec<(Ipv4Addr, u16)> = {
+        // 4. Build and load the dedicated nftables tables via `nft -f -`
+        let upstream_endpoints = controller.nat_table.upstream_endpoints();
+        let dns_listen_port = net.default_dns_listen_port;
+        let dns_standard_port = controller.constants.dns.dns_standard_port;
+        let dot_port = controller.constants.dns.dns_over_tls_port;
+        let (kill_switch_enabled, block_encrypted_dns) = {
             let prof = controller.profile.read();
-            prof.proxies
-                .iter()
-                .filter_map(|p| p.host.parse::<Ipv4Addr>().ok().map(|ip| (ip, p.port)))
-                .collect()
+            (
+                prof.security_policy.kill_switch_enabled,
+                prof.security_policy.block_encrypted_dns_bypass,
+            )
         };
 
-        let ruleset = Self::build_nft_table_ruleset(
+        if let Some(ip6_ruleset) = Self::build_nft_ip6_table_ruleset(
             &table_name,
             &chain_name,
             fwmark,
-            relay_port,
-            &upstream_endpoints,
-        );
-
-        let mut apply_child = Command::new(&nft_bin)
-            .args(["-f", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                self.active.store(false, Ordering::SeqCst);
-                RouteWardError::InterceptorError {
-                    key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
-                    detail: format!("Could not spawn {nft_bin} -f -: {err}"),
+            dns_standard_port,
+            dot_port,
+            kill_switch_enabled,
+            block_encrypted_dns,
+        ) {
+            if let Ok(mut ip6_child) = Command::new(&nft_bin)
+                .args(["-f", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                if let Some(mut stdin) = ip6_child.stdin.take() {
+                    let _ = stdin.write_all(ip6_ruleset.as_bytes());
                 }
-            })?;
-
-        if let Some(mut stdin) = apply_child.stdin.take() {
-            let _ = stdin.write_all(ruleset.as_bytes());
-        }
-
-        let apply_out = apply_child.wait_with_output().map_err(|err| {
-            self.active.store(false, Ordering::SeqCst);
-            RouteWardError::InterceptorError {
-                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
-                detail: format!("Failed waiting for {nft_bin} -f -: {err}"),
+                if let Ok(out) = ip6_child.wait_with_output() {
+                    if out.status.success() {
+                        controller.telemetry.push_log(
+                            LogLevel::Info,
+                            COMPONENT_NFTABLES,
+                            format!(
+                                "Installed nftables IPv6 DNS/DoT guard table \"ip6 {table_name}\""
+                            ),
+                        );
+                    } else {
+                        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                        controller.telemetry.push_log(
+                            LogLevel::Warn,
+                            COMPONENT_NFTABLES,
+                            format!(
+                                "Could not install nftables table \"ip6 {table_name}\": {stderr}"
+                            ),
+                        );
+                    }
+                }
             }
-        })?;
-
-        if !apply_out.status.success() {
-            self.active.store(false, Ordering::SeqCst);
-            let stderr = String::from_utf8_lossy(&apply_out.stderr)
-                .trim()
-                .to_string();
-            return Err(RouteWardError::InterceptorError {
-                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
-                detail: format!("nft -f - rejected table \"ip {table_name}\": {stderr}"),
-            });
         }
 
-        controller.telemetry.push_log(
-            LogLevel::Info,
-            COMPONENT_NFTABLES,
-            format!(
-                "Installed nftables table \"ip {table_name}\" (chain=\"{chain_name}\", fwmark={fwmark:#x}, redirect_port={relay_port})"
-            ),
-        );
-
-        // 5. Spawn pipe-linked fail-open watchdog in its own process group.
+        // 5. Spawn pipe-linked fail-open watchdog in its own process group before installing `ip routeward`.
         // If RouteWard dies with SIGKILL (kill -9), the kernel closes watchdog_stdin immediately,
-        // `cat` exits on EOF, and `nft delete table ip <table_name>` cleans up automatically.
-        let watchdog_script =
-            format!("cat >/dev/null; {nft_bin} delete table ip {table_name} >/dev/null 2>&1");
+        // `cat` exits on EOF, and `nft delete table ip/ip6 <table_name>` cleans up automatically.
+        let watchdog_script = format!(
+            "cat >/dev/null; {nft_bin} delete table ip {table_name} >/dev/null 2>&1; {nft_bin} delete table ip6 {table_name} >/dev/null 2>&1"
+        );
         let mut watchdog_stdin = None;
         let mut watchdog_child = None;
 
@@ -420,12 +653,75 @@ impl Interceptor for NftablesInterceptor {
         }
 
         *self.state.lock() = Some(NftActiveState {
-            nft_binary: nft_bin,
-            table_name,
+            nft_binary: nft_bin.clone(),
+            table_name: table_name.clone(),
             watchdog_stdin,
             watchdog_child,
             telemetry: controller.telemetry.clone(),
         });
+
+        let ruleset = Self::build_nft_table_ruleset_with_dns(
+            &table_name,
+            &chain_name,
+            fwmark,
+            relay_port,
+            dns_listen_port,
+            dns_standard_port,
+            dot_port,
+            block_encrypted_dns,
+            &upstream_endpoints,
+        );
+
+        let mut apply_child = match Command::new(&nft_bin)
+            .args(["-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                self.stop();
+                return Err(RouteWardError::InterceptorError {
+                    key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                    detail: format!("Could not spawn {nft_bin} -f -: {err}"),
+                });
+            }
+        };
+
+        if let Some(mut stdin) = apply_child.stdin.take() {
+            let _ = stdin.write_all(ruleset.as_bytes());
+        }
+
+        let apply_out = match apply_child.wait_with_output() {
+            Ok(out) => out,
+            Err(err) => {
+                self.stop();
+                return Err(RouteWardError::InterceptorError {
+                    key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                    detail: format!("Failed waiting for {nft_bin} -f -: {err}"),
+                });
+            }
+        };
+
+        if !apply_out.status.success() {
+            self.stop();
+            let stderr = String::from_utf8_lossy(&apply_out.stderr)
+                .trim()
+                .to_string();
+            return Err(RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                detail: format!("nft -f - rejected table \"ip {table_name}\": {stderr}"),
+            });
+        }
+
+        controller.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_NFTABLES,
+            format!(
+                "Installed nftables table \"ip {table_name}\" (chain=\"{chain_name}\", fwmark={fwmark:#x}, redirect_port={relay_port}, dns_port={dns_listen_port})"
+            ),
+        );
 
         Ok(())
     }
@@ -484,8 +780,27 @@ mod tests {
         assert!(ruleset.contains("type nat hook output priority -100; policy accept;"));
         assert!(ruleset.contains("meta mark 21079 return"));
         assert!(ruleset.contains("ip daddr 127.0.0.0/8 return"));
+        assert!(ruleset.contains("udp dport 53 redirect to :10853"));
+        assert!(ruleset.contains("tcp dport 53 redirect to :10853"));
         assert!(ruleset.contains("ip daddr 192.168.31.10 tcp dport 1080 return"));
         assert!(ruleset.contains("tcp dport 1-65535 redirect to :10810"));
+        assert!(ruleset.contains("udp dport 853 reject"));
+
+        let ip6_ruleset = NftablesInterceptor::build_nft_ip6_table_ruleset(
+            "routeward",
+            "output",
+            21079,
+            53,
+            853,
+            true,
+            true,
+        )
+        .expect("ip6 ruleset generated");
+        assert!(ip6_ruleset.contains("table ip6 routeward {"));
+        assert!(ip6_ruleset.contains("udp dport 53 reject"));
+        assert!(ip6_ruleset.contains("tcp dport 53 reject with tcp reset"));
+        assert!(ip6_ruleset.contains("udp dport 853 reject"));
+        assert!(ip6_ruleset.contains("tcp dport 853 reject with tcp reset"));
     }
 
     #[test]

@@ -75,6 +75,34 @@ RouteWard est organise en workspace Rust comprenant trois crates (`routeward-cor
 - **Garde Fake-IP non allouee ou expiree (`routeward-core::dns` & `interceptor`)** : Toute connexion ciblant une IPv4 de la plage `fakeIpCidr` (`198.18.0.0/15`) sans correspondance active non expiree est bloquee (`FakeIP:UnmappedOrExpired`) et journalisee en `WARN` au lieu de sortir en `Direct`.
 - **Garde des paquets de fin de session du relais sous Windows (`windivert.rs`)** : Tout paquet de reponse provenant du port du relais transparent local (`10810`) apres la suppression de l'entree `NatSessionEntry` correspondante est jete au lieu d'etre reinjecte sur le reseau.
 
+### Etat du Milestone 4 - Lot 4.1 (Interception DNS Transparente, Fake-IP, DNS-over-TCP Reel et Contournements Entreprise)
+- **Interception du port 53 sortant (UDP et TCP)** :
+  - **Linux (`nftables.rs`)** : `table ip routeward` redirige le port `53` UDP (`udp dport 53 redirect to :10853`) et TCP (`tcp dport 53 redirect to :10853`) vers le resolveur DNS local de RouteWard (`0.0.0.0:10853`). Le service DNS systeme (`systemd-resolved`) n'est jamais exclu de la redirection DNS ; le filtrage par processus s'effectue au moment de la connexion via Fake-IP.
+  - **Windows (`windivert.rs`)** : Intercepte les paquets UDP `53` IPv4 sortants (resolution memoire rapide via `resolve_dns_query_fast` ou asynchrone via `resolve_dns_query_async`, forgeage du paquet UDP de reponse via `build_forged_ipv4_udp_reply` et reinjection entrante via `WinDivertSend`) et reflechit les flux TCP `53` IPv4 sortants vers le relais TCP transparent (`:10810`), qui delegue le port `53` a `handle_dns_tcp_stream`. Les services DNS systeme (`svchost.exe`/`Dnscache` et `dns.exe` sur un serveur DNS Windows) ne sont jamais exclus.
+- **Codec DNS RFC 1035 100 % Safe Rust (`routeward-core::dns::codec`)** : Decodeur et constructeur `#![forbid(unsafe_code)]` gerant `A`, `AAAA`, `CNAME`, `PTR`, `TXT` et `OPT` (EDNS0), la compression de labels (`0xC0`) avec verification stricte des bornes et protection anti-boucle (16 sauts maximum), la troncature UDP (`TC = 1` au-dela de 512 octets ou de la taille EDNS0 annoncee), et le cadrage DNS-over-TCP sur 2 octets big-endian.
+- **Mode Fake-IP (`dnsConfig.enableFakeIp = true`, par defaut)** :
+  - Requete `A` : renvoie une IPv4 de la plage `fakeIpCidr` (`198.18.0.0/15`) avec un **TTL de 5 secondes renvoye a l'OS** (`dns.osResponseTtlSeconds = 5`) afin que le cache DNS du systeme expire rapidement apres l'arret du daemon, tandis que la table interne `FakeIpEngine` conserve l'association pendant `300` secondes (`dns.defaultTtlSeconds = 300`).
+  - Requete `AAAA` : renvoie **`NODATA`** (`RCODE = 0 NOERROR`, `ANCOUNT = 0`) pour que les applications dual-stack se connectent immediatement en IPv4 sur la Fake-IP allouee.
+  - Requete `PTR` sur une IP du pool `198.18.0.0/15` : renvoie le nom de domaine associe.
+  - Lors de la connexion ulterieure vers une Fake-IP, RouteWard retrouve le nom de domaine, evalue les regles sur le processus et le domaine, et transmet le nom de domaine au proxy amont (`ATYP = 0x03` en SOCKS5, nom d'hote dans `CONNECT` HTTP). Si la regle est `Direct`, RouteWard resout lui-meme la vraie IPv4 en direct (`resolve_host_direct_ipv4`, protege contre les boucles) avant d'etablir la connexion.
+- **Resolution DNS reelle via le proxy (`dnsConfig.enableFakeIp = false` ou types hors A/AAAA)** :
+  - Execute une requete **DNS-over-TCP** a travers le proxy ou la chaine determinee par les regles.
+  - Lorsque `securityPolicy.strictDnsNoLocalFallback = true` (defaut) ou `killSwitchEnabled = true` et que le proxy echoue, RouteWard renvoie **`SERVFAIL` (`RCODE = 2`)**, journalise un `WARN` et ne effectue **jamais** de repli DNS en clair.
+- **Contournements DNS directs en entreprise / Active Directory** :
+  - En environnement d'entreprise Active Directory, les controleurs de domaine internes (`_ldap._tcp.dc._msdcs.<domaine>`), royaumes Kerberos et zones split-horizon doivent impérativement etre resolus en direct aupres du resolveur DNS interne vise par le systeme, sans Fake-IP ni passage par un proxy externe.
+  - RouteWard resout directement vers le resolveur vise par l'OS (avec `SO_MARK` sous Linux et `SelfPortGuard` sous Windows contre toute boucle) :
+    1. La liste configurable `dnsConfig.bypassDomains`
+    2. Le suffixe DNS principal et la liste de recherche de la machine detectes automatiquement (domaine Active Directory via `USERDNSDOMAIN` et `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters` `Domain` / `NV Domain` / `SearchList` sous Windows ; directives `domain` et `search` de `/etc/resolv.conf` sous Linux)
+    3. Les noms courts sans point (single-label)
+    4. `.local` et `.localhost`
+    5. Les zones inverses privees (`10.in-addr.arpa`, `168.192.in-addr.arpa`, `16.172.in-addr.arpa`..`31.172.in-addr.arpa`, `127.in-addr.arpa`, `254.169.in-addr.arpa`, IPv6 ULA `c.f.ip6.arpa`/`d.f.ip6.arpa` et link-local `8..b.e.f.ip6.arpa`).
+- **Resolution d'amorçage des proxys amont configures par nom** : Lorsqu'un proxy amont est configure par nom de domaine, RouteWard le resout en direct (`bootstrap_resolve_proxy_hosts` / `prepare_proxy_node_with_bootstrap`) sans Fake-IP ni boucle et injecte les couples `(ip, port)` obtenus dans `nat_table.upstream_endpoints()` pour l'exclusion anti-boucle.
+- **Protection contre le contournement DNS chiffre (`securityPolicy.blockEncryptedDnsBypass = true`, defaut) et blocage DNS IPv6** :
+  - Renvoie **`NXDOMAIN` (`RCODE = 3`)** (journalise en `WARN`) pour le domaine canari DoH `use-application-dns.net` afin de desactiver le DoH opportuniste des navigateurs.
+  - Bloque le port **853 sortant (DoT / DoQ)** en TCP et en UDP et journalise un `WARN`.
+  - En attendant l'interception IPv6 complete au lot 4.3, avec le kill switch actif (`killSwitchEnabled = true`), bloque les ports **53 et 853 sortants en IPv6** (UDP et TCP) sous Windows (`WinDivert`) et sous Linux (`table ip6 routeward` `reject` / `reject with tcp reset`, couverte par le meme watchdog fail-open et par `routeward cleanup`), forçant le systeme a utiliser ses resolveurs IPv4.
+- **Journalisation DNS respectueuse de la vie privee** : Les requetes DNS ordinaires et allocations Fake-IP ne sont jamais journalisees en `INFO` (uniquement en `DEBUG`), tandis que les entrees Fake-IP actives restent consultables via `routeward ctl fake-ips` (`ctl flush-fake-ips`) et dans l'onglet DNS de l'interface. Les erreurs (`SERVFAIL`, proxy injoignable, blocage 853 / canari) sont journalisees en `WARN`.
+
 ## Diagramme des Composants
 
 ```mermaid

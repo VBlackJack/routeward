@@ -66,6 +66,7 @@ impl FileLogger {
         }
         let now = Local::now().format("%Y-%m-%d %H:%M:%S %:z");
         let level_str = match level {
+            LogLevel::Debug => "DEBUG",
             LogLevel::Info => "INFO",
             LogLevel::Warn => "WARN",
             LogLevel::Error => "ERROR",

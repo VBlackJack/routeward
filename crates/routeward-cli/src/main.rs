@@ -108,6 +108,10 @@ enum CtlCommands {
     Connections,
     /// List recent log entries from the daemon
     Logs,
+    /// List active Fake-IP allocations from the daemon
+    FakeIps,
+    /// Flush all Fake-IP allocations on the daemon
+    FlushFakeIps,
     /// Insert or update a routing rule (via inline JSON string or UTF-8 JSON file) on the daemon
     UpsertRule {
         /// Inline JSON string describing the routing rule
@@ -179,6 +183,8 @@ fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, Ip
         CtlCommands::Stop => Ok(("stop", IpcCommand::ToggleEngine { start: false })),
         CtlCommands::Connections => Ok(("connections", IpcCommand::ListConnections)),
         CtlCommands::Logs => Ok(("logs", IpcCommand::ListLogs)),
+        CtlCommands::FakeIps => Ok(("fake-ips", IpcCommand::ListFakeIps)),
+        CtlCommands::FlushFakeIps => Ok(("flush-fake-ips", IpcCommand::FlushFakeIps)),
         CtlCommands::UpsertRule { json, json_file } => {
             let rule = parse_routing_rule_payload(json, json_file)?;
             Ok(("upsert-rule", IpcCommand::UpsertRule { rule }))
@@ -243,19 +249,49 @@ async fn execute_ctl_action(
     Ok(response)
 }
 
-async fn wait_for_shutdown_signal() {
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = sigterm.recv() => {},
+    sigterm: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    sigint: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    fn register() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Self {
+                sigterm: signal(SignalKind::terminate()).ok(),
+                sigint: signal(SignalKind::interrupt()).ok(),
             }
-            return;
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
         }
     }
-    let _ = tokio::signal::ctrl_c().await;
+
+    async fn wait(#[cfg_attr(not(unix), allow(unused_mut))] mut self) {
+        #[cfg(unix)]
+        {
+            match (&mut self.sigterm, &mut self.sigint) {
+                (Some(term), Some(intr)) => {
+                    tokio::select! {
+                        _ = term.recv() => {},
+                        _ = intr.recv() => {},
+                    }
+                    return;
+                }
+                (Some(term), None) => {
+                    let _ = term.recv().await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[tokio::main]
@@ -305,6 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        let shutdown_signals = ShutdownSignals::register();
         let controller = RouteWardController::new(constants, profile, &args.locale);
 
         let service = match DaemonIpcService::bind(controller.clone()) {
@@ -334,11 +371,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(secs) = duration_secs {
             tokio::select! {
-                _ = wait_for_shutdown_signal() => {},
+                _ = shutdown_signals.wait() => {},
                 _ = tokio::time::sleep(Duration::from_secs(secs)) => {},
             }
         } else {
-            wait_for_shutdown_signal().await;
+            shutdown_signals.wait().await;
         }
 
         accept_handle.abort();
@@ -362,6 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match args.command {
         Commands::Run { duration_secs } => {
+            let shutdown_signals = ShutdownSignals::register();
             println!("=== {} ===", controller.i18n.t("cli.engine.startup.banner"));
             controller.start_engine();
             let diag = controller.diagnostics();
@@ -402,11 +440,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Some(secs) = duration_secs {
                 tokio::select! {
-                    _ = wait_for_shutdown_signal() => {},
+                    _ = shutdown_signals.wait() => {},
                     _ = tokio::time::sleep(Duration::from_secs(secs)) => {},
                 }
             } else {
-                wait_for_shutdown_signal().await;
+                shutdown_signals.wait().await;
             }
 
             controller.stop_engine();

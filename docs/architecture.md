@@ -75,6 +75,34 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
 - **Unmapped / Expired Fake-IP Guard (`routeward-core::dns` & `interceptor`)**: Any connection targeting an IPv4 address inside the configured `fakeIpCidr` (`198.18.0.0/15`) that has no live non-expired domain mapping is blocked (`FakeIP:UnmappedOrExpired`) and logged at `WARN` level instead of falling through to `Direct`.
 - **Windows Trailing Relay Packet Guard (`windivert.rs`)**: Outbound reply packets originating from the local transparent relay port (`10810`) after the corresponding `NatSessionEntry` has been removed are dropped instead of falling through to `WinDivertSend`.
 
+### Milestone 4 - Batch 4.1 Status (Transparent DNS Interception, Fake-IP, Real DNS-over-TCP, and Enterprise Bypass)
+- **Outbound Port 53 Interception (UDP & TCP)**:
+  - **Linux (`nftables.rs`)**: `table ip routeward` redirects outbound UDP port `53` (`udp dport 53 redirect to :10853`) and TCP port `53` (`tcp dport 53 redirect to :10853`) to RouteWard's local UDP and TCP DNS listeners (`0.0.0.0:10853`). OS DNS services (`systemd-resolved`) are never excluded from DNS redirection; process-level rule matching happens at connection time via Fake-IP domain recovery.
+  - **Windows (`windivert.rs`)**: Intercepts outbound IPv4 UDP port `53` packets (resolving in-memory via `resolve_dns_query_fast` or asynchronously via `resolve_dns_query_async`, forging the IPv4+UDP reply with `build_forged_ipv4_udp_reply`, and reinjecting it inbound via `WinDivertSend`) and reflects outbound IPv4 TCP port `53` flows to the transparent TCP relay (`:10810`), which delegates destination port `53` connections to `handle_dns_tcp_stream`. System DNS services (`svchost.exe`/`Dnscache` and `dns.exe` on Windows DNS Servers) are never excluded.
+- **Custom Safe Rust RFC 1035 Wire Codec (`routeward-core::dns::codec`)**: `#![forbid(unsafe_code)]` parser and builder supporting `A`, `AAAA`, `CNAME`, `PTR`, `TXT`, and EDNS0 `OPT` payload sizes, pointer compression (`0xC0`) with strict bounds and loop protection (maximum 16 jumps), UDP truncation (`TC = 1` when exceeding 512 bytes or the client's EDNS0 payload limit), and 2-byte big-endian DNS-over-TCP framing.
+- **Fake-IP Mode (`dnsConfig.enableFakeIp = true`, default)**:
+  - `A` queries return a synthetic IPv4 from `fakeIpCidr` (`198.18.0.0/15`) with a short **5-second OS wire TTL** (`dns.osResponseTtlSeconds = 5`) so OS stub caches expire quickly after daemon stop, while the internal `FakeIpEngine` table retains the mapping for `300` seconds (`dns.defaultTtlSeconds = 300`).
+  - `AAAA` queries return **`NODATA`** (`RCODE = 0 NOERROR`, `ANCOUNT = 0`) so dual-stack applications immediately connect over IPv4 using the allocated Fake-IP.
+  - Reverse `PTR` queries for addresses inside `198.18.0.0/15` return the mapped domain name.
+  - When an application subsequently connects to a Fake-IP, RouteWard recovers the original domain name, evaluates routing rules against both process identity and domain patterns, and passes the domain name to the upstream proxy (`ATYP = 0x03` in SOCKS5, hostname in HTTP `CONNECT`). If the matched rule is `Direct`, RouteWard resolves the real IPv4 address directly via `resolve_host_direct_ipv4` (anti-loop protected) before opening the direct connection.
+- **Real DNS Resolution via Proxy (`dnsConfig.enableFakeIp = false` or non-A/AAAA queries)**:
+  - Executes **DNS-over-TCP** through the proxy/chain selected by routing rules.
+  - When `securityPolicy.strictDnsNoLocalFallback = true` (default) or `killSwitchEnabled = true` and the proxy fails, RouteWard returns **`SERVFAIL` (`RCODE = 2`)**, logs a `WARN` entry, and **never** falls back to cleartext DNS.
+- **Enterprise Active Directory & Split-Horizon Direct DNS Bypass**:
+  - In corporate Active Directory environments, internal domain controllers (`_ldap._tcp.dc._msdcs.<domain>`), Kerberos realms, and split-horizon intranet zones must be resolved directly against the internal DNS servers configured on the machine rather than receiving a Fake-IP or being tunneled through an external proxy.
+  - RouteWard resolves bypassed domains directly (with `SO_MARK` on Linux and `SelfPortGuard` on Windows to prevent interception loops) toward the DNS server that the OS originally targeted (`orig_resolver` / system nameservers):
+    1. User-configured `dnsConfig.bypassDomains`
+    2. Automatically detected machine primary DNS suffix and DNS search list (Active Directory domain via `USERDNSDOMAIN` and `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters` `Domain` / `NV Domain` / `SearchList` on Windows; `/etc/resolv.conf` `domain` and `search` directives on Linux)
+    3. Single-label hostnames (names without a dot)
+    4. `.local` and `.localhost`
+    5. Private reverse lookup zones (`10.in-addr.arpa`, `168.192.in-addr.arpa`, `16.172.in-addr.arpa`..`31.172.in-addr.arpa`, `127.in-addr.arpa`, `254.169.in-addr.arpa`, IPv6 ULA `c.f.ip6.arpa`/`d.f.ip6.arpa`, and IPv6 link-local `8..b.e.f.ip6.arpa`).
+- **Bootstrap Resolution for Domain-Named Upstream Proxies**: If an upstream proxy node is configured with a hostname rather than an IP literal, RouteWard resolves its IPv4 address(es) directly (`bootstrap_resolve_proxy_hosts` / `prepare_proxy_node_with_bootstrap`) without Fake-IP or loops and registers the resolved `(ip, port)` pairs in `nat_table.upstream_endpoints()` for anti-loop exclusion.
+- **Encrypted DNS Bypass Protection (`securityPolicy.blockEncryptedDnsBypass = true`, default) & IPv6 DNS Blocking**:
+  - Returns **`NXDOMAIN` (`RCODE = 3`)** (logged at `WARN`) for the Mozilla DoH canary domain (`use-application-dns.net`) so browsers fall back to the OS DNS resolver.
+  - Blocks outbound **DoT / DoQ port `853`** (both TCP and UDP) and logs `WARN`.
+  - Until full IPv6 interception in Batch 4.3, when `killSwitchEnabled = true`, blocks outbound **IPv6 port `53` and port `853`** (UDP and TCP) on both Windows (`WinDivert` drop) and Linux (`table ip6 routeward` `reject` / `reject with tcp reset`, guarded by the same fail-open watchdog and `routeward cleanup`), forcing immediate fallback to IPv4 DNS.
+- **Privacy-Preserving DNS Logging**: Ordinary DNS queries and Fake-IP allocations are logged exclusively at `DEBUG` level (never `INFO`), keeping telemetry and daily log files free of per-query noise while exposing active Fake-IP allocations via `routeward ctl fake-ips` (`ctl flush-fake-ips`) and the UI DNS tab. DNS errors (`SERVFAIL`, unreachable proxy, blocked DoT/canary) are logged at `WARN`.
+
 ## Component Diagram
 
 ```mermaid

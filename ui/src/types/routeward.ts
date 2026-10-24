@@ -18,7 +18,7 @@ export type InterceptionMode = 'hybrid' | 'driver' | 'relay';
 export type ProxyProtocol = 'socks5' | 'http' | 'https';
 export type TransportProtocol = 'tcp' | 'udp' | 'any';
 export type ConnectionStatus = 'active' | 'closed' | 'blocked';
-export type LogLevel = 'INFO' | 'WARN' | 'ERROR';
+export type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
 export type ChainStrategy =
   | 'sequence'
   | 'failover'
@@ -140,6 +140,8 @@ export interface SecurityPolicyConfig {
   killSwitchEnabled: boolean;
   blockUdpOnTcpOnlyProxy: boolean;
   strictDnsNoLocalFallback: boolean;
+  blockEncryptedDnsBypass?: boolean;
+  unknownProcessAction?: RuleAction;
 }
 
 export interface ProfileConfig {
