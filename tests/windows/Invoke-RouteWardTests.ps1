@@ -139,6 +139,76 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$script:Utf8NoBomEncoding = New-Object System.Text.UTF8Encoding($false)
+try {
+    [Console]::InputEncoding = $script:Utf8NoBomEncoding
+    [Console]::OutputEncoding = $script:Utf8NoBomEncoding
+} catch {
+    # Ignore if host does not attach a console handle
+}
+$OutputEncoding = $script:Utf8NoBomEncoding
+
+$script:ScenarioExecutionPlan = @(
+    [PSCustomObject]@{ ExecutionOrder = 1;  Id = "a"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Daemon background startup" },
+    [PSCustomObject]@{ ExecutionOrder = 2;  Id = "b"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Profile & Named Pipe ACLs" },
+    [PSCustomObject]@{ ExecutionOrder = 3;  Id = "c"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "ctl status initial state" },
+    [PSCustomObject]@{ ExecutionOrder = 4;  Id = "d"; RequiresSocks5 = $true;  StopsSocks5 = $false; Title = "ctl start and SOCKS5 routing" },
+    [PSCustomObject]@{ ExecutionOrder = 5;  Id = "e"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Temporary Block rule via ctl" },
+    [PSCustomObject]@{ ExecutionOrder = 6;  Id = "f"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "ctl stop and direct pass-through" },
+    [PSCustomObject]@{ ExecutionOrder = 7;  Id = "g"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Daemon crash fail-open & orphaned rule" },
+    [PSCustomObject]@{ ExecutionOrder = 8;  Id = "h"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Automatic orphan cleanup on daemon restart" },
+    [PSCustomObject]@{ ExecutionOrder = 9;  Id = "i"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Daemon & user log paths and CWD cleanliness" },
+    [PSCustomObject]@{ ExecutionOrder = 10; Id = "k"; RequiresSocks5 = $true;  StopsSocks5 = $false; Title = "Fake-IP DNS interception & domain routing via SOCKS5" },
+    [PSCustomObject]@{ ExecutionOrder = 11; Id = "l"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Active Directory domain direct DNS bypass" },
+    [PSCustomObject]@{ ExecutionOrder = 12; Id = "m"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Post-stop direct DNS resolution outside Fake-IP pool" },
+    [PSCustomObject]@{ ExecutionOrder = 13; Id = "n"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "OS DNS cache flushed on engine startup" },
+    [PSCustomObject]@{ ExecutionOrder = 14; Id = "j"; RequiresSocks5 = $true;  StopsSocks5 = $true;  Title = "Kill-Switch blocks curl when SOCKS5 proxy is stopped" }
+)
+
+function Get-ScenarioPlanEntry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Id
+    )
+    foreach ($entry in $script:ScenarioExecutionPlan) {
+        if ($entry.Id -eq $Id) {
+            return $entry
+        }
+    }
+    throw "Unknown scenario Id '$Id' in ScenarioExecutionPlan."
+}
+
+function Get-StartupDnsFlushMethodFromLogs {
+    param(
+        [Parameter(Mandatory = $false)]
+        [object[]]$CtlLogItems = @(),
+
+        [Parameter(Mandatory = $false)]
+        [string]$DaemonLogDirectory = "",
+
+        [Parameter(Mandatory = $false)]
+        [string]$DaemonLogFilter = "RouteWard_*.log"
+    )
+    foreach ($l in @($CtlLogItems)) {
+        if ($null -ne $l -and $l.component -eq "FakeIpDNS" -and ([string]$l.message) -match "startup via (?<method>dnsapi\.dll!DnsFlushResolverCache|ipconfig /flushdns)") {
+            return [string]$Matches["method"]
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DaemonLogDirectory) -and (Test-Path -LiteralPath $DaemonLogDirectory)) {
+        $latestLogs = @(Get-ChildItem -Path $DaemonLogDirectory -Filter $DaemonLogFilter -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+        if ($latestLogs.Count -gt 0) {
+            $linesUtf8 = @(Get-Content -LiteralPath $latestLogs[0].FullName -Encoding UTF8 -ErrorAction SilentlyContinue)
+            for ($idx = $linesUtf8.Count - 1; $idx -ge 0; $idx--) {
+                $ln = [string]$linesUtf8[$idx]
+                if ($ln.Contains("[FakeIpDNS]") -and ($ln -match "startup via (?<method>dnsapi\.dll!DnsFlushResolverCache|ipconfig /flushdns)")) {
+                    return [string]$Matches["method"]
+                }
+            }
+        }
+    }
+    return ""
+}
+
 # ---------------------------------------------------------------------------
 # Guardrail 1: Refuse execution without explicit -ConfirmTestMachine or -DryRun
 # ---------------------------------------------------------------------------
@@ -813,10 +883,33 @@ if ($DryRun.IsPresent) {
         -Context "DryRun-logsDnsCacheFlushed" `
         -ExpectResultArray `
         -RequiredArrayElementProperties @("level", "component", "message")
-    if ($logsDnsFlushDryRun.Count -ne 1 -or $logsDnsFlushDryRun[0].component -ne "FakeIpDNS" -or $logsDnsFlushDryRun[0].message -notmatch "startup via (dnsapi\.dll!DnsFlushResolverCache|ipconfig /flushdns)") {
-        throw "DryRun failed: unexpected logsDnsCacheFlushed payload."
+    $dryRunFlushMethod = Get-StartupDnsFlushMethodFromLogs -CtlLogItems $logsDnsFlushDryRun
+    if ($logsDnsFlushDryRun.Count -ne 1 -or $logsDnsFlushDryRun[0].component -ne "FakeIpDNS" -or [string]::IsNullOrWhiteSpace($dryRunFlushMethod)) {
+        throw "DryRun failed: unexpected logsDnsCacheFlushed payload or empty flush method."
     }
-    Write-Host "[DRYRUN-PASS] Verified Fake-IP CIDR pool helper, 'ctl fake-ips', domain-routed connection, and OS DNS cache flush fixtures for Scenarios (k)-(n)." -ForegroundColor Green
+    $frSampleLog = @([PSCustomObject]@{
+        level     = "INFO"
+        component = "FakeIpDNS"
+        message   = "Cache DNS de l'OS vide (startup via dnsapi.dll!DnsFlushResolverCache)"
+    })
+    $frExtractedMethod = Get-StartupDnsFlushMethodFromLogs -CtlLogItems $frSampleLog
+    if ($frExtractedMethod -ne "dnsapi.dll!DnsFlushResolverCache") {
+        throw "DryRun failed: expected invariant English method from localized log, got '$frExtractedMethod'."
+    }
+    if ($script:ScenarioExecutionPlan.Count -ne 14) {
+        throw "DryRun failed: expected 14 scenarios in ScenarioExecutionPlan, got $($script:ScenarioExecutionPlan.Count)."
+    }
+    $lastScenario = $script:ScenarioExecutionPlan[$script:ScenarioExecutionPlan.Count - 1]
+    if ($lastScenario.Id -ne "j" -or $lastScenario.ExecutionOrder -ne 14 -or (-not $lastScenario.StopsSocks5)) {
+        throw "DryRun failed: Scenario (j) must execute last (ExecutionOrder=14, StopsSocks5=true)."
+    }
+    foreach ($planItem in $script:ScenarioExecutionPlan) {
+        if ($planItem.RequiresSocks5 -and $planItem.Id -ne "j" -and $planItem.ExecutionOrder -ge $lastScenario.ExecutionOrder) {
+            throw "DryRun failed: Scenario ($($planItem.Id)) requires SOCKS5 and must run before Scenario (j)."
+        }
+    }
+    $orderChain = ($script:ScenarioExecutionPlan | ForEach-Object { "{0:D2}:({1})" -f $_.ExecutionOrder, $_.Id }) -join " -> "
+    Write-Host "[DRYRUN-PASS] Verified Fake-IP CIDR pool helper, 'ctl fake-ips', domain-routed connection, English-only OS DNS cache flush parser, and explicit execution order ($orderChain)." -ForegroundColor Green
 
     $upsertAck = ConvertFrom-CtlResponseJson `
         -RawJson ($fixtures.upsertRuleOk | ConvertTo-Json -Depth 6) `
@@ -920,8 +1013,7 @@ if ($runningRouteWard.Count -gt 0) {
 }
 
 if (-not (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs $TcpConnectTimeoutMs)) {
-    Write-Host "[ABORT] Pre-flight check failed: Upstream SOCKS5 proxy at ${Socks5Host}:${Socks5Port} is not reachable." -ForegroundColor Red
-    exit 2
+    Write-Host "[WARN] Pre-flight check: Upstream SOCKS5 proxy at ${Socks5Host}:${Socks5Port} is not reachable. Scenarios requiring SOCKS5 will be marked SKIP (upstream SOCKS5 unreachable)." -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------------------
@@ -1073,26 +1165,57 @@ $postCleanupCurlStatus = "Not executed"
 
 function Record-ScenarioResult {
     param(
+        [Parameter(Mandatory = $true)]
         [string]$Id,
+
+        [Parameter(Mandatory = $true)]
         [ValidateSet("PASS", "FAIL", "SKIP")]
         [string]$Status,
-        [string]$Title,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Title = "",
+
+        [Parameter(Mandatory = $true)]
         [string]$Detail
     )
-    $line = "[$Status] Scenario ($Id) $Title - $Detail"
+    $planEntry = Get-ScenarioPlanEntry -Id $Id
+    $effectiveTitle = if (-not [string]::IsNullOrWhiteSpace($Title)) { $Title } else { $planEntry.Title }
+    $totalScenarios = $script:ScenarioExecutionPlan.Count
+    $orderTag = ("{0:D2}/{1:D2}" -f $planEntry.ExecutionOrder, $totalScenarios)
+    $line = "[$Status] [Order $orderTag] Scenario ($Id) $effectiveTitle - $Detail"
     switch ($Status) {
         "PASS" { Write-Host $line -ForegroundColor Green }
         "FAIL" { Write-Host $line -ForegroundColor Red }
         "SKIP" { Write-Host $line -ForegroundColor Yellow }
     }
     $scenarioResults.Add([PSCustomObject]@{
-        Id     = $Id
-        Status = $Status
-        Title  = $Title
-        Detail = $Detail
-        Line   = $line
+        ExecutionOrder = $planEntry.ExecutionOrder
+        Id             = $Id
+        Status         = $Status
+        Title          = $effectiveTitle
+        Detail         = $Detail
+        Line           = $line
     })
 }
+
+function Test-ScenarioSocks5Prerequisite {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Id
+    )
+    $planEntry = Get-ScenarioPlanEntry -Id $Id
+    if (-not $planEntry.RequiresSocks5) {
+        return $true
+    }
+    if (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs $TcpConnectTimeoutMs) {
+        return $true
+    }
+    Record-ScenarioResult -Id $Id -Status "SKIP" -Title $planEntry.Title -Detail "upstream SOCKS5 unreachable"
+    return $false
+}
+
+$executionOrderSummary = ($script:ScenarioExecutionPlan | ForEach-Object { "{0:D2}:({1})" -f $_.ExecutionOrder, $_.Id }) -join " -> "
+Write-Host "Scenario Execution Order: $executionOrderSummary" -ForegroundColor Cyan
 
 # ---------------------------------------------------------------------------
 # Main Scenario Execution (Protected by try/finally)
@@ -1208,41 +1331,43 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (d): ctl start then curl.exe (HTTP 200, ctl connections shows curl.exe, expected rule, rxBytes > 0)
+    # Scenario (d) [Order 04/14]: ctl start then curl.exe (HTTP 200, ctl connections shows curl.exe, expected rule, rxBytes > 0)
     # -----------------------------------------------------------------------
     try {
-        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $false
+        if (Test-ScenarioSocks5Prerequisite -Id "d") {
+            Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $false
 
-        $startRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("start") -Label "Scenario-d-start"
-        $startDiag = ConvertFrom-CtlResponseJson `
-            -RawJson $startRes.RawText `
-            -Context "Scenario-d-start" `
-            -RequiredResultProperties @("running")
+            $startRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("start") -Label "Scenario-d-start"
+            $startDiag = ConvertFrom-CtlResponseJson `
+                -RawJson $startRes.RawText `
+                -Context "Scenario-d-start" `
+                -RequiredResultProperties @("running")
 
-        if ($startRes.ExitCode -ne 0 -or $startDiag.running -ne $true) {
-            Record-ScenarioResult -Id "d" -Status "FAIL" -Title "ctl start and SOCKS5 routing" -Detail "ctl start failed or result.running!=true"
-        } else {
-            $curlRes = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
-            Start-Sleep -Milliseconds $PollIntervalMs
-            $connsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-d-connections"
-            $connsList = ConvertFrom-CtlResponseJson `
-                -RawJson $connsRes.RawText `
-                -Context "Scenario-d-connections" `
-                -ExpectResultArray `
-                -RequiredArrayElementProperties @("processName", "matchedRule", "rxBytes", "status")
-
-            $matchingConn = $null
-            foreach ($c in $connsList) {
-                if ($c.processName -ieq "curl.exe" -and $c.matchedRule -eq $ExpectedProxyRuleName -and ([int64]$c.rxBytes) -gt 0) {
-                    $matchingConn = $c
-                    break
-                }
-            }
-
-            if ($curlRes.ExitCode -eq 0 -and $curlRes.HttpCode -eq $ExpectedHttpStatus -and $null -ne $matchingConn) {
-                Record-ScenarioResult -Id "d" -Status "PASS" -Title "ctl start and SOCKS5 routing" -Detail "curl HTTP $($curlRes.HttpCode), PID=$($matchingConn.pid), rule='$($matchingConn.matchedRule)', rxBytes=$($matchingConn.rxBytes)"
+            if ($startRes.ExitCode -ne 0 -or $startDiag.running -ne $true) {
+                Record-ScenarioResult -Id "d" -Status "FAIL" -Title "ctl start and SOCKS5 routing" -Detail "ctl start failed or result.running!=true"
             } else {
-                Record-ScenarioResult -Id "d" -Status "FAIL" -Title "ctl start and SOCKS5 routing" -Detail "curl exit=$($curlRes.ExitCode) http=$($curlRes.HttpCode), matching curl.exe connection found=$($null -ne $matchingConn)"
+                $curlRes = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
+                Start-Sleep -Milliseconds $PollIntervalMs
+                $connsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-d-connections"
+                $connsList = ConvertFrom-CtlResponseJson `
+                    -RawJson $connsRes.RawText `
+                    -Context "Scenario-d-connections" `
+                    -ExpectResultArray `
+                    -RequiredArrayElementProperties @("processName", "matchedRule", "rxBytes", "status")
+
+                $matchingConn = $null
+                foreach ($c in $connsList) {
+                    if ($c.processName -ieq "curl.exe" -and $c.matchedRule -eq $ExpectedProxyRuleName -and ([int64]$c.rxBytes) -gt 0) {
+                        $matchingConn = $c
+                        break
+                    }
+                }
+
+                if ($curlRes.ExitCode -eq 0 -and $curlRes.HttpCode -eq $ExpectedHttpStatus -and $null -ne $matchingConn) {
+                    Record-ScenarioResult -Id "d" -Status "PASS" -Title "ctl start and SOCKS5 routing" -Detail "curl HTTP $($curlRes.HttpCode), PID=$($matchingConn.pid), rule='$($matchingConn.matchedRule)', rxBytes=$($matchingConn.rxBytes)"
+                } else {
+                    Record-ScenarioResult -Id "d" -Status "FAIL" -Title "ctl start and SOCKS5 routing" -Detail "curl exit=$($curlRes.ExitCode) http=$($curlRes.HttpCode), matching curl.exe connection found=$($null -ne $matchingConn)"
+                }
             }
         }
     } catch {
@@ -1451,173 +1576,65 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (j): Kill-Switch (killSwitchEnabled=true) — SOCKS5 proxy stopped
-    #               during test, curl.exe matched by Proxy rule fails without
-    #               falling back to Direct, and ctl connections reports Blocked
-    # -----------------------------------------------------------------------
-    try {
-        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
-
-        $socksListenerInfo = Get-LocalPortListenerProcessInfo -Port $Socks5Port
-        $socksStoppedByScript = $false
-
-        try {
-            if ($null -ne $socksListenerInfo -and $socksListenerInfo.Pid -gt 0) {
-                Stop-Process -Id $socksListenerInfo.Pid -Force -ErrorAction SilentlyContinue
-                Wait-Process -Id $socksListenerInfo.Pid -Timeout 5 -ErrorAction SilentlyContinue
-                $socksStoppedByScript = $true
-            }
-
-            $stopWaitSw = [System.Diagnostics.Stopwatch]::StartNew()
-            while ($stopWaitSw.ElapsedMilliseconds -lt 3000) {
-                if (-not (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs 250)) {
-                    break
-                }
-                Start-Sleep -Milliseconds 100
-            }
-
-            $socksStillUp = Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs 300
-            if ($socksStillUp) {
-                Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail "Could not stop SOCKS5 listener on ${Socks5Host}:${Socks5Port}"
-            } else {
-                $curlKillSwitch = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec 5
-                Start-Sleep -Milliseconds $PollIntervalMs
-
-                $connsKsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-j-connections"
-                $connsKsList = ConvertFrom-CtlResponseJson `
-                    -RawJson $connsKsRes.RawText `
-                    -Context "Scenario-j-connections" `
-                    -ExpectResultArray `
-                    -RequiredArrayElementProperties @("processName", "matchedRule", "routeLabel", "status")
-
-                $logsKsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-j-logs"
-                $logsKsList = ConvertFrom-CtlResponseJson `
-                    -RawJson $logsKsRes.RawText `
-                    -Context "Scenario-j-logs" `
-                    -ExpectResultArray `
-                    -RequiredArrayElementProperties @("level", "component", "message")
-
-                $sawKillSwitchBlockedConn = $false
-                foreach ($c in $connsKsList) {
-                    if ($c.processName -ieq "curl.exe" -and $c.matchedRule -eq $ExpectedProxyRuleName -and $c.status -eq "blocked" -and $c.routeLabel -eq "BLOCKED") {
-                        $sawKillSwitchBlockedConn = $true
-                        break
-                    }
-                }
-
-                $sawKillSwitchWarnLog = $false
-                foreach ($l in $logsKsList) {
-                    if ($l.level -eq "WARN" -and ([string]$l.message).Contains("Kill-Switch blocked connection")) {
-                        $sawKillSwitchWarnLog = $true
-                        break
-                    }
-                }
-
-                if ($curlKillSwitch.ExitCode -ne 0 -and $curlKillSwitch.HttpCode -ne $ExpectedHttpStatus -and $sawKillSwitchBlockedConn -and $sawKillSwitchWarnLog) {
-                    Record-ScenarioResult -Id "j" -Status "PASS" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail "curl failed as expected (exit=$($curlKillSwitch.ExitCode) http=$($curlKillSwitch.HttpCode), no Direct leak), connection recorded with status=blocked/routeLabel=BLOCKED, WARN logged"
-                } else {
-                    Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail "curlExit=$($curlKillSwitch.ExitCode) http=$($curlKillSwitch.HttpCode), sawBlockedConn=$sawKillSwitchBlockedConn, sawWarnLog=$sawKillSwitchWarnLog"
-                }
-            }
-        } finally {
-            if ($socksStoppedByScript) {
-                $restartedOk = $false
-                if ($null -ne $socksListenerInfo -and (-not [string]::IsNullOrWhiteSpace($socksListenerInfo.ExecutablePath)) -and (Test-Path -LiteralPath $socksListenerInfo.ExecutablePath)) {
-                    try {
-                        $restartArgs = Split-ProcessCommandLineArgs -ExecutablePath $socksListenerInfo.ExecutablePath -CommandLine $socksListenerInfo.CommandLine
-                        $restartedProc = if ([string]::IsNullOrWhiteSpace($restartArgs)) {
-                            Start-Process -FilePath $socksListenerInfo.ExecutablePath -WindowStyle Hidden -PassThru
-                        } else {
-                            Start-Process -FilePath $socksListenerInfo.ExecutablePath -ArgumentList $restartArgs -WindowStyle Hidden -PassThru
-                        }
-                        $restartSw = [System.Diagnostics.Stopwatch]::StartNew()
-                        while ($restartSw.ElapsedMilliseconds -lt 3000) {
-                            if (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs 250) {
-                                $restartedOk = $true
-                                break
-                            }
-                            Start-Sleep -Milliseconds 150
-                        }
-                        if ($restartedOk) {
-                            $msg = "SOCKS5 listener on ${Socks5Host}:${Socks5Port} was automatically restarted after Scenario (j) (PID=$($restartedProc.Id))."
-                            $auditNotes.Add($msg)
-                            Write-Host "[INFO] $msg" -ForegroundColor Cyan
-                        } elseif ($null -ne $restartedProc -and (-not $restartedProc.HasExited)) {
-                            Stop-Process -Id $restartedProc.Id -Force -ErrorAction SilentlyContinue
-                        }
-                    } catch {
-                        # Will report manual restart notice below
-                    }
-                }
-                if (-not $restartedOk) {
-                    $noticeMsg = "SOCKS5 listener on ${Socks5Host}:${Socks5Port} (original PID=$($socksListenerInfo.Pid)) was stopped for Scenario (j) and requires manual restart before the next test run."
-                    $auditNotes.Add("NOTICE: $noticeMsg")
-                    Write-Host "[NOTICE] $noticeMsg" -ForegroundColor Yellow
-                }
-            }
-        }
-    } catch {
-        Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail $_.Exception.Message
-    }
-
-    # -----------------------------------------------------------------------
-    # Scenario (k): Resolve-DnsName on a public domain toward an explicit external
+    # Scenario (k) [Order 10/14]: Resolve-DnsName on a public domain toward an explicit external
     #               resolver returns a Fake-IP (198.18.0.0/15), and curl.exe to
     #               that domain is routed via the SOCKS5 proxy with its domain name
     # -----------------------------------------------------------------------
     try {
-        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
-        $null = Clear-AllWindowsDnsCaches
+        if (Test-ScenarioSocks5Prerequisite -Id "k") {
+            Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+            $null = Clear-AllWindowsDnsCaches
 
-        $dnsResK = @(Resolve-DnsName -Name $PublicDnsTestDomain -Type A -Server $ExternalDnsServer -DnsOnly -NoHostsFile -ErrorAction Stop | Where-Object { $null -ne $_.IPAddress })
-        $resolvedIpK = if ($dnsResK.Count -gt 0) { [string]$dnsResK[0].IPAddress } else { "" }
-        $isFakeIpK = Test-IpInFakePool -IpAddressString $resolvedIpK -PoolCidr $FakeIpCidr
+            $dnsResK = @(Resolve-DnsName -Name $PublicDnsTestDomain -Type A -Server $ExternalDnsServer -DnsOnly -NoHostsFile -ErrorAction Stop | Where-Object { $null -ne $_.IPAddress })
+            $resolvedIpK = if ($dnsResK.Count -gt 0) { [string]$dnsResK[0].IPAddress } else { "" }
+            $isFakeIpK = Test-IpInFakePool -IpAddressString $resolvedIpK -PoolCidr $FakeIpCidr
 
-        $fakeIpsResK = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("fake-ips") -Label "Scenario-k-fake-ips"
-        $fakeIpsListK = ConvertFrom-CtlResponseJson `
-            -RawJson $fakeIpsResK.RawText `
-            -Context "Scenario-k-fake-ips" `
-            -ExpectResultArray `
-            -RequiredArrayElementProperties @("fakeIp", "domain", "ttlRemainingSeconds")
+            $fakeIpsResK = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("fake-ips") -Label "Scenario-k-fake-ips"
+            $fakeIpsListK = ConvertFrom-CtlResponseJson `
+                -RawJson $fakeIpsResK.RawText `
+                -Context "Scenario-k-fake-ips" `
+                -ExpectResultArray `
+                -RequiredArrayElementProperties @("fakeIp", "domain", "ttlRemainingSeconds")
 
-        $sawFakeIpEntryK = $false
-        foreach ($entry in $fakeIpsListK) {
-            if ($entry.domain -ieq $PublicDnsTestDomain -and (Test-IpInFakePool -IpAddressString ([string]$entry.fakeIp) -PoolCidr $FakeIpCidr)) {
-                $sawFakeIpEntryK = $true
-                break
+            $sawFakeIpEntryK = $false
+            foreach ($entry in $fakeIpsListK) {
+                if ($entry.domain -ieq $PublicDnsTestDomain -and (Test-IpInFakePool -IpAddressString ([string]$entry.fakeIp) -PoolCidr $FakeIpCidr)) {
+                    $sawFakeIpEntryK = $true
+                    break
+                }
             }
-        }
 
-        $curlResK = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
-        Start-Sleep -Milliseconds $PollIntervalMs
+            $curlResK = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
+            Start-Sleep -Milliseconds $PollIntervalMs
 
-        $connsResK = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-k-connections"
-        $connsListK = ConvertFrom-CtlResponseJson `
-            -RawJson $connsResK.RawText `
-            -Context "Scenario-k-connections" `
-            -ExpectResultArray `
-            -RequiredArrayElementProperties @("processName", "targetHost", "matchedRule", "rxBytes", "status")
+            $connsResK = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-k-connections"
+            $connsListK = ConvertFrom-CtlResponseJson `
+                -RawJson $connsResK.RawText `
+                -Context "Scenario-k-connections" `
+                -ExpectResultArray `
+                -RequiredArrayElementProperties @("processName", "targetHost", "matchedRule", "rxBytes", "status")
 
-        $matchingDomainConnK = $null
-        foreach ($c in $connsListK) {
-            $domMatch = ($c.targetHost -ieq $PublicDnsTestDomain) -or ($null -ne $c.resolvedDomain -and $c.resolvedDomain -ieq $PublicDnsTestDomain)
-            if ($c.processName -ieq "curl.exe" -and $domMatch -and $c.matchedRule -eq $ExpectedProxyRuleName -and ([int64]$c.rxBytes) -gt 0) {
-                $matchingDomainConnK = $c
-                break
+            $matchingDomainConnK = $null
+            foreach ($c in $connsListK) {
+                $domMatch = ($c.targetHost -ieq $PublicDnsTestDomain) -or ($null -ne $c.resolvedDomain -and $c.resolvedDomain -ieq $PublicDnsTestDomain)
+                if ($c.processName -ieq "curl.exe" -and $domMatch -and $c.matchedRule -eq $ExpectedProxyRuleName -and ([int64]$c.rxBytes) -gt 0) {
+                    $matchingDomainConnK = $c
+                    break
+                }
             }
-        }
 
-        if ($isFakeIpK -and $sawFakeIpEntryK -and $curlResK.ExitCode -eq 0 -and $curlResK.HttpCode -eq $ExpectedHttpStatus -and $null -ne $matchingDomainConnK) {
-            Record-ScenarioResult -Id "k" -Status "PASS" -Title "Fake-IP DNS interception & domain routing via SOCKS5" -Detail "$PublicDnsTestDomain -> $resolvedIpK (in $FakeIpCidr), curl HTTP $($curlResK.HttpCode) routed with domain '$($matchingDomainConnK.targetHost)'"
-        } else {
-            Record-ScenarioResult -Id "k" -Status "FAIL" -Title "Fake-IP DNS interception & domain routing via SOCKS5" -Detail "resolvedIp='$resolvedIpK' (isFakeIp=$isFakeIpK), inCtlTable=$sawFakeIpEntryK, curlHttp=$($curlResK.HttpCode), domainConnFound=$($null -ne $matchingDomainConnK)"
+            if ($isFakeIpK -and $sawFakeIpEntryK -and $curlResK.ExitCode -eq 0 -and $curlResK.HttpCode -eq $ExpectedHttpStatus -and $null -ne $matchingDomainConnK) {
+                Record-ScenarioResult -Id "k" -Status "PASS" -Title "Fake-IP DNS interception & domain routing via SOCKS5" -Detail "$PublicDnsTestDomain -> $resolvedIpK (in $FakeIpCidr), curl HTTP $($curlResK.HttpCode) routed with domain '$($matchingDomainConnK.targetHost)'"
+            } else {
+                Record-ScenarioResult -Id "k" -Status "FAIL" -Title "Fake-IP DNS interception & domain routing via SOCKS5" -Detail "resolvedIp='$resolvedIpK' (isFakeIp=$isFakeIpK), inCtlTable=$sawFakeIpEntryK, curlHttp=$($curlResK.HttpCode), domainConnFound=$($null -ne $matchingDomainConnK)"
+            }
         }
     } catch {
         Record-ScenarioResult -Id "k" -Status "FAIL" -Title "Fake-IP DNS interception & domain routing via SOCKS5" -Detail $_.Exception.Message
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (l): Resolve-DnsName on the VM's Active Directory / primary DNS
+    # Scenario (l) [Order 11/14]: Resolve-DnsName on the VM's Active Directory / primary DNS
     #               suffix continues to resolve normally and directly (outside Fake-IP)
     # -----------------------------------------------------------------------
     try {
@@ -1646,7 +1663,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (m): After ctl stop and Clear-DnsClientCache, normal DNS resolution
+    # Scenario (m) [Order 12/14]: After ctl stop and Clear-DnsClientCache, normal DNS resolution
     #               returns a real IP outside the Fake-IP pool
     # -----------------------------------------------------------------------
     try {
@@ -1672,7 +1689,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (n): Starting the engine automatically flushes the OS DNS
+    # Scenario (n) [Order 13/14]: Starting the engine automatically flushes the OS DNS
     #               resolver cache (DnsFlushResolverCache / ipconfig /flushdns)
     # -----------------------------------------------------------------------
     try {
@@ -1699,23 +1716,131 @@ try {
             -ExpectResultArray `
             -RequiredArrayElementProperties @("level", "component", "message")
 
-        $sawStartupFlushLog = $false
-        $flushDetail = ""
-        foreach ($l in $logsListN) {
-            if ($l.component -eq "FakeIpDNS" -and ([string]$l.message) -match "startup via (dnsapi\.dll!DnsFlushResolverCache|ipconfig /flushdns)") {
-                $sawStartupFlushLog = $true
-                $flushDetail = [string]$l.message
-                break
-            }
-        }
+        $flushMethod = Get-StartupDnsFlushMethodFromLogs `
+            -CtlLogItems $logsListN `
+            -DaemonLogDirectory $daemonLogsDir `
+            -DaemonLogFilter $logWildcard
+        $sawStartupFlushLog = (-not [string]::IsNullOrWhiteSpace($flushMethod))
 
         if ($startResN.ExitCode -eq 0 -and $startDiagN.running -eq $true -and $sawStartupFlushLog -and $cachedAfterStart.Count -eq 0) {
-            Record-ScenarioResult -Id "n" -Status "PASS" -Title "OS DNS cache flushed on engine startup" -Detail "$flushDetail; Get-DnsClientCache entries for $PublicDnsTestDomain after start = $($cachedAfterStart.Count)"
+            Record-ScenarioResult -Id "n" -Status "PASS" -Title "OS DNS cache flushed on engine startup" -Detail "OS DNS cache flushed at startup via $flushMethod; Get-DnsClientCache entries for $PublicDnsTestDomain after start = $($cachedAfterStart.Count)"
         } else {
             Record-ScenarioResult -Id "n" -Status "FAIL" -Title "OS DNS cache flushed on engine startup" -Detail "running=$($startDiagN.running), sawStartupFlushLog=$sawStartupFlushLog, cachedAfterStartCount=$($cachedAfterStart.Count)"
         }
     } catch {
         Record-ScenarioResult -Id "n" -Status "FAIL" -Title "OS DNS cache flushed on engine startup" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (j) [Order 14/14 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) —
+    #               SOCKS5 proxy stopped during test, curl.exe matched by Proxy rule
+    #               fails without falling back to Direct, and ctl connections reports Blocked
+    # -----------------------------------------------------------------------
+    try {
+        if (Test-ScenarioSocks5Prerequisite -Id "j") {
+            Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+            $socksListenerInfo = Get-LocalPortListenerProcessInfo -Port $Socks5Port
+            $socksStoppedByScript = $false
+
+            try {
+                if ($null -ne $socksListenerInfo -and $socksListenerInfo.Pid -gt 0) {
+                    Stop-Process -Id $socksListenerInfo.Pid -Force -ErrorAction SilentlyContinue
+                    Wait-Process -Id $socksListenerInfo.Pid -Timeout 5 -ErrorAction SilentlyContinue
+                    $socksStoppedByScript = $true
+                }
+
+                $stopWaitSw = [System.Diagnostics.Stopwatch]::StartNew()
+                while ($stopWaitSw.ElapsedMilliseconds -lt 3000) {
+                    if (-not (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs 250)) {
+                        break
+                    }
+                    Start-Sleep -Milliseconds 100
+                }
+
+                $socksStillUp = Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs 300
+                if ($socksStillUp) {
+                    Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail "Could not stop SOCKS5 listener on ${Socks5Host}:${Socks5Port}"
+                } else {
+                    $curlKillSwitch = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec 5
+                    Start-Sleep -Milliseconds $PollIntervalMs
+
+                    $connsKsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-j-connections"
+                    $connsKsList = ConvertFrom-CtlResponseJson `
+                        -RawJson $connsKsRes.RawText `
+                        -Context "Scenario-j-connections" `
+                        -ExpectResultArray `
+                        -RequiredArrayElementProperties @("processName", "matchedRule", "routeLabel", "status")
+
+                    $logsKsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-j-logs"
+                    $logsKsList = ConvertFrom-CtlResponseJson `
+                        -RawJson $logsKsRes.RawText `
+                        -Context "Scenario-j-logs" `
+                        -ExpectResultArray `
+                        -RequiredArrayElementProperties @("level", "component", "message")
+
+                    $sawKillSwitchBlockedConn = $false
+                    foreach ($c in $connsKsList) {
+                        if ($c.processName -ieq "curl.exe" -and $c.matchedRule -eq $ExpectedProxyRuleName -and $c.status -eq "blocked" -and $c.routeLabel -eq "BLOCKED") {
+                            $sawKillSwitchBlockedConn = $true
+                            break
+                        }
+                    }
+
+                    $sawKillSwitchWarnLog = $false
+                    foreach ($l in $logsKsList) {
+                        if ($l.level -eq "WARN" -and ([string]$l.message).Contains("Kill-Switch blocked connection")) {
+                            $sawKillSwitchWarnLog = $true
+                            break
+                        }
+                    }
+
+                    if ($curlKillSwitch.ExitCode -ne 0 -and $curlKillSwitch.HttpCode -ne $ExpectedHttpStatus -and $sawKillSwitchBlockedConn -and $sawKillSwitchWarnLog) {
+                        Record-ScenarioResult -Id "j" -Status "PASS" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail "curl failed as expected (exit=$($curlKillSwitch.ExitCode) http=$($curlKillSwitch.HttpCode), no Direct leak), connection recorded with status=blocked/routeLabel=BLOCKED, WARN logged"
+                    } else {
+                        Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail "curlExit=$($curlKillSwitch.ExitCode) http=$($curlKillSwitch.HttpCode), sawBlockedConn=$sawKillSwitchBlockedConn, sawWarnLog=$sawKillSwitchWarnLog"
+                    }
+                }
+            } finally {
+                if ($socksStoppedByScript) {
+                    $restartedOk = $false
+                    if ($null -ne $socksListenerInfo -and (-not [string]::IsNullOrWhiteSpace($socksListenerInfo.ExecutablePath)) -and (Test-Path -LiteralPath $socksListenerInfo.ExecutablePath)) {
+                        try {
+                            $restartArgs = Split-ProcessCommandLineArgs -ExecutablePath $socksListenerInfo.ExecutablePath -CommandLine $socksListenerInfo.CommandLine
+                            $restartedProc = if ([string]::IsNullOrWhiteSpace($restartArgs)) {
+                                Start-Process -FilePath $socksListenerInfo.ExecutablePath -WindowStyle Hidden -PassThru
+                            } else {
+                                Start-Process -FilePath $socksListenerInfo.ExecutablePath -ArgumentList $restartArgs -WindowStyle Hidden -PassThru
+                            }
+                            $restartSw = [System.Diagnostics.Stopwatch]::StartNew()
+                            while ($restartSw.ElapsedMilliseconds -lt 3000) {
+                                if (Test-TcpEndpoint -TargetHost $Socks5Host -Port $Socks5Port -TimeoutMs 250) {
+                                    $restartedOk = $true
+                                    break
+                                }
+                                Start-Sleep -Milliseconds 150
+                            }
+                            if ($restartedOk) {
+                                $msg = "SOCKS5 listener on ${Socks5Host}:${Socks5Port} was automatically restarted after Scenario (j) (PID=$($restartedProc.Id))."
+                                $auditNotes.Add($msg)
+                                Write-Host "[INFO] $msg" -ForegroundColor Cyan
+                            } elseif ($null -ne $restartedProc -and (-not $restartedProc.HasExited)) {
+                                Stop-Process -Id $restartedProc.Id -Force -ErrorAction SilentlyContinue
+                            }
+                        } catch {
+                            # Will report manual restart notice below
+                        }
+                    }
+                    if (-not $restartedOk) {
+                        $noticeMsg = "SOCKS5 listener on ${Socks5Host}:${Socks5Port} (original PID=$($socksListenerInfo.Pid)) was stopped for Scenario (j) (executed last) and requires manual restart before the next test run."
+                        $auditNotes.Add("NOTICE: $noticeMsg")
+                        Write-Host "[NOTICE] $noticeMsg" -ForegroundColor Yellow
+                    }
+                }
+            }
+        }
+    } catch {
+        Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail $_.Exception.Message
     }
 } finally {
     # -----------------------------------------------------------------------
@@ -1806,6 +1931,7 @@ $reportLines.Add("Finished At: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'))
 $reportLines.Add("Host / OS  : $([Environment]::MachineName) - $([Environment]::OSVersion.VersionString)")
 $reportLines.Add("PS Version : $($PSVersionTable.PSVersion.ToString())")
 $reportLines.Add("Summary    : $summaryBanner")
+$reportLines.Add("Exec Order : $executionOrderSummary")
 $reportLines.Add("Post-Cleanup Connectivity: $postCleanupCurlStatus")
 $reportLines.Add("================================================================================")
 $reportLines.Add("")
