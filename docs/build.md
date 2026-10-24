@@ -12,7 +12,15 @@
 
 ## Step 1: Build the Frontend Bundle
 
-`routeward-desktop` embeds `ui/dist/index.html`, `ui/dist/assets/app.js`, and `ui/dist/assets/app.css` at compile time using `include_bytes!`. Always build the frontend first:
+`routeward-desktop` embeds `ui/dist/index.html`, `ui/dist/assets/app.js`, `ui/dist/assets/app.css`, and the branding assets in `assets/branding/` (`routeward-glyph.svg`, `routeward-icon.svg`, `routeward-32.rgba`, `routeward-256.rgba`) at compile time using `include_bytes!`. On Windows, `build.rs` also embeds `assets/branding/routeward.ico` into `routeward.exe` and `routeward-desktop.exe` via `embed-resource`.
+
+All generated branding assets in `assets/branding/` (`routeward-16.png` to `routeward-512.png`, `routeward.ico`, `routeward-32.rgba`, `routeward-256.rgba`) are committed so standard builds do not need to regenerate them. To regenerate them after editing `assets/branding/routeward-icon.svg`, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\branding\build-icons.ps1
+```
+
+Always build the frontend first:
 
 ```powershell
 Set-Location ui

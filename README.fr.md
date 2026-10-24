@@ -25,6 +25,14 @@ Outil de routage reseau par processus et de chainage de proxies ecrit en Rust, a
 - [Depannage](docs/fr/troubleshooting.md) ([English](docs/troubleshooting.md))
 - [Contribution et Versionnement](CONTRIBUTING.fr.md) ([English](CONTRIBUTING.md))
 
+## Identite Visuelle et Icones
+
+Les fichiers de marque et icones de l'application se trouvent dans [`assets/branding/`](assets/branding/) :
+- `routeward-icon.svg` et `routeward-glyph.svg` (sources vectorielles Drakul)
+- `routeward-16.png` a `routeward-512.png`, `routeward.ico` (embarque dans les executables Windows via `embed-resource`), ainsi que `routeward-32.rgba` et `routeward-256.rgba` (utilises par `tao` pour l'icone de fenetre et de barre des taches)
+- `preview.html` (planche de controle visuel des PNG generes sur fonds sombre et clair)
+- Regenerer tous les fichiers matriciels depuis `routeward-icon.svg` via Microsoft Edge headless et PowerShell : `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\branding\build-icons.ps1`
+
 ## Compilation et Execution
 
 ```powershell

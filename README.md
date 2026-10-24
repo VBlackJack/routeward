@@ -25,6 +25,14 @@ Process-aware network routing and proxy chaining toolkit written in Rust, with a
 - [Troubleshooting](docs/troubleshooting.md) ([Francais](docs/fr/troubleshooting.md))
 - [Contributing & Versioning](CONTRIBUTING.md) ([Francais](CONTRIBUTING.fr.md))
 
+## Branding Assets
+
+Application icons and brand vectors live in [`assets/branding/`](assets/branding/):
+- `routeward-icon.svg` and `routeward-glyph.svg` (Drakul vector masters)
+- `routeward-16.png` through `routeward-512.png`, `routeward.ico` (embedded in Windows binaries via `embed-resource`), and `routeward-32.rgba` / `routeward-256.rgba` (used by `tao` for window and taskbar icons)
+- `preview.html` (visual verification sheet of the rasterized PNGs on dark and light backgrounds)
+- Regenerate all raster assets from `routeward-icon.svg` using headless Microsoft Edge and PowerShell: `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\branding\build-icons.ps1`
+
 ## Build and Run
 
 ```powershell

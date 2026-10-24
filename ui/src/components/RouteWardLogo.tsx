@@ -28,38 +28,31 @@ export const RouteWardLogo: React.FC<RouteWardLogoProps> = ({
 
   return (
     <div
-      className={`relative flex ${dim} shrink-0 items-center justify-center overflow-hidden rounded-tf-lg border border-tf-accent/50 bg-tf-bg shadow-md`}
+      className={`relative flex ${dim} shrink-0 items-center justify-center`}
     >
       {!imgError ? (
         <img
-          src="/logo.jpg"
+          src="/routeward-glyph.svg"
           alt="RouteWard"
           onError={() => setImgError(true)}
-          className="h-full w-full object-cover"
+          className="h-full w-full object-contain"
         />
       ) : (
         <svg
-          viewBox="0 0 32 32"
-          className="h-full w-full p-1"
+          viewBox="0 0 48 48"
+          className="h-full w-full"
           fill="none"
           xmlns="http://www.w3.org/2000/svg"
         >
-          <polygon
-            points="10,2 22,2 30,10 30,22 22,30 10,30 2,22 2,10"
-            className="fill-tf-surface stroke-tf-accent"
-            strokeWidth="2"
-          />
           <path
-            d="M7 16H14L24 9M14 16L24 16M14 16L24 23"
-            className="stroke-tf-cyan"
-            strokeWidth="2.2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
+            d="M15 39V9H27L34 16V20L27 27H15M22 27L32 37"
+            fill="none"
+            stroke="#A170E6"
+            strokeWidth="6"
+            strokeLinecap="square"
+            strokeLinejoin="miter"
           />
-          <circle cx="14" cy="16" r="3" className="fill-tf-accent" />
-          <circle cx="24" cy="9" r="2" className="fill-tf-pink" />
-          <circle cx="24" cy="16" r="2" className="fill-tf-cyan" />
-          <circle cx="24" cy="23" r="2" className="fill-tf-green" />
+          <rect x="30" y="33" width="9" height="9" rx="1.5" fill="#50FA7B" />
         </svg>
       )}
     </div>

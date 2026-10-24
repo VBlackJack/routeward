@@ -1,0 +1,206 @@
+<!--
+  Copyright 2026 Julien Bombled
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RouteWard — Rasterized PNG Icon Preview</title>
+  <style>
+    :root {
+      --drakul-bg: #282A36;
+      --drakul-deep: #1E1F29;
+      --drakul-surface-alt: #44475A;
+      --drakul-fg: #F8F8F2;
+      --drakul-comment: #B3BBD6;
+      --drakul-purple: #BD93F9;
+      --drakul-accent-pressed: #A170E6;
+      --drakul-green: #50FA7B;
+      --light-bg: #F3F3F3;
+      --light-border: #D6D6D6;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 32px;
+      background-color: var(--drakul-deep);
+      color: var(--drakul-fg);
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      line-height: 1.5;
+    }
+
+    header, main {
+      max-width: 1320px;
+      margin: 0 auto;
+    }
+
+    header {
+      margin-bottom: 28px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--drakul-surface-alt);
+    }
+
+    h1 {
+      margin: 0 0 6px 0;
+      font-size: 22px;
+      color: var(--drakul-purple);
+    }
+
+    p.subtitle {
+      margin: 0;
+      color: var(--drakul-comment);
+      font-size: 13px;
+    }
+
+    .surface-card {
+      border-radius: 10px;
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+
+    .surface-dark {
+      background-color: var(--drakul-deep);
+      border: 1px solid var(--drakul-surface-alt);
+      color: var(--drakul-fg);
+    }
+
+    .surface-ui {
+      background-color: var(--drakul-bg);
+      border: 1px solid var(--drakul-surface-alt);
+      color: var(--drakul-fg);
+    }
+
+    .surface-light {
+      background-color: var(--light-bg);
+      border: 1px solid var(--light-border);
+      color: #1E1F29;
+    }
+
+    .surface-title {
+      margin: 0 0 18px 0;
+      font-size: 14px;
+      font-family: Consolas, monospace;
+      opacity: 0.9;
+    }
+
+    .png-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-end;
+      gap: 24px;
+    }
+
+    .png-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .png-item img {
+      display: block;
+      image-rendering: -webkit-optimize-contrast;
+      image-rendering: crisp-edges;
+    }
+
+    .png-label {
+      font-family: Consolas, monospace;
+      font-size: 11px;
+      opacity: 0.8;
+    }
+
+    .svg-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 32px;
+    }
+
+    .svg-item {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>RouteWard — Generated PNG &amp; Vector Branding Preview</h1>
+    <p class="subtitle">
+      Rendered directly from the generated raster PNG files (<code>routeward-16.png</code> through <code>routeward-512.png</code>) on dark and light surfaces.
+    </p>
+  </header>
+
+  <main>
+    <section class="surface-card surface-dark">
+      <h2 class="surface-title">Dark Surface (#1E1F29) — Raster PNGs (16, 20, 24, 32, 40, 48, 64, 128, 256, 512 px)</h2>
+      <div class="png-row" data-png-row></div>
+    </section>
+
+    <section class="surface-card surface-ui">
+      <h2 class="surface-title">Drakul UI Surface (#282A36) — Raster PNGs (16, 20, 24, 32, 40, 48, 64, 128, 256, 512 px)</h2>
+      <div class="png-row" data-png-row></div>
+    </section>
+
+    <section class="surface-card surface-light">
+      <h2 class="surface-title">Light Taskbar Surface (#F3F3F3) — Raster PNGs (16, 20, 24, 32, 40, 48, 64, 128, 256, 512 px)</h2>
+      <div class="png-row" data-png-row></div>
+    </section>
+
+    <section class="surface-card surface-ui">
+      <h2 class="surface-title">Vector Master Files (routeward-icon.svg &amp; routeward-glyph.svg on #282A36)</h2>
+      <div class="svg-row">
+        <div class="svg-item">
+          <img src="routeward-icon.svg" width="48" height="48" alt="routeward-icon.svg" />
+          <span class="png-label">routeward-icon.svg (48×48)</span>
+        </div>
+        <div class="svg-item">
+          <img src="routeward-glyph.svg" width="48" height="48" alt="routeward-glyph.svg" />
+          <span class="png-label">routeward-glyph.svg (48×48)</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256, 512];
+    document.querySelectorAll("[data-png-row]").forEach((row) => {
+      SIZES.forEach((size) => {
+        const item = document.createElement("div");
+        item.className = "png-item";
+
+        const img = document.createElement("img");
+        img.src = `routeward-${size}.png`;
+        img.width = size;
+        img.height = size;
+        img.alt = `routeward-${size}.png`;
+
+        const label = document.createElement("span");
+        label.className = "png-label";
+        label.textContent = `${size}×${size} px`;
+
+        item.appendChild(img);
+        item.appendChild(label);
+        row.appendChild(item);
+      });
+    });
+  </script>
+</body>
+</html>

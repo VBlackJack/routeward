@@ -34,56 +34,35 @@ use wry::WebViewBuilder;
 const EMBEDDED_INDEX_HTML: &[u8] = include_bytes!("../../../ui/dist/index.html");
 const EMBEDDED_APP_JS: &[u8] = include_bytes!("../../../ui/dist/assets/app.js");
 const EMBEDDED_APP_CSS: &[u8] = include_bytes!("../../../ui/dist/assets/app.css");
-const EMBEDDED_LOGO_JPG: &[u8] = include_bytes!("../../../ui/public/logo.jpg");
+const EMBEDDED_GLYPH_SVG: &[u8] = include_bytes!("../../../assets/branding/routeward-glyph.svg");
+const EMBEDDED_ICON_SVG: &[u8] = include_bytes!("../../../assets/branding/routeward-icon.svg");
+const EMBEDDED_ICON_32_RGBA: &[u8] = include_bytes!("../../../assets/branding/routeward-32.rgba");
+const EMBEDDED_ICON_256_RGBA: &[u8] = include_bytes!("../../../assets/branding/routeward-256.rgba");
 
 const WINDOW_DEFAULT_WIDTH: f64 = 1400.0;
 const WINDOW_DEFAULT_HEIGHT: f64 = 900.0;
 const WINDOW_MIN_WIDTH: f64 = 980.0;
 const WINDOW_MIN_HEIGHT: f64 = 660.0;
 const LOOPBACK_EPHEMERAL_ADDR: &str = "127.0.0.1:0";
-const ICON_DIMENSION: u32 = 32;
+const ICON_WINDOW_DIMENSION: u32 = 32;
+const ICON_TASKBAR_DIMENSION: u32 = 256;
 
-fn build_drakul_window_icon() -> Option<Icon> {
-    let mut rgba = Vec::with_capacity((ICON_DIMENSION * ICON_DIMENSION * 4) as usize);
-    let center = (ICON_DIMENSION as f32 - 1.0) / 2.0;
+fn load_window_icon_32() -> Option<Icon> {
+    Icon::from_rgba(
+        EMBEDDED_ICON_32_RGBA.to_vec(),
+        ICON_WINDOW_DIMENSION,
+        ICON_WINDOW_DIMENSION,
+    )
+    .ok()
+}
 
-    for y in 0..ICON_DIMENSION {
-        for x in 0..ICON_DIMENSION {
-            let dx = (x as f32 - center).abs();
-            let dy = (y as f32 - center).abs();
-            let dist = (dx * dx + dy * dy).sqrt();
-            let oct_dist = dx.max(dy) + 0.414 * dx.min(dy);
-
-            let (r, g, b, a) = if oct_dist > 15.0 {
-                (0, 0, 0, 0)
-            } else if oct_dist > 13.4 {
-                // Metallic bevel (#44475A / #BD93F9 glow)
-                (189, 147, 249, 255)
-            } else if dist < 4.2 {
-                // Central prism core (#8BE9FD)
-                (139, 233, 253, 255)
-            } else if (dx - dy).abs() < 1.8 && y < 16 {
-                // Upper neon purple beam (#BD93F9)
-                (189, 147, 249, 255)
-            } else if (dx - dy).abs() < 1.8 && y >= 16 {
-                // Lower emerald tunnel beam (#50FA7B)
-                (80, 250, 123, 255)
-            } else if dy < 1.5 && x > 14 {
-                // Horizontal cyan beam (#8BE9FD)
-                (139, 233, 253, 255)
-            } else {
-                // Drakul deep slate background (#282A36)
-                (40, 42, 54, 255)
-            };
-
-            rgba.push(r);
-            rgba.push(g);
-            rgba.push(b);
-            rgba.push(a);
-        }
-    }
-
-    Icon::from_rgba(rgba, ICON_DIMENSION, ICON_DIMENSION).ok()
+fn load_taskbar_icon_256() -> Option<Icon> {
+    Icon::from_rgba(
+        EMBEDDED_ICON_256_RGBA.to_vec(),
+        ICON_TASKBAR_DIMENSION,
+        ICON_TASKBAR_DIMENSION,
+    )
+    .ok()
 }
 
 fn spawn_embedded_ui_server(
@@ -167,8 +146,10 @@ fn spawn_embedded_ui_server(
                         ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
                     } else if path.starts_with("/assets/app.css") {
                         ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
-                    } else if path.starts_with("/logo.jpg") {
-                        ("image/jpeg", EMBEDDED_LOGO_JPG)
+                    } else if path.starts_with("/routeward-glyph.svg") {
+                        ("image/svg+xml", EMBEDDED_GLYPH_SVG)
+                    } else if path.starts_with("/routeward-icon.svg") {
+                        ("image/svg+xml", EMBEDDED_ICON_SVG)
                     } else {
                         ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
                     };
@@ -207,16 +188,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_proxy,
     );
 
-    let window = WindowBuilder::new()
+    let mut window_builder = WindowBuilder::new()
         .with_title("RouteWard")
-        .with_window_icon(build_drakul_window_icon())
+        .with_window_icon(load_window_icon_32())
         .with_inner_size(LogicalSize::new(
             WINDOW_DEFAULT_WIDTH,
             WINDOW_DEFAULT_HEIGHT,
         ))
         .with_min_inner_size(LogicalSize::new(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT))
-        .with_theme(Some(Theme::Dark))
-        .build(&event_loop)?;
+        .with_theme(Some(Theme::Dark));
+
+    #[cfg(target_os = "windows")]
+    {
+        use tao::platform::windows::WindowBuilderExtWindows;
+        window_builder = window_builder.with_taskbar_icon(load_taskbar_icon_256());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = load_taskbar_icon_256();
+    }
+
+    let window = window_builder.build(&event_loop)?;
 
     let init_script = format!("window.__ROUTEWARD_TOKEN__ = {ephemeral_token:?};");
     let _webview = WebViewBuilder::new()
@@ -250,4 +242,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_embedded_window_and_taskbar_rgba_icons_and_svgs() {
+        assert_eq!(
+            EMBEDDED_ICON_32_RGBA.len(),
+            (ICON_WINDOW_DIMENSION * ICON_WINDOW_DIMENSION * 4) as usize
+        );
+        assert_eq!(
+            EMBEDDED_ICON_256_RGBA.len(),
+            (ICON_TASKBAR_DIMENSION * ICON_TASKBAR_DIMENSION * 4) as usize
+        );
+        assert!(load_window_icon_32().is_some());
+        assert!(load_taskbar_icon_256().is_some());
+        assert!(std::str::from_utf8(EMBEDDED_GLYPH_SVG)
+            .expect("UTF-8 glyph SVG")
+            .contains("<svg"));
+        assert!(std::str::from_utf8(EMBEDDED_ICON_SVG)
+            .expect("UTF-8 icon SVG")
+            .contains("<svg"));
+    }
 }

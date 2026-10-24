@@ -37,3 +37,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tao = "0.30"
 wry = "0.47"
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource.workspace = true

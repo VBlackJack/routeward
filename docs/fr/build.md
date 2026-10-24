@@ -12,7 +12,15 @@
 
 ## Etape 1 : Compiler le Bundle Frontend
 
-`routeward-desktop` embarque `ui/dist/index.html`, `ui/dist/assets/app.js` et `ui/dist/assets/app.css` a la compilation via `include_bytes!`. Il faut donc compiler le frontend en premier :
+`routeward-desktop` embarque `ui/dist/index.html`, `ui/dist/assets/app.js`, `ui/dist/assets/app.css` ainsi que les ressources de marque de `assets/branding/` (`routeward-glyph.svg`, `routeward-icon.svg`, `routeward-32.rgba`, `routeward-256.rgba`) a la compilation via `include_bytes!`. Sous Windows, `build.rs` incorpore egalement `assets/branding/routeward.ico` dans `routeward.exe` et `routeward-desktop.exe` via `embed-resource`.
+
+Tous les fichiers generes dans `assets/branding/` (`routeward-16.png` a `routeward-512.png`, `routeward.ico`, `routeward-32.rgba`, `routeward-256.rgba`) sont versionnes dans le depot afin que la compilation standard n'ait pas besoin d'executer le script. Pour les regenerer a partir de `assets/branding/routeward-icon.svg`, executer :
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\branding\build-icons.ps1
+```
+
+Il faut compiler le frontend en premier :
 
 ```powershell
 Set-Location ui
