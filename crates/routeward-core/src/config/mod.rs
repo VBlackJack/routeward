@@ -447,6 +447,12 @@ pub struct TelemetryConstants {
     pub linux_user_log_dir: String,
     #[serde(default = "default_linux_user_fallback_log_dir")]
     pub linux_user_fallback_log_dir: String,
+    #[serde(default = "default_windows_user_webview_dir")]
+    pub windows_user_webview_dir: String,
+    #[serde(default = "default_linux_user_webview_dir")]
+    pub linux_user_webview_dir: String,
+    #[serde(default = "default_linux_user_fallback_webview_dir")]
+    pub linux_user_fallback_webview_dir: String,
     pub log_app_name: String,
     pub log_flush_interval_ms: u64,
     #[serde(default = "default_event_broadcast_capacity")]
@@ -473,6 +479,18 @@ fn default_linux_user_fallback_log_dir() -> String {
     ".local/state/routeward/logs".to_string()
 }
 
+fn default_windows_user_webview_dir() -> String {
+    r"%LOCALAPPDATA%\RouteWard\WebView2".to_string()
+}
+
+fn default_linux_user_webview_dir() -> String {
+    "$XDG_DATA_HOME/routeward/webview".to_string()
+}
+
+fn default_linux_user_fallback_webview_dir() -> String {
+    ".local/share/routeward/webview".to_string()
+}
+
 impl TelemetryConstants {
     /// Resolves the absolute log directory for the privileged daemon (`%ProgramData%\RouteWard\logs`
     /// on Windows via `SHGetKnownFolderPath(FOLDERID_ProgramData)`, `/var/log/routeward` on Linux).
@@ -494,28 +512,39 @@ impl TelemetryConstants {
         }
     }
 
-    /// Resolves the absolute log directory for the desktop UI and unprivileged CLI
-    /// (`%LOCALAPPDATA%\RouteWard\logs` on Windows via `SHGetKnownFolderPath(FOLDERID_LocalAppData)`,
-    /// `$XDG_STATE_HOME/routeward/logs` or `~/.local/state/routeward/logs` on Linux).
-    pub fn resolve_user_log_dir(&self) -> std::path::PathBuf {
+    fn resolve_user_template_dir(
+        win_template: &str,
+        linux_template: &str,
+        linux_env_var: &str,
+        linux_fallback_rel: &str,
+    ) -> std::path::PathBuf {
         #[cfg(windows)]
         {
+            let _ = (linux_template, linux_env_var, linux_fallback_rel);
             if let Ok(local_app_data) = security::resolve_windows_local_app_data_dir() {
                 let local_str = local_app_data.to_string_lossy();
                 return std::path::PathBuf::from(
-                    self.windows_user_log_dir
-                        .replace("%LOCALAPPDATA%", &local_str),
+                    win_template.replace("%LOCALAPPDATA%", &local_str),
                 );
             }
-            std::path::PathBuf::from(&self.windows_user_log_dir)
+            if let Ok(env_local) = std::env::var("LOCALAPPDATA") {
+                let trimmed = env_local.trim();
+                if !trimmed.is_empty() {
+                    return std::path::PathBuf::from(
+                        win_template.replace("%LOCALAPPDATA%", trimmed),
+                    );
+                }
+            }
+            std::path::PathBuf::from(win_template)
         }
         #[cfg(not(windows))]
         {
-            if let Ok(xdg_state) = std::env::var("XDG_STATE_HOME") {
-                let trimmed = xdg_state.trim();
+            let _ = win_template;
+            if let Ok(xdg_dir) = std::env::var(linux_env_var) {
+                let trimmed = xdg_dir.trim();
                 if !trimmed.is_empty() {
                     return std::path::PathBuf::from(
-                        self.linux_user_log_dir.replace("$XDG_STATE_HOME", trimmed),
+                        linux_template.replace(&format!("${linux_env_var}"), trimmed),
                     );
                 }
             }
@@ -525,8 +554,33 @@ impl TelemetryConstants {
                 .map(std::path::PathBuf::from)
                 .or_else(resolve_unix_passwd_home)
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-            home_dir.join(&self.linux_user_fallback_log_dir)
+            home_dir.join(linux_fallback_rel)
         }
+    }
+
+    /// Resolves the absolute log directory for the desktop UI and unprivileged CLI
+    /// (`%LOCALAPPDATA%\RouteWard\logs` on Windows via `SHGetKnownFolderPath(FOLDERID_LocalAppData)`,
+    /// `$XDG_STATE_HOME/routeward/logs` or `~/.local/state/routeward/logs` on Linux).
+    pub fn resolve_user_log_dir(&self) -> std::path::PathBuf {
+        Self::resolve_user_template_dir(
+            &self.windows_user_log_dir,
+            &self.linux_user_log_dir,
+            "XDG_STATE_HOME",
+            &self.linux_user_fallback_log_dir,
+        )
+    }
+
+    /// Resolves the writable per-user WebView data directory (`%LOCALAPPDATA%\RouteWard\WebView2`
+    /// on Windows, `$XDG_DATA_HOME/routeward/webview` or `~/.local/share/routeward/webview` on Linux)
+    /// so per-machine installs under `Program Files` never attempt to write WebView2 state into a
+    /// read-only installation folder.
+    pub fn resolve_user_webview_dir(&self) -> std::path::PathBuf {
+        Self::resolve_user_template_dir(
+            &self.windows_user_webview_dir,
+            &self.linux_user_webview_dir,
+            "XDG_DATA_HOME",
+            &self.linux_user_fallback_webview_dir,
+        )
     }
 
     /// Resolves the appropriate log directory for the current process privilege level.
@@ -1055,6 +1109,7 @@ mod tests {
         let constants = SystemConstants::load_embedded().expect("SystemConstants");
         let daemon_log_dir = constants.telemetry.resolve_daemon_log_dir();
         let user_log_dir = constants.telemetry.resolve_user_log_dir();
+        let user_webview_dir = constants.telemetry.resolve_user_webview_dir();
 
         assert!(
             daemon_log_dir.is_absolute(),
@@ -1066,6 +1121,11 @@ mod tests {
             "User log dir must be absolute: {}",
             user_log_dir.display()
         );
+        assert!(
+            user_webview_dir.is_absolute(),
+            "User WebView dir must be absolute: {}",
+            user_webview_dir.display()
+        );
 
         #[cfg(windows)]
         {
@@ -1073,7 +1133,11 @@ mod tests {
                 .to_string_lossy()
                 .ends_with(r"RouteWard\logs"));
             assert!(user_log_dir.to_string_lossy().ends_with(r"RouteWard\logs"));
+            assert!(user_webview_dir
+                .to_string_lossy()
+                .ends_with(r"RouteWard\WebView2"));
             assert_ne!(daemon_log_dir, user_log_dir);
+            assert_ne!(daemon_log_dir, user_webview_dir);
         }
         #[cfg(not(windows))]
         {
@@ -1082,6 +1146,9 @@ mod tests {
                 std::path::PathBuf::from("/var/log/routeward")
             );
             assert!(user_log_dir.to_string_lossy().ends_with("routeward/logs"));
+            assert!(user_webview_dir
+                .to_string_lossy()
+                .ends_with("routeward/webview"));
         }
     }
 

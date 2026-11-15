@@ -781,6 +781,9 @@
       "disconnected": "Privileged RouteWard daemon is not connected",
       "insecure_profile": "Refusing to start: profile directory or file has insecure ownership or write permissions",
       "cleanup_refused_active": "Refusing to run cleanup while a RouteWard daemon is active (stop the daemon first or pass --force)"
+    },
+    "desktop": {
+      "ui_init": "RouteWard could not initialize its desktop WebView window. Ensure Microsoft Edge WebView2 Runtime is installed and your user data folder is writable."
     }
   },
   "themeforge": {

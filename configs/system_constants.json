@@ -117,6 +117,9 @@
     "windowsUserLogDir": "%LOCALAPPDATA%\\RouteWard\\logs",
     "linuxUserLogDir": "$XDG_STATE_HOME/routeward/logs",
     "linuxUserFallbackLogDir": ".local/state/routeward/logs",
+    "windowsUserWebviewDir": "%LOCALAPPDATA%\\RouteWard\\WebView2",
+    "linuxUserWebviewDir": "$XDG_DATA_HOME/routeward/webview",
+    "linuxUserFallbackWebviewDir": ".local/share/routeward/webview",
     "logAppName": "RouteWard",
     "logFlushIntervalMs": 500,
     "eventBroadcastCapacity": 256
