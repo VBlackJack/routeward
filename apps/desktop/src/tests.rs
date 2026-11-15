@@ -827,3 +827,48 @@ async fn loopback_http_enforces_post_and_syncs_locale_with_tray_snapshot() {
 
     server_task.abort();
 }
+
+#[tokio::test]
+async fn theme_route_parses_hex_colors_and_dispatches_window_theme_command() {
+    use crate::{
+        handle_api_route, parse_hex_colorref, resolve_palette_window_appearance,
+        DesktopWindowCommand, WindowThemeAppearance,
+    };
+
+    assert_eq!(parse_hex_colorref("#282A36"), Some(0x00362A28));
+    assert_eq!(parse_hex_colorref("#FF112233"), Some(0x00332211));
+    assert_eq!(parse_hex_colorref("not-hex"), None);
+
+    let parchment = resolve_palette_window_appearance("Parchment");
+    assert!(parchment.is_light);
+    assert!(parchment.caption_color.is_some());
+
+    let constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let bridge = DesktopCommandBridge::new(constants, profile, "en");
+
+    let captured = Arc::new(parking_lot::Mutex::new(Vec::<DesktopWindowCommand>::new()));
+    let captured_cb = Arc::clone(&captured);
+    let cb = move |cmd: DesktopWindowCommand| {
+        captured_cb.lock().push(cmd);
+    };
+
+    let get_res = handle_api_route("GET", "/api/theme", "", &bridge, Some(&cb)).await;
+    assert_eq!(get_res.map(|(code, _, _)| code), Some(405));
+
+    let payload = r##"{"theme":"Drakul","accent":"Purple","isLight":false,"surfaceHex":"#112233","textPrimaryHex":"#AABBCC","borderHex":"#445566"}"##;
+    let post_res = handle_api_route("POST", "/api/theme", payload, &bridge, Some(&cb)).await;
+    assert_eq!(post_res.map(|(code, _, _)| code), Some(200));
+
+    let cmds = captured.lock();
+    assert_eq!(
+        cmds.as_slice(),
+        &[DesktopWindowCommand::ApplyTheme(WindowThemeAppearance {
+            is_light: false,
+            caption_color: Some(0x00332211),
+            text_color: Some(0x00CCBBAA),
+            border_color: Some(0x00665544),
+        })]
+    );
+}

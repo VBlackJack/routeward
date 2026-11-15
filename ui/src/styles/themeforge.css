@@ -19,6 +19,7 @@
 @tailwind utilities;
 
 :root {
+  color-scheme: dark;
   --tf-Background: #282A36;
   --tf-CurrentLine: #44475A;
   --tf-Selection: #44475A;
@@ -51,8 +52,10 @@
   --tf-radius-lg: 6px;
   --tf-radius-xl: 10px;
   --tf-border-width: 1px;
+  --tf-scrollbar-thumb: color-mix(in srgb, var(--tf-TextSecondary) 45%, var(--tf-SurfaceAlt));
 }
 
+html,
 body {
   background-color: var(--tf-Background);
   color: var(--tf-TextPrimary);
@@ -60,6 +63,38 @@ body {
   margin: 0;
   padding: 0;
   -webkit-font-smoothing: antialiased;
+}
+
+* {
+  scrollbar-color: var(--tf-scrollbar-thumb, var(--tf-Border)) var(--tf-Background);
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--tf-Background);
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--tf-scrollbar-thumb, var(--tf-Border));
+  border: 2px solid var(--tf-Background);
+  border-radius: var(--tf-radius-lg);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--tf-Accent);
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background-color: var(--tf-AccentPressed);
+}
+
+*::-webkit-scrollbar-corner {
+  background: var(--tf-Background);
 }
 
 .tf-card {
