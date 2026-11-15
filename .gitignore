@@ -18,5 +18,6 @@ logs/
 *.dll
 *.sys
 *.zip
+*.msi
 third_party/windivert/bin/
 tests/windows/RouteWard_TestReport_*.txt

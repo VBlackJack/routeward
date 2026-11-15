@@ -170,10 +170,25 @@ RouteWard est organisé en workspace Rust comprenant trois crates (`routeward-co
   - Organise l'interface autour de 5 onglets (`Alt+1`..`Alt+5`) : **Accueil** (`DashboardView.tsx`), **Mes Apps & Sites** (`RulesView.tsx`), **Mon Proxy** (`ProxiesView.tsx`), **Activité** (`ConnectionsView.tsx`) et **Réglages** (`SettingsView.tsx`, intégrant les sous-onglets techniques `DnsView` et `LogsView`).
   - Démarre par défaut en mode **Simple** (bascule `Simple` / `Avancé` persistée dans `localStorage`), conditionne l'ouverture automatique de l'assistant `QuickSetupWizardModal` à `daemonConnected` pour ne pas masquer la bannière de déconnexion, signale le proxy actif par un badge `Principal` et permet l'édition des règles existantes en mode Simple comme Avancé.
 - **Zone de Notification Windows Native (`apps/desktop/src/tray.rs`)** :
-  - Exécute une boucle Win32 dédiée (`Shell_NotifyIconW` / `NOTIFYICONDATAW`, reprise automatique sur `TaskbarCreated`) avec infobulle d'état UTF-16 et menu contextuel bilingue (`Ouvrir RouteWard`, `Activer la protection` / `Mettre en pause`, `Quitter`) synchronisés en temps réel via `DesktopCommandBridge::notify_tray()`.
+  - Exécute une boucle Win32 dédiée (`Shell_NotifyIconW` / `NOTIFYICONDATAW`, reprise automatique sur `TaskbarCreated`) avec infobulle d'état UTF-16 et menu contextuel bilingue (`Ouvrir RouteWard`, `Activer la protection` / `Mettre en pause`, sous-menu de sélection rapide des profils, `Quitter`) synchronisés en temps réel via `DesktopCommandBridge::notify_tray()`.
   - Fermer la fenêtre réduit l'application dans la zone de notification (`window.set_visible(false)`) lorsque le System Tray est actif ; le menu `Quitter` arrête complètement l'interface.
 - **Démarrage Privilégié du Daemon / Service en 1 Clic (`apps/desktop/src/daemon_launcher.rs` & `routes.rs`)** :
   - Expose `POST /api/daemon/start` protégé contre les appels concurrents (`DaemonStartGuard`). Sous Windows, si le service SCM `RouteWard` est installé et arrêté, l'appel tente d'abord `start_windows_service()` puis élève `routeward.exe service start` via `ShellExecuteExW` (`"runas"`). Si le service tourne déjà avec accès refusé au Named Pipe, l'endpoint renvoie HTTP `409` (`access_denied`) sans dupliquer de daemon. Si aucun service n'est installé, il lance `routeward.exe daemon --locale <en|fr> --allow-sid <SID>` en UAC et surveille la reconnexion (`refresh_state()`).
+
+### Fonctionnalités Proxifier / ProxyBridge / Edge FoxyProxy (`routeward-core::proxy`, `rules`, `pac`, `process`)
+- **Protocoles Étendus et Windows SSPI (`routeward-core::proxy`)** :
+  - Ajoute **SOCKS4 / SOCKS4a** (`ProxyProtocol::Socks4`), **HTTPS `CONNECT`** chiffré par TLS (`tokio-rustls` avec option `tlsSkipVerify` signalée dans l'interface et URIs `?insecure=1` / `?tlsSkipVerify=1`) ainsi que l'authentification Windows **SSPI (`Negotiate` / `NTLM` / Kerberos)** (`crates/routeward-core/src/proxy/ntlm.rs`) lorsqu'un proxy HTTP/HTTPS d'entreprise répond avec `Proxy-Authenticate: Negotiate` ou `NTLM` sans identifiants explicites.
+- **Inspection HTTP `Host:` et Exclusions `!motif` (`tcp_relay.rs`, `rules/mod.rs`)** :
+  - En complément de l'inspection TLS `ClientHello` SNI (`peek_tls_client_hello_sni`) sur le port `443`, `peek_http_host_header` inspecte l'en-tête HTTP en clair sur les ports configurés via `httpHostInspectPorts` (`[80, 8080, 8000, 8888]` dans `configs/system_constants.json`) afin d'évaluer les règles de domaine même sur IP littérale.
+  - `RuleEngine::evaluate` gère les motifs d'exclusion `!motif` dans `processPatterns`, `domainPatterns` et `ipCidrs`.
+- **Routage Navigateur Natif Sans Extension (`routeward-core::pac`)** :
+  - **Importateur FoxyProxy (`FoxyProxyImporter`)** : Parse les fichiers JSON FoxyProxy (v7/v8 et anciens schémas), importe les proxys et les motifs d'inclusion/exclusion par domaine en les liant à `msedge.exe` (ou tout autre navigateur), complété par le préréglage intégré `preset-edge-foxyproxy`.
+  - **Serveur PAC Local Dynamique (`PacGenerator`)** : Expose un fichier PAC dynamique sur `http://127.0.0.1:10811/proxy.pac` généré depuis les règles actives du `RuleEngine` et s'intègre avec Windows `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` (`AutoConfigURL`) via `/api/system/pac`.
+- **Profils Nommés, Sélecteur d'Apps, Diagnostics Activité et Installateur `.msi`** :
+  - **Profils Multi-Configurations (`controller.rs`, `SettingsView.tsx`, `tray.rs`)** : Enregistre, liste, bascule et supprime des profils nommés (`%ProgramData%\RouteWard\profiles\*.json` / `/etc/routeward/profiles/*.json`, avec vérification stricte des liens symboliques et des ACL en mode élevé).
+  - **Sélecteur Visuel d'Applications (`process::list_system_applications`)** : Liste et déduplique les processus actifs et les applications installées dans `%ProgramFiles%`, `%ProgramFiles(x86)%` et `%LOCALAPPDATA%\Programs` sous Windows pour une sélection en 1 clic (`GET /api/system/apps`).
+  - **Diagnostics & Export Activité (`ConnectionsView.tsx`)** : Enregistre le détail d'erreur `errorDetail` dans `TrackedConnection` et propose l'export CSV (protégé contre l'injection de formules) et JSON.
+  - **Démarrage Automatique Session & Installateur `.msi`** : Expose `/api/system/autostart` (`HKCU\...\Run`) et génère un paquet WiX v6 `.msi` via `packaging/windows/RouteWard.wxs` et `packaging/windows/build-msi.ps1`.
 
 ## Diagramme des Composants
 
@@ -210,10 +225,11 @@ flowchart TD
 
 | Chemin | Crate / Paquet | Responsabilité |
 | :--- | :--- | :--- |
-| `crates/routeward-core` | `routeward-core` | Trait `Interceptor`, `WinDivertInterceptor` (Windows), `NftablesInterceptor` (Linux), `TransparentNatTable`, `ProcessResolver`, `RuleEngine`, `ProxyConnector` (TCP + SOCKS5 `UDP ASSOCIATE` via `UdpAssociationManager`), rejet QUIC (`UDP 443`) par ICMP Port Unreachable, filtrage LLMNR (`5355`) / mDNS (`5353`) / NetBIOS-NS (`137`) et `FileLogger` quotidien. |
-| `crates/routeward-cli` | `routeward-cli` (`routeward`) | Interface en ligne de commande (`run --duration-secs`, `cleanup`, `check`, `eval`, `fake-ip`). |
-| `apps/desktop` | `routeward-desktop` | Application bureau native basée sur `tao` et `wry` embarquant `ui/dist`, avec System Tray Windows (`tray.rs`) et lancement UAC en 1 clic (`daemon_launcher.rs`). |
-| `ui` | `routeward-ui` | Interface React 18 + TypeScript + Tailwind CSS à 5 onglets (`Simple`/`Avancé`) avec palettes ThemeForge et suites Vitest. |
+| `crates/routeward-core` | `routeward-core` | Trait `Interceptor`, `WinDivertInterceptor` (Windows), `NftablesInterceptor` (Linux), `TransparentNatTable`, `ProcessResolver` (avec `list_system_applications`), `RuleEngine` (exclusions `!motif` + HTTP `Host:` / TLS SNI), `PacGenerator` & `FoxyProxyImporter`, `ProxyConnector` (SOCKS4/SOCKS5/HTTP/HTTPS + Windows SSPI + `UdpAssociationManager`), rejet QUIC (`UDP 443`) par ICMP Port Unreachable, filtrage LLMNR/mDNS/NetBIOS et `FileLogger` quotidien. |
+| `crates/routeward-cli` | `routeward-cli` (`routeward`) | Interface en ligne de commande (`daemon`, `service`, `ctl`, `run --duration-secs`, `cleanup`, `check`, `eval`, `fake-ip`). |
+| `apps/desktop` | `routeward-desktop` | Application bureau native basée sur `tao` et `wry` embarquant `ui/dist`, avec System Tray Windows (`tray.rs`), routes profils nommés & PAC/démarrage auto et lancement UAC en 1 clic (`daemon_launcher.rs`). |
+| `ui` | `routeward-ui` | Interface React 18 + TypeScript + Tailwind CSS à 5 onglets (`Simple`/`Avancé`) avec palettes ThemeForge, importateur FoxyProxy, sélecteur d'apps, export Activité et suites Vitest. |
+| `packaging/` | Scripts d'empaquetage | Constructeurs `.deb` / `systemd` Linux (`packaging/linux/`), constructeurs ZIP Windows + `.msi` WiX (`packaging/windows/package-windows.ps1`, `build-msi.ps1`, `RouteWard.wxs`, `install-service.ps1`). |
 | `tools/fetch-windivert.ps1` | Script PowerShell | Télécharge WinDivert 2.2.2-A officiel, vérifie le SHA-256 et extrait `WinDivert.dll` et `WinDivert64.sys` dans `third_party/windivert/bin/`. |
 | `tests/linux/` | Suite de Tests Conteneur | Scénarios d'intégration automatisés sous Docker Debian 12 + `nftables` (`run-scenarios.sh`). |
 | `tests/windows/` | Suite de Tests Windows | Scénarios de non-régression Windows PowerShell 5.1 (`Invoke-RouteWardTests.ps1`, `Run-RouteWardTests.bat`). |

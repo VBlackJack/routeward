@@ -170,10 +170,25 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
   - Organizes controls across 5 use-case tabs (`Alt+1`..`Alt+5`): **Home** (`DashboardView.tsx`), **My Apps & Sites** (`RulesView.tsx`), **My Proxy** (`ProxiesView.tsx`), **Activity** (`ConnectionsView.tsx`), and **Settings** (`SettingsView.tsx`, embedding `DnsView` and `LogsView` diagnostic subtabs).
   - Defaults to **Simple** mode (hiding low-level cockpit metrics behind a persistent `Simple` / `Advanced` toggle in `localStorage`), gates automatic opening of the 3-step `QuickSetupWizardModal` on `daemonConnected` so it never covers the disconnected banner, highlights the active primary proxy with a `Primary` badge, and supports editing existing rules in both Simple and Advanced views.
 - **Native Windows System Tray (`apps/desktop/src/tray.rs`)**:
-  - Hosts a dedicated Win32 tray thread (`Shell_NotifyIconW` / `NOTIFYICONDATAW`, `TaskbarCreated` recovery) with a live UTF-16 status tooltip and localized (`en`/`fr`) context menu (`Open RouteWard`, `Enable/Pause Protection`, `Exit`) synchronized via `DesktopCommandBridge::notify_tray()`.
+  - Hosts a dedicated Win32 tray thread (`Shell_NotifyIconW` / `NOTIFYICONDATAW`, `TaskbarCreated` recovery) with a live UTF-16 status tooltip, localized (`en`/`fr`) context menu (`Open RouteWard`, `Enable/Pause Protection`, `Profiles` quick-switch submenu, `Exit`) synchronized via `DesktopCommandBridge::notify_tray()`.
   - Closing the desktop window minimizes to the Windows notification area (`window.set_visible(false)`) when the tray icon is ready, while `Exit` in the tray menu terminates the desktop process cleanly.
 - **1-Click Privileged Daemon / Service Start (`apps/desktop/src/daemon_launcher.rs` & `routes.rs`)**:
   - Exposes `POST /api/daemon/start` guarded against concurrent attempts (`DaemonStartGuard`). On Windows, if the `RouteWard` SCM service is installed and stopped, it attempts `start_windows_service()` first and falls back to elevating sibling `routeward.exe service start` via `ShellExecuteExW` (`"runas"`). If the service is already running with access denied to the pipe, it returns HTTP `409` (`access_denied`) instead of spawning a duplicate daemon. If no service is registered, it elevates `routeward.exe daemon --locale <en|fr> --allow-sid <SID>` via UAC and polls daemon readiness (`refresh_state()`).
+
+### Proxifier / ProxyBridge / Edge FoxyProxy Capabilities (`routeward-core::proxy`, `rules`, `pac`, `process`)
+- **Expanded Proxy Protocols & Windows SSPI (`routeward-core::proxy`)**:
+  - Adds **SOCKS4 / SOCKS4a** (`ProxyProtocol::Socks4`), TLS-encrypted **HTTPS `CONNECT`** (`tokio-rustls` with optional `tlsSkipVerify` surfaced cleanly in UI and `?insecure=1` / `?tlsSkipVerify=1` URIs), and Windows **SSPI (`Negotiate` / `NTLM` / Kerberos)** challenge/response authentication (`crates/routeward-core/src/proxy/ntlm.rs`) when an enterprise HTTP/HTTPS proxy requests `Proxy-Authenticate: Negotiate` or `NTLM` without explicit basic credentials.
+- **Plain HTTP `Host:` Inspection & `!pattern` Exclusions (`tcp_relay.rs`, `rules/mod.rs`)**:
+  - Alongside TLS `ClientHello` SNI (`peek_tls_client_hello_sni`) on port `443`, `peek_http_host_header` inspects cleartext HTTP requests on ports configured via `httpHostInspectPorts` (`[80, 8080, 8000, 8888]` in `configs/system_constants.json`) so domain-based rules match literal-IP or non-Fake-IP HTTP traffic.
+  - `RuleEngine::evaluate` supports `!pattern` exclusion entries across `processPatterns`, `domainPatterns`, and `ipCidrs`.
+- **Native Browser Routing Without Extensions (`routeward-core::pac`)**:
+  - **FoxyProxy Importer (`FoxyProxyImporter`)**: Parses FoxyProxy JSON configurations (v7/v8 and legacy schemas), importing proxy definitions and include/exclude domain wildcard/regex patterns targeting `msedge.exe` (or any chosen browser executable), complemented by the built-in `preset-edge-foxyproxy` rule preset.
+  - **Dynamic Local PAC Server (`PacGenerator`)**: Serves live PAC rules at `http://127.0.0.1:10811/proxy.pac` backed by active `RuleEngine` rules and integrates with Windows `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` (`AutoConfigURL`) via `/api/system/pac`.
+- **Named Profiles, System App Picker, Activity Diagnostics & `.msi` Packaging**:
+  - **Named Multi-Profiles (`controller.rs`, `SettingsView.tsx`, `tray.rs`)**: Saves, lists, switches, and deletes named profiles (`%ProgramData%\RouteWard\profiles\*.json` / `/etc/routeward/profiles/*.json`, with strict symlink & DACL verification when elevated).
+  - **Visual System App Picker (`process::list_system_applications`)**: Enumerates deduplicated running processes alongside applications installed in `%ProgramFiles%`, `%ProgramFiles(x86)%`, and `%LOCALAPPDATA%\Programs` on Windows for 1-click selection in rule creation (`GET /api/system/apps`).
+  - **Activity Diagnostics & Export (`ConnectionsView.tsx`)**: Captures `errorDetail` failure explanations in `TrackedConnection` and provides formula-injection-safe CSV & JSON exports.
+  - **Windows Logon Autostart & `.msi` Installer**: Exposes `/api/system/autostart` (`HKCU\...\Run`) and builds signed-ready WiX v6 `.msi` packages via `packaging/windows/RouteWard.wxs` and `packaging/windows/build-msi.ps1`.
 
 ## Component Diagram
 
@@ -210,10 +225,11 @@ flowchart TD
 
 | Path | Crate / Package | Responsibility |
 | :--- | :--- | :--- |
-| `crates/routeward-core` | `routeward-core` | `Interceptor` trait, `WinDivertInterceptor` (Windows), `NftablesInterceptor` (Linux), `TransparentNatTable`, `ProcessResolver`, `RuleEngine`, `ProxyConnector` (TCP + SOCKS5 `UDP ASSOCIATE` via `UdpAssociationManager`), QUIC (`UDP 443`) ICMP Port Unreachable rejection, LLMNR (`5355`) / mDNS (`5353`) / NetBIOS-NS (`137`) leak guard, and daily `FileLogger`. |
-| `crates/routeward-cli` | `routeward-cli` (`routeward`) | Command-line interface (`run --duration-secs`, `cleanup`, `check`, `eval`, `fake-ip`). |
-| `apps/desktop` | `routeward-desktop` | Native desktop shell built with `tao` and `wry` serving the compiled `ui/dist` bundle, plus Windows System Tray (`tray.rs`) and UAC 1-click service launcher (`daemon_launcher.rs`). |
-| `ui` | `routeward-ui` | React 18 + TypeScript + Tailwind CSS 5-tab interface (`Simple`/`Advanced`) with ThemeForge palettes and Vitest suites. |
+| `crates/routeward-core` | `routeward-core` | `Interceptor` trait, `WinDivertInterceptor` (Windows), `NftablesInterceptor` (Linux), `TransparentNatTable`, `ProcessResolver` (plus `list_system_applications`), `RuleEngine` (`!pattern` exclusions + HTTP `Host:` / TLS SNI), `PacGenerator` & `FoxyProxyImporter`, `ProxyConnector` (SOCKS4/SOCKS5/HTTP/HTTPS + Windows SSPI + `UdpAssociationManager`), QUIC (`UDP 443`) ICMP Port Unreachable rejection, LLMNR/mDNS/NetBIOS guards, and daily `FileLogger`. |
+| `crates/routeward-cli` | `routeward-cli` (`routeward`) | Command-line interface (`daemon`, `service`, `ctl`, `run --duration-secs`, `cleanup`, `check`, `eval`, `fake-ip`). |
+| `apps/desktop` | `routeward-desktop` | Native desktop shell built with `tao` and `wry` serving the compiled `ui/dist` bundle, plus Windows System Tray (`tray.rs`), named profiles & PAC/autostart routes, and UAC 1-click service launcher (`daemon_launcher.rs`). |
+| `ui` | `routeward-ui` | React 18 + TypeScript + Tailwind CSS 5-tab interface (`Simple`/`Advanced`) with ThemeForge palettes, FoxyProxy importer modal, app picker, Activity export, and Vitest suites. |
+| `packaging/` | Packaging Scripts | Linux `.deb` / `systemd` builders (`packaging/linux/`), Windows ZIP + WiX `.msi` builders (`packaging/windows/package-windows.ps1`, `build-msi.ps1`, `RouteWard.wxs`, `install-service.ps1`). |
 | `tools/fetch-windivert.ps1` | PowerShell Script | Downloads official WinDivert 2.2.2-A, verifies SHA-256, and extracts `WinDivert.dll` and `WinDivert64.sys` into `third_party/windivert/bin/`. |
 | `tests/linux/` | Container Test Suite | Automated Debian 12 + `nftables` Docker integration scenarios (`run-scenarios.sh`). |
 | `tests/windows/` | Windows Test Suite | Automated Windows PowerShell 5.1 non-regression suite (`Invoke-RouteWardTests.ps1`, `Run-RouteWardTests.bat`). |

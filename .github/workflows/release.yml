@@ -99,18 +99,24 @@ jobs:
       - name: Build Windows release binaries
         run: cargo build --release --workspace
 
-      - name: Package Windows bundle
+      - name: Setup WiX Toolset CLI
+        run: dotnet tool install --global wix --version 6.0.2
+
+      - name: Package Windows bundle and MSI installer
         shell: pwsh
         run: |
           ./packaging/windows/package-windows.ps1 -TargetDir target/release -OutDir dist -Arch x64
+          ./packaging/windows/build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64
 
-      - name: Upload Windows ZIP bundle
+      - name: Upload Windows ZIP and MSI artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-windows-zip
           path: |
             dist/*.zip
             dist/*.zip.sha256
+            dist/*.msi
+            dist/*.msi.sha256
 
   publish-release:
     needs: [linux-deb, windows-zip]
@@ -125,10 +131,10 @@ jobs:
       - name: Prepare combined release files and SHA256SUMS
         run: |
           mkdir -p release-files
-          find artifacts -type f \( -name '*.deb' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release-files/ \;
+          find artifacts -type f \( -name '*.deb' -o -name '*.zip' -o -name '*.msi' -o -name '*.sha256' \) -exec cp {} release-files/ \;
           (
             cd release-files
-            sha256sum *.deb *.zip > SHA256SUMS.txt
+            sha256sum *.deb *.zip *.msi > SHA256SUMS.txt
           )
 
       - name: Publish GitHub Release
@@ -137,6 +143,7 @@ jobs:
           files: |
             release-files/*.deb
             release-files/*.zip
+            release-files/*.msi
             release-files/*.sha256
             release-files/SHA256SUMS.txt
           generate_release_notes: true

@@ -122,6 +122,9 @@ Pour une exécution persistante sous `LocalSystem`, enregistrez RouteWard comme 
 
 # Empaqueter les binaires release en ZIP + SHA-256 (sans inclure les pilotes WinDivert) :
 .\packaging\windows\package-windows.ps1
+
+# Générer l'installateur Windows MSI (requiert WiX Toolset v6 `wix.exe`; l'option `-IncludeWinDivert` embarque les pilotes WinDivert présents) :
+.\packaging\windows\build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64
 ```
 
 ### Unité `systemd` & Paquet `.deb` sous Linux

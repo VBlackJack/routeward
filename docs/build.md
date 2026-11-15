@@ -122,6 +122,9 @@ For persistent background execution under `LocalSystem`, register RouteWard as a
 
 # Package release binaries into a distributable ZIP + SHA-256 (excludes WinDivert drivers):
 .\packaging\windows\package-windows.ps1
+
+# Build the Windows MSI installer (requires WiX Toolset v6 `wix.exe`; optional `-IncludeWinDivert` bundles staged WinDivert drivers):
+.\packaging\windows\build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64
 ```
 
 ### Linux `systemd` Unit & `.deb` Packaging
