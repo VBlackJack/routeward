@@ -186,6 +186,14 @@
       "usecase": {
         "applied": "Scenario preset applied"
       },
+      "engine": {
+        "driver_missing": "WinDivert driver is missing from the installation folder (run tools/fetch-windivert.ps1)",
+        "open_failed": "Failed to open packet filter (Administrator privileges required)",
+        "not_root": "Root privileges required for transparent interception",
+        "nft_missing": "nftables binary (nft) not found",
+        "nft_failed": "Failed to configure nftables rules",
+        "start_failed": "Failed to change protection state"
+      },
       "daemon": {
         "started": "Privileged service started and connected",
         "uac_cancelled": "Administrator authorization was cancelled",

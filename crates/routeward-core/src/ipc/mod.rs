@@ -248,7 +248,11 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
                 if mode != InterceptionMode::Relay {
                     if let Err(err) = controller.start_transparent_interceptor() {
                         controller.stop_engine();
-                        return IpcResponse::error(Some(id), err.to_string());
+                        return IpcResponse::error_with_key(
+                            Some(id),
+                            Some(err.i18n_key().to_string()),
+                            err.to_string(),
+                        );
                     }
                 }
             } else {
@@ -434,7 +438,49 @@ where
     writer.flush().await
 }
 
-#[derive(Clone)]
+/// Structured outcome failure when exchanging an IPC command with the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcCallError {
+    /// Pipe/socket connection loss, write error, EOF, or idle timeout before a complete reply.
+    Transport(String),
+    /// Connected daemon responded cleanly with `ok: false`.
+    Remote {
+        message: String,
+        error_key: Option<String>,
+    },
+    /// Daemon reply exceeded `max_line_bytes` or failed JSON decoding.
+    Protocol(String),
+}
+
+impl IpcCallError {
+    /// Returns `true` only when the IPC transport connection itself failed or dropped.
+    pub fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Transport(msg) | Self::Protocol(msg) | Self::Remote { message: msg, .. } => msg,
+        }
+    }
+
+    pub fn error_key(&self) -> Option<&str> {
+        match self {
+            Self::Remote { error_key, .. } => error_key.as_deref(),
+            Self::Transport(_) | Self::Protocol(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for IpcCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for IpcCallError {}
+
+#[derive(Debug, Clone)]
 pub struct IpcClient {
     ipc_config: IpcConstants,
 }
@@ -455,32 +501,57 @@ impl IpcClient {
         .await
     }
 
-    pub async fn call_typed<T: DeserializeOwned>(&self, command: IpcCommand) -> RouteWardResult<T> {
-        let resp = self.call_raw(command).await?;
+    /// Calls `command` on the daemon, preserving whether any failure came from transport loss,
+    /// protocol framing/decoding, or a live daemon application error (`ok: false`).
+    pub async fn call_typed_detailed<T: DeserializeOwned>(
+        &self,
+        command: IpcCommand,
+    ) -> Result<T, IpcCallError> {
+        let stream = connect_ipc_stream(&self.ipc_config)
+            .await
+            .map_err(|err| IpcCallError::Transport(err.to_string()))?;
+        let resp = Self::exchange_on_stream_detailed(
+            stream,
+            command,
+            self.ipc_config.max_line_bytes,
+            self.ipc_config.idle_timeout_ms,
+        )
+        .await?;
         if !resp.ok {
-            return Err(RouteWardError::DaemonError {
-                key: ERR_KEY_DAEMON_IPC_ERROR,
-                detail: resp
+            return Err(IpcCallError::Remote {
+                message: resp
                     .error
                     .unwrap_or_else(|| "Daemon returned error".to_string()),
+                error_key: resp.error_key,
             });
         }
-        let val = resp.result.ok_or_else(|| RouteWardError::DaemonError {
-            key: ERR_KEY_DAEMON_IPC_ERROR,
-            detail: "Daemon returned empty result".to_string(),
-        })?;
-        serde_json::from_value(val).map_err(|err| RouteWardError::DaemonError {
-            key: ERR_KEY_DAEMON_IPC_ERROR,
-            detail: format!("Failed to decode daemon response: {err}"),
+        let val = resp
+            .result
+            .ok_or_else(|| IpcCallError::Protocol("Daemon returned empty result".to_string()))?;
+        serde_json::from_value(val).map_err(|err| {
+            IpcCallError::Protocol(format!("Failed to decode daemon response: {err}"))
         })
     }
 
-    pub async fn exchange_on_stream(
+    pub async fn call_typed<T: DeserializeOwned>(&self, command: IpcCommand) -> RouteWardResult<T> {
+        self.call_typed_detailed(command).await.map_err(|err| {
+            let key = match &err {
+                IpcCallError::Transport(_) => crate::error::ERR_KEY_DAEMON_DISCONNECTED,
+                IpcCallError::Remote { .. } | IpcCallError::Protocol(_) => ERR_KEY_DAEMON_IPC_ERROR,
+            };
+            RouteWardError::DaemonError {
+                key,
+                detail: err.to_string(),
+            }
+        })
+    }
+
+    pub async fn exchange_on_stream_detailed(
         stream: IpcStream,
         command: IpcCommand,
         max_line_bytes: usize,
         idle_timeout_ms: u64,
-    ) -> RouteWardResult<IpcResponse> {
+    ) -> Result<IpcResponse, IpcCallError> {
         let req_id = Uuid::new_v4().to_string();
         let req = IpcRequest {
             id: req_id,
@@ -490,26 +561,38 @@ impl IpcClient {
         let (read_half, mut write_half) = tokio::io::split(stream);
         write_json_line(&mut write_half, &req)
             .await
-            .map_err(|err| RouteWardError::DaemonError {
-                key: ERR_KEY_DAEMON_IPC_ERROR,
-                detail: format!("Failed to send IPC request: {err}"),
-            })?;
+            .map_err(|err| IpcCallError::Transport(format!("Failed to send IPC request: {err}")))?;
 
         let mut reader = BufReader::new(read_half);
         match read_bounded_line(&mut reader, max_line_bytes, idle_timeout_ms).await {
-            ReadLineOutcome::Line(line) => {
-                serde_json::from_str::<IpcResponse>(&line).map_err(|err| {
-                    RouteWardError::DaemonError {
-                        key: ERR_KEY_DAEMON_IPC_ERROR,
-                        detail: format!("Invalid IPC response JSON: {err}"),
-                    }
-                })
-            }
-            other => Err(RouteWardError::DaemonError {
-                key: ERR_KEY_DAEMON_IPC_ERROR,
-                detail: format!("Unexpected IPC read outcome: {other:?}"),
-            }),
+            ReadLineOutcome::Line(line) => serde_json::from_str::<IpcResponse>(&line)
+                .map_err(|err| IpcCallError::Protocol(format!("Invalid IPC response JSON: {err}"))),
+            ReadLineOutcome::LineTooLong => Err(IpcCallError::Protocol(format!(
+                "Unexpected IPC read outcome: {:?}",
+                ReadLineOutcome::LineTooLong
+            ))),
+            other => Err(IpcCallError::Transport(format!(
+                "Unexpected IPC read outcome: {other:?}"
+            ))),
         }
+    }
+
+    pub async fn exchange_on_stream(
+        stream: IpcStream,
+        command: IpcCommand,
+        max_line_bytes: usize,
+        idle_timeout_ms: u64,
+    ) -> RouteWardResult<IpcResponse> {
+        Self::exchange_on_stream_detailed(stream, command, max_line_bytes, idle_timeout_ms)
+            .await
+            .map_err(|err| RouteWardError::DaemonError {
+                key: if err.is_transport() {
+                    crate::error::ERR_KEY_DAEMON_DISCONNECTED
+                } else {
+                    ERR_KEY_DAEMON_IPC_ERROR
+                },
+                detail: err.to_string(),
+            })
     }
 }
 

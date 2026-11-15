@@ -245,7 +245,10 @@ export class RouteWardClientService {
             ...this.connections.slice(idx + 1)
           ];
         } else {
-          this.connections = [updated, ...this.connections];
+          this.connections = this.trimConnectionsCache([
+            updated,
+            ...this.connections
+          ]);
         }
         const activeCount = this.connections.filter(
           (c) => c.status === 'active'
@@ -296,6 +299,33 @@ export class RouteWardClientService {
         break;
       }
     }
+  }
+
+  private trimConnectionsCache(
+    list: TrackedConnection[]
+  ): TrackedConnection[] {
+    const cap = Math.max(
+      1,
+      SYSTEM_CONSTANTS.telemetry.maxConnectionHistoryEntries ?? 500
+    );
+    if (list.length <= cap) {
+      return list;
+    }
+    const result = [...list];
+    while (result.length > cap) {
+      let removeIdx = -1;
+      for (let i = result.length - 1; i >= 0; i -= 1) {
+        if (result[i].status !== 'active') {
+          removeIdx = i;
+          break;
+        }
+      }
+      if (removeIdx < 0) {
+        break;
+      }
+      result.splice(removeIdx, 1);
+    }
+    return result;
   }
 
   private computeTopTalkers(): ProcessTrafficSummary[] {
@@ -444,8 +474,12 @@ export class RouteWardClientService {
       );
       this.diagnostics = diag;
       await this.fetchState();
+      return this.diagnostics;
     } catch (err) {
       this.handleRequestFailure(err);
+      if (err instanceof HttpResponseError) {
+        throw err;
+      }
     }
     return this.diagnostics;
   }

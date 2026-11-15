@@ -108,6 +108,7 @@
   },
   "telemetry": {
     "maxLogRingBufferEntries": 1000,
+    "maxConnectionHistoryEntries": 500,
     "maxBandwidthHistorySamples": 60,
     "samplingIntervalMs": 1000,
     "processCacheTtlMs": 15000,
@@ -132,7 +133,7 @@
     "windowsPipeName": "\\\\.\\pipe\\routeward-daemon",
     "windowsProfilePath": "%ProgramData%\\RouteWard\\active_profile.json",
     "linuxProfilePath": "/etc/routeward/active_profile.json",
-    "maxLineBytes": 65536,
+    "maxLineBytes": 8388608,
     "idleTimeoutMs": 30000,
     "reconnectIntervalMs": 2000
   },

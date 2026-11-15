@@ -28,7 +28,6 @@ import {
 } from 'lucide-react';
 import { ModalContainer } from './ModalContainer';
 import { SYSTEM_CONSTANTS } from '../config/constants';
-import { generateClientId } from '../services/ipc';
 import {
   ProxyChain,
   ProxyNode,
@@ -43,8 +42,8 @@ interface QuickSetupWizardModalProps {
   proxies: ProxyNode[];
   chains: ProxyChain[];
   currentMode: ExperienceMode;
-  onImportUris: (uriText: string) => void;
-  onAddRule: (rule: RoutingRule) => void;
+  onImportUris: (uriText: string) => Promise<unknown> | void;
+  onAddRule: (rule: RoutingRule) => Promise<unknown> | void;
   onSelectMode: (mode: ExperienceMode) => void;
   onComplete: () => void;
   onClose: () => void;
@@ -68,64 +67,71 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   const [goal, setGoal] = useState<GoalProfile>('privacy');
   const [customUri, setCustomUri] = useState('');
   const [selectedMode, setSelectedMode] = useState<ExperienceMode>(currentMode);
+  const [applying, setApplying] = useState(false);
 
-  const applySelectedGoalRules = () => {
-    if (customUri.trim()) {
-      onImportUris(customUri.trim());
+  const applySelectedGoalRules = async () => {
+    if (applying) return;
+    setApplying(true);
+    try {
+      if (customUri.trim()) {
+        await onImportUris(customUri.trim());
+      }
+
+      const primaryProxyId = proxies[0]?.id || 'proxy-socks5-primary';
+      const primaryChainId = chains[0]?.id || primaryProxyId;
+
+      const findPreset = (id: string) =>
+        SYSTEM_CONSTANTS.rulePresets.find((p) => p.id === id);
+
+      const presetsToApply: string[] =
+        goal === 'privacy'
+          ? [
+              'preset-privacy-browsers',
+              'preset-block-os-telemetry',
+              'preset-rfc1918-direct'
+            ]
+          : goal === 'work'
+            ? ['preset-dev-toolchains', 'preset-rfc1918-direct']
+            : ['preset-rfc1918-direct'];
+
+      for (const pid of presetsToApply) {
+        const preset = findPreset(pid);
+        if (!preset) continue;
+        const actType = preset.suggestedActionType as
+          | 'proxy'
+          | 'chain'
+          | 'direct'
+          | 'block';
+        const targetId =
+          actType === 'proxy'
+            ? primaryProxyId
+            : actType === 'chain'
+              ? primaryChainId
+              : undefined;
+
+        await onAddRule({
+          id: `rule-wiz-${preset.id}`,
+          name: t(`${preset.i18nKey}.name`),
+          enabled: true,
+          priority: preset.priority,
+          processPatterns: [...preset.processPatterns],
+          domainPatterns: [...preset.domainPatterns],
+          ipCidrs: [...preset.ipCidrs],
+          portRanges: preset.portRanges.map((r) => ({
+            start: r.start,
+            end: r.end
+          })),
+          protocol: preset.protocol as TransportProtocol,
+          action: targetId ? { type: actType, targetId } : { type: actType }
+        });
+      }
+
+      onSelectMode(selectedMode);
+      onComplete();
+      onClose();
+    } finally {
+      setApplying(false);
     }
-
-    const primaryProxyId = proxies[0]?.id || 'proxy-socks5-primary';
-    const primaryChainId = chains[0]?.id || primaryProxyId;
-
-    const findPreset = (id: string) =>
-      SYSTEM_CONSTANTS.rulePresets.find((p) => p.id === id);
-
-    const presetsToApply: string[] =
-      goal === 'privacy'
-        ? [
-            'preset-privacy-browsers',
-            'preset-block-os-telemetry',
-            'preset-rfc1918-direct'
-          ]
-        : goal === 'work'
-          ? ['preset-dev-toolchains', 'preset-rfc1918-direct']
-          : ['preset-rfc1918-direct'];
-
-    for (const pid of presetsToApply) {
-      const preset = findPreset(pid);
-      if (!preset) continue;
-      const actType = preset.suggestedActionType as
-        | 'proxy'
-        | 'chain'
-        | 'direct'
-        | 'block';
-      const targetId =
-        actType === 'proxy'
-          ? primaryProxyId
-          : actType === 'chain'
-            ? primaryChainId
-            : undefined;
-
-      onAddRule({
-        id: `${generateClientId('rule-wiz')}-${preset.id}`,
-        name: t(`${preset.i18nKey}.name`),
-        enabled: true,
-        priority: preset.priority,
-        processPatterns: [...preset.processPatterns],
-        domainPatterns: [...preset.domainPatterns],
-        ipCidrs: [...preset.ipCidrs],
-        portRanges: preset.portRanges.map((r) => ({
-          start: r.start,
-          end: r.end
-        })),
-        protocol: preset.protocol as TransportProtocol,
-        action: targetId ? { type: actType, targetId } : { type: actType }
-      });
-    }
-
-    onSelectMode(selectedMode);
-    onComplete();
-    onClose();
   };
 
   return (
@@ -340,8 +346,11 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
           ) : (
             <button
               type="button"
-              onClick={applySelectedGoalRules}
-              className="tf-btn-accent flex items-center gap-2 px-5 py-2 text-xs font-bold"
+              disabled={applying}
+              onClick={() => {
+                void applySelectedGoalRules();
+              }}
+              className="tf-btn-accent flex items-center gap-2 px-5 py-2 text-xs font-bold disabled:cursor-not-allowed disabled:opacity-50"
             >
               <CheckCircle2 className="h-4 w-4" />
               {t('wizard.modal.finish')}

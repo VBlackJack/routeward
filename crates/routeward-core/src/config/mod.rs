@@ -433,6 +433,8 @@ pub struct CheckerConstants {
 #[serde(rename_all = "camelCase")]
 pub struct TelemetryConstants {
     pub max_log_ring_buffer_entries: usize,
+    #[serde(default = "default_max_connection_history_entries")]
+    pub max_connection_history_entries: usize,
     pub max_bandwidth_history_samples: usize,
     pub sampling_interval_ms: u64,
     pub process_cache_ttl_ms: u64,
@@ -457,6 +459,10 @@ pub struct TelemetryConstants {
     pub log_flush_interval_ms: u64,
     #[serde(default = "default_event_broadcast_capacity")]
     pub event_broadcast_capacity: usize,
+}
+
+fn default_max_connection_history_entries() -> usize {
+    500
 }
 
 fn default_windows_daemon_log_dir() -> String {

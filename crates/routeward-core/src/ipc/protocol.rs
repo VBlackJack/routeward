@@ -145,6 +145,8 @@ pub struct IpcResponse {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(rename = "errorKey", skip_serializing_if = "Option::is_none")]
+    pub error_key: Option<String>,
 }
 
 impl IpcResponse {
@@ -155,17 +157,27 @@ impl IpcResponse {
                 ok: true,
                 result: Some(val),
                 error: None,
+                error_key: None,
             },
             Err(err) => Self::error(Some(id), format!("serialization_error: {err}")),
         }
     }
 
     pub fn error(id: Option<String>, message: impl Into<String>) -> Self {
+        Self::error_with_key(id, None, message)
+    }
+
+    pub fn error_with_key(
+        id: Option<String>,
+        error_key: Option<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             id,
             ok: false,
             result: None,
             error: Some(message.into()),
+            error_key,
         }
     }
 }
@@ -198,6 +210,7 @@ pub async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     max_line_bytes: usize,
     idle_timeout_ms: u64,
 ) -> ReadLineOutcome {
+    let effective_limit = max_line_bytes.max(1);
     let mut accumulated: Vec<u8> = Vec::new();
     let timeout_duration = Duration::from_millis(idle_timeout_ms);
 
@@ -220,7 +233,7 @@ pub async fn read_bounded_line<R: AsyncBufRead + Unpin>(
 
             if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
                 let to_consume = newline_pos + 1;
-                if accumulated.len() + newline_pos > max_line_bytes {
+                if accumulated.len() + newline_pos > effective_limit {
                     reader.consume(to_consume);
                     return ReadLineOutcome::LineTooLong;
                 }
@@ -235,7 +248,7 @@ pub async fn read_bounded_line<R: AsyncBufRead + Unpin>(
                 };
             } else {
                 let chunk_len = available.len();
-                if accumulated.len() + chunk_len > max_line_bytes {
+                if accumulated.len() + chunk_len > effective_limit {
                     reader.consume(chunk_len);
                     return ReadLineOutcome::LineTooLong;
                 }

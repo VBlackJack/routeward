@@ -120,6 +120,61 @@ pub(super) struct WinDivertApi {
     pub(super) calc_checksums: FnWinDivertHelperCalcChecksums,
 }
 
+fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        std::path::PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(plain) = raw.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(plain)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn push_unique_candidate(candidates: &mut Vec<String>, path: &Path) {
+    let normalized = strip_verbatim_prefix(path).to_string_lossy().into_owned();
+    if normalized.is_empty() {
+        return;
+    }
+    let already_present = candidates.iter().any(|existing| {
+        if cfg!(windows) {
+            existing.eq_ignore_ascii_case(&normalized)
+        } else {
+            existing == &normalized
+        }
+    });
+    if !already_present {
+        candidates.push(normalized);
+    }
+}
+
+fn collect_windivert_candidates(
+    search_paths: &[String],
+    exe_dir: Option<&Path>,
+    env_override: Option<&str>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(env_path) = env_override {
+        let trimmed = env_path.trim();
+        if !trimmed.is_empty() {
+            push_unique_candidate(&mut candidates, Path::new(trimmed));
+        }
+    }
+    for raw in search_paths {
+        let rel_or_abs = Path::new(raw);
+        if rel_or_abs.is_absolute() {
+            push_unique_candidate(&mut candidates, rel_or_abs);
+            continue;
+        }
+        // Check executable directory before CWD so elevated processes resolve bundled DLLs safely.
+        if let Some(dir) = exe_dir {
+            push_unique_candidate(&mut candidates, &dir.join(rel_or_abs));
+        }
+        push_unique_candidate(&mut candidates, rel_or_abs);
+    }
+    candidates
+}
+
 #[cfg(windows)]
 impl WinDivertInterceptor {
     #[cfg(windows)]
@@ -128,13 +183,11 @@ impl WinDivertInterceptor {
             GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH,
         };
 
-        let mut candidates = Vec::new();
-        if let Ok(env_path) = std::env::var(ENV_WINDIVERT_DLL_PATH) {
-            if !env_path.trim().is_empty() {
-                candidates.push(env_path);
-            }
-        }
-        candidates.extend_from_slice(search_paths);
+        let env_override = std::env::var(ENV_WINDIVERT_DLL_PATH).ok();
+        let exe_path = std::env::current_exe().ok();
+        let exe_dir = exe_path.as_deref().and_then(|p| p.parent());
+        let candidates =
+            collect_windivert_candidates(search_paths, exe_dir, env_override.as_deref());
 
         let mut module_handle = std::ptr::null_mut();
         let mut loaded_from = String::new();
@@ -142,7 +195,8 @@ impl WinDivertInterceptor {
         for candidate in &candidates {
             let resolved = Path::new(candidate)
                 .canonicalize()
-                .unwrap_or_else(|_| Path::new(candidate).to_path_buf());
+                .map(|p| strip_verbatim_prefix(&p))
+                .unwrap_or_else(|_| strip_verbatim_prefix(Path::new(candidate)));
             let wide: Vec<u16> = resolved
                 .to_string_lossy()
                 .encode_utf16()
@@ -227,5 +281,36 @@ impl WinDivertInterceptor {
                 >(calc_ptr),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_windivert_candidates_with_exe_dir_before_cwd_and_strips_verbatim_prefix() {
+        let search_paths = vec![
+            "WinDivert.dll".to_string(),
+            "third_party/windivert/bin/WinDivert.dll".to_string(),
+        ];
+        let exe_dir = Path::new(r"\\?\C:\Program Files\RouteWard");
+        let candidates = collect_windivert_candidates(
+            &search_paths,
+            Some(exe_dir),
+            Some(r"\\?\D:\Custom\WinDivert.dll"),
+        );
+        assert_eq!(candidates[0], r"D:\Custom\WinDivert.dll");
+        assert_eq!(
+            Path::new(&candidates[1]),
+            Path::new(r"C:\Program Files\RouteWard").join("WinDivert.dll")
+        );
+        assert_eq!(candidates[2], "WinDivert.dll");
+        assert_eq!(
+            Path::new(&candidates[3]),
+            Path::new(r"C:\Program Files\RouteWard")
+                .join("third_party/windivert/bin/WinDivert.dll")
+        );
+        assert_eq!(candidates[4], "third_party/windivert/bin/WinDivert.dll");
     }
 }

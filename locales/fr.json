@@ -186,6 +186,14 @@
       "usecase": {
         "applied": "Scénario appliqué"
       },
+      "engine": {
+        "driver_missing": "Le pilote WinDivert est absent du dossier d'installation (exécutez tools/fetch-windivert.ps1)",
+        "open_failed": "Impossible d'ouvrir le filtre réseau (droits Administrateur requis)",
+        "not_root": "Privilèges root requis pour l'interception transparente",
+        "nft_missing": "Binaire nftables (nft) introuvable",
+        "nft_failed": "Échec de la configuration des règles nftables",
+        "start_failed": "Impossible de changer l'état de protection"
+      },
       "daemon": {
         "started": "Service privilégié démarré et connecté",
         "uac_cancelled": "Autorisation administrateur annulée",
