@@ -17,7 +17,7 @@
 use crate::commands::DesktopCommandBridge;
 use crate::security::{extract_json_body, validate_loopback_http_request_with_method};
 use crate::sse::stream_sse_events;
-use crate::DesktopWindowCommand;
+use crate::{parse_hex_colorref, resolve_palette_window_appearance, DesktopWindowCommand};
 use routeward_core::config::{InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule};
 use routeward_core::rules::ConnectionRequest;
 use serde::Deserialize;
@@ -142,9 +142,14 @@ struct SetModeRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetThemeRequest {
     theme: String,
     accent: String,
+    is_light: Option<bool>,
+    surface_hex: Option<String>,
+    text_primary_hex: Option<String>,
+    border_hex: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,8 +355,33 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/theme") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         if let Ok(req) = serde_json::from_str::<SetThemeRequest>(body_str) {
+            let fallback = resolve_palette_window_appearance(&req.theme);
+            let appearance = crate::WindowThemeAppearance {
+                is_light: req.is_light.unwrap_or(fallback.is_light),
+                caption_color: req
+                    .surface_hex
+                    .as_deref()
+                    .and_then(parse_hex_colorref)
+                    .or(fallback.caption_color),
+                text_color: req
+                    .text_primary_hex
+                    .as_deref()
+                    .and_then(parse_hex_colorref)
+                    .or(fallback.text_color),
+                border_color: req
+                    .border_hex
+                    .as_deref()
+                    .and_then(parse_hex_colorref)
+                    .or(fallback.border_color),
+            };
             bridge.set_theme(req.theme, req.accent).await;
+            if let Some(cb) = on_window_cmd {
+                cb(DesktopWindowCommand::ApplyTheme(appearance));
+            }
         }
         return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
     }

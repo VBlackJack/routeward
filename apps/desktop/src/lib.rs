@@ -25,7 +25,7 @@ mod tests;
 pub mod tray;
 
 use commands::DesktopCommandBridge;
-use routeward_core::config::{ProfileConfig, SystemConstants};
+use routeward_core::config::{ProfileConfig, SystemConstants, ThemeForgeCatalog};
 
 pub use routes::{
     handle_api_route, http_status_line, serve_loopback_api_connection,
@@ -50,6 +50,83 @@ pub struct TrayStatusSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowThemeAppearance {
+    pub is_light: bool,
+    pub caption_color: Option<u32>,
+    pub text_color: Option<u32>,
+    pub border_color: Option<u32>,
+}
+
+/// Parses `#RRGGBB` or `#AARRGGBB` CSS hex into Win32 `COLORREF` (`0x00BBGGRR`).
+pub fn parse_hex_colorref(raw: &str) -> Option<u32> {
+    let clean = raw.trim().trim_start_matches('#');
+    let rgb = match clean.len() {
+        6 => clean,
+        8 => &clean[2..],
+        _ => return None,
+    };
+    let r = u32::from_str_radix(&rgb[0..2], 16).ok()?;
+    let g = u32::from_str_radix(&rgb[2..4], 16).ok()?;
+    let b = u32::from_str_radix(&rgb[4..6], 16).ok()?;
+    Some((b << 16) | (g << 8) | r)
+}
+
+/// Resolves native window chrome colors from the embedded ThemeForge catalog.
+pub fn resolve_palette_window_appearance(theme_name: &str) -> WindowThemeAppearance {
+    let Ok(catalog) = ThemeForgeCatalog::load_embedded() else {
+        return WindowThemeAppearance {
+            is_light: false,
+            caption_color: None,
+            text_color: None,
+            border_color: None,
+        };
+    };
+
+    let selected = catalog
+        .palettes
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(theme_name))
+        .or_else(|| {
+            catalog
+                .palettes
+                .iter()
+                .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(&catalog.default_theme))
+        })
+        .or_else(|| catalog.palettes.first());
+
+    let Some(pal) = selected else {
+        return WindowThemeAppearance {
+            is_light: false,
+            caption_color: None,
+            text_color: None,
+            border_color: None,
+        };
+    };
+
+    let is_light = pal
+        .get("isLight")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let colors = pal.get("colors");
+    let caption_color = colors
+        .and_then(|c| c.get("Surface").and_then(|v| v.as_str()))
+        .and_then(parse_hex_colorref);
+    let text_color = colors
+        .and_then(|c| c.get("TextPrimary").and_then(|v| v.as_str()))
+        .and_then(parse_hex_colorref);
+    let border_color = colors
+        .and_then(|c| c.get("Border").and_then(|v| v.as_str()))
+        .and_then(parse_hex_colorref);
+
+    WindowThemeAppearance {
+        is_light,
+        caption_color,
+        text_color,
+        border_color,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopWindowCommand {
     Minimize,
     ToggleMaximize,
@@ -58,6 +135,7 @@ pub enum DesktopWindowCommand {
     ShowWindow,
     ToggleEngine,
     SwitchProfile(usize),
+    ApplyTheme(WindowThemeAppearance),
     Quit,
 }
 

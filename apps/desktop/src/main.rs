@@ -22,13 +22,14 @@ use routeward_desktop_lib::commands::DesktopCommandBridge;
 use routeward_desktop_lib::tray::TrayHandle;
 use routeward_desktop_lib::{
     create_desktop_bridge, serve_loopback_http_connection, DesktopWindowCommand,
+    WindowThemeAppearance,
 };
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
-use tao::window::{Icon, Theme, WindowBuilder};
+use tao::window::{Icon, Theme, Window, WindowBuilder};
 use tokio::net::TcpListener;
 use wry::{WebContext, WebViewBuilder};
 
@@ -66,6 +67,61 @@ fn load_taskbar_icon_256() -> Option<Icon> {
         ICON_TASKBAR_DIMENSION,
     )
     .ok()
+}
+
+fn apply_window_theme(window: &Window, appearance: WindowThemeAppearance) {
+    let target_theme = if appearance.is_light {
+        Theme::Light
+    } else {
+        Theme::Dark
+    };
+    window.set_theme(Some(target_theme));
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::size_of;
+        use tao::platform::windows::WindowExtWindows;
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::Graphics::Dwm::{
+            DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+        };
+
+        let hwnd = window.hwnd() as HWND;
+        let use_dark: i32 = i32::from(!appearance.is_light);
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                &use_dark as *const i32 as *const _,
+                size_of::<i32>() as u32,
+            );
+            if let Some(caption) = appearance.caption_color {
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_CAPTION_COLOR as u32,
+                    &caption as *const u32 as *const _,
+                    size_of::<u32>() as u32,
+                );
+            }
+            if let Some(text) = appearance.text_color {
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_TEXT_COLOR as u32,
+                    &text as *const u32 as *const _,
+                    size_of::<u32>() as u32,
+                );
+            }
+            if let Some(border) = appearance.border_color {
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_BORDER_COLOR as u32,
+                    &border as *const u32 as *const _,
+                    size_of::<u32>() as u32,
+                );
+            }
+        }
+    }
 }
 
 fn spawn_embedded_ui_server(
@@ -255,6 +311,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_proxy,
     );
 
+    let initial_appearance = bridge.initial_window_theme();
+    let initial_tao_theme = if initial_appearance.is_light {
+        Theme::Light
+    } else {
+        Theme::Dark
+    };
+
     let mut window_builder = WindowBuilder::new()
         .with_title(WINDOW_TITLE)
         .with_window_icon(load_window_icon_32())
@@ -263,7 +326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             WINDOW_DEFAULT_HEIGHT,
         ))
         .with_min_inner_size(LogicalSize::new(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT))
-        .with_theme(Some(Theme::Dark));
+        .with_theme(Some(initial_tao_theme));
 
     #[cfg(target_os = "windows")]
     {
@@ -282,6 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(Box::new(err));
         }
     };
+    apply_window_theme(&window, initial_appearance);
 
     let webview_data_dir = bridge.webview_data_dir();
     if let Err(err) = std::fs::create_dir_all(&webview_data_dir) {
@@ -364,6 +428,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rt_for_loop.spawn(async move {
                         b.switch_profile_by_index(idx).await;
                     });
+                }
+                DesktopWindowCommand::ApplyTheme(appearance) => {
+                    apply_window_theme(&window, appearance);
                 }
                 DesktopWindowCommand::Quit => {
                     #[cfg(target_os = "windows")]

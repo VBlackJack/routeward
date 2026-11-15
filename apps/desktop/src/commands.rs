@@ -678,9 +678,16 @@ impl DesktopCommandBridge {
             st.profile.theme_config.theme = theme.clone();
             st.profile.theme_config.accent = accent.clone();
         }
-        let _ = self
-            .call_daemon::<serde_json::Value>(IpcCommand::SetTheme { theme, accent })
-            .await;
+        if self.is_daemon_connected() {
+            let _ = self
+                .call_daemon::<serde_json::Value>(IpcCommand::SetTheme { theme, accent })
+                .await;
+        }
+    }
+
+    pub fn initial_window_theme(&self) -> crate::WindowThemeAppearance {
+        let theme_name = self.state.read().profile.theme_config.theme.clone();
+        crate::resolve_palette_window_appearance(&theme_name)
     }
 
     pub fn get_diagnostics(&self) -> SystemDiagnostics {

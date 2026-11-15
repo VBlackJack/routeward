@@ -16,6 +16,7 @@
 
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { THEMEFORGE_CATALOG_DATA, UI_CONFIG } from '../config/constants';
+import { routewardClient } from '../services/ipc';
 import {
   AccentTint,
   ThemeForgeColors,
@@ -150,7 +151,16 @@ export const ThemeForgeProvider: React.FC<{ children: React.ReactNode }> = ({
         ? UI_CONFIG.HIGH_CONTRAST_BORDER_PX
         : UI_CONFIG.STANDARD_BORDER_PX
     );
-  }, [effectiveColors, activePalette]);
+    root.style.colorScheme = Boolean(activePalette.isLight) ? 'light' : 'dark';
+    void routewardClient.setDesktopTheme({
+      theme: activePalette.name,
+      accent: activeAccent,
+      isLight: Boolean(activePalette.isLight),
+      surfaceHex: normalizeHex(effectiveColors.Surface),
+      textPrimaryHex: normalizeHex(effectiveColors.TextPrimary),
+      borderHex: normalizeHex(effectiveColors.Border)
+    });
+  }, [effectiveColors, activePalette, activeAccent]);
 
   const setTheme = (themeName: string) => {
     setActiveThemeName(themeName);

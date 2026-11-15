@@ -917,6 +917,25 @@ export class RouteWardClientService {
     }
   }
 
+  public async setDesktopTheme(payload: {
+    theme: string;
+    accent: string;
+    isLight: boolean;
+    surfaceHex: string;
+    textPrimaryHex: string;
+    borderHex: string;
+  }): Promise<void> {
+    try {
+      await this.requestJson<{ ok: boolean }>(
+        UI_CONFIG.API_ENDPOINTS.THEME,
+        'POST',
+        payload
+      );
+    } catch {
+      // Ignore network errors when UI runs standalone outside desktop host
+    }
+  }
+
   public async getPacStatus(): Promise<PacStatus> {
     const net = SYSTEM_CONSTANTS.network;
     const fallbackUrl = `http://${net.localBindHost}:${net.defaultPacPort}/proxy.pac`;
