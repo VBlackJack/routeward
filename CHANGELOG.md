@@ -3,6 +3,15 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
+## [v2026.1115.01] - 2026-11-15
+
+### Fixed
+- Store desktop WebView2 user data under `%LOCALAPPDATA%\RouteWard\WebView2` on Windows (`$XDG_DATA_HOME/routeward/webview` on Linux) instead of the read-only installation folder under `C:\Program Files\RouteWard\`, fixing silent launch failures (`HRESULT 0x80070005`) for standard users.
+- Log window and WebView2 startup errors to `%LOCALAPPDATA%\RouteWard\logs` and display a localized Windows error dialog (`MessageBoxW`) when initialization fails.
+
+### Changed
+- Redesigned the RouteWard application icon, system tray/EXE icon, and UI glyph (`Prisme Passerelle` hexagonal gateway emblem across SVG, PNG, `.ico`, and RGBA resources).
+
 ## [v2026.1115.00] - 2026-11-15
 
 ### Added
