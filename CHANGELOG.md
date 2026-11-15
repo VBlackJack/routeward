@@ -3,6 +3,17 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
+## [v2026.1115.03] - 2026-11-15
+
+### Fixed
+- Raise `ipc.maxLineBytes` to 8 MiB and bound tracked connection history (`telemetry.maxConnectionHistoryEntries` = 500, preserving active connections) across the daemon, desktop command bridge, and UI store so large connection lists no longer break Named Pipe IPC.
+- Distinguish IPC transport drops from live daemon application errors (`ok: false`) in `IpcClient::call_typed_detailed`, and surface structured `/api/engine/toggle` errors (`400`/`409`/`503`) as localized UI toasts across Header, Dashboard, and Command Palette controls.
+- Deduplicate quick-setup wizard rule IDs (`rule-wiz-<preset>`) and await sequential proxy/rule saves while preventing concurrent wizard submissions.
+- Resolve relative `windivertDllPaths` against the executable directory before the current working directory and strip Windows `\\?\` verbatim prefixes before loading `WinDivert.dll`.
+
+### Changed
+- Default `rule-browsers-socks5` and `rule-cli-tools-chain` to `enabled: false` in `configs/default_profile.json` so browsers and CLI tools pass through cleanly until explicitly routed or enabled.
+
 ## [v2026.1115.02] - 2026-11-15
 
 ### Fixed
