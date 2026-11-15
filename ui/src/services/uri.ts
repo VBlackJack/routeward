@@ -74,7 +74,14 @@ export function formatProxyUri(node: ProxyNode): string {
     node.auth && node.auth.username
       ? `${encodeURIComponent(node.auth.username)}@`
       : '';
-  const queryPart = node.sni ? `?sni=${encodeURIComponent(node.sni)}` : '';
+  const queryParams: string[] = [];
+  if (node.sni) {
+    queryParams.push(`sni=${encodeURIComponent(node.sni)}`);
+  }
+  if (node.tls && node.tlsSkipVerify) {
+    queryParams.push('insecure=1');
+  }
+  const queryPart = queryParams.length > 0 ? `?${queryParams.join('&')}` : '';
   const hashPart = `#${encodeURIComponent(node.name)}`;
   const hostPort = formatProxyHostPort(node.host, node.port);
   return `${scheme}://${authPart}${hostPort}${queryPart}${hashPart}`;
@@ -90,6 +97,8 @@ export function parseSingleProxyUri(uri: string): ProxyNode | null {
 
   const protocolMap: Record<string, ProxyProtocol> = {
     socks5: 'socks5',
+    socks4: 'socks4',
+    socks4a: 'socks4',
     http: 'http',
     https: 'https'
   };
@@ -138,8 +147,18 @@ export function parseSingleProxyUri(uri: string): ProxyNode | null {
   }
 
   const params = new URLSearchParams(query.replace(/^\?/, ''));
-  const sni = params.get('sni');
+  let sni: string | null = null;
+  let insecureVal = '';
+  for (const [key, val] of params.entries()) {
+    const low = key.toLowerCase();
+    if (low === 'sni' && val) {
+      sni = val;
+    } else if (low === 'insecure' || low === 'skipverify' || low === 'tlsskipverify') {
+      insecureVal = val.toLowerCase();
+    }
+  }
   const tls = protocol === 'https' || Boolean(sni);
+  const tlsSkipVerify = insecureVal === '1' || insecureVal === 'true' || insecureVal === 'yes';
 
   return {
     id: generateClientId('proxy'),
@@ -150,6 +169,7 @@ export function parseSingleProxyUri(uri: string): ProxyNode | null {
     auth,
     udpEnabled: protocol === 'socks5',
     tls,
+    tlsSkipVerify,
     sni,
     enabled: true,
     lastLatencyMs: null,

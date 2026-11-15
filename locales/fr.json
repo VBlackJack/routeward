@@ -147,12 +147,20 @@
       },
       "connection": {
         "terminated": "Socket de connexion terminé",
-        "os_scanned": "Sockets TCP réels du système analysés et importés"
+        "os_scanned": "Sockets TCP réels du système analysés et importés",
+        "exported": "Activité réseau exportée"
       },
       "system": {
         "proxy_enabled": "Proxy Système Windows activé sur le relais local",
         "proxy_disabled": "Proxy Système Windows désactivé",
         "proxy_error": "Échec de la mise à jour du Proxy Système Windows",
+        "pac_enabled": "Auto-configuration PAC Windows activée",
+        "pac_disabled": "Auto-configuration PAC Windows désactivée",
+        "pac_error": "Échec de mise à jour de la configuration PAC Windows",
+        "pac_copied": "URL PAC locale copiée dans le presse-papiers",
+        "autostart_enabled": "RouteWard démarrera automatiquement à l'ouverture de session",
+        "autostart_disabled": "Lancement automatique à l'ouverture de session désactivé",
+        "autostart_error": "Échec de mise à jour du démarrage automatique",
         "process_launched": "Processus démarré avec injection proxy",
         "process_launch_error": "Échec du lancement du processus via le proxy"
       },
@@ -165,7 +173,15 @@
       "profile": {
         "imported": "Profil de configuration importé",
         "import_error": "Fichier JSON de profil invalide",
-        "exported": "Profil exporté au format JSON"
+        "exported": "Profil exporté au format JSON",
+        "saved_named": "Profil nommé enregistré",
+        "switched": "Profil actif basculé",
+        "deleted": "Profil supprimé",
+        "error": "Échec de l'opération sur le profil"
+      },
+      "foxyproxy": {
+        "imported": "Règles et proxies FoxyProxy importés",
+        "import_error": "Fichier ou JSON FoxyProxy invalide"
       },
       "usecase": {
         "applied": "Scénario appliqué"
@@ -334,6 +350,8 @@
       "scan_os": {
         "button": "Scanner Sockets OS Réels"
       },
+      "export_csv": "Exporter CSV",
+      "export_json": "Exporter JSON",
       "clear": {
         "button": "Purger les Fermées"
       }
@@ -384,6 +402,7 @@
         "routing_section": "Routage Appliqué & Télémétrie",
         "matched_rule": "Règle Appliquée",
         "upstream_route": "Tunnel / Route",
+        "error_detail": "Motif du blocage / erreur",
         "quick_actions_title": "Création de Règle en 1 Clic & Contrôle Socket",
         "route_process_proxy": "Router ce Processus via Proxy",
         "route_process_direct": "Exempter ce Processus (DIRECT)",
@@ -408,7 +427,7 @@
       "servers": {
         "title": "Serveurs Proxy en Amont",
         "add": "Ajouter un Serveur Proxy",
-        "import_uri": "Importer URI (socks5://, http://, https://)",
+        "import_uri": "Importer URI (socks5://, socks4://, http://, https://)",
         "test_all": "Tester Tous les Proxies"
       },
       "chains": {
@@ -440,6 +459,7 @@
         "udp_ready": "Support UDP",
         "tcp_only": "TCP Uniquement",
         "tls_enabled": "TLS",
+        "tls_insecure": "TLS Non vérifié",
         "password_set": "Mot de passe défini",
         "untested": "Non testé",
         "online": "En ligne",
@@ -462,6 +482,8 @@
         "cancel_replace_password": "Conserver le mot de passe actuel",
         "udp_label": "Activer UDP Associate",
         "tls_label": "Activer le transport TLS",
+        "tls_skip_verify_label": "Ignorer la vérification du certificat TLS (Non sécurisé - labo uniquement)",
+        "sspi_hint": "Astuce : pour les proxies NTLM/Negotiate, laissez vide pour la session Windows ou saisissez DOMAINE\\identifiant",
         "submit": "Enregistrer le Proxy",
         "cancel": "Annuler"
       },
@@ -507,7 +529,8 @@
       "title": "Règles de Routage par Processus et Destination",
       "subtitle": "Les règles sont évaluées par ordre de priorité croissant. La première correspondance s'applique.",
       "add_button": "Nouvelle Règle",
-      "presets_button": "Modèles de Règles en 1 Clic"
+      "presets_button": "Modèles de Règles en 1 Clic",
+      "import_foxyproxy": "Importer FoxyProxy JSON"
     },
     "presets": {
       "dev_toolchains": {
@@ -525,6 +548,10 @@
       "rfc1918_direct": {
         "name": "Exempter le Réseau Local & RFC 1918 (DIRECT)",
         "desc": "Garantit un accès direct aux sous-réseaux privés (127.0.0.0/8, 192.168.0.0/16, 10.0.0.0/8, *.local)"
+      },
+      "edge_foxyproxy": {
+        "name": "Routage Edge & Navigateurs (Remplacement FoxyProxy)",
+        "desc": "Route le trafic HTTP/HTTPS de msedge.exe via proxy tout en excluant localhost, *.local, *.lan et le LAN avec '!'"
       }
     },
     "visual_apps": {
@@ -619,7 +646,23 @@
         "protocol_label": "Protocole",
         "action_type_label": "Action de Routage",
         "action_target_label": "Proxy ou Chaîne Cible",
+        "negation_hint": "Astuce : préfixez un motif par '!' pour l'exclure (ex. !*.internal, !192.168.0.0/16)",
+        "pick_app": "Choisir une application...",
+        "pick_app_loading": "Analyse des applications...",
+        "pick_app_running": "Active",
+        "pick_app_installed": "Installée",
+        "pick_app_empty": "Aucune application détectée",
         "submit": "Enregistrer la Règle",
+        "cancel": "Annuler"
+      },
+      "foxyproxy": {
+        "title": "Importer un export FoxyProxy JSON (Edge & Navigateurs)",
+        "subtitle": "Collez un export JSON FoxyProxy (v6/v7/v8+) ou chargez un fichier .json. Jokers, regex et exclusions ('!') deviennent des règles système.",
+        "process_label": "Filtre d'application cible (Optionnel, séparé par virgule)",
+        "process_placeholder": "msedge.exe, chrome.exe",
+        "json_placeholder": "Collez le JSON FoxyProxy ici...",
+        "load_file": "Charger un fichier .json",
+        "submit": "Convertir et importer",
         "cancel": "Annuler"
       }
     }
@@ -860,13 +903,33 @@
     },
     "system": {
       "title": "Intégration Système & Profil",
-      "subtitle": "Mode d'interception avancé, proxy système Windows, lanceur CLI et sauvegarde JSON.",
+      "subtitle": "Mode d'interception avancé, proxy système, auto-config PAC, démarrage et sauvegarde JSON.",
       "interception_mode_label": "Mode du Moteur d'Interception",
       "system_proxy_label": "Proxy Système Windows (Relais HTTP)",
+      "pac_title": "Auto-Configuration PAC Windows (Edge & Navigateurs)",
+      "pac_desc": "Sert un script PAC local FindProxyForURL reflétant vos règles (127.0.0.1 uniquement).",
+      "pac_enabled": "PAC Actif",
+      "pac_disabled": "PAC Inactif",
+      "pac_copy": "Copier l'URL",
+      "autostart_title": "Démarrer l'application avec Windows",
+      "autostart_desc": "Ajoute RouteWard Desktop dans HKCU Run pour démarrer avec la barre système.",
+      "autostart_enabled": "Activé",
+      "autostart_disabled": "Désactivé",
       "launcher_title": "Lancer un Programme via Proxy",
       "launcher_desc": "Démarre un exécutable avec ALL_PROXY et HTTPS_PROXY préconfigurés.",
       "profile_title": "Sauvegarde de Profil (JSON)",
       "profile_desc": "Importez ou exportez tous vos proxies, règles et préférences."
+    },
+    "profiles": {
+      "title": "Profils Nommés (Bascule Rapide)",
+      "subtitle": "Enregistrez plusieurs jeux de proxies et règles (Bureau, Edge, Labo) et basculez ici ou via la barre système.",
+      "save_placeholder": "Nom du profil (ex. Edge Entreprise)",
+      "save_button": "Enregistrer comme profil",
+      "active_badge": "Actif",
+      "switch_button": "Activer",
+      "delete_button": "Supprimer",
+      "proxies_unit": "proxies",
+      "rules_unit": "règles"
     },
     "diagnostics": {
       "title": "Diagnostics Techniques",

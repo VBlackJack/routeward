@@ -20,20 +20,25 @@ import {
   UI_CONFIG
 } from '../config/constants';
 import {
+  AutostartStatus,
   ConnectionRequest,
   DaemonFullState,
   FakeIpEntry,
+  FoxyProxyImportResult,
   InterceptionMode,
   IpcStreamEvent,
   LogEntry,
+  PacStatus,
   ProcessTrafficSummary,
   ProfileConfig,
+  ProfileSummary,
   ProxyChain,
   ProxyHealthReport,
   ProxyNode,
   RoutingRule,
   RuleEvaluationResult,
   SecurityPolicyConfig,
+  SystemApplicationEntry,
   SystemDiagnostics,
   TelemetryEventPayload,
   TelemetrySnapshot,
@@ -910,6 +915,113 @@ export class RouteWardClientService {
     } catch {
       // Ignore network errors when UI runs standalone outside desktop host
     }
+  }
+
+  public async getPacStatus(): Promise<PacStatus> {
+    const net = SYSTEM_CONSTANTS.network;
+    const fallbackUrl = `http://${net.localBindHost}:${net.defaultPacPort}/proxy.pac`;
+    try {
+      return await this.requestJson<PacStatus>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_PAC,
+        'GET'
+      );
+    } catch {
+      return { enabled: false, pacUrl: fallbackUrl };
+    }
+  }
+
+  public async setSystemPac(enabled: boolean): Promise<PacStatus> {
+    return this.requestJson<PacStatus>(
+      UI_CONFIG.API_ENDPOINTS.SYSTEM_PAC,
+      'POST',
+      { enabled }
+    );
+  }
+
+  public async getAutostartStatus(): Promise<AutostartStatus> {
+    try {
+      return await this.requestJson<AutostartStatus>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_AUTOSTART,
+        'GET'
+      );
+    } catch {
+      return { enabled: false };
+    }
+  }
+
+  public async setAutostart(enabled: boolean): Promise<AutostartStatus> {
+    return this.requestJson<AutostartStatus>(
+      UI_CONFIG.API_ENDPOINTS.SYSTEM_AUTOSTART,
+      'POST',
+      { enabled }
+    );
+  }
+
+  public async listSystemApplications(): Promise<SystemApplicationEntry[]> {
+    try {
+      return await this.requestJson<SystemApplicationEntry[]>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_APPS,
+        'GET'
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  public async importFoxyProxyJson(
+    json: string,
+    processPatterns: string[] = []
+  ): Promise<FoxyProxyImportResult> {
+    const result = await this.requestJson<FoxyProxyImportResult>(
+      UI_CONFIG.API_ENDPOINTS.IMPORT_FOXYPROXY,
+      'POST',
+      { json, processPatterns }
+    );
+    await this.fetchState();
+    return result;
+  }
+
+  public async listNamedProfiles(): Promise<ProfileSummary[]> {
+    try {
+      return await this.requestJson<ProfileSummary[]>(
+        UI_CONFIG.API_ENDPOINTS.PROFILES_LIST,
+        'GET'
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  public async saveNamedProfile(
+    profileId?: string,
+    name?: string
+  ): Promise<ProfileSummary[]> {
+    const list = await this.requestJson<ProfileSummary[]>(
+      UI_CONFIG.API_ENDPOINTS.PROFILES_SAVE,
+      'POST',
+      { profileId, name }
+    );
+    await this.fetchState();
+    return list;
+  }
+
+  public async switchNamedProfile(profileId: string): Promise<ProfileConfig> {
+    const updated = await this.requestJson<ProfileConfig>(
+      UI_CONFIG.API_ENDPOINTS.PROFILES_SWITCH,
+      'POST',
+      { profileId }
+    );
+    this.profile = updated;
+    this.notifyListeners();
+    return updated;
+  }
+
+  public async deleteNamedProfile(profileId: string): Promise<ProfileSummary[]> {
+    return this.requestJson<ProfileSummary[]>(
+      UI_CONFIG.API_ENDPOINTS.PROFILES_DELETE,
+      'POST',
+      { profileId }
+    );
   }
 }
 

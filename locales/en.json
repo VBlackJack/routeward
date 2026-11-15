@@ -147,12 +147,20 @@
       },
       "connection": {
         "terminated": "Connection socket terminated",
-        "os_scanned": "Scanned and ingested real established OS TCP sockets"
+        "os_scanned": "Scanned and ingested real established OS TCP sockets",
+        "exported": "Exported connection activity"
       },
       "system": {
         "proxy_enabled": "Windows System Proxy enabled on local relay",
         "proxy_disabled": "Windows System Proxy disabled",
         "proxy_error": "Failed to update Windows System Proxy",
+        "pac_enabled": "Windows PAC auto-configuration enabled",
+        "pac_disabled": "Windows PAC auto-configuration disabled",
+        "pac_error": "Failed to update Windows PAC configuration",
+        "pac_copied": "Local PAC URL copied to clipboard",
+        "autostart_enabled": "RouteWard will launch automatically on Windows logon",
+        "autostart_disabled": "Automatic launch on logon disabled",
+        "autostart_error": "Failed to update logon startup setting",
         "process_launched": "Process launched with injected proxy tunnel",
         "process_launch_error": "Failed to launch process via proxy"
       },
@@ -165,7 +173,15 @@
       "profile": {
         "imported": "Profile configuration imported",
         "import_error": "Invalid profile JSON file",
-        "exported": "Profile exported to JSON"
+        "exported": "Profile exported to JSON",
+        "saved_named": "Saved named profile",
+        "switched": "Switched active profile",
+        "deleted": "Deleted profile",
+        "error": "Profile operation failed"
+      },
+      "foxyproxy": {
+        "imported": "Imported FoxyProxy rules and proxies",
+        "import_error": "Invalid FoxyProxy JSON payload"
       },
       "usecase": {
         "applied": "Scenario preset applied"
@@ -334,6 +350,8 @@
       "scan_os": {
         "button": "Scan Real OS Sockets"
       },
+      "export_csv": "Export CSV",
+      "export_json": "Export JSON",
       "clear": {
         "button": "Clear Closed"
       }
@@ -384,6 +402,7 @@
         "routing_section": "Applied Routing & Telemetry",
         "matched_rule": "Matched Rule",
         "upstream_route": "Upstream Tunnel",
+        "error_detail": "Block / Failure Reason",
         "quick_actions_title": "1-Click Rule Creation & Socket Control",
         "route_process_proxy": "Route Process via Proxy",
         "route_process_direct": "Bypass Process (DIRECT)",
@@ -408,7 +427,7 @@
       "servers": {
         "title": "Upstream Proxy Servers",
         "add": "Add Proxy Server",
-        "import_uri": "Import URI (socks5://, http://, https://)",
+        "import_uri": "Import URI (socks5://, socks4://, http://, https://)",
         "test_all": "Test All Proxies"
       },
       "chains": {
@@ -440,6 +459,7 @@
         "udp_ready": "UDP Ready",
         "tcp_only": "TCP Only",
         "tls_enabled": "TLS",
+        "tls_insecure": "TLS Unverified",
         "password_set": "Password Set",
         "untested": "Untested",
         "online": "Online",
@@ -462,6 +482,8 @@
         "cancel_replace_password": "Keep Existing Password",
         "udp_label": "Enable UDP Associate",
         "tls_label": "Enable TLS Transport",
+        "tls_skip_verify_label": "Skip TLS certificate verification (Insecure - lab only)",
+        "sspi_hint": "Tip: for Windows NTLM/Negotiate proxies, leave blank for current logon or use DOMAIN\\username",
         "submit": "Save Proxy",
         "cancel": "Cancel"
       },
@@ -507,7 +529,8 @@
       "title": "Process & Destination Routing Rules",
       "subtitle": "Rules are evaluated in ascending priority order. First match wins.",
       "add_button": "Add Routing Rule",
-      "presets_button": "1-Click Rule Templates"
+      "presets_button": "1-Click Rule Templates",
+      "import_foxyproxy": "Import FoxyProxy JSON"
     },
     "presets": {
       "dev_toolchains": {
@@ -525,6 +548,10 @@
       "rfc1918_direct": {
         "name": "Bypass Local LAN & RFC 1918 Subnets",
         "desc": "Ensures local network traffic (127.0.0.0/8, 192.168.0.0/16, 10.0.0.0/8, *.local) connects directly"
+      },
+      "edge_foxyproxy": {
+        "name": "Edge & Browser Pattern Routing (FoxyProxy Replacement)",
+        "desc": "Routes msedge.exe HTTP/HTTPS via proxy while excluding localhost, *.local, *.lan, and RFC 1918 LANs with '!'"
       }
     },
     "visual_apps": {
@@ -619,7 +646,23 @@
         "protocol_label": "Protocol",
         "action_type_label": "Routing Action",
         "action_target_label": "Target Proxy or Chain",
+        "negation_hint": "Tip: prefix any pattern with '!' to exclude it (e.g. !*.internal, !192.168.0.0/16)",
+        "pick_app": "Pick Running / Installed App...",
+        "pick_app_loading": "Scanning system apps...",
+        "pick_app_running": "Running",
+        "pick_app_installed": "Installed",
+        "pick_app_empty": "No applications discovered",
         "submit": "Save Rule",
+        "cancel": "Cancel"
+      },
+      "foxyproxy": {
+        "title": "Import FoxyProxy JSON (Edge & Browsers)",
+        "subtitle": "Paste a FoxyProxy v6/v7/v8+ JSON export or load a .json file. Wildcards, regexes, and exclusions ('!') convert into native OS rules.",
+        "process_label": "Target Browser / App Filter (Optional, comma-separated)",
+        "process_placeholder": "msedge.exe, chrome.exe",
+        "json_placeholder": "Paste FoxyProxy JSON here...",
+        "load_file": "Load JSON File",
+        "submit": "Convert & Import",
         "cancel": "Cancel"
       }
     }
@@ -860,13 +903,33 @@
     },
     "system": {
       "title": "System Integration & Profile",
-      "subtitle": "Advanced routing mode, Windows system proxy, CLI launcher, and JSON profile backup.",
+      "subtitle": "Advanced routing mode, Windows system proxy, PAC auto-config, startup, and JSON profile backup.",
       "interception_mode_label": "Interception Engine Mode",
       "system_proxy_label": "Windows System Proxy (HTTP Relay)",
+      "pac_title": "Windows PAC Auto-Config (Edge & Browsers)",
+      "pac_desc": "Serves a local FindProxyForURL PAC script reflecting your rules (127.0.0.1 only).",
+      "pac_enabled": "PAC Active",
+      "pac_disabled": "PAC Off",
+      "pac_copy": "Copy URL",
+      "autostart_title": "Launch Desktop App at Windows Logon",
+      "autostart_desc": "Registers RouteWard Desktop in HKCU Run for automatic tray startup.",
+      "autostart_enabled": "Enabled",
+      "autostart_disabled": "Disabled",
       "launcher_title": "Launch One Program via Proxy",
       "launcher_desc": "Start an executable with ALL_PROXY and HTTPS_PROXY pre-configured.",
       "profile_title": "Profile Backup (JSON)",
       "profile_desc": "Import or export all your proxies, rules, and preferences."
+    },
+    "profiles": {
+      "title": "Named Profiles (Quick Switch)",
+      "subtitle": "Save distinct proxy and rule sets (Work, Edge Split-Tunnel, Lab) and switch here or via the system tray.",
+      "save_placeholder": "Profile name (e.g. Corporate Edge)",
+      "save_button": "Save as Profile",
+      "active_badge": "Active",
+      "switch_button": "Switch",
+      "delete_button": "Delete",
+      "proxies_unit": "proxies",
+      "rules_unit": "rules"
     },
     "diagnostics": {
       "title": "Technical Diagnostics",

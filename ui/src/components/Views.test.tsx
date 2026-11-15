@@ -18,6 +18,7 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import i18n from '../i18n';
+import { formatProxyUri, parseSingleProxyUri } from '../services/uri';
 import { ConnectionsView } from './ConnectionsView';
 import { DashboardView } from './DashboardView';
 import { DnsView } from './DnsView';
@@ -671,5 +672,176 @@ describe('Core UI view components', () => {
       })
     );
     expect(screen.getByText('Relay listening')).toBeInTheDocument();
+  });
+
+  it('supports socks4 & insecure URIs, FoxyProxy import, Apps Picker, errorDetail inspector, and PAC/Autostart/Named Profiles', async () => {
+    const parsedSocks4 = parseSingleProxyUri('socks4://127.0.0.1:1080#LegacySocks');
+    expect(parsedSocks4?.protocol).toBe('socks4');
+    expect(parsedSocks4?.udpEnabled).toBe(false);
+
+    const parsedHttpsInsecure = parseSingleProxyUri(
+      'https://alice:secret@proxy.example.com:8443?sni=cdn.example.com&insecure=1#LabHttps'
+    );
+    expect(parsedHttpsInsecure?.tls).toBe(true);
+    expect(parsedHttpsInsecure?.tlsSkipVerify).toBe(true);
+    expect(formatProxyUri(parsedHttpsInsecure!)).toContain('insecure=1');
+
+    const parsedRustTlsSkip = parseSingleProxyUri(
+      'https://proxy.example.com:8443?tlsSkipVerify=1#RustUri'
+    );
+    expect(parsedRustTlsSkip?.tls).toBe(true);
+    expect(parsedRustTlsSkip?.tlsSkipVerify).toBe(true);
+
+    const onImportFoxy = vi.fn().mockResolvedValue({
+      proxies: [],
+      rules: [],
+      skippedEntries: 0
+    });
+    const onListApps = vi.fn().mockResolvedValue([
+      { name: 'msedge.exe', executablePath: 'C:\\Edge\\msedge.exe', running: true }
+    ]);
+
+    render(
+      <RulesView
+        rules={[]}
+        proxies={[parsedHttpsInsecure!]}
+        chains={[]}
+        experienceMode="expert"
+        onEvaluateRule={vi.fn()}
+        onAddRule={vi.fn()}
+        onToggleRule={vi.fn()}
+        onReorderRule={vi.fn()}
+        onRemoveRule={vi.fn()}
+        onImportFoxyProxy={onImportFoxy}
+        onListSystemApps={onListApps}
+      />
+    );
+
+    expect(screen.getByText(i18n.t('rules.header.import_foxyproxy'))).toBeInTheDocument();
+    fireEvent.click(screen.getByText(i18n.t('rules.header.import_foxyproxy')));
+    fireEvent.change(
+      screen.getByPlaceholderText(i18n.t('rules.modal.foxyproxy.json_placeholder')),
+      { target: { value: '{"data":[{"title":"Edge","type":"socks5","hostname":"127.0.0.1","port":1080}]}' } }
+    );
+    fireEvent.click(screen.getByText(i18n.t('rules.modal.foxyproxy.submit')));
+    await waitFor(() => {
+      expect(onImportFoxy).toHaveBeenCalledWith(
+        '{"data":[{"title":"Edge","type":"socks5","hostname":"127.0.0.1","port":1080}]}',
+        ['msedge.exe']
+      );
+    });
+
+    fireEvent.click(screen.getByText(i18n.t('rules.header.add_button')));
+    fireEvent.click(screen.getByText(i18n.t('rules.modal.add.pick_app')));
+    await waitFor(() => {
+      expect(screen.getByText('msedge.exe')).toBeInTheDocument();
+    });
+
+    cleanup();
+
+    const blockedConn: TrackedConnection = {
+      id: 'c-err-1',
+      pid: 4242,
+      processName: 'msedge.exe',
+      processPath: 'C:\\Edge\\msedge.exe',
+      targetHost: 'blocked.example.com',
+      resolvedDomain: 'blocked.example.com',
+      targetPort: 443,
+      protocol: 'tcp',
+      matchedRule: 'Edge Rule',
+      routeLabel: 'BLOCK',
+      latencyMs: 12,
+      rxBytes: 0,
+      txBytes: 0,
+      status: 'blocked',
+      startedAt: '2026-11-15T12:00:00Z',
+      errorDetail: 'Kill-switch blocked connection: upstream auth rejected'
+    };
+
+    render(
+      <ConnectionsView
+        connections={[blockedConn]}
+        proxies={[parsedHttpsInsecure!]}
+        experienceMode="expert"
+        onScanOsSockets={vi.fn()}
+        onClearClosed={vi.fn()}
+        onTerminateConnection={vi.fn()}
+        onQuickCreateRule={vi.fn()}
+      />
+    );
+    fireEvent.click(screen.getByText('msedge.exe'));
+    expect(
+      screen.getByText('Kill-switch blocked connection: upstream auth rejected')
+    ).toBeInTheDocument();
+    expect(screen.getByText(i18n.t('connections.toolbar.export_csv'))).toBeInTheDocument();
+
+    cleanup();
+
+    const onTogglePac = vi.fn().mockResolvedValue(undefined);
+    const onToggleAutostart = vi.fn().mockResolvedValue(undefined);
+    const onSwitchNamedProfile = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <SettingsView
+        diagnostics={{
+          daemonConnected: true,
+          running: true,
+          osName: 'WINDOWS',
+          interceptionMode: 'hybrid',
+          elevatedPrivileges: true,
+          relayTcpEndpoint: '127.0.0.1:10808',
+          relayHttpEndpoint: '127.0.0.1:10809',
+          dnsEndpoint: '127.0.0.1:1053',
+          fakeIpCidr: '198.18.0.0/15',
+          activeLocale: 'en'
+        }}
+        securityPolicy={{
+          killSwitchEnabled: true,
+          blockUdpOnTcpOnlyProxy: true,
+          strictDnsNoLocalFallback: true
+        }}
+        experienceMode="expert"
+        systemProxyEnabled={false}
+        fakeIps={[]}
+        logs={[]}
+        activePaletteDisplayName="Drakul"
+        activeAccent="Default"
+        language="en"
+        onUpdateSecurityPolicy={vi.fn()}
+        onSetInterceptionMode={vi.fn()}
+        onToggleSystemProxy={vi.fn().mockResolvedValue(undefined)}
+        onOpenThemeForge={vi.fn()}
+        onToggleLanguage={vi.fn()}
+        onOpenWizard={vi.fn()}
+        onOpenGlossary={vi.fn()}
+        onOpenLauncher={vi.fn()}
+        onImportProfile={vi.fn()}
+        onExportProfile={vi.fn()}
+        onAllocateDns={vi.fn()}
+        onFlushDns={vi.fn()}
+        onClearLogs={vi.fn()}
+        pacEnabled={false}
+        pacUrl="http://127.0.0.1:10811/proxy.pac"
+        autostartEnabled={false}
+        profiles={[
+          { profileId: 'default', name: 'Default', proxyCount: 1, ruleCount: 3, active: true },
+          { profileId: 'edge-work', name: 'Edge Work', proxyCount: 2, ruleCount: 5, active: false }
+        ]}
+        onTogglePac={onTogglePac}
+        onCopyPacUrl={vi.fn()}
+        onToggleAutostart={onToggleAutostart}
+        onSaveNamedProfile={vi.fn().mockResolvedValue(undefined)}
+        onSwitchNamedProfile={onSwitchNamedProfile}
+        onDeleteNamedProfile={vi.fn().mockResolvedValue(undefined)}
+      />
+    );
+
+    expect(screen.getByText('http://127.0.0.1:10811/proxy.pac')).toBeInTheDocument();
+    fireEvent.click(screen.getByText(i18n.t('settings.system.pac_disabled')));
+    expect(onTogglePac).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByText(i18n.t('settings.system.autostart_disabled')));
+    expect(onToggleAutostart).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByText(i18n.t('settings.profiles.switch_button')));
+    expect(onSwitchNamedProfile).toHaveBeenCalledWith('edge-work');
   });
 });

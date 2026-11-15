@@ -15,7 +15,7 @@
  */
 
 export type InterceptionMode = 'hybrid' | 'driver' | 'relay';
-export type ProxyProtocol = 'socks5' | 'http' | 'https';
+export type ProxyProtocol = 'socks5' | 'socks4' | 'http' | 'https';
 export type TransportProtocol = 'tcp' | 'udp' | 'any';
 export type ConnectionStatus = 'active' | 'closed' | 'blocked';
 export type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
@@ -91,6 +91,7 @@ export interface ProxyNode {
   auth: ProxyCredentials | null;
   udpEnabled: boolean;
   tls: boolean;
+  tlsSkipVerify?: boolean;
   sni: string | null;
   enabled: boolean;
   lastLatencyMs: number | null;
@@ -179,6 +180,36 @@ export interface TrackedConnection {
   txBytes: number;
   status: ConnectionStatus;
   startedAt: string;
+  errorDetail?: string | null;
+}
+
+export interface ProfileSummary {
+  profileId: string;
+  name: string;
+  proxyCount: number;
+  ruleCount: number;
+  active: boolean;
+}
+
+export interface SystemApplicationEntry {
+  name: string;
+  executablePath: string;
+  running: boolean;
+}
+
+export interface PacStatus {
+  enabled: boolean;
+  pacUrl: string;
+}
+
+export interface AutostartStatus {
+  enabled: boolean;
+}
+
+export interface FoxyProxyImportResult {
+  proxies: ProxyNode[];
+  rules: RoutingRule[];
+  skippedEntries: number;
 }
 
 export interface BandwidthSample {

@@ -18,6 +18,7 @@ import React, { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Activity,
+  AlertTriangle,
   ArrowDown,
   ArrowRight,
   ArrowUp,
@@ -58,7 +59,7 @@ interface ProxiesViewProps {
   onRemoveChain: (id: string) => void;
 }
 
-const PROTOCOLS: ProxyProtocol[] = ['socks5', 'http', 'https'];
+const PROTOCOLS: ProxyProtocol[] = ['socks5', 'socks4', 'http', 'https'];
 
 const STRATEGIES: ChainStrategy[] = [
   'sequence',
@@ -104,6 +105,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [password, setPassword] = useState('');
   const [udpEnabled, setUdpEnabled] = useState(true);
   const [tls, setTls] = useState(false);
+  const [tlsSkipVerify, setTlsSkipVerify] = useState(false);
 
   // Import URI state
   const [uriBatchText, setUriBatchText] = useState('');
@@ -132,6 +134,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setPassword('');
     setUdpEnabled(true);
     setTls(false);
+    setTlsSkipVerify(false);
     setShowAddProxy(true);
   };
 
@@ -148,6 +151,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setPassword('');
     setUdpEnabled(proxy.udpEnabled);
     setTls(proxy.tls);
+    setTlsSkipVerify(Boolean(proxy.tlsSkipVerify));
     setShowAddProxy(true);
   };
 
@@ -165,6 +169,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
           }
         : null;
 
+    const effectiveTls = protocol === 'https' ? true : tls;
     onAddProxy({
       id: editingProxyId || generateClientId('proxy'),
       name: name.trim(),
@@ -172,9 +177,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       host: host.trim(),
       port,
       auth: authPayload,
-      udpEnabled,
-      tls,
-      sni: tls ? host.trim() : null,
+      udpEnabled: protocol === 'socks5' ? udpEnabled : false,
+      tls: effectiveTls,
+      tlsSkipVerify: effectiveTls ? tlsSkipVerify : false,
+      sni: effectiveTls ? host.trim() : null,
       enabled: true,
       lastLatencyMs: null,
       exitIp: null
@@ -310,9 +316,21 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       : t('proxies.card.badge.tcp_only')}
                   </span>
                   {proxy.tls && (
-                    <span className="flex items-center gap-1 rounded bg-tf-green/20 px-2 py-0.5 font-semibold text-tf-green">
-                      <Lock className="h-2.5 w-2.5" />
-                      {t('proxies.card.badge.tls_enabled')}
+                    <span
+                      className={`flex items-center gap-1 rounded px-2 py-0.5 font-semibold ${
+                        proxy.tlsSkipVerify
+                          ? 'bg-tf-orange/20 text-tf-orange'
+                          : 'bg-tf-green/20 text-tf-green'
+                      }`}
+                    >
+                      {proxy.tlsSkipVerify ? (
+                        <AlertTriangle className="h-2.5 w-2.5" />
+                      ) : (
+                        <Lock className="h-2.5 w-2.5" />
+                      )}
+                      {proxy.tlsSkipVerify
+                        ? t('proxies.card.badge.tls_insecure')
+                        : t('proxies.card.badge.tls_enabled')}
                     </span>
                   )}
                   {proxy.auth?.hasPassword && (
@@ -638,6 +656,11 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 )}
               </div>
             </div>
+            {(protocol === 'http' || protocol === 'https') && (
+              <p className="text-[11px] text-tf-secondary">
+                {t('proxies.modal.add_proxy.sspi_hint')}
+              </p>
+            )}
             {experienceMode === 'simple' && (
               <button
                 type="button"
@@ -650,23 +673,36 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               </button>
             )}
             {(experienceMode === 'expert' || showProtocolOptions) && (
-              <div className="flex items-center gap-6 pt-1 text-xs text-tf-primary">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={udpEnabled}
-                    onChange={(e) => setUdpEnabled(e.target.checked)}
-                  />
-                  {t('proxies.modal.add_proxy.udp_label')}
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={tls}
-                    onChange={(e) => setTls(e.target.checked)}
-                  />
-                  {t('proxies.modal.add_proxy.tls_label')}
-                </label>
+              <div className="space-y-2 pt-1 text-xs text-tf-primary">
+                <div className="flex items-center gap-6">
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={udpEnabled}
+                      onChange={(e) => setUdpEnabled(e.target.checked)}
+                    />
+                    {t('proxies.modal.add_proxy.udp_label')}
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={tls || protocol === 'https'}
+                      disabled={protocol === 'https'}
+                      onChange={(e) => setTls(e.target.checked)}
+                    />
+                    {t('proxies.modal.add_proxy.tls_label')}
+                  </label>
+                </div>
+                {(tls || protocol === 'https') && (
+                  <label className="flex items-center gap-2 text-[11px] text-tf-orange">
+                    <input
+                      type="checkbox"
+                      checked={tlsSkipVerify}
+                      onChange={(e) => setTlsSkipVerify(e.target.checked)}
+                    />
+                    {t('proxies.modal.add_proxy.tls_skip_verify_label')}
+                  </label>
+                )}
               </div>
             )}
             <div className="flex justify-end gap-2 pt-3">

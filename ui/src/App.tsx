@@ -41,6 +41,7 @@ import { useThemeForge } from './theme/ThemeForgeContext';
 import {
   InterceptionMode,
   PortRange,
+  ProfileSummary,
   ToastNotification,
   TransportProtocol
 } from './types/routeward';
@@ -84,6 +85,12 @@ export const App: React.FC = () => {
   const [showWizardModal, setShowWizardModal] = useState(false);
   const [showGlossaryModal, setShowGlossaryModal] = useState(false);
   const [systemProxyEnabled, setSystemProxyEnabled] = useState(false);
+  const [pacEnabled, setPacEnabled] = useState(false);
+  const [pacUrl, setPacUrl] = useState(
+    `http://${SYSTEM_CONSTANTS.network.localBindHost}:${SYSTEM_CONSTANTS.network.defaultPacPort}/proxy.pac`
+  );
+  const [autostartEnabled, setAutostartEnabled] = useState(false);
+  const [namedProfiles, setNamedProfiles] = useState<ProfileSummary[]>([]);
   const [startingDaemon, setStartingDaemon] = useState(false);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const wizardAutoCheckedRef = useRef(false);
@@ -218,6 +225,25 @@ export const App: React.FC = () => {
     }
   };
 
+  useEffect(() => {
+    void routewardClient.getPacStatus().then((res) => {
+      setPacEnabled(res.enabled);
+      setPacUrl(res.pacUrl);
+    });
+    void routewardClient.getAutostartStatus().then((res) => {
+      setAutostartEnabled(res.enabled);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!diagnostics.daemonConnected) {
+      return;
+    }
+    void routewardClient.listNamedProfiles().then((list) => {
+      setNamedProfiles(list);
+    });
+  }, [diagnostics.daemonConnected, profile.profileId, profile.name]);
+
   const handleToggleSystemProxy = async () => {
     const next = !systemProxyEnabled;
     try {
@@ -231,6 +257,73 @@ export const App: React.FC = () => {
       );
     } catch {
       pushToast(t('app.toast.system.proxy_error'), 'error');
+    }
+  };
+
+  const handleTogglePac = async () => {
+    const next = !pacEnabled;
+    try {
+      const res = await routewardClient.setSystemPac(next);
+      setPacEnabled(res.enabled);
+      setPacUrl(res.pacUrl);
+      pushToast(
+        res.enabled
+          ? t('app.toast.system.pac_enabled')
+          : t('app.toast.system.pac_disabled'),
+        res.enabled ? 'success' : 'info'
+      );
+    } catch {
+      pushToast(t('app.toast.system.pac_error'), 'error');
+    }
+  };
+
+  const handleToggleAutostart = async () => {
+    const next = !autostartEnabled;
+    try {
+      const res = await routewardClient.setAutostart(next);
+      setAutostartEnabled(res.enabled);
+      pushToast(
+        res.enabled
+          ? t('app.toast.system.autostart_enabled')
+          : t('app.toast.system.autostart_disabled'),
+        res.enabled ? 'success' : 'info'
+      );
+    } catch {
+      pushToast(t('app.toast.system.autostart_error'), 'error');
+    }
+  };
+
+  const handleSaveNamedProfile = async (name: string) => {
+    try {
+      const list = await routewardClient.saveNamedProfile(undefined, name);
+      setNamedProfiles(list);
+      pushToast(`${t('app.toast.profile.saved_named')}: ${name}`, 'success');
+    } catch {
+      pushToast(t('app.toast.profile.error'), 'error');
+    }
+  };
+
+  const handleSwitchNamedProfile = async (profileId: string) => {
+    try {
+      const switched = await routewardClient.switchNamedProfile(profileId);
+      const list = await routewardClient.listNamedProfiles();
+      setNamedProfiles(list);
+      pushToast(
+        `${t('app.toast.profile.switched')}: ${switched.name}`,
+        'info'
+      );
+    } catch {
+      pushToast(t('app.toast.profile.error'), 'error');
+    }
+  };
+
+  const handleDeleteNamedProfile = async (profileId: string) => {
+    try {
+      const list = await routewardClient.deleteNamedProfile(profileId);
+      setNamedProfiles(list);
+      pushToast(t('app.toast.profile.deleted'), 'warning');
+    } catch {
+      pushToast(t('app.toast.profile.error'), 'error');
     }
   };
 
@@ -653,6 +746,23 @@ export const App: React.FC = () => {
                 pushToast(t('app.toast.rule.deleted'), 'warning');
               });
             }}
+            onImportFoxyProxy={async (jsonText, processPatterns) => {
+              try {
+                const res = await routewardClient.importFoxyProxyJson(
+                  jsonText,
+                  processPatterns
+                );
+                pushToast(
+                  `${t('app.toast.foxyproxy.imported')} (${res.rules.length})`,
+                  'success'
+                );
+                return res;
+              } catch {
+                pushToast(t('app.toast.foxyproxy.import_error'), 'error');
+                return null;
+              }
+            }}
+            onListSystemApps={() => routewardClient.listSystemApplications()}
           />
         )}
 
@@ -719,6 +829,12 @@ export const App: React.FC = () => {
               });
             }}
             onSwitchToExpert={() => handleSetExperienceMode('expert')}
+            onExportActivity={(fmt) => {
+              pushToast(
+                `${t('app.toast.connection.exported')} (${fmt.toUpperCase()})`,
+                'info'
+              );
+            }}
           />
         )}
 
@@ -758,6 +874,18 @@ export const App: React.FC = () => {
             onClearLogs={() => {
               void routewardClient.clearLogs();
             }}
+            pacEnabled={pacEnabled}
+            pacUrl={pacUrl}
+            autostartEnabled={autostartEnabled}
+            profiles={namedProfiles}
+            onTogglePac={handleTogglePac}
+            onCopyPacUrl={() => {
+              pushToast(t('app.toast.system.pac_copied'), 'info');
+            }}
+            onToggleAutostart={handleToggleAutostart}
+            onSaveNamedProfile={handleSaveNamedProfile}
+            onSwitchNamedProfile={handleSwitchNamedProfile}
+            onDeleteNamedProfile={handleDeleteNamedProfile}
           />
         )}
       </main>

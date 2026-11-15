@@ -19,6 +19,7 @@ import { useTranslation } from 'react-i18next';
 import {
   Ban,
   CheckCircle,
+  Download,
   Globe,
   PowerOff,
   Radar,
@@ -47,6 +48,7 @@ interface ConnectionsViewProps {
   onTerminateConnection: (connectionId: string) => void;
   onQuickCreateRule: (rule: RoutingRule) => void;
   onSwitchToExpert?: () => void;
+  onExportActivity?: (format: 'csv' | 'json') => void;
 }
 
 const QUICK_RULE_HIGH_PRIORITY = 8;
@@ -71,7 +73,8 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
   onClearClosed,
   onTerminateConnection,
   onQuickCreateRule,
-  onSwitchToExpert
+  onSwitchToExpert,
+  onExportActivity
 }) => {
   const { t } = useTranslation();
   const [filterText, setFilterText] = useState('');
@@ -198,6 +201,69 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
       protocol: 'any',
       action: { type: 'block' }
     });
+  };
+
+  const escapeCsvCell = (raw: string | number | null | undefined): string => {
+    const str = String(raw ?? '');
+    const neutralized = /^[=+\-@\t\r]/.test(str) ? `'${str}` : str;
+    return `"${neutralized.replace(/"/g, '""')}"`;
+  };
+
+  const handleExportActivity = (format: 'csv' | 'json') => {
+    const content =
+      format === 'json'
+        ? JSON.stringify(filtered, null, 2)
+        : [
+            [
+              'startedAt',
+              'pid',
+              'processName',
+              'processPath',
+              'targetHost',
+              'resolvedDomain',
+              'targetPort',
+              'protocol',
+              'matchedRule',
+              'routeLabel',
+              'status',
+              'latencyMs',
+              'rxBytes',
+              'txBytes',
+              'errorDetail'
+            ].join(','),
+            ...filtered.map((c) =>
+              [
+                c.startedAt,
+                c.pid,
+                c.processName,
+                c.processPath,
+                c.targetHost,
+                c.resolvedDomain || '',
+                c.targetPort,
+                c.protocol,
+                c.matchedRule,
+                c.routeLabel,
+                c.status,
+                c.latencyMs,
+                c.rxBytes,
+                c.txBytes,
+                c.errorDetail || ''
+              ]
+                .map(escapeCsvCell)
+                .join(',')
+            )
+          ].join('\n');
+
+    const mime =
+      format === 'json' ? 'application/json' : 'text/csv;charset=utf-8';
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `routeward-activity.${format}`;
+    a.click();
+    URL.revokeObjectURL(url);
+    onExportActivity?.(format);
   };
 
   if (experienceMode === 'simple') {
@@ -381,7 +447,23 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
           ))}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => handleExportActivity('csv')}
+            className="tf-surface-alt flex items-center gap-1.5 px-3 py-2 text-xs text-tf-primary hover:border-tf-accent"
+          >
+            <Download className="h-3.5 w-3.5" />
+            {t('connections.toolbar.export_csv')}
+          </button>
+          <button
+            type="button"
+            onClick={() => handleExportActivity('json')}
+            className="tf-surface-alt flex items-center gap-1.5 px-3 py-2 text-xs text-tf-primary hover:border-tf-accent"
+          >
+            <Download className="h-3.5 w-3.5" />
+            {t('connections.toolbar.export_json')}
+          </button>
           <button
             onClick={onScanOsSockets}
             className="tf-surface-alt flex items-center gap-2 border-tf-cyan/60 px-3 py-2 text-xs font-semibold text-tf-cyan hover:border-tf-cyan"
@@ -625,6 +707,16 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                       {selectedConnection.matchedRule}
                     </span>
                   </div>
+                  {selectedConnection.errorDetail && (
+                    <div className="mt-2 rounded border border-tf-red/40 bg-tf-red/10 p-2 text-tf-red break-words">
+                      <div className="text-[10px] font-bold uppercase">
+                        {t('connections.inspector.drawer.error_detail')}
+                      </div>
+                      <div className="mt-0.5 text-[11px]">
+                        {selectedConnection.errorDetail}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
 

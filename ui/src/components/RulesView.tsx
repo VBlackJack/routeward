@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import React, { useId, useState } from 'react';
+import React, { useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   ArrowDown,
@@ -23,6 +23,8 @@ import {
   CheckCircle2,
   Code2,
   Edit3,
+  FileCode2,
+  FolderSearch,
   Gamepad2,
   Globe,
   MessageSquare,
@@ -31,18 +33,21 @@ import {
   Shield,
   ShieldAlert,
   Sparkles,
-  Trash2
+  Trash2,
+  Upload
 } from 'lucide-react';
 import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
-import { generateClientId } from '../services/ipc';
+import { generateClientId, routewardClient } from '../services/ipc';
 import {
   ConnectionRequest,
+  FoxyProxyImportResult,
   PortRange,
   ProxyChain,
   ProxyNode,
   RoutingRule,
   RuleAction,
   RuleEvaluationResult,
+  SystemApplicationEntry,
   TransportProtocol
 } from '../types/routeward';
 import { ExperienceMode } from './QuickSetupWizardModal';
@@ -60,6 +65,11 @@ interface RulesViewProps {
   onToggleRule: (ruleId: string) => void;
   onReorderRule: (ruleId: string, direction: 'up' | 'down') => void;
   onRemoveRule: (id: string) => void;
+  onImportFoxyProxy?: (
+    jsonText: string,
+    processPatterns: string[]
+  ) => Promise<FoxyProxyImportResult | null>;
+  onListSystemApps?: () => Promise<SystemApplicationEntry[]>;
 }
 
 function parsePortSpec(spec: string): PortRange[] {
@@ -110,10 +120,14 @@ export const RulesView: React.FC<RulesViewProps> = ({
   onAddRule,
   onToggleRule,
   onReorderRule,
-  onRemoveRule
+  onRemoveRule,
+  onImportFoxyProxy,
+  onListSystemApps
 }) => {
   const { t } = useTranslation();
   const addRuleModalTitleId = useId();
+  const foxyModalTitleId = useId();
+  const foxyFileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Simulator state
   const [simProc, setSimProc] = useState('firefox.exe');
@@ -141,6 +155,71 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const [simpleTargetType, setSimpleTargetType] = useState<'app' | 'site'>('app');
   const [simpleTargetValue, setSimpleTargetValue] = useState('');
   const [showAdvancedFields, setShowAdvancedFields] = useState(false);
+
+  // System apps picker state
+  const [showAppPicker, setShowAppPicker] = useState(false);
+  const [loadingApps, setLoadingApps] = useState(false);
+  const [systemApps, setSystemApps] = useState<SystemApplicationEntry[]>([]);
+
+  // FoxyProxy import modal state
+  const [showFoxyProxyModal, setShowFoxyProxyModal] = useState(false);
+  const [foxyJsonText, setFoxyJsonText] = useState('');
+  const [foxyProcessFilter, setFoxyProcessFilter] = useState('msedge.exe');
+  const [foxySubmitting, setFoxySubmitting] = useState(false);
+
+  const loadSystemApps = async () => {
+    setShowAppPicker((prev) => !prev);
+    if (systemApps.length > 0 || loadingApps) return;
+    setLoadingApps(true);
+    try {
+      const fetcher =
+        onListSystemApps ?? (() => routewardClient.listSystemApplications());
+      const apps = await fetcher();
+      setSystemApps(apps);
+    } finally {
+      setLoadingApps(false);
+    }
+  };
+
+  const appendProcessPattern = (appName: string, mode: 'simple' | 'advanced') => {
+    const current = mode === 'simple' ? simpleTargetValue : processesText;
+    const existing = current
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!existing.some((item) => item.toLowerCase() === appName.toLowerCase())) {
+      const next = [...existing, appName].join(', ');
+      if (mode === 'simple') {
+        setSimpleTargetValue(next);
+      } else {
+        setProcessesText(next);
+      }
+    }
+    setShowAppPicker(false);
+  };
+
+  const handleSubmitFoxyProxy = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!foxyJsonText.trim() || foxySubmitting) return;
+    setFoxySubmitting(true);
+    try {
+      const procs = foxyProcessFilter
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const importer =
+        onImportFoxyProxy ??
+        ((json: string, patterns: string[]) =>
+          routewardClient.importFoxyProxyJson(json, patterns));
+      const res = await importer(foxyJsonText, procs);
+      if (res) {
+        setFoxyJsonText('');
+        setShowFoxyProxyModal(false);
+      }
+    } finally {
+      setFoxySubmitting(false);
+    }
+  };
 
   const openCreateRuleModal = () => {
     setEditingRuleId(null);
@@ -195,6 +274,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
     setEditingRuleEnabled(true);
     setEditingRequiresAdvanced(false);
     setShowAdvancedFields(false);
+    setShowAppPicker(false);
     setShowModal(false);
   };
 
@@ -341,15 +421,26 @@ export const RulesView: React.FC<RulesViewProps> = ({
               : t('rules.header.subtitle')}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {experienceMode === 'expert' && (
-            <button
-              onClick={() => setShowPresets((prev) => !prev)}
-              className="tf-surface-alt flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-tf-accent hover:border-tf-accent"
-            >
-              <Sparkles className="h-3.5 w-3.5" />
-              {t('rules.header.presets_button')}
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => setShowFoxyProxyModal(true)}
+                className="tf-surface-alt flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-tf-cyan hover:border-tf-cyan"
+              >
+                <FileCode2 className="h-3.5 w-3.5" />
+                {t('rules.header.import_foxyproxy')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowPresets((prev) => !prev)}
+                className="tf-surface-alt flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-tf-accent hover:border-tf-accent"
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                {t('rules.header.presets_button')}
+              </button>
+            </>
           )}
           <button
             onClick={openCreateRuleModal}
@@ -365,7 +456,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
       {/* 1-Click Rule Templates Gallery (Expert mode) */}
       {experienceMode === 'expert' && showPresets && (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {SYSTEM_CONSTANTS.rulePresets.map((preset) => (
             <button
               key={preset.id}
@@ -806,14 +897,28 @@ export const RulesView: React.FC<RulesViewProps> = ({
                 </div>
 
                 <div>
-                  <label
-                    htmlFor="simple-rule-target"
-                    className="block text-xs text-tf-secondary"
-                  >
-                    {simpleTargetType === 'app'
-                      ? t('rules.simple.target_app_label')
-                      : t('rules.simple.target_site_label')}
-                  </label>
+                  <div className="flex items-center justify-between gap-2">
+                    <label
+                      htmlFor="simple-rule-target"
+                      className="block text-xs text-tf-secondary"
+                    >
+                      {simpleTargetType === 'app'
+                        ? t('rules.simple.target_app_label')
+                        : t('rules.simple.target_site_label')}
+                    </label>
+                    {simpleTargetType === 'app' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void loadSystemApps();
+                        }}
+                        className="flex items-center gap-1 text-[11px] font-semibold text-tf-cyan hover:underline"
+                      >
+                        <FolderSearch className="h-3 w-3" />
+                        {t('rules.modal.add.pick_app')}
+                      </button>
+                    )}
+                  </div>
                   <input
                     id="simple-rule-target"
                     type="text"
@@ -827,6 +932,45 @@ export const RulesView: React.FC<RulesViewProps> = ({
                     }
                     className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
                   />
+                  {simpleTargetType === 'app' && showAppPicker && (
+                    <div className="mt-2 max-h-40 overflow-y-auto rounded-tf-md border border-tf-border bg-tf-surface-alt p-2 text-xs">
+                      {loadingApps ? (
+                        <div className="py-2 text-center text-tf-secondary">
+                          {t('rules.modal.add.pick_app_loading')}
+                        </div>
+                      ) : systemApps.length === 0 ? (
+                        <div className="py-2 text-center text-tf-secondary">
+                          {t('rules.modal.add.pick_app_empty')}
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          {systemApps.map((app) => (
+                            <button
+                              key={`${app.name}-${app.executablePath}`}
+                              type="button"
+                              onClick={() => appendProcessPattern(app.name, 'simple')}
+                              className="flex w-full items-center justify-between rounded px-2 py-1 text-left hover:bg-tf-surface"
+                            >
+                              <span className="truncate font-mono text-tf-primary">
+                                {app.name}
+                              </span>
+                              <span
+                                className={`ml-2 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                                  app.running
+                                    ? 'bg-tf-green/20 text-tf-green'
+                                    : 'bg-tf-surface text-tf-secondary'
+                                }`}
+                              >
+                                {app.running
+                                  ? t('rules.modal.add.pick_app_running')
+                                  : t('rules.modal.add.pick_app_installed')}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 <div>
@@ -922,15 +1066,66 @@ export const RulesView: React.FC<RulesViewProps> = ({
             </div>
 
             <div>
-              <label className="block text-xs text-tf-secondary">
-                {t('rules.modal.add.processes_label')}
-              </label>
+              <div className="flex items-center justify-between gap-2">
+                <label className="block text-xs text-tf-secondary">
+                  {t('rules.modal.add.processes_label')}
+                </label>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void loadSystemApps();
+                  }}
+                  className="flex items-center gap-1 text-[11px] font-semibold text-tf-cyan hover:underline"
+                >
+                  <FolderSearch className="h-3 w-3" />
+                  {t('rules.modal.add.pick_app')}
+                </button>
+              </div>
               <input
                 type="text"
                 value={processesText}
                 onChange={(e) => setProcessesText(e.target.value)}
                 className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
               />
+              {showAppPicker && (
+                <div className="mt-2 max-h-40 overflow-y-auto rounded-tf-md border border-tf-border bg-tf-surface-alt p-2 text-xs">
+                  {loadingApps ? (
+                    <div className="py-2 text-center text-tf-secondary">
+                      {t('rules.modal.add.pick_app_loading')}
+                    </div>
+                  ) : systemApps.length === 0 ? (
+                    <div className="py-2 text-center text-tf-secondary">
+                      {t('rules.modal.add.pick_app_empty')}
+                    </div>
+                  ) : (
+                    <div className="space-y-1">
+                      {systemApps.map((app) => (
+                        <button
+                          key={`${app.name}-${app.executablePath}`}
+                          type="button"
+                          onClick={() => appendProcessPattern(app.name, 'advanced')}
+                          className="flex w-full items-center justify-between rounded px-2 py-1 text-left hover:bg-tf-surface"
+                        >
+                          <span className="truncate font-mono text-tf-primary">
+                            {app.name}
+                          </span>
+                          <span
+                            className={`ml-2 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                              app.running
+                                ? 'bg-tf-green/20 text-tf-green'
+                                : 'bg-tf-surface text-tf-secondary'
+                            }`}
+                          >
+                            {app.running
+                              ? t('rules.modal.add.pick_app_running')
+                              : t('rules.modal.add.pick_app_installed')}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -957,6 +1152,9 @@ export const RulesView: React.FC<RulesViewProps> = ({
                 />
               </div>
             </div>
+            <p className="text-[11px] text-tf-secondary">
+              {t('rules.modal.add.negation_hint')}
+            </p>
 
             <div className="grid grid-cols-3 gap-3">
               <div>
@@ -1052,6 +1250,107 @@ export const RulesView: React.FC<RulesViewProps> = ({
                 className="tf-btn-accent px-4 py-1.5 text-xs"
               >
                 {t('rules.modal.add.submit')}
+              </button>
+            </div>
+          </form>
+        </ModalContainer>
+      )}
+
+      {/* Import FoxyProxy JSON Modal */}
+      {showFoxyProxyModal && (
+        <ModalContainer
+          labelledBy={foxyModalTitleId}
+          onClose={() => setShowFoxyProxyModal(false)}
+          backdropClassName="bg-black/70 p-4"
+        >
+          <form
+            onSubmit={(e) => {
+              void handleSubmitFoxyProxy(e);
+            }}
+            className="tf-card w-full max-w-lg space-y-4 p-6"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <h3
+                  id={foxyModalTitleId}
+                  className="text-base font-bold text-tf-primary"
+                >
+                  {t('rules.modal.foxyproxy.title')}
+                </h3>
+                <p className="mt-1 text-xs text-tf-secondary">
+                  {t('rules.modal.foxyproxy.subtitle')}
+                </p>
+              </div>
+              <input
+                ref={foxyFileInputRef}
+                type="file"
+                accept="application/json,.json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) {
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                      if (typeof reader.result === 'string') {
+                        setFoxyJsonText(reader.result);
+                      }
+                    };
+                    reader.readAsText(file);
+                  }
+                  e.target.value = '';
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => foxyFileInputRef.current?.click()}
+                className="tf-surface-alt flex shrink-0 items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan"
+              >
+                <Upload className="h-3.5 w-3.5" />
+                {t('rules.modal.foxyproxy.load_file')}
+              </button>
+            </div>
+
+            <div>
+              <label
+                htmlFor="foxyproxy-process-filter"
+                className="block text-xs text-tf-secondary"
+              >
+                {t('rules.modal.foxyproxy.process_label')}
+              </label>
+              <input
+                id="foxyproxy-process-filter"
+                type="text"
+                value={foxyProcessFilter}
+                onChange={(e) => setFoxyProcessFilter(e.target.value)}
+                placeholder={t('rules.modal.foxyproxy.process_placeholder')}
+                className="tf-input mt-1 w-full px-3 py-1.5 text-sm font-mono"
+              />
+            </div>
+
+            <textarea
+              rows={6}
+              required
+              aria-label={t('rules.modal.foxyproxy.title')}
+              value={foxyJsonText}
+              onChange={(e) => setFoxyJsonText(e.target.value)}
+              placeholder={t('rules.modal.foxyproxy.json_placeholder')}
+              className="tf-input w-full p-3 font-mono text-xs"
+            />
+
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowFoxyProxyModal(false)}
+                className="tf-surface-alt px-4 py-1.5 text-xs text-tf-secondary"
+              >
+                {t('rules.modal.foxyproxy.cancel')}
+              </button>
+              <button
+                type="submit"
+                disabled={foxySubmitting}
+                className="tf-btn-accent px-4 py-1.5 text-xs disabled:opacity-60"
+              >
+                {t('rules.modal.foxyproxy.submit')}
               </button>
             </div>
           </form>

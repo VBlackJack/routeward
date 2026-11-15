@@ -18,27 +18,34 @@ import React, { useRef, useState } from 'react';
 import {
   Activity,
   BookOpen,
+  Copy,
   Cpu,
   Download,
   FileText,
+  FolderKanban,
   Globe,
   HardDrive,
   Languages,
   Palette,
+  Power,
   Rocket,
+  Save,
   Server,
   Shield,
   ShieldAlert,
   ShieldCheck,
+  Trash2,
   Upload,
   Wand2
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { SYSTEM_CONSTANTS } from '../config/constants';
 import {
   AccentTint,
   FakeIpEntry,
   InterceptionMode,
   LogEntry,
+  ProfileSummary,
   SecurityPolicyConfig,
   SystemDiagnostics
 } from '../types/routeward';
@@ -70,6 +77,16 @@ interface SettingsViewProps {
   onAllocateDns: (domain: string) => void;
   onFlushDns: () => void;
   onClearLogs: () => void;
+  pacEnabled?: boolean;
+  pacUrl?: string;
+  autostartEnabled?: boolean;
+  profiles?: ProfileSummary[];
+  onTogglePac?: () => Promise<void>;
+  onCopyPacUrl?: (url: string) => void;
+  onToggleAutostart?: () => Promise<void>;
+  onSaveNamedProfile?: (name: string) => Promise<void>;
+  onSwitchNamedProfile?: (profileId: string) => Promise<void>;
+  onDeleteNamedProfile?: (profileId: string) => Promise<void>;
 }
 
 type DiagnosticSubtab = 'overview' | 'dns' | 'logs';
@@ -96,12 +113,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onExportProfile,
   onAllocateDns,
   onFlushDns,
-  onClearLogs
+  onClearLogs,
+  pacEnabled = false,
+  pacUrl = `http://${SYSTEM_CONSTANTS.network.localBindHost}:${SYSTEM_CONSTANTS.network.defaultPacPort}/proxy.pac`,
+  autostartEnabled = false,
+  profiles = [],
+  onTogglePac,
+  onCopyPacUrl,
+  onToggleAutostart,
+  onSaveNamedProfile,
+  onSwitchNamedProfile,
+  onDeleteNamedProfile
 }) => {
   const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [diagSubtab, setDiagSubtab] = useState<DiagnosticSubtab>('overview');
   const [showSimpleDiagnostics, setShowSimpleDiagnostics] = useState(false);
+  const [newProfileName, setNewProfileName] = useState('');
 
   const allShieldsActive =
     securityPolicy.killSwitchEnabled &&
@@ -468,7 +496,189 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <span>{t('app.launcher.button')}</span>
             </button>
           </div>
+
+          {/* Windows PAC Auto-Config (Edge & Browsers) */}
+          <div className="tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-4">
+            <div className="min-w-0 flex-1">
+              <div className="text-xs font-semibold text-tf-primary">
+                {t('settings.system.pac_title')}
+              </div>
+              <div className="mt-0.5 text-[11px] text-tf-secondary">
+                {t('settings.system.pac_desc')}
+              </div>
+              <div className="mt-1.5 flex items-center gap-2">
+                <code className="truncate rounded bg-tf-bg px-2 py-0.5 font-mono text-[11px] text-tf-cyan">
+                  {pacUrl}
+                </code>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (navigator.clipboard) {
+                      navigator.clipboard.writeText(pacUrl).catch(() => {});
+                    }
+                    onCopyPacUrl?.(pacUrl);
+                  }}
+                  className="inline-flex shrink-0 items-center gap-1 rounded px-2 py-0.5 text-[11px] font-semibold text-tf-secondary hover:bg-tf-surface hover:text-tf-primary"
+                >
+                  <Copy className="h-3 w-3" />
+                  <span>{t('settings.system.pac_copy')}</span>
+                </button>
+              </div>
+            </div>
+            {onTogglePac && (
+              <button
+                type="button"
+                aria-pressed={pacEnabled}
+                onClick={() => {
+                  void onTogglePac();
+                }}
+                className={`shrink-0 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
+                  pacEnabled
+                    ? 'border border-tf-green bg-tf-green/20 text-tf-green'
+                    : 'tf-surface text-tf-secondary hover:text-tf-primary'
+                }`}
+              >
+                {pacEnabled
+                  ? t('settings.system.pac_enabled')
+                  : t('settings.system.pac_disabled')}
+              </button>
+            )}
+          </div>
+
+          {/* Windows Logon Autostart */}
+          <div className="tf-surface-alt flex items-center justify-between gap-3 p-4">
+            <div>
+              <div className="text-xs font-semibold text-tf-primary">
+                {t('settings.system.autostart_title')}
+              </div>
+              <div className="mt-0.5 text-[11px] text-tf-secondary">
+                {t('settings.system.autostart_desc')}
+              </div>
+            </div>
+            {onToggleAutostart && (
+              <button
+                type="button"
+                aria-pressed={autostartEnabled}
+                onClick={() => {
+                  void onToggleAutostart();
+                }}
+                className={`flex shrink-0 items-center gap-1.5 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
+                  autostartEnabled
+                    ? 'border border-tf-accent bg-tf-accent/20 text-tf-accent'
+                    : 'tf-surface text-tf-secondary hover:text-tf-primary'
+                }`}
+              >
+                <Power className="h-3.5 w-3.5" />
+                <span>
+                  {autostartEnabled
+                    ? t('settings.system.autostart_enabled')
+                    : t('settings.system.autostart_disabled')}
+                </span>
+              </button>
+            )}
+          </div>
         </div>
+
+        {/* Named Profiles Manager */}
+        {onSaveNamedProfile && (
+          <div className="tf-surface-alt space-y-3 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-1.5 text-xs font-bold text-tf-primary">
+                  <FolderKanban className="h-3.5 w-3.5 text-tf-accent" />
+                  <span>{t('settings.profiles.title')}</span>
+                </div>
+                <div className="mt-0.5 text-[11px] text-tf-secondary">
+                  {t('settings.profiles.subtitle')}
+                </div>
+              </div>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const clean = newProfileName.trim();
+                  if (!clean) return;
+                  void onSaveNamedProfile(clean).then(() => {
+                    setNewProfileName('');
+                  });
+                }}
+                className="flex items-center gap-2"
+              >
+                <input
+                  type="text"
+                  value={newProfileName}
+                  onChange={(e) => setNewProfileName(e.target.value)}
+                  placeholder={t('settings.profiles.save_placeholder')}
+                  className="tf-input px-3 py-1.5 text-xs"
+                />
+                <button
+                  type="submit"
+                  className="tf-btn-accent flex items-center gap-1.5 px-3 py-1.5 text-xs"
+                >
+                  <Save className="h-3.5 w-3.5" />
+                  <span>{t('settings.profiles.save_button')}</span>
+                </button>
+              </form>
+            </div>
+
+            {profiles.length > 0 && (
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {profiles.map((prof) => (
+                  <div
+                    key={prof.profileId}
+                    className={`flex items-center justify-between gap-2 rounded-tf-md border px-3 py-2 text-xs ${
+                      prof.active
+                        ? 'border-tf-accent bg-tf-accent/10'
+                        : 'border-tf-border bg-tf-surface'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5 font-semibold text-tf-primary">
+                        <span className="truncate">{prof.name}</span>
+                        {prof.active && (
+                          <span className="rounded bg-tf-accent/20 px-1.5 py-0.5 text-[10px] font-bold text-tf-accent">
+                            {t('settings.profiles.active_badge')}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[10px] text-tf-secondary">
+                        {prof.proxyCount} {t('settings.profiles.proxies_unit')} •{' '}
+                        {prof.ruleCount} {t('settings.profiles.rules_unit')}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      {!prof.active && onSwitchNamedProfile && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void onSwitchNamedProfile(prof.profileId);
+                          }}
+                          className="tf-surface-alt px-2.5 py-1 text-[11px] font-semibold text-tf-cyan hover:border-tf-cyan"
+                        >
+                          {t('settings.profiles.switch_button')}
+                        </button>
+                      )}
+                      {!prof.active &&
+                        prof.profileId !== 'default' &&
+                        onDeleteNamedProfile && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void onDeleteNamedProfile(prof.profileId);
+                            }}
+                            title={t('settings.profiles.delete_button')}
+                            aria-label={`${t('settings.profiles.delete_button')}: ${prof.name}`}
+                            className="rounded p-1 text-tf-secondary hover:text-tf-red"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Expert-only Interception Mode + Profile Backup */}
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
