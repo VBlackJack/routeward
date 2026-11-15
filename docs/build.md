@@ -89,8 +89,8 @@ sudo ./target/release/routeward cleanup
 sudo ./target/release/routeward cleanup --force
 ```
 
-### Windows Two-Step Launch (Named Pipe)
-On Windows, start `routeward.exe daemon` in an elevated Administrator PowerShell session (step 1), then launch `routeward-desktop.exe` or `routeward.exe ctl` in a standard non-elevated session under the same user account (step 2):
+### Windows Two-Step Launch (Named Pipe) & Desktop Tray Behavior
+On Windows, you can start the daemon either in 1 click directly from the `routeward-desktop.exe` UI (**Start Service** button in the disconnected banner, which starts the registered `RouteWard` Windows Service via UAC or launches `routeward.exe daemon --locale <en|fr> --allow-sid <SID>` elevated), or manually in two terminals:
 
 ```powershell
 # Step 1 - Elevated PowerShell (Administrator):
@@ -100,7 +100,7 @@ On Windows, start `routeward.exe daemon` in an elevated Administrator PowerShell
 .\target\release\routeward-desktop.exe
 ```
 
-The daemon binds `\\.\pipe\routeward-daemon` with an explicit DACL restricting access to `SYSTEM`, `Administrators`, and the launching user's SID (plus any SIDs explicitly granted via `--allow-sid`). If the daemon is stopped or not running yet, `routeward-desktop` displays a persistent disconnected banner and reconnects automatically as soon as the daemon starts.
+The daemon binds `\\.\pipe\routeward-daemon` with an explicit DACL restricting access to `SYSTEM`, `Administrators`, and the launching user's SID (plus any SIDs explicitly granted via `--allow-sid`). While the daemon is stopped, `routeward-desktop` displays a persistent disconnected banner with the Windows **Start Service** control and reconnects automatically as soon as the daemon starts. Closing the desktop window hides it into the Windows System Tray so interception status stays accessible; choose **Exit** in the tray menu to close the desktop app completely.
 
 > **Important (Windows UAC Account Elevation):** When launched interactively via `routeward.exe daemon`, the daemon must run under the same user account that runs the desktop UI or `routeward ctl`, unless you pass `--allow-sid <SID>` explicitly.
 

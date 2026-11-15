@@ -161,9 +161,19 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
   - `packaging/linux/routeward.service` runs on Linux with bounded privileges (`CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH`), accompanied by `.deb` packaging (`packaging/linux/build-deb.sh`), Windows ZIP bundling (`packaging/windows/package-windows.ps1`, `install-service.ps1`), and `.github/workflows/release.yml`.
 - **Modular Codebase Split & Extended Test Coverage**:
   - Split `crates/routeward-core/src/interceptor` into focused submodules (`controller.rs`, `tcp_relay.rs`, `udp_relay.rs`, `dns_handler.rs`, `nat.rs`, `nftables/{mod.rs, ruleset.rs, tproxy.rs, watchdog.rs, tests.rs}`, `windivert/{mod.rs, ffi.rs, filters.rs, worker.rs, tests.rs}`, `tests.rs`).
-  - Split `apps/desktop/src` loopback API/bridge into `security.rs`, `sse.rs`, `routes.rs`, `lib.rs`, and `tests.rs`, plus headless `--smoke-ipc` verification on `routeward-desktop`.
-  - Split `ui/src/services` into `uri.ts` (with `[ipv6]:port` URI formatting/parsing), `sse.ts`, and `ipc.ts` alongside Vitest UI view tests (`ui/src/components/Views.test.tsx`).
+  - Split `apps/desktop/src` loopback API/bridge into `security.rs`, `sse.rs`, `routes.rs`, `commands.rs`, `daemon_launcher.rs`, `tray.rs`, `lib.rs`, and `tests.rs`, plus headless `--smoke-ipc` verification on `routeward-desktop`.
+  - Split `ui/src/services` into `uri.ts` (with `[ipv6]:port` URI formatting/parsing), `sse.ts`, and `ipc.ts` alongside Vitest UI view and navigation tests (`ui/src/components/Views.test.tsx`, `ui/src/App.test.tsx`).
   - Verified end-to-end across dual-stack OS integration suites (`tests/linux/run-scenarios.sh` and `25` scenarios in `tests/windows/Invoke-RouteWardTests.ps1`, backed by `crates/routeward-core/examples/socks5_udp_test_server.rs` with `--map-target` and `--udp-echo-bind`).
+
+### Desktop UX, System Tray, and Privileged 1-Click Start
+- **5 Use-Case Tabs & Simple/Advanced Modes (`ui/src/`)**:
+  - Organizes controls across 5 use-case tabs (`Alt+1`..`Alt+5`): **Home** (`DashboardView.tsx`), **My Apps & Sites** (`RulesView.tsx`), **My Proxy** (`ProxiesView.tsx`), **Activity** (`ConnectionsView.tsx`), and **Settings** (`SettingsView.tsx`, embedding `DnsView` and `LogsView` diagnostic subtabs).
+  - Defaults to **Simple** mode (hiding low-level cockpit metrics behind a persistent `Simple` / `Advanced` toggle in `localStorage`), gates automatic opening of the 3-step `QuickSetupWizardModal` on `daemonConnected` so it never covers the disconnected banner, highlights the active primary proxy with a `Primary` badge, and supports editing existing rules in both Simple and Advanced views.
+- **Native Windows System Tray (`apps/desktop/src/tray.rs`)**:
+  - Hosts a dedicated Win32 tray thread (`Shell_NotifyIconW` / `NOTIFYICONDATAW`, `TaskbarCreated` recovery) with a live UTF-16 status tooltip and localized (`en`/`fr`) context menu (`Open RouteWard`, `Enable/Pause Protection`, `Exit`) synchronized via `DesktopCommandBridge::notify_tray()`.
+  - Closing the desktop window minimizes to the Windows notification area (`window.set_visible(false)`) when the tray icon is ready, while `Exit` in the tray menu terminates the desktop process cleanly.
+- **1-Click Privileged Daemon / Service Start (`apps/desktop/src/daemon_launcher.rs` & `routes.rs`)**:
+  - Exposes `POST /api/daemon/start` guarded against concurrent attempts (`DaemonStartGuard`). On Windows, if the `RouteWard` SCM service is installed and stopped, it attempts `start_windows_service()` first and falls back to elevating sibling `routeward.exe service start` via `ShellExecuteExW` (`"runas"`). If the service is already running with access denied to the pipe, it returns HTTP `409` (`access_denied`) instead of spawning a duplicate daemon. If no service is registered, it elevates `routeward.exe daemon --locale <en|fr> --allow-sid <SID>` via UAC and polls daemon readiness (`refresh_state()`).
 
 ## Component Diagram
 
@@ -202,8 +212,8 @@ flowchart TD
 | :--- | :--- | :--- |
 | `crates/routeward-core` | `routeward-core` | `Interceptor` trait, `WinDivertInterceptor` (Windows), `NftablesInterceptor` (Linux), `TransparentNatTable`, `ProcessResolver`, `RuleEngine`, `ProxyConnector` (TCP + SOCKS5 `UDP ASSOCIATE` via `UdpAssociationManager`), QUIC (`UDP 443`) ICMP Port Unreachable rejection, LLMNR (`5355`) / mDNS (`5353`) / NetBIOS-NS (`137`) leak guard, and daily `FileLogger`. |
 | `crates/routeward-cli` | `routeward-cli` (`routeward`) | Command-line interface (`run --duration-secs`, `cleanup`, `check`, `eval`, `fake-ip`). |
-| `apps/desktop` | `routeward-desktop` | Native desktop shell built with `tao` and `wry` serving the compiled `ui/dist` bundle. |
-| `ui` | `routeward-ui` | React 18 + TypeScript + Tailwind CSS interface with ThemeForge palettes. |
+| `apps/desktop` | `routeward-desktop` | Native desktop shell built with `tao` and `wry` serving the compiled `ui/dist` bundle, plus Windows System Tray (`tray.rs`) and UAC 1-click service launcher (`daemon_launcher.rs`). |
+| `ui` | `routeward-ui` | React 18 + TypeScript + Tailwind CSS 5-tab interface (`Simple`/`Advanced`) with ThemeForge palettes and Vitest suites. |
 | `tools/fetch-windivert.ps1` | PowerShell Script | Downloads official WinDivert 2.2.2-A, verifies SHA-256, and extracts `WinDivert.dll` and `WinDivert64.sys` into `third_party/windivert/bin/`. |
 | `tests/linux/` | Container Test Suite | Automated Debian 12 + `nftables` Docker integration scenarios (`run-scenarios.sh`). |
 | `tests/windows/` | Windows Test Suite | Automated Windows PowerShell 5.1 non-regression suite (`Invoke-RouteWardTests.ps1`, `Run-RouteWardTests.bat`). |

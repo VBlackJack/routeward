@@ -89,8 +89,8 @@ sudo ./target/release/routeward cleanup
 sudo ./target/release/routeward cleanup --force
 ```
 
-### Lancement en deux étapes sous Windows (Named Pipe)
-Sous Windows, lancez `routeward.exe daemon` dans une console PowerShell en Administrateur (étape 1), puis lancez `routeward-desktop.exe` ou `routeward.exe ctl` dans une session standard non élevée du même compte utilisateur (étape 2) :
+### Lancement Windows (Named Pipe, Démarrage en 1 Clic & System Tray)
+Sous Windows, vous pouvez démarrer le daemon directement en 1 clic depuis `routeward-desktop.exe` via le bouton **Démarrer le Service** de la bannière de déconnexion (qui démarre le service Windows `RouteWard` via UAC ou élève `routeward.exe daemon --locale <en|fr> --allow-sid <SID>`), ou manuellement dans deux consoles :
 
 ```powershell
 # Étape 1 - PowerShell en Administrateur :
@@ -100,7 +100,7 @@ Sous Windows, lancez `routeward.exe daemon` dans une console PowerShell en Admin
 .\target\release\routeward-desktop.exe
 ```
 
-Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lancé le daemon (ainsi que les SID accordés via `--allow-sid`). Si le daemon est arrêté ou non démarré, `routeward-desktop` affiche une bannière persistante de déconnexion et se reconnecte automatiquement dès que le daemon démarre.
+Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lancé le daemon (ainsi que les SID accordés via `--allow-sid`). Tant que le daemon est arrêté, `routeward-desktop` affiche une bannière persistante incluant le bouton **Démarrer le Service** sous Windows et se reconnecte automatiquement dès le démarrage du daemon. La fermeture de la fenêtre réduit l'application dans la zone de notification Windows (System Tray) ; utilisez **Quitter** dans le menu de l'icône pour fermer complètement l'interface.
 
 > **Important (Élévation du compte Windows UAC) :** En lancement interactif via `routeward.exe daemon`, le daemon doit tourner sous le même compte utilisateur que l'interface ou `routeward ctl`, sauf si `--allow-sid <SID>` est fourni explicitement.
 
