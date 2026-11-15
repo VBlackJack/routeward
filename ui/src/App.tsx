@@ -214,8 +214,17 @@ export const App: React.FC = () => {
           pushToast(t('app.toast.daemon.uac_cancelled'), 'warning');
           return;
         }
-        if (err.errorKey === 'access_denied') {
-          pushToast(t('app.toast.daemon.access_denied'), 'error');
+        const errorToastMap: Record<string, string> = {
+          access_denied: 'app.toast.daemon.access_denied',
+          insecure_profile: 'app.toast.daemon.insecure_profile',
+          ipc_error: 'app.toast.daemon.ipc_error',
+          not_elevated: 'app.toast.daemon.not_elevated',
+          config_invalid: 'app.toast.daemon.config_invalid',
+          daemon_exited: 'app.toast.daemon.daemon_exited',
+        };
+        const key = err.errorKey ? errorToastMap[err.errorKey] : undefined;
+        if (key) {
+          pushToast(t(key), 'error');
           return;
         }
       }

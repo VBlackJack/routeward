@@ -33,6 +33,7 @@
 
     <Feature Id="ProductFeature" Title="RouteWard" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
+      <ComponentGroupRef Id="ProgramDataComponents" />
       <ComponentRef Id="ApplicationShortcutComponent" />
       <?if $(var.IncludeWinDivert) = "yes" ?>
       <ComponentGroupRef Id="WinDivertComponents" />
@@ -41,6 +42,10 @@
 
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="RouteWard" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="ProgramDataRouteWardFolder" Name="RouteWard" />
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
@@ -85,6 +90,15 @@
             Part="last"
             Action="set"
             System="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="ProgramDataComponents" Directory="ProgramDataRouteWardFolder">
+      <Component Id="ProgramDataDirComponent" Guid="9A5C3B7D-2F41-4890-B3D6-1C8E7A4F5D12">
+        <CreateFolder>
+          <Permission User="SYSTEM" GenericAll="yes" />
+          <Permission User="Administrators" GenericAll="yes" />
+        </CreateFolder>
       </Component>
     </ComponentGroup>
 

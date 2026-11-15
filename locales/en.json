@@ -190,7 +190,12 @@
         "started": "Privileged service started and connected",
         "uac_cancelled": "Administrator authorization was cancelled",
         "start_failed": "Could not start service automatically",
-        "access_denied": "Service is running without permission for this user session"
+        "access_denied": "Service is running without permission for this user session",
+        "insecure_profile": "Refused to start: insecure ownership or permissions on %ProgramData%\\RouteWard",
+        "ipc_error": "Elevated daemon failed to bind local IPC channel",
+        "not_elevated": "Elevated daemon did not receive administrator privileges",
+        "config_invalid": "Daemon could not load configuration profile",
+        "daemon_exited": "Elevated daemon exited unexpectedly during startup"
       }
     }
   },

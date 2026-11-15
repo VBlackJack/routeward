@@ -1243,7 +1243,59 @@ mod tests {
         let inherit_check = security::verify_windows_dacl_security(&unprotected_dir);
         assert!(inherit_check.is_err());
 
+        // 7. A pre-existing active_profile.json with permissive ACLs must ALWAYS be rejected
+        // by load_or_init_secure_daemon_profile (never silently trusted or upgraded).
+        let preexisting_dir = temp_root.join("PreExistingWithProfile");
+        fs::create_dir_all(&preexisting_dir).expect("create preexisting_dir");
+        let preexisting_profile = preexisting_dir.join("active_profile.json");
+        fs::write(&preexisting_profile, b"{}").expect("write pre-existing profile");
+        security::apply_windows_sddl_dacl(
+            &preexisting_profile,
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)",
+        )
+        .expect("apply Users-readable DACL");
+        match security::load_or_init_secure_daemon_profile(&preexisting_profile) {
+            Err(RouteWardError::DaemonError { key, .. }) => {
+                assert_eq!(key, ERR_KEY_DAEMON_INSECURE_PROFILE);
+            }
+            other => panic!(
+                "Expected ERR_KEY_DAEMON_INSECURE_PROFILE for pre-existing insecure active_profile.json, got {other:?}"
+            ),
+        }
+
+        // 8. A directory junction (reparse point) must be detected cleanly without following it
+        let junction_target = temp_root.join("JunctionTarget");
+        fs::create_dir_all(&junction_target).expect("create junction target");
+        let junction_link = temp_root.join("JunctionLink");
+        assert!(!security::is_symlink_or_reparse_point(&junction_target)
+            .expect("check non-reparse dir"));
+        let mklink = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junction_link.to_string_lossy(),
+                &junction_target.to_string_lossy(),
+            ])
+            .status()
+            .expect("invoke mklink /J");
+        assert!(mklink.success(), "mklink /J should succeed in temp dir");
+        assert!(security::is_symlink_or_reparse_point(&junction_link)
+            .expect("check reparse point junction"));
+        match security::load_or_init_secure_daemon_profile(
+            &junction_link.join("active_profile.json"),
+        ) {
+            Err(RouteWardError::DaemonError { key, .. }) => {
+                assert_eq!(key, ERR_KEY_DAEMON_INSECURE_PROFILE);
+            }
+            other => panic!(
+                "Expected ERR_KEY_DAEMON_INSECURE_PROFILE for directory junction, got {other:?}"
+            ),
+        }
+
         // Cleanup temporary directories/files by restoring full access to current user before removal
+        let _ = fs::remove_dir(&junction_link);
+        let _ = security::apply_windows_sddl_dacl(&preexisting_profile, "D:(A;;FA;;;WD)");
         let _ = security::apply_windows_sddl_dacl(&secure_dir, "D:(A;OICI;FA;;;WD)");
         let _ = security::apply_windows_sddl_dacl(&standard_user_dir, "D:(A;OICI;FA;;;WD)");
         let _ = security::apply_windows_sddl_dacl(&readable_users_file, "D:(A;;FA;;;WD)");

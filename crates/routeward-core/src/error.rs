@@ -41,6 +41,12 @@ pub const ERR_KEY_DAEMON_DISCONNECTED: &str = "errors.daemon.disconnected";
 pub const ERR_KEY_DAEMON_INSECURE_PROFILE: &str = "errors.daemon.insecure_profile";
 pub const ERR_KEY_CLEANUP_DAEMON_ACTIVE: &str = "errors.daemon.cleanup_refused_active";
 
+pub const DAEMON_EXIT_GENERAL_ERROR: u8 = 1;
+pub const DAEMON_EXIT_NOT_ELEVATED: u8 = 10;
+pub const DAEMON_EXIT_INSECURE_PROFILE: u8 = 11;
+pub const DAEMON_EXIT_IPC_ERROR: u8 = 12;
+pub const DAEMON_EXIT_CONFIG_ERROR: u8 = 13;
+
 #[derive(Debug, Error)]
 pub enum RouteWardError {
     #[error("{key}: {detail}")]
@@ -98,6 +104,18 @@ impl RouteWardError {
             | Self::InvalidProxyUri { key, .. }
             | Self::BlockedByPolicy { key, .. } => key,
             Self::Io(_) => ERR_KEY_DAEMON_IPC_ERROR,
+        }
+    }
+
+    pub fn daemon_exit_code(&self) -> u8 {
+        match self.i18n_key() {
+            ERR_KEY_DAEMON_NOT_ELEVATED | ERR_KEY_INTERCEPTOR_NOT_ROOT => DAEMON_EXIT_NOT_ELEVATED,
+            ERR_KEY_DAEMON_INSECURE_PROFILE => DAEMON_EXIT_INSECURE_PROFILE,
+            ERR_KEY_DAEMON_IPC_ERROR => DAEMON_EXIT_IPC_ERROR,
+            ERR_KEY_CONFIG_LOAD | ERR_KEY_CONFIG_SAVE | ERR_KEY_CONFIG_JSON => {
+                DAEMON_EXIT_CONFIG_ERROR
+            }
+            _ => DAEMON_EXIT_GENERAL_ERROR,
         }
     }
 }

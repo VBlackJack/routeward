@@ -830,16 +830,37 @@ impl DesktopCommandBridge {
             .try_acquire()
             .ok_or(DaemonLaunchError::AlreadyInFlight)?;
         let locale = self.i18n.get_locale();
-        daemon_launcher::start_privileged_daemon_with_release(&release, &locale).await?;
+        let proc_handle =
+            match daemon_launcher::start_privileged_daemon_with_release(&release, &locale).await {
+                Ok(handle) => handle,
+                Err(err) => {
+                    self.log_error(format!(
+                        "Failed to launch privileged daemon: {}",
+                        err.detail()
+                    ));
+                    return Err(err);
+                }
+            };
 
         for _ in 0..DAEMON_START_POLL_ATTEMPTS {
             let state = self.refresh_state().await;
             if state.diagnostics.daemon_connected {
                 return Ok(state);
             }
+            if let Some(exit_code) = proc_handle.as_ref().and_then(|h| h.try_exit_code()) {
+                if exit_code != 0 {
+                    let err = DaemonLaunchError::from_daemon_exit_code(exit_code);
+                    self.log_error(format!(
+                        "Elevated daemon exited early before IPC connection: {}",
+                        err.detail()
+                    ));
+                    return Err(err);
+                }
+            }
             tokio::time::sleep(Duration::from_millis(DAEMON_START_POLL_INTERVAL_MS)).await;
         }
 
+        self.log_warn("Timed out waiting for elevated daemon IPC connection after launch");
         Ok(self.refresh_state().await)
     }
 

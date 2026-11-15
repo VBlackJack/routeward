@@ -123,3 +123,16 @@ Listing, saving, or switching named profiles fails when running with elevated pr
 
 **Resolution**:
 Verify that `%ProgramData%\RouteWard\profiles` (Windows) or `/etc/routeward/profiles` (Linux) is a regular directory rather than a symlink, and ensure its ownership and ACLs grant access only to the daemon account (`Administrators` / `SYSTEM` on Windows, `root` on Linux).
+
+## 11. Windows UAC Service Start Fails Immediately (`insecure_profile` or Exit Code)
+
+**Symptom**:
+Clicking **Start Service** and accepting the Windows UAC prompt does not connect the daemon and shows an error toast or logs an early daemon exit in `%LOCALAPPDATA%\RouteWard\logs`.
+
+**Resolution**:
+1. Inspect `%LOCALAPPDATA%\RouteWard\logs` for the exact exit code returned by `routeward.exe daemon` (exit `10`: missing elevation, `11`: insecure `%ProgramData%\RouteWard` ownership or ACLs, `12`: local IPC bind error).
+2. If exit `11` is reported because a pre-existing `C:\ProgramData\RouteWard\active_profile.json` or symlink/junction has non-admin permissions, run the following check in an elevated PowerShell prompt to verify ACLs and remove untrusted pre-existing state:
+
+```powershell
+icacls "C:\ProgramData\RouteWard"
+```
