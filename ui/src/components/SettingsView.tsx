@@ -495,7 +495,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           )}
 
-          <div className="tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-4">
+          <div
+            className={`tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-4 ${
+              experienceMode !== 'expert' ? 'md:col-span-2' : ''
+            }`}
+          >
             <div>
               <div className="text-xs font-semibold text-tf-primary">
                 {t('settings.system.profile_title')}

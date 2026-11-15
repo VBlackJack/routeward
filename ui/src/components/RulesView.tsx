@@ -626,20 +626,26 @@ export const RulesView: React.FC<RulesViewProps> = ({
             <table className="w-full text-left text-xs">
               <thead className="border-b border-tf-border bg-tf-surface-alt text-[11px] uppercase tracking-wider text-tf-secondary">
                 <tr>
-                  <th className="px-4 py-3">
+                  <th className="whitespace-nowrap px-3 py-3">
                     {t('rules.table.enabled.header')}
                   </th>
-                  <th className="px-4 py-3">
+                  <th className="whitespace-nowrap px-3 py-3">
                     {t('rules.table.priority.header')}
                   </th>
-                  <th className="px-4 py-3">{t('rules.table.name.header')}</th>
-                  <th className="px-4 py-3">
+                  <th className="min-w-[160px] whitespace-nowrap px-3 py-3">
+                    {t('rules.table.name.header')}
+                  </th>
+                  <th className="px-3 py-3">
                     {t('rules.table.processes.header')}
                   </th>
-                  <th className="px-4 py-3">{t('rules.table.targets.header')}</th>
-                  <th className="px-4 py-3">{t('rules.table.ports.header')}</th>
-                  <th className="px-4 py-3">{t('rules.table.action.header')}</th>
-                  <th className="px-4 py-3">
+                  <th className="px-3 py-3">{t('rules.table.targets.header')}</th>
+                  <th className="whitespace-nowrap px-3 py-3">
+                    {t('rules.table.ports.header')}
+                  </th>
+                  <th className="whitespace-nowrap px-3 py-3">
+                    {t('rules.table.action.header')}
+                  </th>
+                  <th className="whitespace-nowrap px-3 py-3">
                     {t('rules.table.controls.header')}
                   </th>
                 </tr>
@@ -652,7 +658,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                       !rule.enabled ? 'opacity-50' : ''
                     }`}
                   >
-                    <td className="px-4 py-3">
+                    <td className="px-3 py-3">
                       <input
                         type="checkbox"
                         checked={rule.enabled}
@@ -661,23 +667,23 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         className="h-4 w-4 cursor-pointer accent-tf-accent"
                       />
                     </td>
-                    <td className="px-4 py-3 font-mono font-bold text-tf-accent">
+                    <td className="whitespace-nowrap px-3 py-3 font-mono font-bold text-tf-accent">
                       #{rule.priority}
                     </td>
-                    <td className="px-4 py-3 font-semibold text-tf-primary">
+                    <td className="min-w-[160px] px-3 py-3 font-semibold text-tf-primary">
                       {rule.name}
                     </td>
-                    <td className="px-4 py-3 font-mono text-[11px] text-tf-secondary">
+                    <td className="px-3 py-3 font-mono text-[11px] text-tf-secondary">
                       {rule.processPatterns.length > 0
                         ? rule.processPatterns.join(', ')
                         : t('rules.table.processes.any')}
                     </td>
-                    <td className="px-4 py-3 font-mono text-[11px] text-tf-secondary">
+                    <td className="px-3 py-3 font-mono text-[11px] text-tf-secondary">
                       {[...rule.domainPatterns, ...rule.ipCidrs].length > 0
                         ? [...rule.domainPatterns, ...rule.ipCidrs].join(', ')
                         : t('rules.table.targets.any')}
                     </td>
-                    <td className="px-4 py-3 font-mono text-[11px] text-tf-secondary">
+                    <td className="px-3 py-3 font-mono text-[11px] text-tf-secondary">
                       {rule.portRanges.length > 0
                         ? rule.portRanges
                             .map((r) =>
@@ -688,9 +694,9 @@ export const RulesView: React.FC<RulesViewProps> = ({
                             .join(', ')
                         : t('rules.table.ports.any')}
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="whitespace-nowrap px-3 py-3">
                       <span
-                        className={`rounded px-2 py-0.5 font-mono text-[11px] font-bold ${
+                        className={`inline-flex items-center whitespace-nowrap rounded px-2 py-0.5 font-mono text-[11px] font-bold ${
                           rule.action.type === 'block'
                             ? 'bg-tf-red/20 text-tf-red'
                             : rule.action.type === 'direct'
@@ -702,7 +708,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         {rule.action.targetId ? ` -> ${rule.action.targetId}` : ''}
                       </span>
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="whitespace-nowrap px-3 py-3">
                       <div className="flex items-center gap-1.5">
                         <button
                           disabled={idx === 0}

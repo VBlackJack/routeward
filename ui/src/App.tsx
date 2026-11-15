@@ -480,8 +480,8 @@ export const App: React.FC = () => {
       {/* Persistent Daemon Disconnected / Non-Elevated Warning Banner */}
       {!diagnostics.daemonConnected && (
         <div className="border-b border-tf-red/40 bg-tf-red/15 px-6 py-2.5">
-          <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-2.5">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 text-xs lg:flex-nowrap">
+            <div className="flex items-center gap-2.5 lg:min-w-0 lg:flex-1">
               <AlertTriangle className="h-4 w-4 shrink-0 text-tf-red" />
               <div>
                 <span className="font-bold text-tf-red">
@@ -492,7 +492,7 @@ export const App: React.FC = () => {
                 </span>
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
               <span className="rounded bg-tf-red/20 px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-tf-red">
                 {t('app.daemon_banner.reconnecting_badge')}
               </span>
