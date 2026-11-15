@@ -13,22 +13,22 @@
   See the License for the specific language governing permissions and
   limitations under the License.
 -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">
-  <rect x="0" y="0" width="48" height="48" rx="12" fill="#282A36" />
-  <path
-    d="M15 39V9H27L34 16V20L27 27H15"
-    fill="none"
-    stroke="#A170E6"
-    stroke-width="6"
-    stroke-linecap="square"
-    stroke-linejoin="miter"
-  />
-  <path
-    d="M22 27L32 37"
-    fill="none"
-    stroke="#A170E6"
-    stroke-width="6"
-    stroke-linecap="butt"
-  />
-  <rect x="30" y="33" width="9" height="9" rx="1.5" fill="#50FA7B" />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="rw-tile" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#252838" />
+      <stop offset="100%" stop-color="#151722" />
+    </linearGradient>
+    <linearGradient id="rw-hex" x1="12" y1="8" x2="52" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#BD93F9" />
+      <stop offset="100%" stop-color="#6E47C2" />
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#rw-tile)" stroke="#3D4157" stroke-width="1.5" />
+  <polygon points="32,8 53,20 53,44 32,56 11,44 11,20" fill="#1D202D" stroke="url(#rw-hex)" stroke-width="3" stroke-linejoin="round" />
+  <polygon points="32,9.5 32,54.5 12.5,43 12.5,21" fill="#2A2D40" opacity="0.6" />
+  <path d="M18 32 H29 L39 22 H45" stroke="#50FA7B" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M41.5 17.5 L47 22 L41.5 26.5" stroke="#50FA7B" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M29 32 L38 41 H45" stroke="#8BE9FD" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" opacity="0.9" />
+  <circle cx="18" cy="32" r="3" fill="#F8F8F2" />
 </svg>

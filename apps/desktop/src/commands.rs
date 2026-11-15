@@ -167,6 +167,14 @@ impl DesktopCommandBridge {
             .log(LogLevel::Error, COMPONENT_DESKTOP_BRIDGE, message.as_ref());
     }
 
+    pub fn webview_data_dir(&self) -> std::path::PathBuf {
+        self.constants.telemetry.resolve_user_webview_dir()
+    }
+
+    pub fn translate(&self, key: &str) -> String {
+        self.i18n.t(key)
+    }
+
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<IpcStreamEvent> {
         self.event_tx.subscribe()
     }

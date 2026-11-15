@@ -781,6 +781,9 @@
       "disconnected": "Le démon privilégié RouteWard n'est pas connecté",
       "insecure_profile": "Refus de démarrer : le dossier ou le fichier de profil a un propriétaire ou des droits d'écriture non sécurisés",
       "cleanup_refused_active": "Refus d'exécuter cleanup pendant qu'un démon RouteWard est actif (arrêtez le démon d'abord ou utilisez --force)"
+    },
+    "desktop": {
+      "ui_init": "RouteWard n'a pas pu initialiser sa fenêtre WebView. Vérifiez que Microsoft Edge WebView2 Runtime est installé et que votre dossier utilisateur est accessible en écriture."
     }
   },
   "themeforge": {

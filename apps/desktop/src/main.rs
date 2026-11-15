@@ -30,7 +30,7 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::{Icon, Theme, WindowBuilder};
 use tokio::net::TcpListener;
-use wry::WebViewBuilder;
+use wry::{WebContext, WebViewBuilder};
 
 const EMBEDDED_INDEX_HTML: &[u8] = include_bytes!("../../../ui/dist/index.html");
 const EMBEDDED_APP_JS: &[u8] = include_bytes!("../../../ui/dist/assets/app.js");
@@ -40,6 +40,8 @@ const EMBEDDED_ICON_SVG: &[u8] = include_bytes!("../../../assets/branding/routew
 const EMBEDDED_ICON_32_RGBA: &[u8] = include_bytes!("../../../assets/branding/routeward-32.rgba");
 const EMBEDDED_ICON_256_RGBA: &[u8] = include_bytes!("../../../assets/branding/routeward-256.rgba");
 
+const WINDOW_TITLE: &str = "RouteWard";
+const ERR_KEY_DESKTOP_UI_INIT: &str = "errors.desktop.ui_init";
 const WINDOW_DEFAULT_WIDTH: f64 = 1400.0;
 const WINDOW_DEFAULT_HEIGHT: f64 = 900.0;
 const WINDOW_MIN_WIDTH: f64 = 980.0;
@@ -114,6 +116,35 @@ fn spawn_embedded_ui_server(
             });
         }
     });
+}
+
+fn report_fatal_ui_error(bridge: &DesktopCommandBridge, detail: &str) {
+    let summary = bridge.translate(ERR_KEY_DESKTOP_UI_INIT);
+    bridge.log_error(format!("{summary}: {detail}"));
+    #[cfg(all(target_os = "windows", not(test)))]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+        let title_wide: Vec<u16> = OsStr::new(WINDOW_TITLE)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let body_wide: Vec<u16> = OsStr::new(&format!("{summary}\n\n{detail}"))
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `title_wide` and `body_wide` are null-terminated UTF-16 buffers with valid lifetimes.
+        unsafe {
+            let _ = MessageBoxW(
+                std::ptr::null_mut(),
+                body_wide.as_ptr(),
+                title_wide.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
 }
 
 fn is_smoke_ipc_arg_list<I, S>(args: I) -> bool
@@ -225,7 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut window_builder = WindowBuilder::new()
-        .with_title("RouteWard")
+        .with_title(WINDOW_TITLE)
         .with_window_icon(load_window_icon_32())
         .with_inner_size(LogicalSize::new(
             WINDOW_DEFAULT_WIDTH,
@@ -244,13 +275,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = load_taskbar_icon_256();
     }
 
-    let window = window_builder.build(&event_loop)?;
+    let window = match window_builder.build(&event_loop) {
+        Ok(win) => win,
+        Err(err) => {
+            report_fatal_ui_error(&bridge, &format!("Window build error: {err}"));
+            return Err(Box::new(err));
+        }
+    };
+
+    let webview_data_dir = bridge.webview_data_dir();
+    if let Err(err) = std::fs::create_dir_all(&webview_data_dir) {
+        bridge.log_warn(format!(
+            "Failed to pre-create WebView data directory {}: {err}",
+            webview_data_dir.display()
+        ));
+    } else {
+        bridge.log_info(format!(
+            "Using WebView user data directory: {}",
+            webview_data_dir.display()
+        ));
+    }
 
     let init_script = format!("window.__ROUTEWARD_TOKEN__ = {ephemeral_token:?};");
-    let _webview = WebViewBuilder::new()
+    let mut web_context = WebContext::new(Some(webview_data_dir));
+    let _webview = match WebViewBuilder::with_web_context(&mut web_context)
         .with_initialization_script(&init_script)
         .with_url(&ui_url)
-        .build(&window)?;
+        .build(&window)
+    {
+        Ok(wv) => wv,
+        Err(err) => {
+            report_fatal_ui_error(&bridge, &format!("WebView build error: {err}"));
+            return Err(Box::new(err));
+        }
+    };
 
     let rt_for_loop = Arc::clone(&runtime);
     let bridge_for_loop = Arc::clone(&bridge);
