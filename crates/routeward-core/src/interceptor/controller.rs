@@ -61,6 +61,11 @@ use uuid::Uuid;
 
 impl RouteWardController {
     pub fn new(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
+        let log_dir = constants.telemetry.resolve_process_log_dir();
+        Self::new_with_log_dir(constants, profile, locale, log_dir)
+    }
+
+    pub fn new_daemon(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
         let log_dir = constants.telemetry.resolve_daemon_log_dir();
         Self::new_with_log_dir(constants, profile, locale, log_dir)
     }
@@ -1792,6 +1797,28 @@ impl RouteWardController {
                 verify_profile_path_security(&dir)?;
             }
         } else if !dir.exists() {
+            #[cfg(windows)]
+            if let Ok(program_data) = crate::config::security::resolve_windows_program_data_dir() {
+                if dir.starts_with(program_data.join("RouteWard")) {
+                    return Err(RouteWardError::DaemonError {
+                        key: crate::error::ERR_KEY_DAEMON_NOT_ELEVATED,
+                        detail: format!(
+                            "Refusing unprivileged creation of system profile directory {}",
+                            dir.display()
+                        ),
+                    });
+                }
+            }
+            #[cfg(not(windows))]
+            if dir.starts_with("/etc/routeward") {
+                return Err(RouteWardError::DaemonError {
+                    key: crate::error::ERR_KEY_DAEMON_NOT_ELEVATED,
+                    detail: format!(
+                        "Refusing unprivileged creation of system profile directory {}",
+                        dir.display()
+                    ),
+                });
+            }
             std::fs::create_dir_all(&dir).map_err(|err| RouteWardError::ConfigError {
                 key: ERR_KEY_CONFIG_LOAD,
                 detail: format!(

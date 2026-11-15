@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+use routeward_core::error::{
+    DAEMON_EXIT_CONFIG_ERROR, DAEMON_EXIT_INSECURE_PROFILE, DAEMON_EXIT_IPC_ERROR,
+    DAEMON_EXIT_NOT_ELEVATED,
+};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,17 +41,34 @@ pub enum DaemonLaunchError {
     MissingCliBinary,
     AlreadyRunningAccessDenied,
     UacCancelled,
+    InsecureProfile(u32),
+    IpcBindFailed(u32),
+    NotElevated(u32),
+    ConfigInvalid(u32),
+    DaemonExitedEarly(u32),
     LaunchFailed(String),
 }
 
 impl DaemonLaunchError {
+    pub fn from_daemon_exit_code(exit_code: u32) -> Self {
+        match u8::try_from(exit_code) {
+            Ok(DAEMON_EXIT_NOT_ELEVATED) => Self::NotElevated(exit_code),
+            Ok(DAEMON_EXIT_INSECURE_PROFILE) => Self::InsecureProfile(exit_code),
+            Ok(DAEMON_EXIT_IPC_ERROR) => Self::IpcBindFailed(exit_code),
+            Ok(DAEMON_EXIT_CONFIG_ERROR) => Self::ConfigInvalid(exit_code),
+            _ => Self::DaemonExitedEarly(exit_code),
+        }
+    }
+
     pub fn status_code(&self) -> u16 {
         match self {
             Self::UacCancelled => 400,
+            Self::NotElevated(_) => 403,
             Self::MissingCliBinary => 404,
             Self::AlreadyInFlight | Self::AlreadyRunningAccessDenied => 409,
+            Self::InsecureProfile(_) | Self::ConfigInvalid(_) => 422,
             Self::UnsupportedOs => 501,
-            Self::LaunchFailed(_) => 500,
+            Self::IpcBindFailed(_) | Self::DaemonExitedEarly(_) | Self::LaunchFailed(_) => 500,
         }
     }
 
@@ -58,6 +79,11 @@ impl DaemonLaunchError {
             Self::MissingCliBinary => "cli_missing",
             Self::AlreadyRunningAccessDenied => "access_denied",
             Self::UacCancelled => "uac_cancelled",
+            Self::InsecureProfile(_) => "insecure_profile",
+            Self::IpcBindFailed(_) => "ipc_error",
+            Self::NotElevated(_) => "not_elevated",
+            Self::ConfigInvalid(_) => "config_invalid",
+            Self::DaemonExitedEarly(_) => "daemon_exited",
             Self::LaunchFailed(_) => "start_failed",
         }
     }
@@ -76,8 +102,68 @@ impl DaemonLaunchError {
                     .to_string()
             }
             Self::UacCancelled => "Administrator UAC prompt was cancelled by the user".to_string(),
+            Self::InsecureProfile(code) => format!(
+                "Daemon refused to start because profile directory or file has insecure ownership or permissions (exit code {code})"
+            ),
+            Self::IpcBindFailed(code) => {
+                format!("Daemon failed to bind its local IPC endpoint (exit code {code})")
+            }
+            Self::NotElevated(code) => {
+                format!("Daemon did not receive elevated administrator privileges (exit code {code})")
+            }
+            Self::ConfigInvalid(code) => {
+                format!("Daemon failed to load embedded or saved configuration (exit code {code})")
+            }
+            Self::DaemonExitedEarly(code) => {
+                format!("Elevated daemon process exited unexpectedly with code {code}")
+            }
             Self::LaunchFailed(msg) => msg.clone(),
         }
+    }
+}
+
+/// RAII handle wrapping a launched Windows elevated process handle (`CloseHandle` on drop).
+pub struct ElevatedProcessHandle {
+    #[cfg(windows)]
+    raw_handle: isize,
+}
+
+#[cfg(windows)]
+impl Drop for ElevatedProcessHandle {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        if self.raw_handle != 0 {
+            unsafe {
+                CloseHandle(self.raw_handle as HANDLE);
+            }
+        }
+    }
+}
+
+impl ElevatedProcessHandle {
+    #[cfg(windows)]
+    pub fn try_exit_code(&self) -> Option<u32> {
+        use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+        if self.raw_handle == 0 {
+            return None;
+        }
+        let handle = self.raw_handle as HANDLE;
+        unsafe {
+            if WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 {
+                let mut exit_code: u32 = 0;
+                if GetExitCodeProcess(handle, &mut exit_code) != 0 {
+                    return Some(exit_code);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(windows))]
+    pub fn try_exit_code(&self) -> Option<u32> {
+        None
     }
 }
 
@@ -180,11 +266,11 @@ pub fn build_daemon_launch_plan(
 pub async fn start_privileged_daemon_with_release(
     _release: &InFlightRelease,
     locale: &str,
-) -> Result<(), DaemonLaunchError> {
+) -> Result<Option<ElevatedProcessHandle>, DaemonLaunchError> {
     #[cfg(not(windows))]
     {
         let _ = locale;
-        return Err(DaemonLaunchError::UnsupportedOs);
+        Err(DaemonLaunchError::UnsupportedOs)
     }
 
     #[cfg(windows)]
@@ -199,7 +285,7 @@ pub async fn start_privileged_daemon_with_release(
 pub async fn start_privileged_daemon(
     guard: &DaemonStartGuard,
     locale: &str,
-) -> Result<(), DaemonLaunchError> {
+) -> Result<Option<ElevatedProcessHandle>, DaemonLaunchError> {
     let release = guard
         .try_acquire()
         .ok_or(DaemonLaunchError::AlreadyInFlight)?;
@@ -221,7 +307,9 @@ mod windows_impl {
     use windows_sys::Win32::System::Com::{
         CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
     };
-    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
     fn to_wide_null(s: &str) -> Vec<u16> {
@@ -239,7 +327,10 @@ mod windows_impl {
         }
     }
 
-    fn run_elevated_cli(cli_exe: &Path, args: &[String]) -> Result<(), DaemonLaunchError> {
+    fn run_elevated_cli(
+        cli_exe: &Path,
+        args: &[String],
+    ) -> Result<Option<ElevatedProcessHandle>, DaemonLaunchError> {
         let exe_str = cli_exe.to_string_lossy();
         let params_str = args
             .iter()
@@ -267,7 +358,7 @@ mod windows_impl {
 
             let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
             info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-            info.fMask = SEE_MASK_NOASYNC;
+            info.fMask = SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS;
             info.hwnd = null_mut();
             info.lpVerb = verb_w.as_ptr();
             info.lpFile = file_w.as_ptr();
@@ -284,11 +375,21 @@ mod windows_impl {
                     "ShellExecuteExW failed with Win32 error {err}"
                 )));
             }
+
+            let proc_handle = if !info.hProcess.is_null() {
+                Some(ElevatedProcessHandle {
+                    raw_handle: info.hProcess as isize,
+                })
+            } else {
+                None
+            };
+            Ok(proc_handle)
         }
-        Ok(())
     }
 
-    pub fn launch_elevated(locale: &str) -> Result<(), DaemonLaunchError> {
+    pub fn launch_elevated(
+        locale: &str,
+    ) -> Result<Option<ElevatedProcessHandle>, DaemonLaunchError> {
         let desktop_exe =
             std::env::current_exe().map_err(|e| DaemonLaunchError::LaunchFailed(e.to_string()))?;
         let cli_exe =
@@ -305,7 +406,7 @@ mod windows_impl {
             && !svc_state.eq_ignore_ascii_case("running")
             && start_windows_service().is_ok()
         {
-            return Ok(());
+            return Ok(None);
         }
 
         let user_sid = current_user_sid_string().ok();
@@ -402,5 +503,30 @@ mod tests {
         assert!(guard.try_acquire().is_none());
         drop(first);
         assert!(guard.try_acquire().is_some());
+    }
+
+    #[test]
+    fn maps_daemon_startup_exit_codes_to_specific_errors() {
+        let not_elevated =
+            DaemonLaunchError::from_daemon_exit_code(u32::from(DAEMON_EXIT_NOT_ELEVATED));
+        assert_eq!(not_elevated.error_key(), "not_elevated");
+        assert_eq!(not_elevated.status_code(), 403);
+
+        let insecure =
+            DaemonLaunchError::from_daemon_exit_code(u32::from(DAEMON_EXIT_INSECURE_PROFILE));
+        assert_eq!(insecure.error_key(), "insecure_profile");
+        assert_eq!(insecure.status_code(), 422);
+
+        let ipc_err = DaemonLaunchError::from_daemon_exit_code(u32::from(DAEMON_EXIT_IPC_ERROR));
+        assert_eq!(ipc_err.error_key(), "ipc_error");
+        assert_eq!(ipc_err.status_code(), 500);
+
+        let cfg_err = DaemonLaunchError::from_daemon_exit_code(u32::from(DAEMON_EXIT_CONFIG_ERROR));
+        assert_eq!(cfg_err.error_key(), "config_invalid");
+        assert_eq!(cfg_err.status_code(), 422);
+
+        let unknown = DaemonLaunchError::from_daemon_exit_code(42);
+        assert_eq!(unknown.error_key(), "daemon_exited");
+        assert_eq!(unknown.status_code(), 500);
     }
 }

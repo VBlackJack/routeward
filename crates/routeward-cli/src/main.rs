@@ -444,7 +444,7 @@ async fn run_daemon_host(
         }
     };
 
-    let controller = RouteWardController::new(constants, profile, locale);
+    let controller = RouteWardController::new_daemon(constants, profile, locale);
 
     let service = match DaemonIpcService::bind_with_allowed_sids(controller.clone(), allowed_sids) {
         Ok(svc) => svc,
@@ -584,7 +584,7 @@ fn handle_service_command(
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = CliArgs::parse();
 
@@ -596,6 +596,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     rt.block_on(async_main(args))
+}
+
+fn main() -> std::process::ExitCode {
+    match run_cli() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            let code = err
+                .downcast_ref::<RouteWardError>()
+                .map_or(routeward_core::error::DAEMON_EXIT_GENERAL_ERROR, |rw| {
+                    rw.daemon_exit_code()
+                });
+            std::process::ExitCode::from(code)
+        }
+    }
 }
 
 async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -625,6 +640,19 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     } = args.command
     {
         return run_daemon_host(constants, &args.locale, duration_secs, &allow_sid, None).await;
+    }
+
+    if matches!(args.command, Commands::Run { .. })
+        && !RouteWardController::detect_elevated_privileges()
+    {
+        let i18n = I18nRegistry::new(&args.locale);
+        let msg = i18n.t(routeward_core::error::ERR_KEY_INTERCEPTOR_NOT_ROOT);
+        eprintln!("{msg}");
+        return Err(RouteWardError::DaemonError {
+            key: routeward_core::error::ERR_KEY_DAEMON_NOT_ELEVATED,
+            detail: msg,
+        }
+        .into());
     }
 
     let profile = match &args.profile {

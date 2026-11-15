@@ -97,12 +97,272 @@ fn resolve_windows_known_folder(
     }
 }
 
+/// Checks whether `path` exists as a symlink or (on Windows) NTFS reparse point without following it.
+pub fn is_symlink_or_reparse_point(path: &Path) -> RouteWardResult<bool> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                detail: format!("Failed to inspect {}: {err}", path.display()),
+            });
+        }
+    };
+
+    if meta.file_type().is_symlink() {
+        return Ok(true);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn harden_preexisting_dir_via_handle(dir: &Path) -> RouteWardResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACL, DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+    };
+
+    if is_symlink_or_reparse_point(dir)? {
+        return Err(RouteWardError::DaemonError {
+            key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+            detail: format!(
+                "Refusing symlink or reparse point directory {}",
+                dir.display()
+            ),
+        });
+    }
+
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct SdGuard(PSECURITY_DESCRIPTOR);
+    impl Drop for SdGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    let wide_path: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let handle = CreateFileW(
+            wide_path.as_ptr(),
+            READ_CONTROL | WRITE_DAC | WRITE_OWNER | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            let err = std::io::Error::last_os_error();
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                detail: format!(
+                    "CreateFileW({}, OPEN_REPARSE_POINT) failed: {err}",
+                    dir.display()
+                ),
+            });
+        }
+        let _handle_guard = HandleGuard(handle);
+
+        let mut file_info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(handle, &mut file_info) == 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                detail: format!(
+                    "GetFileInformationByHandle({}) failed: {err}",
+                    dir.display()
+                ),
+            });
+        }
+
+        if (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+        {
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                detail: format!(
+                    "Refusing non-directory or reparse point at {}",
+                    dir.display()
+                ),
+            });
+        }
+
+        let wide_dacl_sddl: Vec<u16> = WINDOWS_PROTECTED_DIR_SDDL
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut dacl_sd: PSECURITY_DESCRIPTOR = null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide_dacl_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut dacl_sd,
+            null_mut(),
+        ) == 0
+            || dacl_sd.is_null()
+        {
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                detail: "Failed to build protected directory DACL descriptor".to_string(),
+            });
+        }
+        let _dacl_sd_guard = SdGuard(dacl_sd);
+
+        let mut dacl_present: i32 = 0;
+        let mut dacl_defaulted: i32 = 0;
+        let mut dacl: *mut ACL = null_mut();
+        if GetSecurityDescriptorDacl(dacl_sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted)
+            == 0
+            || dacl.is_null()
+        {
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                detail: "GetSecurityDescriptorDacl failed".to_string(),
+            });
+        }
+
+        let wide_owner_sddl: Vec<u16> = WINDOWS_ADMIN_OWNER_SDDL
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut owner_sd: PSECURITY_DESCRIPTOR = null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide_owner_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut owner_sd,
+            null_mut(),
+        ) == 0
+            || owner_sd.is_null()
+        {
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                detail: "Failed to build Administrators owner security descriptor".to_string(),
+            });
+        }
+        let _owner_sd_guard = SdGuard(owner_sd);
+
+        let mut owner_sid: PSID = null_mut();
+        let mut owner_defaulted: i32 = 0;
+        if GetSecurityDescriptorOwner(owner_sd, &mut owner_sid, &mut owner_defaulted) == 0
+            || owner_sid.is_null()
+        {
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                detail: "GetSecurityDescriptorOwner failed".to_string(),
+            });
+        }
+
+        let status = SetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner_sid,
+            null_mut(),
+            dacl,
+            null_mut(),
+        );
+        if status != ERROR_SUCCESS {
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                detail: format!(
+                    "SetSecurityInfo on {} failed with Win32 error {status}",
+                    dir.display()
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Ensures the daemon profile directory exists with strict ownership and permissions, or verifies
 /// an existing directory before loading or creating the daemon's active profile.
+///
+/// On Windows, when elevated and no `active_profile.json` exists yet, a non-symlink pre-existing
+/// directory (for instance created by prior unprivileged runs or packaging) is hardened via an
+/// open handle with `FILE_FLAG_OPEN_REPARSE_POINT`. Pre-existing profile files with insecure
+/// ownership or permissions are always rejected.
 pub fn load_or_init_secure_daemon_profile(profile_path: &Path) -> RouteWardResult<ProfileConfig> {
+    if is_symlink_or_reparse_point(profile_path)? {
+        return Err(RouteWardError::DaemonError {
+            key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+            detail: format!("Refusing symlinked profile path {}", profile_path.display()),
+        });
+    }
+
+    let profile_exists_initially = profile_path.exists();
+
     if let Some(parent) = profile_path.parent() {
         if !parent.as_os_str().is_empty() {
+            if is_symlink_or_reparse_point(parent)? {
+                return Err(RouteWardError::DaemonError {
+                    key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                    detail: format!("Refusing symlinked profile directory {}", parent.display()),
+                });
+            }
+
             if parent.exists() {
+                if verify_profile_path_security(parent).is_err() {
+                    #[cfg(windows)]
+                    if !profile_exists_initially
+                        && crate::interceptor::RouteWardController::detect_elevated_privileges()
+                    {
+                        harden_preexisting_dir_via_handle(parent)?;
+                        for sub_name in ["profiles", "logs"] {
+                            let sub = parent.join(sub_name);
+                            if sub.exists() {
+                                harden_preexisting_dir_via_handle(&sub)?;
+                            }
+                        }
+                    }
+                }
                 verify_profile_path_security(parent)?;
             } else {
                 create_secure_profile_dir(parent, true)?;
@@ -111,7 +371,7 @@ pub fn load_or_init_secure_daemon_profile(profile_path: &Path) -> RouteWardResul
         }
     }
 
-    if profile_path.exists() {
+    if profile_exists_initially || profile_path.exists() {
         verify_profile_path_security(profile_path)?;
         ProfileConfig::load_from_path(profile_path)
     } else {

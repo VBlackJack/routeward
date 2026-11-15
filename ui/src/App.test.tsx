@@ -21,7 +21,7 @@ import './i18n';
 import { App } from './App';
 import { UI_CONFIG } from './config/constants';
 import { ThemeForgeProvider } from './theme/ThemeForgeContext';
-import { routewardClient } from './services/ipc';
+import { routewardClient, HttpResponseError } from './services/ipc';
 
 function renderApp() {
   return render(
@@ -128,5 +128,40 @@ describe('App navigation and accessible modals', () => {
     cleanup();
     renderApp();
     expect(screen.getByRole('dialog')).toBeInTheDocument();
+  });
+
+  it('shows specific localized toast when elevated daemon rejects insecure profile directory', async () => {
+    vi.spyOn(routewardClient, 'getDiagnostics').mockReturnValue({
+      daemonConnected: false,
+      running: false,
+      osName: 'WINDOWS',
+      interceptionMode: 'hybrid',
+      elevatedPrivileges: false,
+      relayTcpEndpoint: '127.0.0.1:10808',
+      relayHttpEndpoint: '127.0.0.1:10809',
+      dnsEndpoint: '127.0.0.1:5353',
+      fakeIpCidr: '198.18.0.0/15',
+      activeLocale: 'fr'
+    });
+    vi.spyOn(routewardClient, 'startDaemon').mockRejectedValue(
+      new HttpResponseError(
+        422,
+        'Insecure ACL on %ProgramData%\\RouteWard',
+        'insecure_profile'
+      )
+    );
+
+    renderApp();
+
+    const startBtn = screen.getByRole('button', {
+      name: /démarrer le service|start service/i
+    });
+    fireEvent.click(startBtn);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/droits ou propriétaire non sécurisés|insecure ownership or permissions/i)
+      ).toBeInTheDocument();
+    });
   });
 });

@@ -190,7 +190,12 @@
         "started": "Service privilégié démarré et connecté",
         "uac_cancelled": "Autorisation administrateur annulée",
         "start_failed": "Impossible de démarrer le service automatiquement",
-        "access_denied": "Le service tourne sans autorisation pour cette session"
+        "access_denied": "Le service tourne sans autorisation pour cette session",
+        "insecure_profile": "Démarrage refusé : droits ou propriétaire non sécurisés sur %ProgramData%\\RouteWard",
+        "ipc_error": "Échec d'ouverture du canal IPC local du démon",
+        "not_elevated": "Le démon n'a pas reçu les privilèges administrateur",
+        "config_invalid": "Impossible de charger le profil de configuration du démon",
+        "daemon_exited": "Le démon privilégié s'est arrêté pendant le démarrage"
       }
     }
   },

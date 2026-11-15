@@ -123,3 +123,16 @@ Le listage, la sauvegarde ou le basculement des profils nommés échoue lorsque 
 
 **Solution** :
 Vérifier que `%ProgramData%\RouteWard\profiles` (Windows) ou `/etc/routeward/profiles` (Linux) est un répertoire standard et non un lien symbolique, puis contrôler que son propriétaire et ses ACL restreignent l'accès au compte du daemon (`Administrators` / `SYSTEM` sous Windows, `root` sous Linux).
+
+## 11. Échec immédiat du démarrage UAC sous Windows (`insecure_profile` ou code de sortie)
+
+**Symptôme** :
+Cliquer sur **Démarrer le Service** puis valider l'invite UAC Windows ne connecte pas le daemon et affiche une notification d'erreur ou journalise un arrêt précoce dans `%LOCALAPPDATA%\RouteWard\logs`.
+
+**Solution** :
+1. Consulter `%LOCALAPPDATA%\RouteWard\logs` pour relever le code de sortie exact renvoyé par `routeward.exe daemon` (code `10` : privilèges non élevés, `11` : droits ou propriétaire non sécurisés sur `%ProgramData%\RouteWard`, `12` : échec d'ouverture du canal IPC).
+2. Si le code `11` signale un fichier `C:\ProgramData\RouteWard\active_profile.json` préexistant ou un lien symbolique/jonction avec des droits utilisateur non privilégiés, contrôler les ACL dans un terminal PowerShell administrateur :
+
+```powershell
+icacls "C:\ProgramData\RouteWard"
+```

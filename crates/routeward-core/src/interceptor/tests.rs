@@ -2105,7 +2105,8 @@ fn named_profiles_save_list_switch_and_delete() {
     profile_a.name = "Work Office".to_string();
     profile_a.profile_id = "work-office".to_string();
 
-    let controller = RouteWardController::new(constants, profile_a, "en");
+    let controller =
+        RouteWardController::new_with_log_dir(constants, profile_a, "en", temp_root.join("logs"));
     let summaries = controller
         .save_named_profile(Some("work-office"), Some("Work Office"))
         .expect("save work-office profile");
