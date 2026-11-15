@@ -42,10 +42,12 @@ interface QuickSetupWizardModalProps {
   proxies: ProxyNode[];
   chains: ProxyChain[];
   currentMode: ExperienceMode;
-  onImportUris: (uriText: string) => Promise<unknown> | void;
+  onImportUris: (
+    uriText: string
+  ) => Promise<ProxyNode[] | number | void> | void;
   onAddRule: (rule: RoutingRule) => Promise<unknown> | void;
   onSelectMode: (mode: ExperienceMode) => void;
-  onComplete: () => void;
+  onComplete: (hasEnabledProxy?: boolean) => void;
   onClose: () => void;
 }
 
@@ -69,16 +71,30 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   const [selectedMode, setSelectedMode] = useState<ExperienceMode>(currentMode);
   const [applying, setApplying] = useState(false);
 
+  const enabledExistingProxies = proxies.filter((p) => p.enabled);
+
   const applySelectedGoalRules = async () => {
     if (applying) return;
     setApplying(true);
     try {
+      let postImportProxies = proxies;
       if (customUri.trim()) {
-        await onImportUris(customUri.trim());
+        const importResult = await onImportUris(customUri.trim());
+        if (Array.isArray(importResult)) {
+          postImportProxies = importResult;
+        }
       }
 
-      const primaryProxyId = proxies[0]?.id || 'proxy-socks5-primary';
-      const primaryChainId = chains[0]?.id || primaryProxyId;
+      const enabledProxies = postImportProxies.filter((p) => p.enabled);
+      const primaryProxyId = enabledProxies[0]?.id;
+      const hasEnabledProxy = Boolean(primaryProxyId);
+      const enabledChains = hasEnabledProxy
+        ? chains.filter(
+            (c) =>
+              c.enabled &&
+              c.proxyIds.some((pid) => enabledProxies.some((p) => p.id === pid))
+          )
+        : [];
 
       const findPreset = (id: string) =>
         SYSTEM_CONSTANTS.rulePresets.find((p) => p.id === id);
@@ -86,28 +102,39 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
       const presetsToApply: string[] =
         goal === 'privacy'
           ? [
-              'preset-privacy-browsers',
+              ...(hasEnabledProxy ? ['preset-privacy-browsers'] : []),
               'preset-block-os-telemetry',
               'preset-rfc1918-direct'
             ]
           : goal === 'work'
-            ? ['preset-dev-toolchains', 'preset-rfc1918-direct']
+            ? [
+                ...(hasEnabledProxy ? ['preset-dev-toolchains'] : []),
+                'preset-rfc1918-direct'
+              ]
             : ['preset-rfc1918-direct'];
 
       for (const pid of presetsToApply) {
         const preset = findPreset(pid);
         if (!preset) continue;
-        const actType = preset.suggestedActionType as
+        let actType = preset.suggestedActionType as
           | 'proxy'
           | 'chain'
           | 'direct'
           | 'block';
-        const targetId =
-          actType === 'proxy'
-            ? primaryProxyId
-            : actType === 'chain'
-              ? primaryChainId
-              : undefined;
+        let targetId: string | undefined;
+        if (actType === 'proxy') {
+          targetId = primaryProxyId;
+        } else if (actType === 'chain') {
+          if (enabledChains[0]?.id) {
+            targetId = enabledChains[0].id;
+          } else if (primaryProxyId) {
+            actType = 'proxy';
+            targetId = primaryProxyId;
+          }
+        }
+        if ((actType === 'proxy' || actType === 'chain') && !targetId) {
+          continue;
+        }
 
         await onAddRule({
           id: `rule-wiz-${preset.id}`,
@@ -127,7 +154,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
       }
 
       onSelectMode(selectedMode);
-      onComplete();
+      onComplete(hasEnabledProxy);
       onClose();
     } finally {
       setApplying(false);
@@ -237,19 +264,28 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
               {t('wizard.modal.step2_title')}
             </h3>
 
-            <div className="tf-surface-alt flex items-center justify-between p-3.5 text-xs">
-              <div>
-                <div className="font-bold text-tf-primary">
-                  {t('wizard.modal.step2_use_existing')}
+            {enabledExistingProxies[0] ? (
+              <div className="tf-surface-alt flex items-center justify-between p-3.5 text-xs">
+                <div>
+                  <div className="font-bold text-tf-primary">
+                    {t('wizard.modal.step2_use_existing')}
+                  </div>
+                  <div className="mt-0.5 font-mono text-[11px] text-tf-cyan">
+                    {`${enabledExistingProxies[0].name} (${enabledExistingProxies[0].protocol.toUpperCase()} - ${enabledExistingProxies[0].host}:${enabledExistingProxies[0].port})`}
+                  </div>
                 </div>
-                <div className="mt-0.5 font-mono text-[11px] text-tf-cyan">
-                  {proxies[0]
-                    ? `${proxies[0].name} (${proxies[0].protocol.toUpperCase()} • ${proxies[0].host}:${proxies[0].port})`
-                    : 'SOCKS5 127.0.0.1:1080'}
-                </div>
+                <CheckCircle2 className="h-5 w-5 text-tf-green" />
               </div>
-              <CheckCircle2 className="h-5 w-5 text-tf-green" />
-            </div>
+            ) : (
+              <div className="rounded-tf-md border border-tf-cyan/30 bg-tf-cyan/10 p-3.5 text-xs">
+                <div className="font-bold text-tf-primary">
+                  {t('wizard.modal.step2_no_proxy_title')}
+                </div>
+                <p className="mt-1 text-[11px] text-tf-secondary">
+                  {t('wizard.modal.step2_no_proxy_desc')}
+                </p>
+              </div>
+            )}
 
             <div>
               <label className="mb-1.5 block text-xs font-medium text-tf-secondary">

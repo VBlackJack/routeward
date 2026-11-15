@@ -85,7 +85,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const { t } = useTranslation();
 
   const isEngineRunning = diagnostics.daemonConnected && diagnostics.running;
-  const primaryProxy = proxies.find((p) => p.enabled) ?? proxies[0] ?? null;
+  const primaryProxy = proxies.find((p) => p.enabled) ?? null;
   const protectedRuleCount = rules.filter(
     (r) =>
       r.enabled &&
@@ -229,11 +229,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       </span>
                     )}
                   </div>
-                ) : (
-                  <div className="mt-0.5 text-sm font-semibold text-tf-orange">
-                    {t('dashboard.simple.no_proxy_configured')}
-                  </div>
-                )}
+                  ) : (
+                    <div className="mt-0.5 flex flex-wrap items-center gap-2">
+                      <span className="rounded-tf-sm bg-tf-green/15 px-2 py-0.5 text-xs font-bold text-tf-green">
+                        {t('dashboard.simple.direct_filter_mode_title')}
+                      </span>
+                      <span className="text-xs text-tf-secondary">
+                        {t('dashboard.simple.direct_filter_mode_desc')}
+                      </span>
+                    </div>
+                  )}
               </div>
             </div>
 
@@ -255,7 +260,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   className="tf-btn-primary flex items-center gap-1.5 px-3 py-1.5 text-xs"
                 >
                   <Server className="h-3.5 w-3.5" />
-                  {t('dashboard.simple.configure_proxy_cta')}
+                  {primaryProxy
+                    ? t('dashboard.simple.configure_proxy_cta')
+                    : t('dashboard.simple.add_optional_proxy_cta')}
                 </button>
               )}
             </div>

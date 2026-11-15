@@ -70,6 +70,7 @@ interface RulesViewProps {
     processPatterns: string[]
   ) => Promise<FoxyProxyImportResult | null>;
   onListSystemApps?: () => Promise<SystemApplicationEntry[]>;
+  onMissingProxy?: () => void;
 }
 
 function parsePortSpec(spec: string): PortRange[] {
@@ -98,6 +99,17 @@ function formatPortSpec(ranges: PortRange[]): string {
     .join(', ');
 }
 
+function mergeCommaPattern(current: string, item: string): string {
+  const existing = current
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (existing.some((entry) => entry.toLowerCase() === item.toLowerCase())) {
+    return current;
+  }
+  return [...existing, item].join(', ');
+}
+
 function requiresAdvancedEditor(rule: RoutingRule): boolean {
   const hasProcesses = rule.processPatterns.length > 0;
   const hasDomains = rule.domainPatterns.length > 0;
@@ -106,7 +118,6 @@ function requiresAdvancedEditor(rule: RoutingRule): boolean {
     rule.portRanges.length > 0 ||
     rule.protocol !== 'any' ||
     rule.action.type === 'chain' ||
-    (hasProcesses && hasDomains) ||
     (!hasProcesses && !hasDomains)
   );
 }
@@ -122,12 +133,24 @@ export const RulesView: React.FC<RulesViewProps> = ({
   onReorderRule,
   onRemoveRule,
   onImportFoxyProxy,
-  onListSystemApps
+  onListSystemApps,
+  onMissingProxy
 }) => {
   const { t } = useTranslation();
   const addRuleModalTitleId = useId();
   const foxyModalTitleId = useId();
   const foxyFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const enabledProxies = proxies.filter((p) => p.enabled);
+  const hasEnabledProxy = enabledProxies.length > 0;
+  const enabledChains = hasEnabledProxy
+    ? chains.filter(
+        (c) =>
+          c.enabled &&
+          c.proxyIds.some((pid) => enabledProxies.some((p) => p.id === pid))
+      )
+    : [];
+  const primaryEnabledProxyId = enabledProxies[0]?.id || '';
 
   // Simulator state
   const [simProc, setSimProc] = useState('firefox.exe');
@@ -150,10 +173,14 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const [cidrsText, setCidrsText] = useState('');
   const [portsText, setPortsText] = useState('');
   const [protocol, setProtocol] = useState<TransportProtocol>('any');
-  const [actionType, setActionType] = useState<RuleAction['type']>('proxy');
-  const [actionTargetId, setActionTargetId] = useState(proxies[0]?.id || '');
+  const [actionType, setActionType] = useState<RuleAction['type']>(
+    hasEnabledProxy ? 'proxy' : 'direct'
+  );
+  const [actionTargetId, setActionTargetId] = useState(primaryEnabledProxyId);
   const [simpleTargetType, setSimpleTargetType] = useState<'app' | 'site'>('app');
   const [simpleTargetValue, setSimpleTargetValue] = useState('');
+  const [simpleOptionalDomains, setSimpleOptionalDomains] = useState('');
+  const [simpleOptionalApps, setSimpleOptionalApps] = useState('');
   const [showAdvancedFields, setShowAdvancedFields] = useState(false);
 
   // System apps picker state
@@ -183,12 +210,8 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
   const appendProcessPattern = (appName: string, mode: 'simple' | 'advanced') => {
     const current = mode === 'simple' ? simpleTargetValue : processesText;
-    const existing = current
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (!existing.some((item) => item.toLowerCase() === appName.toLowerCase())) {
-      const next = [...existing, appName].join(', ');
+    const next = mergeCommaPattern(current, appName);
+    if (next !== current) {
       if (mode === 'simple') {
         setSimpleTargetValue(next);
       } else {
@@ -232,10 +255,12 @@ export const RulesView: React.FC<RulesViewProps> = ({
     setCidrsText('');
     setPortsText('');
     setProtocol('any');
-    setActionType('proxy');
-    setActionTargetId(proxies[0]?.id || '');
+    setActionType(hasEnabledProxy ? 'proxy' : 'direct');
+    setActionTargetId(primaryEnabledProxyId);
     setSimpleTargetType('app');
     setSimpleTargetValue('');
+    setSimpleOptionalDomains('');
+    setSimpleOptionalApps('');
     setShowAdvancedFields(false);
     setShowModal(true);
   };
@@ -257,13 +282,21 @@ export const RulesView: React.FC<RulesViewProps> = ({
     setActionType(rule.action.type);
     setActionTargetId(
       rule.action.targetId ||
-        (rule.action.type === 'chain' ? chains[0]?.id || '' : proxies[0]?.id || '')
+        (rule.action.type === 'chain'
+          ? enabledChains[0]?.id || ''
+          : primaryEnabledProxyId)
     );
     setSimpleTargetType(hasDomainsOnly ? 'site' : 'app');
     setSimpleTargetValue(
       hasDomainsOnly
         ? rule.domainPatterns.join(', ')
         : rule.processPatterns.join(', ')
+    );
+    setSimpleOptionalDomains(
+      hasDomainsOnly ? '' : rule.domainPatterns.join(', ')
+    );
+    setSimpleOptionalApps(
+      hasDomainsOnly ? rule.processPatterns.join(', ') : ''
     );
     setShowAdvancedFields(needsAdvanced);
     setShowModal(true);
@@ -292,13 +325,23 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const handleApplyPreset = (
     preset: (typeof SYSTEM_CONSTANTS.rulePresets)[number]
   ) => {
-    const actType = preset.suggestedActionType as RuleAction['type'];
-    const targetId =
-      actType === 'proxy'
-        ? proxies[0]?.id
-        : actType === 'chain'
-          ? chains[0]?.id
-          : undefined;
+    let actType = preset.suggestedActionType as RuleAction['type'];
+    let targetId: string | undefined;
+    if (actType === 'proxy') {
+      targetId = primaryEnabledProxyId || undefined;
+    } else if (actType === 'chain') {
+      if (enabledChains[0]?.id) {
+        targetId = enabledChains[0].id;
+      } else if (primaryEnabledProxyId) {
+        actType = 'proxy';
+        targetId = primaryEnabledProxyId;
+      }
+    }
+
+    if ((actType === 'proxy' || actType === 'chain') && !targetId) {
+      onMissingProxy?.();
+      return;
+    }
 
     onAddRule({
       id: `${generateClientId('rule')}-${preset.id}`,
@@ -322,7 +365,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
     appCard: (typeof SYSTEM_CONSTANTS.visualAppCatalog)[number],
     chosenAction: 'proxy' | 'direct' | 'block'
   ) => {
-    const primaryProxyId = proxies[0]?.id || 'proxy-socks5-primary';
+    if (chosenAction === 'proxy' && !primaryEnabledProxyId) {
+      onMissingProxy?.();
+      return;
+    }
     onAddRule({
       id: `rule-visual-${appCard.id}`,
       name: t(`${appCard.i18nKey}.name`),
@@ -335,7 +381,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
       protocol: 'any',
       action:
         chosenAction === 'proxy'
-          ? { type: 'proxy', targetId: primaryProxyId }
+          ? { type: 'proxy', targetId: primaryEnabledProxyId }
           : { type: chosenAction }
     });
   };
@@ -366,21 +412,49 @@ export const RulesView: React.FC<RulesViewProps> = ({
         .filter(Boolean);
 
     const isSimpleSubmit = experienceMode === 'simple' && !showAdvancedFields;
-    const effectiveName = isSimpleSubmit
-      ? ruleName.trim() || simpleTargetValue.trim()
-      : ruleName.trim();
-    if (!effectiveName) return;
-
     const effectiveProcesses = isSimpleSubmit
       ? simpleTargetType === 'app'
         ? splitList(simpleTargetValue)
-        : []
+        : splitList(simpleOptionalApps)
       : splitList(processesText);
     const effectiveDomains = isSimpleSubmit
       ? simpleTargetType === 'site'
         ? splitList(simpleTargetValue)
-        : []
+        : splitList(simpleOptionalDomains)
       : splitList(domainsText);
+
+    const autoSimpleName =
+      effectiveProcesses.length > 0 && effectiveDomains.length > 0
+        ? `${effectiveProcesses[0]} (${effectiveDomains.join(', ')})`
+        : simpleTargetValue.trim();
+
+    const effectiveName = isSimpleSubmit
+      ? ruleName.trim() || autoSimpleName
+      : ruleName.trim();
+    if (!effectiveName) return;
+
+    let resolvedAction: RuleAction;
+    if (actionType === 'proxy') {
+      const targetId = enabledProxies.some((p) => p.id === actionTargetId)
+        ? actionTargetId
+        : primaryEnabledProxyId;
+      if (!targetId) {
+        onMissingProxy?.();
+        return;
+      }
+      resolvedAction = { type: 'proxy', targetId };
+    } else if (actionType === 'chain') {
+      const targetId = enabledChains.some((c) => c.id === actionTargetId)
+        ? actionTargetId
+        : enabledChains[0]?.id || '';
+      if (!targetId) {
+        onMissingProxy?.();
+        return;
+      }
+      resolvedAction = { type: 'chain', targetId };
+    } else {
+      resolvedAction = { type: actionType };
+    }
 
     onAddRule({
       id: editingRuleId ?? generateClientId('rule'),
@@ -396,13 +470,12 @@ export const RulesView: React.FC<RulesViewProps> = ({
       ipCidrs: isSimpleSubmit ? [] : splitList(cidrsText),
       portRanges: isSimpleSubmit ? [] : parsePortSpec(portsText),
       protocol: isSimpleSubmit ? 'any' : protocol,
-      action:
-        actionType === 'proxy' || actionType === 'chain'
-          ? { type: actionType, targetId: actionTargetId || proxies[0]?.id || '' }
-          : { type: actionType }
+      action: resolvedAction
     });
     setRuleName('');
     setSimpleTargetValue('');
+    setSimpleOptionalDomains('');
+    setSimpleOptionalApps('');
     closeRuleModal();
   };
 
@@ -502,9 +575,17 @@ export const RulesView: React.FC<RulesViewProps> = ({
             const existingRule = rules.find(
               (r) => r.id === `rule-visual-${appCard.id}`
             );
-            const activeAction =
-              existingRule?.action.type ||
-              (appCard.defaultAction as 'proxy' | 'direct' | 'block');
+            const rawAction = existingRule?.enabled
+              ? existingRule.action.type
+              : (appCard.defaultAction as 'proxy' | 'direct' | 'block');
+            const activeAction: 'proxy' | 'direct' | 'block' =
+              rawAction === 'chain'
+                ? hasEnabledProxy
+                  ? 'proxy'
+                  : 'direct'
+                : rawAction === 'proxy' && !hasEnabledProxy
+                  ? 'direct'
+                  : rawAction;
 
             return (
               <div
@@ -906,18 +987,27 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         ? t('rules.simple.target_app_label')
                         : t('rules.simple.target_site_label')}
                     </label>
-                    {simpleTargetType === 'app' && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void loadSystemApps();
-                        }}
-                        className="flex items-center gap-1 text-[11px] font-semibold text-tf-cyan hover:underline"
-                      >
-                        <FolderSearch className="h-3 w-3" />
-                        {t('rules.modal.add.pick_app')}
-                      </button>
-                    )}
+                      {simpleTargetType === 'app' && (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => appendProcessPattern('msedge.exe', 'simple')}
+                            className="rounded border border-tf-cyan/40 bg-tf-cyan/10 px-2 py-0.5 text-[10px] font-semibold text-tf-cyan hover:bg-tf-cyan/20"
+                          >
+                            + {t('rules.simple.quick_edge_chip')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void loadSystemApps();
+                            }}
+                            className="flex items-center gap-1 text-[11px] font-semibold text-tf-cyan hover:underline"
+                          >
+                            <FolderSearch className="h-3 w-3" />
+                            {t('rules.modal.add.pick_app')}
+                          </button>
+                        </div>
+                      )}
                   </div>
                   <input
                     id="simple-rule-target"
@@ -971,6 +1061,57 @@ export const RulesView: React.FC<RulesViewProps> = ({
                       )}
                     </div>
                   )}
+                  {simpleTargetType === 'app' ? (
+                    <div className="mt-3">
+                      <label
+                        htmlFor="simple-rule-optional-domains"
+                        className="block text-xs text-tf-secondary"
+                      >
+                        {t('rules.simple.optional_site_label')}
+                      </label>
+                      <input
+                        id="simple-rule-optional-domains"
+                        type="text"
+                        value={simpleOptionalDomains}
+                        onChange={(e) => setSimpleOptionalDomains(e.target.value)}
+                        placeholder={t('rules.simple.optional_site_placeholder')}
+                        className="tf-input mt-1 w-full px-3 py-1.5 text-sm font-mono"
+                      />
+                      <p className="mt-1 text-[11px] text-tf-secondary">
+                        {t('rules.simple.optional_site_hint')}
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="mt-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <label
+                          htmlFor="simple-rule-optional-apps"
+                          className="block text-xs text-tf-secondary"
+                        >
+                          {t('rules.simple.optional_app_label')}
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setSimpleOptionalApps((prev) =>
+                              mergeCommaPattern(prev, 'msedge.exe')
+                            )
+                          }
+                          className="rounded border border-tf-cyan/40 bg-tf-cyan/10 px-2 py-0.5 text-[10px] font-semibold text-tf-cyan hover:bg-tf-cyan/20"
+                        >
+                          + {t('rules.simple.quick_edge_chip')}
+                        </button>
+                      </div>
+                      <input
+                        id="simple-rule-optional-apps"
+                        type="text"
+                        value={simpleOptionalApps}
+                        onChange={(e) => setSimpleOptionalApps(e.target.value)}
+                        placeholder={t('rules.simple.optional_app_placeholder')}
+                        className="tf-input mt-1 w-full px-3 py-1.5 text-sm font-mono"
+                      />
+                    </div>
+                  )}
                 </div>
 
                 <div>
@@ -1002,9 +1143,13 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         type="button"
                         aria-pressed={actionType === opt.type}
                         onClick={() => {
+                          if (opt.type === 'proxy' && !hasEnabledProxy) {
+                            onMissingProxy?.();
+                            return;
+                          }
                           setActionType(opt.type);
                           if (opt.type === 'proxy' && !actionTargetId) {
-                            setActionTargetId(proxies[0]?.id || '');
+                            setActionTargetId(primaryEnabledProxyId);
                           }
                         }}
                         className={`rounded-tf-md px-3 py-2 text-xs font-bold transition ${
@@ -1194,15 +1339,19 @@ export const RulesView: React.FC<RulesViewProps> = ({
                     const nextType = e.target.value as RuleAction['type'];
                     setActionType(nextType);
                     if (nextType === 'proxy') {
-                      setActionTargetId(proxies[0]?.id || '');
+                      setActionTargetId(primaryEnabledProxyId);
                     } else if (nextType === 'chain') {
-                      setActionTargetId(chains[0]?.id || '');
+                      setActionTargetId(enabledChains[0]?.id || '');
                     }
                   }}
                   className="tf-input mt-1 w-full px-2 py-1.5 text-sm uppercase"
                 >
-                  <option value="proxy">PROXY</option>
-                  <option value="chain">CHAIN</option>
+                  <option value="proxy" disabled={!hasEnabledProxy}>
+                    PROXY
+                  </option>
+                  <option value="chain" disabled={enabledChains.length === 0}>
+                    CHAIN
+                  </option>
                   <option value="direct">DIRECT</option>
                   <option value="block">BLOCK</option>
                 </select>
@@ -1220,12 +1369,12 @@ export const RulesView: React.FC<RulesViewProps> = ({
                   className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
                 >
                   {actionType === 'proxy'
-                    ? proxies.map((p) => (
+                    ? enabledProxies.map((p) => (
                         <option key={p.id} value={p.id}>
                           {p.name} ({p.host}:{p.port})
                         </option>
                       ))
-                    : chains.map((c) => (
+                    : enabledChains.map((c) => (
                         <option key={c.id} value={c.id}>
                           {c.name} ({c.proxyIds.length}{' '}
                           {t('proxies.section.chains.hops')})

@@ -354,13 +354,25 @@ mod tests {
     fn matches_process_and_fake_ip_domain() {
         let constants = SystemConstants::load_embedded().unwrap();
         let mut profile = ProfileConfig::load_embedded_default().unwrap();
-        if let Some(rule) = profile
-            .rules
-            .iter_mut()
-            .find(|r| r.id == "rule-browsers-socks5")
-        {
-            rule.enabled = true;
-        }
+        assert!(profile.proxies.is_empty());
+        assert!(profile.chains.is_empty());
+        profile.rules.push(crate::config::RoutingRule {
+            id: "test-browsers-proxy".to_string(),
+            name: "Web Browsers via Test Proxy".to_string(),
+            enabled: true,
+            priority: 20,
+            process_patterns: vec!["firefox.exe".to_string()],
+            domain_patterns: vec![],
+            ip_cidrs: vec![],
+            port_ranges: vec![crate::config::PortRange {
+                start: 443,
+                end: 443,
+            }],
+            protocol: TransportProtocol::Tcp,
+            action: RuleAction::Proxy {
+                target_id: "test-proxy".to_string(),
+            },
+        });
         let dns = FakeIpEngine::new(&profile.dns_config, &constants.dns);
 
         let fake_ip = dns.allocate_or_get("app.telemetry.example.com").unwrap();
@@ -384,7 +396,7 @@ mod tests {
         assert_eq!(eval.action, RuleAction::Block);
         assert!(eval.resolved_from_fake_ip);
 
-        // 2. Firefox on port 443 should route via proxy-socks5-primary
+        // 2. Firefox on port 443 should route via test-proxy
         let req_browser = ConnectionRequest {
             process_name: "C:\\Program Files\\Mozilla Firefox\\firefox.exe".to_string(),
             process_path: None,
@@ -402,7 +414,7 @@ mod tests {
         assert_eq!(
             eval_browser.action,
             RuleAction::Proxy {
-                target_id: "proxy-socks5-primary".to_string()
+                target_id: "test-proxy".to_string()
             }
         );
     }
@@ -537,5 +549,68 @@ mod tests {
         };
         let eval_local = RuleEngine::evaluate(&local_req, &rules, &RuleAction::Direct, None);
         assert_eq!(eval_local.action, RuleAction::Direct);
+    }
+
+    #[test]
+    fn matches_msedge_with_meshcore_domain_patterns() {
+        let rules = vec![crate::config::RoutingRule {
+            id: "edge-meshcore".to_string(),
+            name: "Edge on meshcore.net".to_string(),
+            enabled: true,
+            priority: 15,
+            process_patterns: vec!["msedge.exe".to_string()],
+            domain_patterns: vec!["meshcore.net".to_string(), "*.meshcore.net".to_string()],
+            ip_cidrs: vec![],
+            port_ranges: vec![],
+            protocol: TransportProtocol::Any,
+            action: RuleAction::Proxy {
+                target_id: "ext-proxy".to_string(),
+            },
+        }];
+
+        for host in ["meshcore.net", "map.meshcore.net", "api.eu.meshcore.net"] {
+            let req = ConnectionRequest {
+                process_name: "msedge.exe".to_string(),
+                process_path: None,
+                target_host: host.to_string(),
+                target_ip: None,
+                target_port: 443,
+                protocol: TransportProtocol::Tcp,
+            };
+            let eval = RuleEngine::evaluate(&req, &rules, &RuleAction::Direct, None);
+            assert_eq!(
+                eval.action,
+                RuleAction::Proxy {
+                    target_id: "ext-proxy".to_string(),
+                },
+                "expected {host} via msedge.exe to match ext-proxy"
+            );
+        }
+
+        let unrelated = ConnectionRequest {
+            process_name: "msedge.exe".to_string(),
+            process_path: None,
+            target_host: "youtube.com".to_string(),
+            target_ip: None,
+            target_port: 443,
+            protocol: TransportProtocol::Tcp,
+        };
+        assert_eq!(
+            RuleEngine::evaluate(&unrelated, &rules, &RuleAction::Direct, None).action,
+            RuleAction::Direct
+        );
+
+        let wrong_browser = ConnectionRequest {
+            process_name: "firefox.exe".to_string(),
+            process_path: None,
+            target_host: "meshcore.net".to_string(),
+            target_ip: None,
+            target_port: 443,
+            protocol: TransportProtocol::Tcp,
+        };
+        assert_eq!(
+            RuleEngine::evaluate(&wrong_browser, &rules, &RuleAction::Direct, None).action,
+            RuleAction::Direct
+        );
     }
 }

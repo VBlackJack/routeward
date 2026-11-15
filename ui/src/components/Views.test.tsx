@@ -23,6 +23,7 @@ import { ConnectionsView } from './ConnectionsView';
 import { DashboardView } from './DashboardView';
 import { DnsView } from './DnsView';
 import { ProxiesView } from './ProxiesView';
+import { QuickSetupWizardModal } from './QuickSetupWizardModal';
 import { RulesView } from './RulesView';
 import { SettingsView } from './SettingsView';
 import {
@@ -843,5 +844,248 @@ describe('Core UI view components', () => {
     expect(onToggleAutostart).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByText(i18n.t('settings.profiles.switch_button')));
     expect(onSwitchNamedProfile).toHaveBeenCalledWith('edge-work');
+  });
+
+  it('RulesView simple mode supports combined msedge.exe + meshcore.net proxy rules and guards missing proxy', () => {
+    const onMissingProxy = vi.fn();
+    const onAddRule = vi.fn();
+    const { rerender } = render(
+      <RulesView
+        rules={[]}
+        proxies={[]}
+        chains={[]}
+        experienceMode="simple"
+        onEvaluateRule={vi.fn()}
+        onAddRule={onAddRule}
+        onToggleRule={vi.fn()}
+        onReorderRule={vi.fn()}
+        onRemoveRule={vi.fn()}
+        onMissingProxy={onMissingProxy}
+      />
+    );
+
+    const proxyButtons = screen.getAllByRole('button', {
+      name: i18n.t('rules.visual_apps.action_proxy')
+    });
+    fireEvent.click(proxyButtons[0]);
+    expect(onMissingProxy).toHaveBeenCalledTimes(1);
+    expect(onAddRule).not.toHaveBeenCalled();
+
+    const extProxy: ProxyNode = {
+      id: 'p-ext',
+      name: 'External SSH Relay',
+      protocol: 'socks5',
+      host: 'proxy.example.com',
+      port: 1080,
+      auth: null,
+      udpEnabled: true,
+      tls: false,
+      sni: null,
+      enabled: true,
+      lastLatencyMs: null,
+      exitIp: null
+    };
+
+    rerender(
+      <RulesView
+        rules={[]}
+        proxies={[extProxy]}
+        chains={[]}
+        experienceMode="simple"
+        onEvaluateRule={vi.fn()}
+        onAddRule={onAddRule}
+        onToggleRule={vi.fn()}
+        onReorderRule={vi.fn()}
+        onRemoveRule={vi.fn()}
+        onMissingProxy={onMissingProxy}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('rules.simple.add_button') })
+    );
+    fireEvent.click(
+      screen.getByRole('button', { name: `+ ${i18n.t('rules.simple.quick_edge_chip')}` })
+    );
+    const domainInput = screen.getByPlaceholderText(
+      i18n.t('rules.simple.optional_site_placeholder')
+    );
+    fireEvent.change(domainInput, {
+      target: { value: 'meshcore.net, *.meshcore.net' }
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('rules.modal.add.submit') })
+    );
+
+    expect(onAddRule).toHaveBeenCalledTimes(1);
+    const createdRule = onAddRule.mock.calls[0][0] as RoutingRule;
+    expect(createdRule.processPatterns).toEqual(['msedge.exe']);
+    expect(createdRule.domainPatterns).toEqual(['meshcore.net', '*.meshcore.net']);
+    expect(createdRule.action).toEqual({ type: 'proxy', targetId: 'p-ext' });
+
+    // Reopening this combined process+domain rule stays in simple mode with both values prefilled
+    rerender(
+      <RulesView
+        rules={[createdRule]}
+        proxies={[extProxy]}
+        chains={[]}
+        experienceMode="simple"
+        onEvaluateRule={vi.fn()}
+        onAddRule={onAddRule}
+        onToggleRule={vi.fn()}
+        onReorderRule={vi.fn()}
+        onRemoveRule={vi.fn()}
+        onMissingProxy={onMissingProxy}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: `${i18n.t('rules.table.controls.edit')}: ${createdRule.name}`
+      })
+    );
+    expect(
+      screen.getByPlaceholderText(i18n.t('rules.simple.target_app_placeholder'))
+    ).toHaveValue('msedge.exe');
+    expect(
+      screen.getByPlaceholderText(i18n.t('rules.simple.optional_site_placeholder'))
+    ).toHaveValue('meshcore.net, *.meshcore.net');
+  });
+
+  it('DashboardView and QuickSetupWizardModal default to Direct Filter Mode without dummy 127.0.0.1:1080', async () => {
+    const telemetry: TelemetrySnapshot = {
+      activeConnections: 0,
+      downloadBytesPerSec: 0,
+      uploadBytesPerSec: 0,
+      totalRxBytes: 0,
+      totalTxBytes: 0,
+      proxiedCount: 0,
+      directCount: 2,
+      blockedCount: 1,
+      bandwidthHistory: [],
+      topTalkers: []
+    };
+    const diagnostics: SystemDiagnostics = {
+      daemonConnected: true,
+      running: true,
+      osName: 'WINDOWS',
+      interceptionMode: 'hybrid',
+      elevatedPrivileges: true,
+      relayTcpEndpoint: '127.0.0.1:10808',
+      relayHttpEndpoint: '127.0.0.1:10809',
+      dnsEndpoint: '127.0.0.1:5353',
+      fakeIpCidr: '198.18.0.0/15',
+      activeLocale: 'en'
+    };
+    const securityPolicy: SecurityPolicyConfig = {
+      killSwitchEnabled: true,
+      blockUdpOnTcpOnlyProxy: true,
+      strictDnsNoLocalFallback: true
+    };
+
+    render(
+      <DashboardView
+        telemetry={telemetry}
+        diagnostics={diagnostics}
+        dnsCount={0}
+        securityPolicy={securityPolicy}
+        experienceMode="simple"
+        proxies={[]}
+        onApplyUseCase={vi.fn()}
+        onUpdateSecurityPolicy={vi.fn()}
+        onOpenWizard={vi.fn()}
+        onNavigateRules={vi.fn()}
+        onSwitchToExpert={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText(i18n.t('dashboard.simple.direct_filter_mode_title'))
+    ).toBeInTheDocument();
+
+    cleanup();
+
+    const onAddRule = vi.fn().mockResolvedValue(undefined);
+    const onComplete = vi.fn();
+    render(
+      <QuickSetupWizardModal
+        proxies={[]}
+        chains={[]}
+        currentMode="simple"
+        onImportUris={vi.fn()}
+        onAddRule={onAddRule}
+        onSelectMode={vi.fn()}
+        onComplete={onComplete}
+        onClose={vi.fn()}
+      />
+    );
+
+    // Step 1 -> Step 2
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.next') }));
+    expect(
+      screen.getByText(i18n.t('wizard.modal.step2_no_proxy_title'))
+    ).toBeInTheDocument();
+    expect(screen.queryByText('SOCKS5 127.0.0.1:1080')).not.toBeInTheDocument();
+
+    // Step 2 -> Step 3 -> Finish without pasting any proxy URI
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.next') }));
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.finish') }));
+
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(false));
+    const appliedIds = onAddRule.mock.calls.map((c) => (c[0] as RoutingRule).id);
+    expect(appliedIds).toEqual([
+      'rule-wiz-preset-block-os-telemetry',
+      'rule-wiz-preset-rfc1918-direct'
+    ]);
+
+    cleanup();
+
+    const importedProxy: ProxyNode = {
+      id: 'imported-ext-1',
+      name: 'ExternalProxy',
+      protocol: 'socks5',
+      host: 'proxy.example.com',
+      port: 1080,
+      auth: null,
+      udpEnabled: true,
+      tls: false,
+      sni: null,
+      enabled: true,
+      lastLatencyMs: null,
+      exitIp: null
+    };
+    const onAddWithProxy = vi.fn().mockResolvedValue(undefined);
+    const onCompleteWithProxy = vi.fn();
+    const onImportUris = vi.fn().mockResolvedValue([importedProxy]);
+
+    render(
+      <QuickSetupWizardModal
+        proxies={[]}
+        chains={[]}
+        currentMode="simple"
+        onImportUris={onImportUris}
+        onAddRule={onAddWithProxy}
+        onSelectMode={vi.fn()}
+        onComplete={onCompleteWithProxy}
+        onClose={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.next') }));
+    fireEvent.change(
+      screen.getByPlaceholderText(i18n.t('wizard.modal.step2_uri_placeholder')),
+      { target: { value: 'socks5://user:pass@proxy.example.com:1080#ExternalProxy' } }
+    );
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.next') }));
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.finish') }));
+
+    await waitFor(() => expect(onCompleteWithProxy).toHaveBeenCalledWith(true));
+    const privacyBrowserRule = onAddWithProxy.mock.calls
+      .map((c) => c[0] as RoutingRule)
+      .find((r) => r.id === 'rule-wiz-preset-privacy-browsers');
+    expect(privacyBrowserRule?.action).toEqual({
+      type: 'proxy',
+      targetId: 'imported-ext-1'
+    });
   });
 });

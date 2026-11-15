@@ -143,7 +143,8 @@
         "added": "Upstream proxy added to profile",
         "imported_uris": "Imported proxy servers from URI list",
         "copied_uri": "Proxy URI copied to clipboard",
-        "tested": "Proxy health and latency check completed"
+        "tested": "Proxy health and latency check completed",
+        "required_for_rule": "Add and enable an external proxy server first to route traffic via proxy"
       },
       "connection": {
         "terminated": "Connection socket terminated",
@@ -165,7 +166,8 @@
         "process_launch_error": "Failed to launch process via proxy"
       },
       "wizard": {
-        "completed": "Configuration applied via Quick Setup Wizard"
+        "completed": "Configuration applied via Quick Setup Wizard",
+        "completed_direct_no_proxy": "Direct Filter Mode active (no external proxy configured yet)"
       },
       "dns": {
         "flushed": "Fake-IP DNS cache flushed"
@@ -184,7 +186,8 @@
         "import_error": "Invalid FoxyProxy JSON payload"
       },
       "usecase": {
-        "applied": "Scenario preset applied"
+        "applied": "Scenario preset applied",
+        "applied_direct_no_proxy": "Direct filter rules applied (add an external proxy in Proxy Server to tunnel traffic)"
       },
       "engine": {
         "driver_missing": "WinDivert driver is missing from the installation folder (run tools/fetch-windivert.ps1)",
@@ -242,7 +245,10 @@
       "metric_protected_traffic": "Total Traffic Handled",
       "proxy_summary_label": "Active Proxy Server",
       "no_proxy_configured": "No proxy server configured yet",
+      "direct_filter_mode_title": "Direct Filter Mode (No External Proxy)",
+      "direct_filter_mode_desc": "Active filtering, tracker blocking, and LAN rules apply directly using your normal Internet connection.",
       "configure_proxy_cta": "Set up a Proxy",
+      "add_optional_proxy_cta": "Add External Proxy (Optional)",
       "test_proxy_cta": "Check Connection",
       "use_cases_title": "What do you want to do today?",
       "use_cases_subtitle": "Pick a ready-made scenario to configure your apps and leak protection in one click.",
@@ -427,11 +433,15 @@
     }
   },
   "proxies": {
+    "external_explainer": {
+      "title": "RouteWard is a traffic router, not a built-in exit proxy",
+      "desc": "Configure your own external SOCKS5, HTTP, or HTTPS proxy server below (SSH tunnel, Tor, VPN gateway, or corporate relay). Without an active proxy, RouteWard operates safely in Direct Filter Mode."
+    },
     "simple": {
       "title": "My Proxy Server",
       "subtitle": "Add your proxy server or subscription link and verify that it responds cleanly.",
       "add": "Add Proxy",
-      "empty": "No proxy configured yet. Add one to start routing your apps.",
+      "empty": "No external proxy configured yet. You can still filter and block apps directly, or add an upstream proxy server above.",
       "show_advanced_options": "Show protocol options (UDP / TLS)",
       "hide_advanced_options": "Hide protocol options",
       "active_badge": "Primary"
@@ -487,6 +497,7 @@
         "name_label": "Display Name",
         "protocol_label": "Protocol",
         "host_label": "Server Host / IP",
+        "host_placeholder": "proxy.example.com",
         "port_label": "Port",
         "username_label": "Username (Optional)",
         "password_label": "Password (Optional)",
@@ -503,7 +514,7 @@
       "import_uri": {
         "title": "Batch Import Proxies (URIs or Base64 Subscription)",
         "subtitle": "Paste proxy URIs (socks5://, http://, https://) or a Base64-encoded subscription payload",
-        "placeholder": "socks5://user:pass@127.0.0.1:1080#LocalSocks\nhttps://user:pass@edge.example.com:443?sni=edge.example.com#EdgeHttps",
+        "placeholder": "socks5://user:pass@proxy.example.com:1080#ExternalSocks\nhttps://user:pass@edge.example.com:443?sni=edge.example.com#EdgeHttps",
         "submit": "Import Proxies",
         "cancel": "Cancel"
       },
@@ -534,6 +545,12 @@
       "target_app_placeholder": "spotify.exe",
       "target_site_label": "Website or domain (e.g. *.example.com)",
       "target_site_placeholder": "*.example.com",
+      "quick_edge_chip": "Edge (msedge.exe)",
+      "optional_site_label": "Only for these domains (Optional, e.g. meshcore.net, *.meshcore.net)",
+      "optional_site_placeholder": "meshcore.net, *.meshcore.net (leave blank for all sites)",
+      "optional_site_hint": "Tip: leave empty to apply to all traffic for this app, or enter patterns like *.meshcore.net so only matching sites go through the proxy.",
+      "optional_app_label": "Only for these applications (Optional, e.g. msedge.exe)",
+      "optional_app_placeholder": "msedge.exe (leave blank for all apps)",
       "action_label": "How should it connect?",
       "show_advanced_options": "Show advanced rule fields (priority, CIDR, ports)",
       "hide_advanced_options": "Back to simple form"
@@ -570,8 +587,8 @@
     "visual_apps": {
       "section_title": "My Applications - 1-Click Visual Routing",
       "section_subtitle": "Choose how each category of application connects to the Internet without typing .exe names or port numbers.",
-      "action_proxy": "Protect via Proxy",
-      "action_direct": "Direct Connection (Normal)",
+      "action_proxy": "Via External Proxy",
+      "action_direct": "Direct (Filter Only)",
       "action_block": "Block Internet",
       "browsers": {
         "name": "Web Browsers",
@@ -841,9 +858,11 @@
       "step1_gaming_title": "Low-Latency Gaming & Split Tunneling",
       "step1_gaming_desc": "Keep games on a fast direct connection while routing Discord and browsers through the proxy.",
       "step2_title": "2. Which Proxy Server do you want to use?",
-      "step2_use_existing": "Use the default pre-configured proxy server",
+      "step2_use_existing": "Use configured external proxy server",
+      "step2_no_proxy_title": "No external proxy configured - Direct Filter Mode ready",
+      "step2_no_proxy_desc": "RouteWard does not embed a built-in proxy server. Continue without a URI to filter trackers and local rules directly, or paste your own external SOCKS5/HTTP/HTTPS proxy URI below.",
       "step2_paste_uri": "Or paste a connection link (socks5://, http://, https:// or Base64 subscription):",
-      "step2_uri_placeholder": "socks5://127.0.0.1:1080#MyProxy",
+      "step2_uri_placeholder": "socks5://user:pass@proxy.example.com:1080#MyExternalProxy",
       "step3_title": "3. Preferred Interface Experience",
       "step3_simple_title": "Simple Mode (Recommended for most users)",
       "step3_simple_desc": "Plain-language explanations, visual app cards, and a reassuring protection summary.",
