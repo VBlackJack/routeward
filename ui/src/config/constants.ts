@@ -69,6 +69,8 @@ export const UI_CONFIG = {
     DNS_FLUSH: '/api/dns/flush',
     LOGS_CLEAR: '/api/logs/clear',
     SYSTEM_PROXY: '/api/system-proxy',
-    LAUNCH_PROCESS: '/api/launch-process'
+    LAUNCH_PROCESS: '/api/launch-process',
+    DAEMON_START: '/api/daemon/start',
+    LOCALE: '/api/locale'
   }
 } as const;

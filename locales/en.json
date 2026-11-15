@@ -38,6 +38,8 @@
       "disconnected_desc": "The desktop bridge cannot reach the background daemon (start 'routeward daemon' as Administrator or root). Automatic reconnection is active.",
       "reconnecting_badge": "Auto-Reconnecting",
       "retry_button": "Retry Now",
+      "start_button": "Start Service",
+      "starting_button": "Starting...",
       "not_elevated_title": "Daemon Running Without Elevated Privileges",
       "not_elevated_desc": "The connected daemon process is not running with Administrator or root privileges. Kernel/OS packet interception requires elevation."
     },
@@ -167,6 +169,12 @@
       },
       "usecase": {
         "applied": "Scenario preset applied"
+      },
+      "daemon": {
+        "started": "Privileged service started and connected",
+        "uac_cancelled": "Administrator authorization was cancelled",
+        "start_failed": "Could not start service automatically",
+        "access_denied": "Service is running without permission for this user session"
       }
     }
   },
@@ -592,6 +600,7 @@
       },
       "controls": {
         "header": "Order & Actions",
+        "edit": "Edit",
         "move_up": "Move Priority Up",
         "move_down": "Move Priority Down",
         "delete": "Delete"
@@ -600,6 +609,7 @@
     "modal": {
       "add": {
         "title": "New Routing Rule",
+        "edit_title": "Edit Routing Rule",
         "name_label": "Rule Name",
         "priority_label": "Priority (Lower runs first)",
         "processes_label": "Process Names / Globs (comma-separated)",

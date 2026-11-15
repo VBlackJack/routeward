@@ -109,6 +109,66 @@ describe('Core UI view components', () => {
     expect(onRemoveRule).toHaveBeenCalledWith('rule-2');
   });
 
+  it('RulesView edits an existing rule preserving id, priority, ports, and protocol', () => {
+    const existingRule: RoutingRule = {
+      id: 'rule-edit-1',
+      name: 'Browser via Proxy',
+      enabled: true,
+      priority: 15,
+      processPatterns: ['firefox.exe'],
+      domainPatterns: ['*.example.org'],
+      ipCidrs: [],
+      portRanges: [{ start: 443, end: 443 }],
+      protocol: 'tcp',
+      action: { type: 'proxy', targetId: 'p1' }
+    };
+    const onAddRule = vi.fn();
+
+    render(
+      <RulesView
+        rules={[existingRule]}
+        proxies={[
+          {
+            id: 'p1',
+            name: 'Primary Proxy',
+            protocol: 'socks5',
+            host: '127.0.0.1',
+            port: 1080,
+            auth: null,
+            udpEnabled: true,
+            tls: false,
+            sni: null,
+            enabled: true,
+            lastLatencyMs: null,
+            exitIp: null
+          }
+        ]}
+        chains={[]}
+        experienceMode="simple"
+        onEvaluateRule={vi.fn().mockResolvedValue(null)}
+        onAddRule={onAddRule}
+        onToggleRule={vi.fn()}
+        onReorderRule={vi.fn()}
+        onRemoveRule={vi.fn()}
+      />
+    );
+
+    const editBtn = screen.getByRole('button', {
+      name: `${i18n.t('rules.table.controls.edit')}: Browser via Proxy`
+    });
+    fireEvent.click(editBtn);
+
+    expect(
+      screen.getByText(i18n.t('rules.modal.add.edit_title'))
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('rules.modal.add.submit') })
+    );
+
+    expect(onAddRule).toHaveBeenCalledTimes(1);
+    expect(onAddRule.mock.calls[0][0]).toEqual(existingRule);
+  });
+
   it('ProxiesView triggers single proxy test, copy URI, batch URI import, and chain delete', async () => {
     const proxies: ProxyNode[] = [
       {
@@ -156,6 +216,7 @@ describe('Core UI view components', () => {
     );
 
     expect(screen.getByText('2001:db8::1:1080')).toBeInTheDocument();
+    expect(screen.getByText(i18n.t('proxies.simple.active_badge'))).toBeInTheDocument();
     expect(screen.getByText('Primary Chain')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: i18n.t('proxies.card.action.test') }));

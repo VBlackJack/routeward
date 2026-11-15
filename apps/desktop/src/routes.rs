@@ -15,7 +15,7 @@
  */
 
 use crate::commands::DesktopCommandBridge;
-use crate::security::{extract_json_body, validate_loopback_http_request};
+use crate::security::{extract_json_body, validate_loopback_http_request_with_method};
 use crate::sse::stream_sse_events;
 use crate::DesktopWindowCommand;
 use routeward_core::config::{InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule};
@@ -83,7 +83,24 @@ struct AllocateFakeIpRequest {
     domain: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SetLocaleRequest {
+    locale: String,
+}
+
+fn require_post(method: &str, json_ct: &str) -> Option<(u16, String, Vec<u8>)> {
+    if method != "POST" {
+        return Some((
+            405,
+            json_ct.to_string(),
+            b"{\"error\":\"method_not_allowed\"}".to_vec(),
+        ));
+    }
+    None
+}
+
 pub async fn handle_api_route(
+    method: &str,
     path: &str,
     body_str: &str,
     bridge: &DesktopCommandBridge,
@@ -143,6 +160,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/engine/toggle") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         let parsed: ToggleEngineRequest =
             serde_json::from_str(body_str).unwrap_or(ToggleEngineRequest { start: false });
         let diag = bridge.toggle_engine(parsed.start).await;
@@ -151,10 +171,60 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/engine/mode") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<SetModeRequest>(body_str) {
             Ok(req) => {
                 let diag = bridge.set_interception_mode(req.mode).await;
                 let json = serde_json::to_vec(&diag).unwrap_or_default();
+                return Some((200, json_ct, json));
+            }
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                    .unwrap_or_default();
+                return Some((400, json_ct, json));
+            }
+        }
+    }
+
+    if path.starts_with("/api/daemon/start") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        match bridge.start_privileged_daemon().await {
+            Ok(state) => {
+                let json = serde_json::to_vec(&serde_json::json!({
+                    "started": true,
+                    "connected": state.diagnostics.daemon_connected,
+                    "state": state,
+                }))
+                .unwrap_or_default();
+                return Some((200, json_ct, json));
+            }
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({
+                    "errorKey": err.error_key(),
+                    "error": err.detail(),
+                }))
+                .unwrap_or_default();
+                return Some((err.status_code(), json_ct, json));
+            }
+        }
+    }
+
+    if path.starts_with("/api/locale") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        match serde_json::from_str::<SetLocaleRequest>(body_str) {
+            Ok(req) => {
+                let active_locale = bridge.set_locale(&req.locale);
+                let json = serde_json::to_vec(&serde_json::json!({
+                    "ok": true,
+                    "locale": active_locale,
+                }))
+                .unwrap_or_default();
                 return Some((200, json_ct, json));
             }
             Err(err) => {
@@ -399,6 +469,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/window/minimize") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         if let Some(cb) = on_window_cmd {
             cb(DesktopWindowCommand::Minimize);
         }
@@ -406,6 +479,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/window/maximize") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         if let Some(cb) = on_window_cmd {
             cb(DesktopWindowCommand::ToggleMaximize);
         }
@@ -413,6 +489,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/window/close") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         if let Some(cb) = on_window_cmd {
             cb(DesktopWindowCommand::Close);
         }
@@ -420,6 +499,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/window/drag") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         if let Some(cb) = on_window_cmd {
             cb(DesktopWindowCommand::DragWindow);
         }
@@ -436,6 +518,9 @@ pub fn http_status_line(code: u16) -> &'static str {
         401 => "HTTP/1.1 401 Unauthorized",
         403 => "HTTP/1.1 403 Forbidden",
         404 => "HTTP/1.1 404 Not Found",
+        405 => "HTTP/1.1 405 Method Not Allowed",
+        409 => "HTTP/1.1 409 Conflict",
+        501 => "HTTP/1.1 501 Not Implemented",
         503 => "HTTP/1.1 503 Service Unavailable",
         _ => "HTTP/1.1 500 Internal Server Error",
     }
@@ -459,15 +544,19 @@ pub async fn serve_loopback_http_connection<FStatic>(
     }
     let req = String::from_utf8_lossy(&buf[..n]);
 
-    let path = match validate_loopback_http_request(&req, bound_port, expected_token) {
-        Ok(valid_path) => valid_path,
+    let (method, path) = match validate_loopback_http_request_with_method(
+        &req,
+        bound_port,
+        expected_token,
+    ) {
+        Ok(valid) => valid,
         Err(rejection) => {
             let status = rejection.status_line();
             let body = b"{\"error\":\"forbidden\"}";
             let resp = format!(
-                "{status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
+                    "{status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
             let _ = stream.write_all(resp.as_bytes()).await;
             let _ = stream.write_all(body).await;
             let _ = stream.flush().await;
@@ -485,7 +574,7 @@ pub async fn serve_loopback_http_connection<FStatic>(
     let allowed_origin = format!("http://127.0.0.1:{bound_port}");
 
     if let Some((status_code, content_type, payload)) =
-        handle_api_route(&path, body_str, bridge, on_window_cmd).await
+        handle_api_route(&method, &path, body_str, bridge, on_window_cmd).await
     {
         let status = http_status_line(status_code);
         let header = format!(

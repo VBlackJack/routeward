@@ -49,12 +49,12 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 /// Strictly validates the `Host`, `Origin`, and ephemeral token headers on incoming loopback HTTP requests.
-/// Returns the request path if valid.
-pub fn validate_loopback_http_request(
+/// Returns the request `(method, path)` tuple if valid.
+pub fn validate_loopback_http_request_with_method(
     raw_request: &str,
     expected_port: u16,
     expected_token: &str,
-) -> Result<String, HttpSecurityRejection> {
+) -> Result<(String, String), HttpSecurityRejection> {
     let header_section = raw_request
         .split("\r\n\r\n")
         .next()
@@ -125,7 +125,17 @@ pub fn validate_loopback_http_request(
         }
     }
 
-    Ok(path)
+    Ok((method, path))
+}
+
+/// Strictly validates incoming loopback HTTP requests and returns only the request path.
+pub fn validate_loopback_http_request(
+    raw_request: &str,
+    expected_port: u16,
+    expected_token: &str,
+) -> Result<String, HttpSecurityRejection> {
+    validate_loopback_http_request_with_method(raw_request, expected_port, expected_token)
+        .map(|(_, path)| path)
 }
 
 pub fn extract_json_body(raw_request: &str) -> &str {

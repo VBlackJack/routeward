@@ -15,11 +15,14 @@
  */
 
 pub mod commands;
+pub mod daemon_launcher;
 mod routes;
 mod security;
 mod sse;
 #[cfg(test)]
 mod tests;
+#[cfg(target_os = "windows")]
+pub mod tray;
 
 use commands::DesktopCommandBridge;
 use routeward_core::config::{ProfileConfig, SystemConstants};
@@ -29,13 +32,20 @@ pub use routes::{
     serve_loopback_http_connection, HTTP_REQ_BUFFER_BYTES,
 };
 pub use security::{
-    constant_time_eq, extract_json_body, validate_loopback_http_request, HttpSecurityRejection,
-    HEADER_ROUTEWARD_TOKEN,
+    constant_time_eq, extract_json_body, validate_loopback_http_request,
+    validate_loopback_http_request_with_method, HttpSecurityRejection, HEADER_ROUTEWARD_TOKEN,
 };
 pub use sse::stream_sse_events;
 
 const DEFAULT_DESKTOP_LOCALE: &str = "fr";
 const ENV_ROUTEWARD_LOCALE: &str = "ROUTEWARD_LOCALE";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayStatusSnapshot {
+    pub daemon_connected: bool,
+    pub running: bool,
+    pub locale: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopWindowCommand {
@@ -43,6 +53,9 @@ pub enum DesktopWindowCommand {
     ToggleMaximize,
     Close,
     DragWindow,
+    ShowWindow,
+    ToggleEngine,
+    Quit,
 }
 
 pub fn create_desktop_bridge() -> Result<DesktopCommandBridge, String> {

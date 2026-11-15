@@ -22,6 +22,7 @@ import {
   Ban,
   CheckCircle2,
   Code2,
+  Edit3,
   Gamepad2,
   Globe,
   MessageSquare,
@@ -81,6 +82,25 @@ function parsePortSpec(spec: string): PortRange[] {
   return ranges;
 }
 
+function formatPortSpec(ranges: PortRange[]): string {
+  return ranges
+    .map((r) => (r.start === r.end ? `${r.start}` : `${r.start}-${r.end}`))
+    .join(', ');
+}
+
+function requiresAdvancedEditor(rule: RoutingRule): boolean {
+  const hasProcesses = rule.processPatterns.length > 0;
+  const hasDomains = rule.domainPatterns.length > 0;
+  return (
+    rule.ipCidrs.length > 0 ||
+    rule.portRanges.length > 0 ||
+    rule.protocol !== 'any' ||
+    rule.action.type === 'chain' ||
+    (hasProcesses && hasDomains) ||
+    (!hasProcesses && !hasDomains)
+  );
+}
+
 export const RulesView: React.FC<RulesViewProps> = ({
   rules,
   proxies,
@@ -101,9 +121,12 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const [simPort, setSimPort] = useState<number>(UI_CONFIG.DEFAULT_TEST_PORT);
   const [simResult, setSimResult] = useState<RuleEvaluationResult | null>(null);
 
-  // Add Rule & Presets modal state
+  // Add / Edit Rule & Presets modal state
   const [showModal, setShowModal] = useState(false);
   const [showPresets, setShowPresets] = useState(false);
+  const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
+  const [editingRuleEnabled, setEditingRuleEnabled] = useState(true);
+  const [editingRequiresAdvanced, setEditingRequiresAdvanced] = useState(false);
   const [ruleName, setRuleName] = useState('');
   const [priority, setPriority] = useState<number>(
     UI_CONFIG.DEFAULT_RULE_PRIORITY
@@ -118,6 +141,62 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const [simpleTargetType, setSimpleTargetType] = useState<'app' | 'site'>('app');
   const [simpleTargetValue, setSimpleTargetValue] = useState('');
   const [showAdvancedFields, setShowAdvancedFields] = useState(false);
+
+  const openCreateRuleModal = () => {
+    setEditingRuleId(null);
+    setEditingRuleEnabled(true);
+    setEditingRequiresAdvanced(false);
+    setRuleName('');
+    setPriority(UI_CONFIG.DEFAULT_RULE_PRIORITY);
+    setProcessesText('');
+    setDomainsText('');
+    setCidrsText('');
+    setPortsText('');
+    setProtocol('any');
+    setActionType('proxy');
+    setActionTargetId(proxies[0]?.id || '');
+    setSimpleTargetType('app');
+    setSimpleTargetValue('');
+    setShowAdvancedFields(false);
+    setShowModal(true);
+  };
+
+  const openEditRuleModal = (rule: RoutingRule) => {
+    const needsAdvanced = requiresAdvancedEditor(rule);
+    const hasDomainsOnly =
+      rule.domainPatterns.length > 0 && rule.processPatterns.length === 0;
+    setEditingRuleId(rule.id);
+    setEditingRuleEnabled(rule.enabled);
+    setEditingRequiresAdvanced(needsAdvanced);
+    setRuleName(rule.name);
+    setPriority(rule.priority);
+    setProcessesText(rule.processPatterns.join(', '));
+    setDomainsText(rule.domainPatterns.join(', '));
+    setCidrsText(rule.ipCidrs.join(', '));
+    setPortsText(formatPortSpec(rule.portRanges));
+    setProtocol(rule.protocol);
+    setActionType(rule.action.type);
+    setActionTargetId(
+      rule.action.targetId ||
+        (rule.action.type === 'chain' ? chains[0]?.id || '' : proxies[0]?.id || '')
+    );
+    setSimpleTargetType(hasDomainsOnly ? 'site' : 'app');
+    setSimpleTargetValue(
+      hasDomainsOnly
+        ? rule.domainPatterns.join(', ')
+        : rule.processPatterns.join(', ')
+    );
+    setShowAdvancedFields(needsAdvanced);
+    setShowModal(true);
+  };
+
+  const closeRuleModal = () => {
+    setEditingRuleId(null);
+    setEditingRuleEnabled(true);
+    setEditingRequiresAdvanced(false);
+    setShowAdvancedFields(false);
+    setShowModal(false);
+  };
 
   const handleRunSimulator = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -224,10 +303,14 @@ export const RulesView: React.FC<RulesViewProps> = ({
       : splitList(domainsText);
 
     onAddRule({
-      id: generateClientId('rule'),
+      id: editingRuleId ?? generateClientId('rule'),
       name: effectiveName,
-      enabled: true,
-      priority: isSimpleSubmit ? UI_CONFIG.DEFAULT_RULE_PRIORITY : priority,
+      enabled: editingRuleId ? editingRuleEnabled : true,
+      priority: isSimpleSubmit
+        ? editingRuleId
+          ? priority
+          : UI_CONFIG.DEFAULT_RULE_PRIORITY
+        : priority,
       processPatterns: effectiveProcesses,
       domainPatterns: effectiveDomains,
       ipCidrs: isSimpleSubmit ? [] : splitList(cidrsText),
@@ -240,8 +323,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
     });
     setRuleName('');
     setSimpleTargetValue('');
-    setShowAdvancedFields(false);
-    setShowModal(false);
+    closeRuleModal();
   };
 
   return (
@@ -270,7 +352,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
             </button>
           )}
           <button
-            onClick={() => setShowModal(true)}
+            onClick={openCreateRuleModal}
             className="tf-btn-accent flex items-center gap-1.5 px-3.5 py-2 text-xs"
           >
             <Plus className="h-3.5 w-3.5" />
@@ -515,6 +597,15 @@ export const RulesView: React.FC<RulesViewProps> = ({
                       </span>
                       <button
                         type="button"
+                        onClick={() => openEditRuleModal(rule)}
+                        className="rounded p-1 text-tf-secondary hover:text-tf-accent"
+                        title={t('rules.table.controls.edit')}
+                        aria-label={`${t('rules.table.controls.edit')}: ${rule.name}`}
+                      >
+                        <Edit3 className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => onRemoveRule(rule.id)}
                         className="rounded p-1 text-tf-secondary hover:text-tf-red"
                         title={t('rules.table.controls.delete')}
@@ -632,6 +723,15 @@ export const RulesView: React.FC<RulesViewProps> = ({
                           <ArrowDown className="h-3.5 w-3.5" />
                         </button>
                         <button
+                          type="button"
+                          onClick={() => openEditRuleModal(rule)}
+                          className="rounded p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-accent"
+                          title={t('rules.table.controls.edit')}
+                          aria-label={`${t('rules.table.controls.edit')}: ${rule.name}`}
+                        >
+                          <Edit3 className="h-3.5 w-3.5" />
+                        </button>
+                        <button
                           onClick={() => onRemoveRule(rule.id)}
                           className="rounded p-1 text-tf-secondary hover:text-tf-red"
                           title={t('rules.table.controls.delete')}
@@ -649,11 +749,11 @@ export const RulesView: React.FC<RulesViewProps> = ({
         </div>
       )}
 
-      {/* Add Rule Modal */}
+      {/* Add / Edit Rule Modal */}
       {showModal && (
         <ModalContainer
           labelledBy={addRuleModalTitleId}
-          onClose={() => setShowModal(false)}
+          onClose={closeRuleModal}
         >
           <form
             onSubmit={handleCreateRule}
@@ -663,9 +763,11 @@ export const RulesView: React.FC<RulesViewProps> = ({
               id={addRuleModalTitleId}
               className="text-base font-bold text-tf-primary"
             >
-              {experienceMode === 'simple'
-                ? t('rules.simple.add_button')
-                : t('rules.modal.add.title')}
+              {editingRuleId
+                ? t('rules.modal.add.edit_title')
+                : experienceMode === 'simple'
+                  ? t('rules.simple.add_button')
+                  : t('rules.modal.add.title')}
             </h3>
 
             {experienceMode === 'simple' && !showAdvancedFields ? (
@@ -777,7 +879,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
               </>
             ) : (
               <>
-                {experienceMode === 'simple' && (
+                {experienceMode === 'simple' && !editingRequiresAdvanced && (
                   <button
                     type="button"
                     onClick={() => setShowAdvancedFields(false)}
@@ -934,7 +1036,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
             <div className="flex justify-end gap-2 pt-3">
               <button
                 type="button"
-                onClick={() => setShowModal(false)}
+                onClick={closeRuleModal}
                 className="tf-surface-alt px-4 py-1.5 text-xs text-tf-secondary"
               >
                 {t('rules.modal.add.cancel')}

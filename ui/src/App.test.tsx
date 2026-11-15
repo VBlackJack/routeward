@@ -15,7 +15,7 @@
  */
 
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import './i18n';
 import { App } from './App';
@@ -35,6 +35,7 @@ describe('App navigation and accessible modals', () => {
   beforeEach(() => {
     window.localStorage.clear();
     window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.EXPERIENCE_MODE, 'simple');
+    window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED, 'true');
     vi.spyOn(routewardClient, 'startRealtimeStream').mockImplementation(() => {});
   });
 
@@ -81,5 +82,51 @@ describe('App navigation and accessible modals', () => {
 
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('auto-opens first-run wizard only after daemon connects and triggers 1-click service start on Windows', async () => {
+    window.localStorage.removeItem(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED);
+    const getDiagSpy = vi.spyOn(routewardClient, 'getDiagnostics').mockReturnValue({
+      daemonConnected: false,
+      running: false,
+      osName: 'WINDOWS',
+      interceptionMode: 'hybrid',
+      elevatedPrivileges: false,
+      relayTcpEndpoint: '127.0.0.1:10808',
+      relayHttpEndpoint: '127.0.0.1:10809',
+      dnsEndpoint: '127.0.0.1:5353',
+      fakeIpCidr: '198.18.0.0/15',
+      activeLocale: 'fr'
+    });
+    const startDaemonSpy = vi
+      .spyOn(routewardClient, 'startDaemon')
+      .mockResolvedValue({ connected: true });
+
+    renderApp();
+
+    // Never auto-open wizard over disconnected banner
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    const startBtn = screen.getByRole('button', {
+      name: /démarrer le service|start service/i
+    });
+    fireEvent.click(startBtn);
+    await waitFor(() => expect(startDaemonSpy).toHaveBeenCalledTimes(1));
+
+    // Once connected on first run, Quick Setup Wizard auto-opens
+    getDiagSpy.mockReturnValue({
+      daemonConnected: true,
+      running: false,
+      osName: 'WINDOWS',
+      interceptionMode: 'hybrid',
+      elevatedPrivileges: true,
+      relayTcpEndpoint: '127.0.0.1:10808',
+      relayHttpEndpoint: '127.0.0.1:10809',
+      dnsEndpoint: '127.0.0.1:5353',
+      fakeIpCidr: '198.18.0.0/15',
+      activeLocale: 'fr'
+    });
+    cleanup();
+    renderApp();
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
   });
 });

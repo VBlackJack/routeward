@@ -17,6 +17,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use routeward_core::ipc::generate_ephemeral_token;
+use routeward_desktop_lib::commands::DesktopCommandBridge;
+#[cfg(target_os = "windows")]
+use routeward_desktop_lib::tray::TrayHandle;
 use routeward_desktop_lib::{
     create_desktop_bridge, serve_loopback_http_connection, DesktopWindowCommand,
 };
@@ -64,58 +67,52 @@ fn load_taskbar_icon_256() -> Option<Icon> {
 }
 
 fn spawn_embedded_ui_server(
+    runtime: &tokio::runtime::Handle,
+    bridge: Arc<DesktopCommandBridge>,
     std_listener: StdTcpListener,
     bound_port: u16,
     ephemeral_token: String,
     event_proxy: EventLoopProxy<DesktopWindowCommand>,
 ) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Tokio runtime");
+    runtime.spawn(async move {
+        bridge.log_info(format!(
+            "Loopback UI server listening on http://127.0.0.1:{bound_port}"
+        ));
+        let listener = TcpListener::from_std(std_listener).expect("Async listener");
+        let token_arc = Arc::new(ephemeral_token);
 
-        rt.block_on(async move {
-            let bridge = Arc::new(create_desktop_bridge().expect("DesktopCommandBridge"));
-            bridge.log_info(format!(
-                "Loopback UI server listening on http://127.0.0.1:{bound_port}"
-            ));
-            let listener = TcpListener::from_std(std_listener).expect("Async listener");
-            let token_arc = Arc::new(ephemeral_token);
+        while let Ok((stream, _)) = listener.accept().await {
+            let bridge_ref = Arc::clone(&bridge);
+            let proxy_ref = event_proxy.clone();
+            let token_ref = Arc::clone(&token_arc);
 
-            while let Ok((stream, _)) = listener.accept().await {
-                let bridge_ref = Arc::clone(&bridge);
-                let proxy_ref = event_proxy.clone();
-                let token_ref = Arc::clone(&token_arc);
-
-                tokio::spawn(async move {
-                    let win_cb = |cmd: DesktopWindowCommand| {
-                        let _ = proxy_ref.send_event(cmd);
-                    };
-                    serve_loopback_http_connection(
-                        stream,
-                        bound_port,
-                        &token_ref,
-                        &bridge_ref,
-                        Some(&win_cb),
-                        Some(|path: &str| {
-                            if path.starts_with("/assets/app.js") {
-                                ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
-                            } else if path.starts_with("/assets/app.css") {
-                                ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
-                            } else if path.starts_with("/routeward-glyph.svg") {
-                                ("image/svg+xml", EMBEDDED_GLYPH_SVG)
-                            } else if path.starts_with("/routeward-icon.svg") {
-                                ("image/svg+xml", EMBEDDED_ICON_SVG)
-                            } else {
-                                ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
-                            }
-                        }),
-                    )
-                    .await;
-                });
-            }
-        });
+            tokio::spawn(async move {
+                let win_cb = |cmd: DesktopWindowCommand| {
+                    let _ = proxy_ref.send_event(cmd);
+                };
+                serve_loopback_http_connection(
+                    stream,
+                    bound_port,
+                    &token_ref,
+                    &bridge_ref,
+                    Some(&win_cb),
+                    Some(|path: &str| {
+                        if path.starts_with("/assets/app.js") {
+                            ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
+                        } else if path.starts_with("/assets/app.css") {
+                            ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
+                        } else if path.starts_with("/routeward-glyph.svg") {
+                            ("image/svg+xml", EMBEDDED_GLYPH_SVG)
+                        } else if path.starts_with("/routeward-icon.svg") {
+                            ("image/svg+xml", EMBEDDED_ICON_SVG)
+                        } else {
+                            ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
+                        }
+                    }),
+                )
+                .await;
+            });
+        }
     });
 }
 
@@ -179,6 +176,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::fmt::init();
 
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?,
+    );
+    let _rt_guard = runtime.enter();
+    let bridge = Arc::new(create_desktop_bridge()?);
+
     let std_listener = StdTcpListener::bind(LOOPBACK_EPHEMERAL_ADDR)?;
     std_listener.set_nonblocking(true)?;
     let local_addr = std_listener.local_addr()?;
@@ -189,7 +194,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoopBuilder::<DesktopWindowCommand>::with_user_event().build();
     let event_proxy = event_loop.create_proxy();
 
+    #[cfg(target_os = "windows")]
+    let (tray_handle, tray_ready) = {
+        let proxy_for_tray = event_proxy.clone();
+        let tray = Arc::new(parking_lot::Mutex::new(TrayHandle::spawn(
+            bridge.tray_snapshot(),
+            Box::new(move |cmd| {
+                let _ = proxy_for_tray.send_event(cmd);
+            }),
+        )));
+        let ready = tray.lock().is_ready();
+        if ready {
+            let tray_for_bridge = Arc::clone(&tray);
+            bridge.set_tray_callback(Arc::new(move |snapshot| {
+                tray_for_bridge.lock().sync_status(snapshot);
+            }));
+        }
+        (tray, ready)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let tray_ready = false;
+
     spawn_embedded_ui_server(
+        runtime.handle(),
+        Arc::clone(&bridge),
         std_listener,
         bound_port,
         ephemeral_token.clone(),
@@ -224,6 +252,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_url(&ui_url)
         .build(&window)?;
 
+    let rt_for_loop = Arc::clone(&runtime);
+    let bridge_for_loop = Arc::clone(&bridge);
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
@@ -231,7 +262,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                *control_flow = ControlFlow::Exit;
+                if tray_ready {
+                    window.set_visible(false);
+                } else {
+                    #[cfg(target_os = "windows")]
+                    tray_handle.lock().shutdown();
+                    *control_flow = ControlFlow::Exit;
+                }
             }
             Event::UserEvent(cmd) => match cmd {
                 DesktopWindowCommand::Minimize => {
@@ -241,10 +278,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     window.set_maximized(!window.is_maximized());
                 }
                 DesktopWindowCommand::Close => {
-                    *control_flow = ControlFlow::Exit;
+                    if tray_ready {
+                        window.set_visible(false);
+                    } else {
+                        #[cfg(target_os = "windows")]
+                        tray_handle.lock().shutdown();
+                        *control_flow = ControlFlow::Exit;
+                    }
                 }
                 DesktopWindowCommand::DragWindow => {
                     let _ = window.drag_window();
+                }
+                DesktopWindowCommand::ShowWindow => {
+                    window.set_visible(true);
+                    window.set_minimized(false);
+                    window.set_focus();
+                }
+                DesktopWindowCommand::ToggleEngine => {
+                    let b = Arc::clone(&bridge_for_loop);
+                    rt_for_loop.spawn(async move {
+                        let running = b.get_diagnostics().running;
+                        let _ = b.toggle_engine(!running).await;
+                    });
+                }
+                DesktopWindowCommand::Quit => {
+                    #[cfg(target_os = "windows")]
+                    tray_handle.lock().shutdown();
+                    *control_flow = ControlFlow::Exit;
                 }
             },
             _ => {}

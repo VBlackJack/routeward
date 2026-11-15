@@ -60,11 +60,13 @@ const PRIORITY_STEP = 5;
 
 export class HttpResponseError extends Error {
   public readonly status: number;
+  public readonly errorKey?: string;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, errorKey?: string) {
     super(message);
     this.name = 'HttpResponseError';
     this.status = status;
+    this.errorKey = errorKey;
   }
 }
 
@@ -336,15 +338,26 @@ export class RouteWardClientService {
     });
     if (!response.ok) {
       let detail = `HTTP ${response.status}`;
+      let errorKey: string | undefined;
       try {
-        const errBody = (await response.json()) as { error?: unknown };
+        const errBody = (await response.json()) as {
+          error?: unknown;
+          errorKey?: unknown;
+        };
         if (errBody && typeof errBody.error === 'string' && errBody.error.trim()) {
           detail = errBody.error;
+        }
+        if (
+          errBody &&
+          typeof errBody.errorKey === 'string' &&
+          errBody.errorKey.trim()
+        ) {
+          errorKey = errBody.errorKey;
         }
       } catch {
         // Response did not contain a structured JSON error payload
       }
-      throw new HttpResponseError(response.status, detail);
+      throw new HttpResponseError(response.status, detail, errorKey);
     }
     return (await response.json()) as T;
   }
@@ -870,6 +883,32 @@ export class RouteWardClientService {
       await this.fetchState();
     } catch (err) {
       this.handleRequestFailure(err);
+    }
+  }
+
+  public async startDaemon(): Promise<{ connected: boolean }> {
+    const res = await this.requestJson<{
+      started: boolean;
+      connected: boolean;
+      state?: DaemonFullState;
+    }>(UI_CONFIG.API_ENDPOINTS.DAEMON_START, 'POST', {});
+    if (res.state) {
+      this.applyFullState(res.state);
+    } else {
+      await this.fetchState();
+    }
+    return { connected: this.diagnostics.daemonConnected };
+  }
+
+  public async setDesktopLocale(locale: 'fr' | 'en'): Promise<void> {
+    try {
+      await this.requestJson<{ ok: boolean }>(
+        UI_CONFIG.API_ENDPOINTS.LOCALE,
+        'POST',
+        { locale }
+      );
+    } catch {
+      // Ignore network errors when UI runs standalone outside desktop host
     }
   }
 }

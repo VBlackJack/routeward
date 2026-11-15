@@ -32,7 +32,11 @@ import {
   Wand2
 } from 'lucide-react';
 import { SYSTEM_CONSTANTS, UI_CONFIG } from './config/constants';
-import { generateClientId, routewardClient } from './services/ipc';
+import {
+  generateClientId,
+  HttpResponseError,
+  routewardClient
+} from './services/ipc';
 import { useThemeForge } from './theme/ThemeForgeContext';
 import {
   InterceptionMode,
@@ -80,7 +84,9 @@ export const App: React.FC = () => {
   const [showWizardModal, setShowWizardModal] = useState(false);
   const [showGlossaryModal, setShowGlossaryModal] = useState(false);
   const [systemProxyEnabled, setSystemProxyEnabled] = useState(false);
+  const [startingDaemon, setStartingDaemon] = useState(false);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
+  const wizardAutoCheckedRef = useRef(false);
 
   const handleSetExperienceMode = (mode: ExperienceMode) => {
     setExperienceMode(mode);
@@ -103,8 +109,25 @@ export const App: React.FC = () => {
   const tabRefs = useRef<Partial<Record<NavTabId, HTMLButtonElement | null>>>({});
 
   useEffect(() => {
-    document.documentElement.lang = i18n.language.slice(0, 2) || 'en';
+    const activeLocale: 'fr' | 'en' = i18n.language.startsWith('fr')
+      ? 'fr'
+      : 'en';
+    document.documentElement.lang = activeLocale;
+    void routewardClient.setDesktopLocale(activeLocale);
   }, [i18n.language]);
+
+  useEffect(() => {
+    if (!diagnostics.daemonConnected || wizardAutoCheckedRef.current) {
+      return;
+    }
+    wizardAutoCheckedRef.current = true;
+    const alreadyCompleted =
+      window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED) ===
+      'true';
+    if (!alreadyCompleted) {
+      setShowWizardModal(true);
+    }
+  }, [diagnostics.daemonConnected]);
 
   const pushToast = useCallback(
     (message: string, severity: ToastNotification['severity'] = 'success') => {
@@ -166,6 +189,33 @@ export const App: React.FC = () => {
 
   const handleToggleLanguage = () => {
     handleSetLanguage(i18n.language.startsWith('fr') ? 'en' : 'fr');
+  };
+
+  const handleStartDaemon = async () => {
+    if (startingDaemon) return;
+    setStartingDaemon(true);
+    try {
+      const res = await routewardClient.startDaemon();
+      if (res.connected) {
+        pushToast(t('app.toast.daemon.started'), 'success');
+      } else {
+        pushToast(t('app.toast.daemon.start_failed'), 'warning');
+      }
+    } catch (err) {
+      if (err instanceof HttpResponseError) {
+        if (err.errorKey === 'uac_cancelled') {
+          pushToast(t('app.toast.daemon.uac_cancelled'), 'warning');
+          return;
+        }
+        if (err.errorKey === 'access_denied') {
+          pushToast(t('app.toast.daemon.access_denied'), 'error');
+          return;
+        }
+      }
+      pushToast(t('app.toast.daemon.start_failed'), 'error');
+    } finally {
+      setStartingDaemon(false);
+    }
   };
 
   const handleToggleSystemProxy = async () => {
@@ -446,6 +496,21 @@ export const App: React.FC = () => {
               <span className="rounded bg-tf-red/20 px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-tf-red">
                 {t('app.daemon_banner.reconnecting_badge')}
               </span>
+              {diagnostics.osName === 'WINDOWS' && (
+                <button
+                  type="button"
+                  disabled={startingDaemon}
+                  onClick={() => {
+                    void handleStartDaemon();
+                  }}
+                  className="tf-btn-accent flex items-center gap-1.5 px-3 py-1 text-xs disabled:opacity-60"
+                >
+                  <Power className="h-3 w-3" />
+                  {startingDaemon
+                    ? t('app.daemon_banner.starting_button')
+                    : t('app.daemon_banner.start_button')}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
@@ -567,8 +632,12 @@ export const App: React.FC = () => {
             experienceMode={experienceMode}
             onEvaluateRule={(req) => routewardClient.evaluateRule(req)}
             onAddRule={(rule) => {
+              const isUpdate = profile.rules.some((r) => r.id === rule.id);
               void routewardClient.upsertRule(rule).then(() => {
-                pushToast(t('app.toast.rule.created'));
+                pushToast(
+                  t(isUpdate ? 'app.toast.rule.updated' : 'app.toast.rule.created'),
+                  isUpdate ? 'info' : 'success'
+                );
               });
             }}
             onToggleRule={(id) => {
@@ -784,9 +853,19 @@ export const App: React.FC = () => {
           }}
           onSelectMode={(mode) => handleSetExperienceMode(mode)}
           onComplete={() => {
+            window.localStorage.setItem(
+              UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED,
+              'true'
+            );
             pushToast(t('app.toast.wizard.completed'));
           }}
-          onClose={() => setShowWizardModal(false)}
+          onClose={() => {
+            window.localStorage.setItem(
+              UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED,
+              'true'
+            );
+            setShowWizardModal(false);
+          }}
         />
       )}
 

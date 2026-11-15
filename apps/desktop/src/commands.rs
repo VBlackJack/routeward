@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
-use parking_lot::RwLock;
+use crate::daemon_launcher::{self, DaemonLaunchError, DaemonStartGuard};
+use crate::TrayStatusSnapshot;
+use parking_lot::{Mutex, RwLock};
 use routeward_core::checker::ProxyHealthReport;
 use routeward_core::config::{
     InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule, SystemConstants,
@@ -44,6 +46,10 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 const COMPONENT_DESKTOP_BRIDGE: &str = "DesktopBridge";
 const BRIDGE_EVENT_CHANNEL_CAPACITY: usize = 256;
+const DAEMON_START_POLL_ATTEMPTS: usize = 16;
+const DAEMON_START_POLL_INTERVAL_MS: u64 = 250;
+
+type TrayNotifyCallback = Arc<dyn Fn(TrayStatusSnapshot) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct DesktopCommandBridge {
@@ -54,6 +60,8 @@ pub struct DesktopCommandBridge {
     state: Arc<RwLock<DaemonFullState>>,
     daemon_connected: Arc<AtomicBool>,
     event_tx: tokio::sync::broadcast::Sender<IpcStreamEvent>,
+    daemon_start_guard: Arc<DaemonStartGuard>,
+    tray_notify: Arc<Mutex<Option<TrayNotifyCallback>>>,
 }
 
 impl DesktopCommandBridge {
@@ -108,6 +116,8 @@ impl DesktopCommandBridge {
             state: Arc::new(RwLock::new(initial_state)),
             daemon_connected: Arc::new(AtomicBool::new(false)),
             event_tx,
+            daemon_start_guard: Arc::new(DaemonStartGuard::default()),
+            tray_notify: Arc::new(Mutex::new(None)),
         };
 
         bridge.log_info(format!(
@@ -147,6 +157,46 @@ impl DesktopCommandBridge {
 
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<IpcStreamEvent> {
         self.event_tx.subscribe()
+    }
+
+    pub fn tray_snapshot(&self) -> TrayStatusSnapshot {
+        let running = self.state.read().diagnostics.running;
+        TrayStatusSnapshot {
+            daemon_connected: self.is_daemon_connected(),
+            running,
+            locale: self.i18n.get_locale(),
+        }
+    }
+
+    pub fn set_tray_callback(&self, cb: TrayNotifyCallback) {
+        *self.tray_notify.lock() = Some(cb);
+        self.notify_tray();
+    }
+
+    fn notify_tray(&self) {
+        let snapshot = self.tray_snapshot();
+        let cb = self.tray_notify.lock().clone();
+        if let Some(cb) = cb {
+            cb(snapshot);
+        }
+    }
+
+    fn emit_resync(&self) {
+        let _ = self
+            .event_tx
+            .send(IpcStreamEvent::Resync { skipped_events: 0 });
+    }
+
+    pub fn set_locale(&self, locale: &str) -> String {
+        let normalized = if locale.trim().to_ascii_lowercase().starts_with("en") {
+            "en"
+        } else {
+            "fr"
+        };
+        self.i18n.set_locale(normalized);
+        self.state.write().diagnostics.active_locale = normalized.to_string();
+        self.notify_tray();
+        normalized.to_string()
     }
 
     /// Spawns the background IPC subscription and automatic reconnection task.
@@ -289,17 +339,25 @@ impl DesktopCommandBridge {
 
     fn apply_full_state(&self, mut full_state: DaemonFullState) {
         full_state.diagnostics.daemon_connected = true;
+        full_state.diagnostics.active_locale = self.i18n.get_locale();
+        let new_running = full_state.diagnostics.running;
         let was_connected = self.daemon_connected.swap(true, Ordering::SeqCst);
-        *self.state.write() = full_state;
+        let prev_running = {
+            let mut st = self.state.write();
+            let prev = st.diagnostics.running;
+            *st = full_state;
+            prev
+        };
         if !was_connected {
             self.log_info(format!(
                 "Daemon connection established ({})",
                 self.ipc_endpoint_label()
             ));
-            let _ = self
-                .event_tx
-                .send(IpcStreamEvent::Resync { skipped_events: 0 });
+            self.emit_resync();
+        } else if prev_running != new_running {
+            self.emit_resync();
         }
+        self.notify_tray();
     }
 
     fn apply_telemetry_event(&self, event: TelemetryEvent) {
@@ -361,10 +419,9 @@ impl DesktopCommandBridge {
                 "Daemon connection lost ({})",
                 self.ipc_endpoint_label()
             ));
-            let _ = self
-                .event_tx
-                .send(IpcStreamEvent::Resync { skipped_events: 0 });
+            self.emit_resync();
         }
+        self.notify_tray();
     }
 
     async fn call_daemon<T: DeserializeOwned>(&self, command: IpcCommand) -> Result<T, String> {
@@ -588,9 +645,13 @@ impl DesktopCommandBridge {
             .await
         {
             diag.daemon_connected = true;
+            diag.active_locale = self.i18n.get_locale();
             self.state.write().diagnostics = diag.clone();
+            self.emit_resync();
+            self.notify_tray();
             return diag;
         }
+        self.notify_tray();
         self.get_diagnostics()
     }
 
@@ -600,10 +661,37 @@ impl DesktopCommandBridge {
             .await
         {
             diag.daemon_connected = true;
+            diag.active_locale = self.i18n.get_locale();
             self.state.write().diagnostics = diag.clone();
+            self.emit_resync();
+            self.notify_tray();
             return diag;
         }
+        self.notify_tray();
         self.get_diagnostics()
+    }
+
+    pub async fn start_privileged_daemon(&self) -> Result<DaemonFullState, DaemonLaunchError> {
+        if self.is_daemon_connected() {
+            return Ok(self.refresh_state().await);
+        }
+
+        let release = self
+            .daemon_start_guard
+            .try_acquire()
+            .ok_or(DaemonLaunchError::AlreadyInFlight)?;
+        let locale = self.i18n.get_locale();
+        daemon_launcher::start_privileged_daemon_with_release(&release, &locale).await?;
+
+        for _ in 0..DAEMON_START_POLL_ATTEMPTS {
+            let state = self.refresh_state().await;
+            if state.diagnostics.daemon_connected {
+                return Ok(state);
+            }
+            tokio::time::sleep(Duration::from_millis(DAEMON_START_POLL_INTERVAL_MS)).await;
+        }
+
+        Ok(self.refresh_state().await)
     }
 
     pub fn list_fake_ip_entries(&self) -> Vec<FakeIpEntry> {

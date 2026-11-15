@@ -38,6 +38,8 @@
       "disconnected_desc": "Le pont de l'interface ne parvient pas à joindre le démon (lancez 'routeward daemon' en Administrateur ou root). Reconnexion automatique active.",
       "reconnecting_badge": "Reconnexion auto",
       "retry_button": "Réessayer",
+      "start_button": "Démarrer le Service",
+      "starting_button": "Démarrage...",
       "not_elevated_title": "Démon Lancé Sans Privilèges Élevés",
       "not_elevated_desc": "Le démon connecté tourne sans privilèges Administrateur ou root. L'interception transparente des paquets système requiert l'élévation."
     },
@@ -167,6 +169,12 @@
       },
       "usecase": {
         "applied": "Scénario appliqué"
+      },
+      "daemon": {
+        "started": "Service privilégié démarré et connecté",
+        "uac_cancelled": "Autorisation administrateur annulée",
+        "start_failed": "Impossible de démarrer le service automatiquement",
+        "access_denied": "Le service tourne sans autorisation pour cette session"
       }
     }
   },
@@ -592,6 +600,7 @@
       },
       "controls": {
         "header": "Ordre & Actions",
+        "edit": "Modifier",
         "move_up": "Monter la priorité",
         "move_down": "Descendre la priorité",
         "delete": "Supprimer"
@@ -600,6 +609,7 @@
     "modal": {
       "add": {
         "title": "Nouvelle Règle de Routage",
+        "edit_title": "Modifier la Règle de Routage",
         "name_label": "Nom de la règle",
         "priority_label": "Priorité (Plus petit exécuté en premier)",
         "processes_label": "Noms d'exécutables / Globs (séparés par virgule)",

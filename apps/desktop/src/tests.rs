@@ -772,3 +772,58 @@ async fn bridge_started_before_daemon_transitions_from_never_connected_to_connec
     daemon_task.abort();
     server_task.abort();
 }
+
+#[tokio::test]
+async fn loopback_http_enforces_post_and_syncs_locale_with_tray_snapshot() {
+    let constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+
+    let bridge = Arc::new(DesktopCommandBridge::new(constants, profile, "fr"));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let port = listener.local_addr().expect("local_addr").port();
+    let token = generate_ephemeral_token();
+    let token_for_server = token.clone();
+    let bridge_for_server = Arc::clone(&bridge);
+
+    let server_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let b = Arc::clone(&bridge_for_server);
+            let t = token_for_server.clone();
+            tokio::spawn(async move {
+                serve_loopback_api_connection(stream, port, &t, &b).await;
+            });
+        }
+    });
+
+    // GET on POST-only /api/daemon/start must return 405 Method Not Allowed
+    let get_start_resp = send_raw_http(
+        port,
+        &format!(
+            "GET /api/daemon/start HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-RouteWard-Token: {token}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        get_start_resp.starts_with("HTTP/1.1 405 Method Not Allowed"),
+        "Expected 405 Method Not Allowed on GET /api/daemon/start, got: {get_start_resp}"
+    );
+
+    // POST /api/locale must update bridge locale and tray snapshot
+    let post_locale_resp = send_raw_http(
+        port,
+        &format!(
+            "POST /api/locale HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nX-RouteWard-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{{\"locale\":\"en\"}}"
+        ),
+    )
+    .await;
+    assert!(
+        post_locale_resp.starts_with("HTTP/1.1 200 OK"),
+        "Expected 200 OK on POST /api/locale, got: {post_locale_resp}"
+    );
+    assert_eq!(bridge.tray_snapshot().locale, "en");
+
+    server_task.abort();
+}

@@ -81,6 +81,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   onRemoveChain
 }) => {
   const { t } = useTranslation();
+  const primaryProxyId =
+    (proxies.find((p) => p.enabled) ?? proxies[0] ?? null)?.id ?? null;
   const importTitleId = useId();
   const proxyTitleId = useId();
   const chainTitleId = useId();
@@ -274,12 +276,17 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               className="tf-card flex flex-col justify-between p-4"
             >
               <div>
-                <div className="flex items-start justify-between">
-                  <div className="flex items-center gap-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <Server className="h-4 w-4 text-tf-accent" />
                     <span className="font-bold text-tf-primary">
                       {proxy.name}
                     </span>
+                    {primaryProxyId === proxy.id && (
+                      <span className="rounded bg-tf-green/20 px-2 py-0.5 text-[10px] font-bold text-tf-green">
+                        {t('proxies.simple.active_badge')}
+                      </span>
+                    )}
                   </div>
                   <span className="rounded bg-tf-surface-alt px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-tf-accent">
                     {proxy.protocol}
