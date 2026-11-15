@@ -36,32 +36,109 @@ import {
   RoutingRule,
   TrackedConnection
 } from '../types/routeward';
+import { ExperienceMode } from './QuickSetupWizardModal';
 
 interface ConnectionsViewProps {
   connections: TrackedConnection[];
   proxies: ProxyNode[];
+  experienceMode?: ExperienceMode;
   onScanOsSockets: () => void;
   onClearClosed: () => void;
   onTerminateConnection: (connectionId: string) => void;
   onQuickCreateRule: (rule: RoutingRule) => void;
+  onSwitchToExpert?: () => void;
 }
 
 const QUICK_RULE_HIGH_PRIORITY = 8;
 
+type SimpleActivityFilter = 'all' | 'proxied' | 'blocked';
+
+interface AppActivityGroup {
+  processName: string;
+  count: number;
+  totalBytes: number;
+  domains: string[];
+  routeKind: 'proxied' | 'blocked' | 'direct';
+  routeLabel: string;
+  sampleConn: TrackedConnection;
+}
+
 export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
   connections,
   proxies,
+  experienceMode = 'expert',
   onScanOsSockets,
   onClearClosed,
   onTerminateConnection,
-  onQuickCreateRule
+  onQuickCreateRule,
+  onSwitchToExpert
 }) => {
   const { t } = useTranslation();
   const [filterText, setFilterText] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | ConnectionStatus>(
     'all'
   );
+  const [simpleFilter, setSimpleFilter] = useState<SimpleActivityFilter>('all');
   const [selectedConnId, setSelectedConnId] = useState<string | null>(null);
+
+  const groupedApps = useMemo<AppActivityGroup[]>(() => {
+    const q = filterText.trim().toLowerCase();
+    const map = new Map<string, AppActivityGroup>();
+
+    for (const conn of connections) {
+      const domainOrHost = conn.resolvedDomain || conn.targetHost;
+      const key = conn.processName.toLowerCase();
+      const existing = map.get(key);
+      const isBlocked = conn.status === 'blocked';
+      const isDirect = conn.routeLabel.toLowerCase().includes('direct');
+      const connKind: AppActivityGroup['routeKind'] = isBlocked
+        ? 'blocked'
+        : isDirect
+          ? 'direct'
+          : 'proxied';
+
+      if (!existing) {
+        map.set(key, {
+          processName: conn.processName,
+          count: 1,
+          totalBytes: conn.rxBytes + conn.txBytes,
+          domains: domainOrHost ? [domainOrHost] : [],
+          routeKind: connKind,
+          routeLabel: conn.routeLabel,
+          sampleConn: conn
+        });
+      } else {
+        existing.count += 1;
+        existing.totalBytes += conn.rxBytes + conn.txBytes;
+        if (
+          domainOrHost &&
+          existing.domains.length < 3 &&
+          !existing.domains.includes(domainOrHost)
+        ) {
+          existing.domains.push(domainOrHost);
+        }
+        if (connKind === 'blocked' && existing.routeKind !== 'blocked') {
+          existing.routeKind = 'blocked';
+        } else if (connKind === 'proxied' && existing.routeKind === 'direct') {
+          existing.routeKind = 'proxied';
+        }
+      }
+    }
+
+    return Array.from(map.values()).filter((group) => {
+      if (simpleFilter === 'proxied' && group.routeKind !== 'proxied') {
+        return false;
+      }
+      if (simpleFilter === 'blocked' && group.routeKind !== 'blocked') {
+        return false;
+      }
+      if (!q) return true;
+      return (
+        group.processName.toLowerCase().includes(q) ||
+        group.domains.some((d) => d.toLowerCase().includes(q))
+      );
+    });
+  }, [connections, filterText, simpleFilter]);
 
   const selectedConnection = useMemo(
     () => connections.find((c) => c.id === selectedConnId) || null,
@@ -122,6 +199,157 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
       action: { type: 'block' }
     });
   };
+
+  if (experienceMode === 'simple') {
+    return (
+      <div className="space-y-4">
+        <div className="tf-card p-5">
+          <h2 className="text-base font-bold text-tf-primary">
+            {t('connections.simple.title')}
+          </h2>
+          <p className="mt-1 text-xs text-tf-secondary">
+            {t('connections.simple.subtitle')}
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="relative min-w-[240px] flex-1">
+            <Search className="absolute left-3 top-2.5 h-4 w-4 text-tf-secondary" />
+            <input
+              type="text"
+              value={filterText}
+              onChange={(e) => setFilterText(e.target.value)}
+              placeholder={t('connections.simple.search_placeholder')}
+              className="tf-input w-full py-2 pl-9 pr-4 text-sm"
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            {(
+              [
+                { id: 'all' as const, label: t('connections.simple.filter_all') },
+                {
+                  id: 'proxied' as const,
+                  label: t('connections.simple.filter_proxied')
+                },
+                {
+                  id: 'blocked' as const,
+                  label: t('connections.simple.filter_blocked')
+                }
+              ]
+            ).map((chip) => (
+              <button
+                key={chip.id}
+                type="button"
+                aria-pressed={simpleFilter === chip.id}
+                onClick={() => setSimpleFilter(chip.id)}
+                className={`rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
+                  simpleFilter === chip.id
+                    ? 'bg-tf-accent text-tf-bg'
+                    : 'tf-surface-alt text-tf-secondary hover:text-tf-primary'
+                }`}
+              >
+                {chip.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {groupedApps.length === 0 ? (
+          <div className="tf-card p-6 text-center text-xs text-tf-secondary">
+            {t('connections.simple.no_apps')}
+          </div>
+        ) : (
+          <div className="space-y-2.5">
+            {groupedApps.map((group) => (
+              <div
+                key={group.processName}
+                className="tf-card flex flex-wrap items-center justify-between gap-4 p-4"
+              >
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-bold text-tf-primary">
+                      {group.processName}
+                    </span>
+                    <span className="rounded bg-tf-surface-alt px-2 py-0.5 text-[11px] font-medium text-tf-secondary">
+                      {group.count} {t('connections.simple.count_connections')}
+                    </span>
+                    <span className="font-mono text-[11px] text-tf-cyan">
+                      {formatBytes(group.totalBytes)}
+                    </span>
+                  </div>
+                  <div className="text-xs text-tf-secondary">
+                    {group.domains.join(', ')}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    aria-pressed={group.routeKind === 'proxied'}
+                    onClick={() =>
+                      buildQuickProcessRule(group.sampleConn, 'proxy')
+                    }
+                    className={`flex items-center gap-1.5 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
+                      group.routeKind === 'proxied'
+                        ? 'bg-tf-accent text-tf-bg'
+                        : 'tf-surface-alt text-tf-accent hover:border-tf-accent'
+                    }`}
+                  >
+                    <Server className="h-3.5 w-3.5" />
+                    {t('connections.simple.route_proxy')}
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={group.routeKind === 'direct'}
+                    onClick={() =>
+                      buildQuickProcessRule(group.sampleConn, 'direct')
+                    }
+                    className={`flex items-center gap-1.5 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
+                      group.routeKind === 'direct'
+                        ? 'bg-tf-green text-tf-bg'
+                        : 'tf-surface-alt text-tf-green hover:border-tf-green'
+                    }`}
+                  >
+                    <CheckCircle className="h-3.5 w-3.5" />
+                    {t('connections.simple.route_direct')}
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={group.routeKind === 'blocked'}
+                    onClick={() =>
+                      buildQuickProcessRule(group.sampleConn, 'block')
+                    }
+                    className={`flex items-center gap-1.5 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
+                      group.routeKind === 'blocked'
+                        ? 'bg-tf-red text-tf-bg'
+                        : 'tf-surface-alt text-tf-red hover:border-tf-red'
+                    }`}
+                  >
+                    <Ban className="h-3.5 w-3.5" />
+                    {t('connections.simple.route_blocked')}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {onSwitchToExpert && (
+          <div className="flex justify-center pt-2">
+            <button
+              type="button"
+              onClick={onSwitchToExpert}
+              className="tf-surface-alt flex items-center gap-2 px-4 py-2 text-xs font-medium text-tf-secondary hover:border-tf-cyan hover:text-tf-cyan"
+            >
+              <Terminal className="h-3.5 w-3.5" />
+              {t('connections.simple.switch_expert_cta')}
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">

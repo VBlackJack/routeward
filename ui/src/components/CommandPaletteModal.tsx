@@ -19,30 +19,22 @@ import { useTranslation } from 'react-i18next';
 import {
   Activity,
   Command,
-  FileText,
   Globe,
   LayoutDashboard,
   Palette,
   Power,
   Search,
   Server,
+  Settings,
   Shield,
   Zap
 } from 'lucide-react';
 import { useThemeForge } from '../theme/ThemeForgeContext';
 import { ModalContainer } from './ModalContainer';
-import { ExperienceMode } from './QuickSetupWizardModal';
 
-export type NavTabId =
-  | 'dashboard'
-  | 'connections'
-  | 'proxies'
-  | 'rules'
-  | 'dns'
-  | 'logs';
+export type NavTabId = 'home' | 'apps' | 'proxy' | 'activity' | 'settings';
 
 interface CommandPaletteModalProps {
-  experienceMode: ExperienceMode;
   onClose: () => void;
   onNavigate: (tab: NavTabId) => void;
   onToggleEngine: () => void;
@@ -64,7 +56,6 @@ interface PaletteItem {
 }
 
 export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
-  experienceMode,
   onClose,
   onNavigate,
   onToggleEngine,
@@ -91,57 +82,45 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
 
     const navItems: PaletteItem[] = [
       {
-        id: 'nav-dashboard',
+        id: 'nav-home',
         group: navGroup,
-        label: t('app.nav.dashboard.tab'),
+        label: t('app.nav.home.tab'),
         badge: 'Alt+1',
         icon: LayoutDashboard,
-        onSelect: () => onNavigate('dashboard')
+        onSelect: () => onNavigate('home')
       },
       {
-        id: 'nav-connections',
+        id: 'nav-apps',
         group: navGroup,
-        label: t('app.nav.connections.tab'),
+        label: t('app.nav.apps.tab'),
         badge: 'Alt+2',
-        icon: Activity,
-        onSelect: () => onNavigate('connections')
+        icon: Shield,
+        onSelect: () => onNavigate('apps')
       },
       {
-        id: 'nav-proxies',
+        id: 'nav-proxy',
         group: navGroup,
-        label: t('app.nav.proxies.tab'),
+        label: t('app.nav.proxy.tab'),
         badge: 'Alt+3',
         icon: Server,
-        onSelect: () => onNavigate('proxies')
+        onSelect: () => onNavigate('proxy')
       },
       {
-        id: 'nav-rules',
+        id: 'nav-activity',
         group: navGroup,
-        label: t('app.nav.rules.tab'),
+        label: t('app.nav.activity.tab'),
         badge: 'Alt+4',
-        icon: Shield,
-        onSelect: () => onNavigate('rules')
+        icon: Activity,
+        onSelect: () => onNavigate('activity')
       },
-      ...(experienceMode === 'expert'
-        ? [
-            {
-              id: 'nav-dns',
-              group: navGroup,
-              label: t('app.nav.dns.tab'),
-              badge: 'Alt+5',
-              icon: Globe,
-              onSelect: () => onNavigate('dns')
-            },
-            {
-              id: 'nav-logs',
-              group: navGroup,
-              label: t('app.nav.logs.tab'),
-              badge: 'Alt+6',
-              icon: FileText,
-              onSelect: () => onNavigate('logs')
-            }
-          ]
-        : [])
+      {
+        id: 'nav-settings',
+        group: navGroup,
+        label: t('app.nav.settings.tab'),
+        badge: 'Alt+5',
+        icon: Settings,
+        onSelect: () => onNavigate('settings')
+      }
     ];
 
     const actionItems: PaletteItem[] = [
@@ -203,7 +182,6 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
   }, [
     t,
     palettes,
-    experienceMode,
     onNavigate,
     onToggleEngine,
     onTestAllProxies,

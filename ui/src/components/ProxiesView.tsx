@@ -34,6 +34,7 @@ import {
   Zap
 } from 'lucide-react';
 import { ModalContainer } from './ModalContainer';
+import { ExperienceMode } from './QuickSetupWizardModal';
 import { UI_CONFIG } from '../config/constants';
 import { generateClientId, routewardClient } from '../services/ipc';
 import {
@@ -46,6 +47,7 @@ import {
 interface ProxiesViewProps {
   proxies: ProxyNode[];
   chains: ProxyChain[];
+  experienceMode?: ExperienceMode;
   onTestProxy: (id: string) => Promise<void>;
   onTestAllProxies: () => Promise<void>;
   onAddProxy: (node: ProxyNode) => void;
@@ -68,6 +70,7 @@ const STRATEGIES: ChainStrategy[] = [
 export const ProxiesView: React.FC<ProxiesViewProps> = ({
   proxies,
   chains,
+  experienceMode = 'expert',
   onTestProxy,
   onTestAllProxies,
   onAddProxy,
@@ -85,6 +88,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [showAddProxy, setShowAddProxy] = useState(false);
   const [showImportUri, setShowImportUri] = useState(false);
   const [showAddChain, setShowAddChain] = useState(false);
+  const [showProtocolOptions, setShowProtocolOptions] = useState(false);
 
   // Add / Edit Proxy state
   const [editingProxyId, setEditingProxyId] = useState<string | null>(null);
@@ -215,34 +219,54 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       {/* Upstream Proxy Servers */}
       <div className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-base font-bold text-tf-primary">
-            {t('proxies.section.servers.title')}
-          </h2>
+          <div>
+            <h2 className="text-base font-bold text-tf-primary">
+              {experienceMode === 'simple'
+                ? t('proxies.simple.title')
+                : t('proxies.section.servers.title')}
+            </h2>
+            {experienceMode === 'simple' && (
+              <p className="text-xs text-tf-secondary">
+                {t('proxies.simple.subtitle')}
+              </p>
+            )}
+          </div>
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              onClick={onTestAllProxies}
-              className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-cyan hover:border-tf-cyan"
-            >
-              <Activity className="h-3.5 w-3.5" />
-              {t('proxies.section.servers.test_all')}
-            </button>
-            <button
-              onClick={() => setShowImportUri(true)}
-              className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-primary hover:border-tf-accent"
-            >
-              <FileCode2 className="h-3.5 w-3.5 text-tf-accent" />
-              {t('proxies.section.servers.import_uri')}
-            </button>
+            {experienceMode === 'expert' && (
+              <>
+                <button
+                  onClick={onTestAllProxies}
+                  className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-cyan hover:border-tf-cyan"
+                >
+                  <Activity className="h-3.5 w-3.5" />
+                  {t('proxies.section.servers.test_all')}
+                </button>
+                <button
+                  onClick={() => setShowImportUri(true)}
+                  className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-primary hover:border-tf-accent"
+                >
+                  <FileCode2 className="h-3.5 w-3.5 text-tf-accent" />
+                  {t('proxies.section.servers.import_uri')}
+                </button>
+              </>
+            )}
             <button
               onClick={openNewProxyModal}
               className="tf-btn-accent flex items-center gap-1.5 px-3.5 py-1.5 text-xs"
             >
               <Plus className="h-3.5 w-3.5" />
-              {t('proxies.section.servers.add')}
+              {experienceMode === 'simple'
+                ? t('proxies.simple.add')
+                : t('proxies.section.servers.add')}
             </button>
           </div>
         </div>
 
+        {experienceMode === 'simple' && proxies.length === 0 ? (
+          <div className="tf-card p-6 text-center text-xs text-tf-secondary">
+            {t('proxies.simple.empty')}
+          </div>
+        ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
           {proxies.map((proxy) => (
             <div
@@ -330,15 +354,17 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   >
                     <Edit3 className="h-3.5 w-3.5" />
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => handleCopyNodeUri(proxy)}
-                    className="flex items-center gap-1 text-xs text-tf-secondary hover:text-tf-primary"
-                    title={t('proxies.card.action.copy_uri')}
-                    aria-label={t('proxies.card.action.copy_uri')}
-                  >
-                    <Copy className="h-3.5 w-3.5" />
-                  </button>
+                  {experienceMode === 'expert' && (
+                    <button
+                      type="button"
+                      onClick={() => handleCopyNodeUri(proxy)}
+                      className="flex items-center gap-1 text-xs text-tf-secondary hover:text-tf-primary"
+                      title={t('proxies.card.action.copy_uri')}
+                      aria-label={t('proxies.card.action.copy_uri')}
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => onRemoveProxy(proxy.id)}
@@ -353,9 +379,11 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             </div>
           ))}
         </div>
+        )}
       </div>
 
-      {/* Smart Proxy Chains & Failover Groups */}
+      {/* Smart Proxy Chains & Failover Groups (Expert mode) */}
+      {experienceMode === 'expert' && (
       <div className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -432,6 +460,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
           })}
         </div>
       </div>
+      )}
 
       {/* Batch Import URI Modal */}
       {showImportUri && (
@@ -602,24 +631,37 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 )}
               </div>
             </div>
-            <div className="flex items-center gap-6 pt-1 text-xs text-tf-primary">
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={udpEnabled}
-                  onChange={(e) => setUdpEnabled(e.target.checked)}
-                />
-                {t('proxies.modal.add_proxy.udp_label')}
-              </label>
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={tls}
-                  onChange={(e) => setTls(e.target.checked)}
-                />
-                {t('proxies.modal.add_proxy.tls_label')}
-              </label>
-            </div>
+            {experienceMode === 'simple' && (
+              <button
+                type="button"
+                onClick={() => setShowProtocolOptions((prev) => !prev)}
+                className="text-xs font-semibold text-tf-cyan hover:underline"
+              >
+                {showProtocolOptions
+                  ? t('proxies.simple.hide_advanced_options')
+                  : t('proxies.simple.show_advanced_options')}
+              </button>
+            )}
+            {(experienceMode === 'expert' || showProtocolOptions) && (
+              <div className="flex items-center gap-6 pt-1 text-xs text-tf-primary">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={udpEnabled}
+                    onChange={(e) => setUdpEnabled(e.target.checked)}
+                  />
+                  {t('proxies.modal.add_proxy.udp_label')}
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={tls}
+                    onChange={(e) => setTls(e.target.checked)}
+                  />
+                  {t('proxies.modal.add_proxy.tls_label')}
+                </label>
+              </div>
+            )}
             <div className="flex justify-end gap-2 pt-3">
               <button
                 type="button"

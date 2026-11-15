@@ -115,6 +115,9 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const [protocol, setProtocol] = useState<TransportProtocol>('any');
   const [actionType, setActionType] = useState<RuleAction['type']>('proxy');
   const [actionTargetId, setActionTargetId] = useState(proxies[0]?.id || '');
+  const [simpleTargetType, setSimpleTargetType] = useState<'app' | 'site'>('app');
+  const [simpleTargetValue, setSimpleTargetValue] = useState('');
+  const [showAdvancedFields, setShowAdvancedFields] = useState(false);
 
   const handleRunSimulator = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -197,29 +200,47 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
   const handleCreateRule = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!ruleName.trim()) return;
     const splitList = (raw: string) =>
       raw
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean);
 
+    const isSimpleSubmit = experienceMode === 'simple' && !showAdvancedFields;
+    const effectiveName = isSimpleSubmit
+      ? ruleName.trim() || simpleTargetValue.trim()
+      : ruleName.trim();
+    if (!effectiveName) return;
+
+    const effectiveProcesses = isSimpleSubmit
+      ? simpleTargetType === 'app'
+        ? splitList(simpleTargetValue)
+        : []
+      : splitList(processesText);
+    const effectiveDomains = isSimpleSubmit
+      ? simpleTargetType === 'site'
+        ? splitList(simpleTargetValue)
+        : []
+      : splitList(domainsText);
+
     onAddRule({
       id: generateClientId('rule'),
-      name: ruleName.trim(),
+      name: effectiveName,
       enabled: true,
-      priority,
-      processPatterns: splitList(processesText),
-      domainPatterns: splitList(domainsText),
-      ipCidrs: splitList(cidrsText),
-      portRanges: parsePortSpec(portsText),
-      protocol,
+      priority: isSimpleSubmit ? UI_CONFIG.DEFAULT_RULE_PRIORITY : priority,
+      processPatterns: effectiveProcesses,
+      domainPatterns: effectiveDomains,
+      ipCidrs: isSimpleSubmit ? [] : splitList(cidrsText),
+      portRanges: isSimpleSubmit ? [] : parsePortSpec(portsText),
+      protocol: isSimpleSubmit ? 'any' : protocol,
       action:
         actionType === 'proxy' || actionType === 'chain'
-          ? { type: actionType, targetId: actionTargetId }
+          ? { type: actionType, targetId: actionTargetId || proxies[0]?.id || '' }
           : { type: actionType }
     });
     setRuleName('');
+    setSimpleTargetValue('');
+    setShowAdvancedFields(false);
     setShowModal(false);
   };
 
@@ -228,32 +249,40 @@ export const RulesView: React.FC<RulesViewProps> = ({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-base font-bold text-tf-primary">
-            {t('rules.header.title')}
+            {experienceMode === 'simple'
+              ? t('rules.simple.title')
+              : t('rules.header.title')}
           </h2>
           <p className="text-xs text-tf-secondary">
-            {t('rules.header.subtitle')}
+            {experienceMode === 'simple'
+              ? t('rules.simple.subtitle')
+              : t('rules.header.subtitle')}
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => setShowPresets((prev) => !prev)}
-            className="tf-surface-alt flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-tf-accent hover:border-tf-accent"
-          >
-            <Sparkles className="h-3.5 w-3.5" />
-            {t('rules.header.presets_button')}
-          </button>
+          {experienceMode === 'expert' && (
+            <button
+              onClick={() => setShowPresets((prev) => !prev)}
+              className="tf-surface-alt flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-tf-accent hover:border-tf-accent"
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              {t('rules.header.presets_button')}
+            </button>
+          )}
           <button
             onClick={() => setShowModal(true)}
             className="tf-btn-accent flex items-center gap-1.5 px-3.5 py-2 text-xs"
           >
             <Plus className="h-3.5 w-3.5" />
-            {t('rules.header.add_button')}
+            {experienceMode === 'simple'
+              ? t('rules.simple.add_button')
+              : t('rules.header.add_button')}
           </button>
         </div>
       </div>
 
-      {/* 1-Click Rule Templates Gallery */}
-      {showPresets && (
+      {/* 1-Click Rule Templates Gallery (Expert mode) */}
+      {experienceMode === 'expert' && showPresets && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {SYSTEM_CONSTANTS.rulePresets.map((preset) => (
             <button
@@ -428,109 +457,64 @@ export const RulesView: React.FC<RulesViewProps> = ({
       </form>
       )}
 
-      {/* Rules Table */}
-      <div className="tf-card overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="border-b border-tf-border bg-tf-surface-alt text-[11px] uppercase tracking-wider text-tf-secondary">
-              <tr>
-                <th className="px-4 py-3">
-                  {t('rules.table.enabled.header')}
-                </th>
-                <th className="px-4 py-3">
-                  {t('rules.table.priority.header')}
-                </th>
-                <th className="px-4 py-3">{t('rules.table.name.header')}</th>
-                <th className="px-4 py-3">
-                  {t('rules.table.processes.header')}
-                </th>
-                <th className="px-4 py-3">{t('rules.table.targets.header')}</th>
-                <th className="px-4 py-3">{t('rules.table.ports.header')}</th>
-                <th className="px-4 py-3">{t('rules.table.action.header')}</th>
-                <th className="px-4 py-3">
-                  {t('rules.table.controls.header')}
-                </th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-tf-border">
-              {rules.map((rule, idx) => (
-                <tr
-                  key={rule.id}
-                  className={`transition hover:bg-tf-surface-alt/50 ${
-                    !rule.enabled ? 'opacity-50' : ''
-                  }`}
-                >
-                  <td className="px-4 py-3">
-                    <input
-                      type="checkbox"
-                      checked={rule.enabled}
-                      onChange={() => onToggleRule(rule.id)}
-                      aria-label={`${t('rules.table.enabled.toggle_aria')}: ${rule.name}`}
-                      className="h-4 w-4 cursor-pointer accent-tf-accent"
-                    />
-                  </td>
-                  <td className="px-4 py-3 font-mono font-bold text-tf-accent">
-                    #{rule.priority}
-                  </td>
-                  <td className="px-4 py-3 font-semibold text-tf-primary">
-                    {rule.name}
-                  </td>
-                  <td className="px-4 py-3 font-mono text-[11px] text-tf-secondary">
-                    {rule.processPatterns.length > 0
-                      ? rule.processPatterns.join(', ')
-                      : t('rules.table.processes.any')}
-                  </td>
-                  <td className="px-4 py-3 font-mono text-[11px] text-tf-secondary">
-                    {[...rule.domainPatterns, ...rule.ipCidrs].length > 0
-                      ? [...rule.domainPatterns, ...rule.ipCidrs].join(', ')
-                      : t('rules.table.targets.any')}
-                  </td>
-                  <td className="px-4 py-3 font-mono text-[11px] text-tf-secondary">
-                    {rule.portRanges.length > 0
-                      ? rule.portRanges
-                          .map((r) =>
-                            r.start === r.end
-                              ? `${r.start}`
-                              : `${r.start}-${r.end}`
-                          )
-                          .join(', ')
-                      : t('rules.table.ports.any')}
-                  </td>
-                  <td className="px-4 py-3">
-                    <span
-                      className={`rounded px-2 py-0.5 font-mono text-[11px] font-bold ${
-                        rule.action.type === 'block'
-                          ? 'bg-tf-red/20 text-tf-red'
-                          : rule.action.type === 'direct'
-                            ? 'bg-tf-green/20 text-tf-green'
-                            : 'bg-tf-accent/20 text-tf-accent'
-                      }`}
-                    >
-                      {t(`rules.table.action.${rule.action.type}`)}
-                      {rule.action.targetId ? ` → ${rule.action.targetId}` : ''}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        disabled={idx === 0}
-                        onClick={() => onReorderRule(rule.id, 'up')}
-                        className="rounded p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary disabled:opacity-30"
-                        title={t('rules.table.controls.move_up')}
-                        aria-label={`${t('rules.table.controls.move_up')}: ${rule.name}`}
+      {/* Simplified Custom Rules List (Simple) vs Full Priority Table (Expert) */}
+      {experienceMode === 'simple' ? (
+        <div className="tf-card space-y-3 p-5">
+          <h3 className="text-sm font-bold text-tf-primary">
+            {t('rules.simple.custom_rules_title')}
+          </h3>
+          {rules.length === 0 ? (
+            <p className="py-4 text-center text-xs text-tf-secondary">
+              {t('rules.simple.custom_rules_empty')}
+            </p>
+          ) : (
+            <div className="divide-y divide-tf-border">
+              {rules.map((rule) => {
+                const targets = [
+                  ...rule.processPatterns,
+                  ...rule.domainPatterns,
+                  ...rule.ipCidrs
+                ];
+                return (
+                  <div
+                    key={rule.id}
+                    className={`flex flex-wrap items-center justify-between gap-3 py-3 ${
+                      !rule.enabled ? 'opacity-50' : ''
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        checked={rule.enabled}
+                        onChange={() => onToggleRule(rule.id)}
+                        aria-label={`${t('rules.table.enabled.toggle_aria')}: ${rule.name}`}
+                        className="h-4 w-4 cursor-pointer accent-tf-accent"
+                      />
+                      <div>
+                        <div className="text-xs font-bold text-tf-primary">
+                          {rule.name}
+                        </div>
+                        <div className="font-mono text-[11px] text-tf-secondary">
+                          {targets.length > 0
+                            ? targets.join(', ')
+                            : t('rules.table.targets.any')}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`rounded px-2.5 py-0.5 text-[11px] font-bold ${
+                          rule.action.type === 'block'
+                            ? 'bg-tf-red/20 text-tf-red'
+                            : rule.action.type === 'direct'
+                              ? 'bg-tf-green/20 text-tf-green'
+                              : 'bg-tf-accent/20 text-tf-accent'
+                        }`}
                       >
-                        <ArrowUp className="h-3.5 w-3.5" />
-                      </button>
+                        {t(`rules.table.action.${rule.action.type}`)}
+                      </span>
                       <button
-                        disabled={idx === rules.length - 1}
-                        onClick={() => onReorderRule(rule.id, 'down')}
-                        className="rounded p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary disabled:opacity-30"
-                        title={t('rules.table.controls.move_down')}
-                        aria-label={`${t('rules.table.controls.move_down')}: ${rule.name}`}
-                      >
-                        <ArrowDown className="h-3.5 w-3.5" />
-                      </button>
-                      <button
+                        type="button"
                         onClick={() => onRemoveRule(rule.id)}
                         className="rounded p-1 text-tf-secondary hover:text-tf-red"
                         title={t('rules.table.controls.delete')}
@@ -539,13 +523,131 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
                     </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
-      </div>
+      ) : (
+        <div className="tf-card overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="border-b border-tf-border bg-tf-surface-alt text-[11px] uppercase tracking-wider text-tf-secondary">
+                <tr>
+                  <th className="px-4 py-3">
+                    {t('rules.table.enabled.header')}
+                  </th>
+                  <th className="px-4 py-3">
+                    {t('rules.table.priority.header')}
+                  </th>
+                  <th className="px-4 py-3">{t('rules.table.name.header')}</th>
+                  <th className="px-4 py-3">
+                    {t('rules.table.processes.header')}
+                  </th>
+                  <th className="px-4 py-3">{t('rules.table.targets.header')}</th>
+                  <th className="px-4 py-3">{t('rules.table.ports.header')}</th>
+                  <th className="px-4 py-3">{t('rules.table.action.header')}</th>
+                  <th className="px-4 py-3">
+                    {t('rules.table.controls.header')}
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-tf-border">
+                {rules.map((rule, idx) => (
+                  <tr
+                    key={rule.id}
+                    className={`transition hover:bg-tf-surface-alt/50 ${
+                      !rule.enabled ? 'opacity-50' : ''
+                    }`}
+                  >
+                    <td className="px-4 py-3">
+                      <input
+                        type="checkbox"
+                        checked={rule.enabled}
+                        onChange={() => onToggleRule(rule.id)}
+                        aria-label={`${t('rules.table.enabled.toggle_aria')}: ${rule.name}`}
+                        className="h-4 w-4 cursor-pointer accent-tf-accent"
+                      />
+                    </td>
+                    <td className="px-4 py-3 font-mono font-bold text-tf-accent">
+                      #{rule.priority}
+                    </td>
+                    <td className="px-4 py-3 font-semibold text-tf-primary">
+                      {rule.name}
+                    </td>
+                    <td className="px-4 py-3 font-mono text-[11px] text-tf-secondary">
+                      {rule.processPatterns.length > 0
+                        ? rule.processPatterns.join(', ')
+                        : t('rules.table.processes.any')}
+                    </td>
+                    <td className="px-4 py-3 font-mono text-[11px] text-tf-secondary">
+                      {[...rule.domainPatterns, ...rule.ipCidrs].length > 0
+                        ? [...rule.domainPatterns, ...rule.ipCidrs].join(', ')
+                        : t('rules.table.targets.any')}
+                    </td>
+                    <td className="px-4 py-3 font-mono text-[11px] text-tf-secondary">
+                      {rule.portRanges.length > 0
+                        ? rule.portRanges
+                            .map((r) =>
+                              r.start === r.end
+                                ? `${r.start}`
+                                : `${r.start}-${r.end}`
+                            )
+                            .join(', ')
+                        : t('rules.table.ports.any')}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span
+                        className={`rounded px-2 py-0.5 font-mono text-[11px] font-bold ${
+                          rule.action.type === 'block'
+                            ? 'bg-tf-red/20 text-tf-red'
+                            : rule.action.type === 'direct'
+                              ? 'bg-tf-green/20 text-tf-green'
+                              : 'bg-tf-accent/20 text-tf-accent'
+                        }`}
+                      >
+                        {t(`rules.table.action.${rule.action.type}`)}
+                        {rule.action.targetId ? ` -> ${rule.action.targetId}` : ''}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          disabled={idx === 0}
+                          onClick={() => onReorderRule(rule.id, 'up')}
+                          className="rounded p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary disabled:opacity-30"
+                          title={t('rules.table.controls.move_up')}
+                          aria-label={`${t('rules.table.controls.move_up')}: ${rule.name}`}
+                        >
+                          <ArrowUp className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          disabled={idx === rules.length - 1}
+                          onClick={() => onReorderRule(rule.id, 'down')}
+                          className="rounded p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary disabled:opacity-30"
+                          title={t('rules.table.controls.move_down')}
+                          aria-label={`${t('rules.table.controls.move_down')}: ${rule.name}`}
+                        >
+                          <ArrowDown className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          onClick={() => onRemoveRule(rule.id)}
+                          className="rounded p-1 text-tf-secondary hover:text-tf-red"
+                          title={t('rules.table.controls.delete')}
+                          aria-label={`${t('rules.table.controls.delete')}: ${rule.name}`}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Add Rule Modal */}
       {showModal && (
@@ -561,8 +663,129 @@ export const RulesView: React.FC<RulesViewProps> = ({
               id={addRuleModalTitleId}
               className="text-base font-bold text-tf-primary"
             >
-              {t('rules.modal.add.title')}
+              {experienceMode === 'simple'
+                ? t('rules.simple.add_button')
+                : t('rules.modal.add.title')}
             </h3>
+
+            {experienceMode === 'simple' && !showAdvancedFields ? (
+              <>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    aria-pressed={simpleTargetType === 'app'}
+                    onClick={() => setSimpleTargetType('app')}
+                    className={`flex-1 rounded-tf-md px-3 py-2 text-xs font-bold transition ${
+                      simpleTargetType === 'app'
+                        ? 'bg-tf-accent text-tf-bg'
+                        : 'tf-surface-alt text-tf-secondary hover:text-tf-primary'
+                    }`}
+                  >
+                    {t('rules.simple.type_app')}
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={simpleTargetType === 'site'}
+                    onClick={() => setSimpleTargetType('site')}
+                    className={`flex-1 rounded-tf-md px-3 py-2 text-xs font-bold transition ${
+                      simpleTargetType === 'site'
+                        ? 'bg-tf-accent text-tf-bg'
+                        : 'tf-surface-alt text-tf-secondary hover:text-tf-primary'
+                    }`}
+                  >
+                    {t('rules.simple.type_site')}
+                  </button>
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="simple-rule-target"
+                    className="block text-xs text-tf-secondary"
+                  >
+                    {simpleTargetType === 'app'
+                      ? t('rules.simple.target_app_label')
+                      : t('rules.simple.target_site_label')}
+                  </label>
+                  <input
+                    id="simple-rule-target"
+                    type="text"
+                    required
+                    value={simpleTargetValue}
+                    onChange={(e) => setSimpleTargetValue(e.target.value)}
+                    placeholder={
+                      simpleTargetType === 'app'
+                        ? t('rules.simple.target_app_placeholder')
+                        : t('rules.simple.target_site_placeholder')
+                    }
+                    className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs text-tf-secondary">
+                    {t('rules.simple.action_label')}
+                  </label>
+                  <div className="mt-1 grid grid-cols-3 gap-2">
+                    {(
+                      [
+                        {
+                          type: 'proxy' as const,
+                          label: t('connections.simple.route_proxy'),
+                          activeClass: 'bg-tf-accent text-tf-bg'
+                        },
+                        {
+                          type: 'direct' as const,
+                          label: t('connections.simple.route_direct'),
+                          activeClass: 'bg-tf-green text-tf-bg'
+                        },
+                        {
+                          type: 'block' as const,
+                          label: t('connections.simple.route_blocked'),
+                          activeClass: 'bg-tf-red text-tf-bg'
+                        }
+                      ]
+                    ).map((opt) => (
+                      <button
+                        key={opt.type}
+                        type="button"
+                        aria-pressed={actionType === opt.type}
+                        onClick={() => {
+                          setActionType(opt.type);
+                          if (opt.type === 'proxy' && !actionTargetId) {
+                            setActionTargetId(proxies[0]?.id || '');
+                          }
+                        }}
+                        className={`rounded-tf-md px-3 py-2 text-xs font-bold transition ${
+                          actionType === opt.type
+                            ? opt.activeClass
+                            : 'tf-surface-alt text-tf-secondary hover:text-tf-primary'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setShowAdvancedFields(true)}
+                  className="text-xs font-semibold text-tf-cyan hover:underline"
+                >
+                  {t('rules.simple.show_advanced_options')}
+                </button>
+              </>
+            ) : (
+              <>
+                {experienceMode === 'simple' && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAdvancedFields(false)}
+                    className="text-xs font-semibold text-tf-cyan hover:underline"
+                  >
+                    {t('rules.simple.hide_advanced_options')}
+                  </button>
+                )}
             <div className="grid grid-cols-3 gap-3">
               <div className="col-span-2">
                 <label className="block text-xs text-tf-secondary">
@@ -698,11 +921,14 @@ export const RulesView: React.FC<RulesViewProps> = ({
                       ))
                     : chains.map((c) => (
                         <option key={c.id} value={c.id}>
-                          {c.name} ({c.proxyIds.length} nodes)
+                          {c.name} ({c.proxyIds.length}{' '}
+                          {t('proxies.section.chains.hops')})
                         </option>
                       ))}
                 </select>
               </div>
+            )}
+              </>
             )}
 
             <div className="flex justify-end gap-2 pt-3">

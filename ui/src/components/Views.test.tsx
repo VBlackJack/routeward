@@ -19,14 +19,20 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import i18n from '../i18n';
 import { ConnectionsView } from './ConnectionsView';
+import { DashboardView } from './DashboardView';
 import { DnsView } from './DnsView';
 import { ProxiesView } from './ProxiesView';
 import { RulesView } from './RulesView';
+import { SettingsView } from './SettingsView';
 import {
   FakeIpEntry,
+  LogEntry,
   ProxyChain,
   ProxyNode,
   RoutingRule,
+  SecurityPolicyConfig,
+  SystemDiagnostics,
+  TelemetrySnapshot,
   TrackedConnection
 } from '../types/routeward';
 
@@ -287,5 +293,322 @@ describe('Core UI view components', () => {
       })
     );
     expect(onTerminateConnection).toHaveBeenCalledWith('c-active');
+  });
+
+  it('DashboardView simple mode renders use-case cards and triggers one-click scenario', () => {
+    const telemetry: TelemetrySnapshot = {
+      activeConnections: 4,
+      downloadBytesPerSec: 1200,
+      uploadBytesPerSec: 400,
+      totalRxBytes: 2048,
+      totalTxBytes: 1024,
+      proxiedCount: 3,
+      directCount: 1,
+      blockedCount: 2,
+      bandwidthHistory: [],
+      topTalkers: []
+    };
+    const diagnostics: SystemDiagnostics = {
+      daemonConnected: true,
+      running: true,
+      osName: 'Windows 11',
+      interceptionMode: 'hybrid',
+      elevatedPrivileges: true,
+      relayTcpEndpoint: '127.0.0.1:10808',
+      relayHttpEndpoint: '127.0.0.1:10809',
+      dnsEndpoint: '127.0.0.1:10853',
+      fakeIpCidr: '198.18.0.0/15',
+      activeLocale: 'fr'
+    };
+    const securityPolicy: SecurityPolicyConfig = {
+      killSwitchEnabled: true,
+      blockUdpOnTcpOnlyProxy: true,
+      strictDnsNoLocalFallback: true
+    };
+    const onApplyUseCase = vi.fn();
+
+    render(
+      <DashboardView
+        telemetry={telemetry}
+        diagnostics={diagnostics}
+        dnsCount={5}
+        securityPolicy={securityPolicy}
+        experienceMode="simple"
+        onApplyUseCase={onApplyUseCase}
+        onUpdateSecurityPolicy={vi.fn()}
+        onOpenWizard={vi.fn()}
+        onNavigateRules={vi.fn()}
+        onSwitchToExpert={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByText(i18n.t('dashboard.simple.uc_privacy_title')));
+    expect(onApplyUseCase).toHaveBeenCalledWith('privacy');
+  });
+
+  it('RulesView simple mode hides priority table and creates rule from simple modal', () => {
+    const onAddRule = vi.fn();
+    render(
+      <RulesView
+        rules={[
+          {
+            id: 'r1',
+            name: 'Firefox',
+            enabled: true,
+            priority: 10,
+            processPatterns: ['firefox.exe'],
+            domainPatterns: [],
+            ipCidrs: [],
+            portRanges: [],
+            protocol: 'any',
+            action: { type: 'proxy', targetId: 'p1' }
+          }
+        ]}
+        proxies={[]}
+        chains={[]}
+        experienceMode="simple"
+        onEvaluateRule={vi.fn()}
+        onAddRule={onAddRule}
+        onToggleRule={vi.fn()}
+        onReorderRule={vi.fn()}
+        onRemoveRule={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.queryByRole('button', { name: i18n.t('rules.header.presets_button') })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText('#10')).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('rules.simple.add_button') })
+    );
+
+    const targetInput = screen.getByPlaceholderText(
+      i18n.t('rules.simple.target_app_placeholder')
+    );
+    fireEvent.change(targetInput, { target: { value: 'spotify.exe' } });
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('connections.simple.route_direct') })
+    );
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('rules.modal.add.submit') })
+    );
+
+    expect(onAddRule).toHaveBeenCalledTimes(1);
+    expect(onAddRule.mock.calls[0][0].processPatterns).toEqual(['spotify.exe']);
+    expect(onAddRule.mock.calls[0][0].action).toEqual({ type: 'direct' });
+  });
+
+  it('ProxiesView and ConnectionsView adapt cleanly to simple mode', () => {
+    const onQuickCreateRule = vi.fn();
+    render(
+      <>
+        <ProxiesView
+          proxies={[]}
+          chains={[]}
+          experienceMode="simple"
+          onTestProxy={vi.fn()}
+          onTestAllProxies={vi.fn()}
+          onAddProxy={vi.fn()}
+          onImportUris={vi.fn()}
+          onCopyUri={vi.fn()}
+          onRemoveProxy={vi.fn()}
+          onAddChain={vi.fn()}
+          onRemoveChain={vi.fn()}
+        />
+        <ConnectionsView
+          connections={[
+            {
+              id: 'c1',
+              pid: 100,
+              processName: 'firefox.exe',
+              processPath: 'C:\\Program Files\\Mozilla Firefox\\firefox.exe',
+              targetHost: 'example.com',
+              resolvedDomain: 'example.com',
+              targetPort: 443,
+              protocol: 'tcp',
+              matchedRule: 'Browsers',
+              routeLabel: 'PROXY',
+              latencyMs: 25,
+              rxBytes: 100,
+              txBytes: 50,
+              status: 'active',
+              startedAt: '2026-11-15T08:00:00Z'
+            },
+            {
+              id: 'c2',
+              pid: 100,
+              processName: 'firefox.exe',
+              processPath: 'C:\\Program Files\\Mozilla Firefox\\firefox.exe',
+              targetHost: 'mozilla.org',
+              resolvedDomain: 'mozilla.org',
+              targetPort: 443,
+              protocol: 'tcp',
+              matchedRule: 'Browsers',
+              routeLabel: 'PROXY',
+              latencyMs: 30,
+              rxBytes: 200,
+              txBytes: 100,
+              status: 'active',
+              startedAt: '2026-11-15T08:01:00Z'
+            }
+          ]}
+          proxies={[]}
+          experienceMode="simple"
+          onScanOsSockets={vi.fn()}
+          onClearClosed={vi.fn()}
+          onTerminateConnection={vi.fn()}
+          onQuickCreateRule={onQuickCreateRule}
+        />
+      </>
+    );
+
+    expect(
+      screen.queryByRole('button', { name: i18n.t('proxies.section.servers.test_all') })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(i18n.t('proxies.section.chains.title'))
+    ).not.toBeInTheDocument();
+
+    expect(screen.getAllByText('firefox.exe')).toHaveLength(1);
+    expect(
+      screen.getByText(`2 ${i18n.t('connections.simple.count_connections')}`)
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('connections.simple.route_blocked') })
+    );
+    expect(onQuickCreateRule).toHaveBeenCalledTimes(1);
+    expect(onQuickCreateRule.mock.calls[0][0].processPatterns).toEqual(['firefox.exe']);
+    expect(onQuickCreateRule.mock.calls[0][0].action).toEqual({ type: 'block' });
+  });
+
+  it('SettingsView manages language, unified anti-leak shield, and expert diagnostics subtabs', () => {
+    const diagnostics: SystemDiagnostics = {
+      daemonConnected: true,
+      running: true,
+      osName: 'Windows 11',
+      interceptionMode: 'hybrid',
+      elevatedPrivileges: true,
+      relayTcpEndpoint: '127.0.0.1:10808',
+      relayHttpEndpoint: '127.0.0.1:10809',
+      dnsEndpoint: '127.0.0.1:10853',
+      fakeIpCidr: '198.18.0.0/15',
+      activeLocale: 'fr'
+    };
+    const logs: LogEntry[] = [
+      {
+        id: 'l1',
+        timestamp: '2026-11-15T09:00:00Z',
+        level: 'INFO',
+        component: 'relay',
+        message: 'Relay listening'
+      }
+    ];
+    const onUpdateSecurityPolicy = vi.fn();
+    const onToggleLanguage = vi.fn();
+
+    const { rerender } = render(
+      <SettingsView
+        diagnostics={diagnostics}
+        securityPolicy={{
+          killSwitchEnabled: true,
+          blockUdpOnTcpOnlyProxy: true,
+          strictDnsNoLocalFallback: true,
+          blockQuicUdp443: true,
+          blockEncryptedDnsBypass: true
+        }}
+        experienceMode="simple"
+        systemProxyEnabled={false}
+        fakeIps={[]}
+        logs={logs}
+        activePaletteDisplayName="Dracula"
+        activeAccent="Default"
+        language="fr"
+        onUpdateSecurityPolicy={onUpdateSecurityPolicy}
+        onSetInterceptionMode={vi.fn()}
+        onToggleSystemProxy={vi.fn().mockResolvedValue(undefined)}
+        onOpenThemeForge={vi.fn()}
+        onToggleLanguage={onToggleLanguage}
+        onOpenWizard={vi.fn()}
+        onOpenGlossary={vi.fn()}
+        onOpenLauncher={vi.fn()}
+        onImportProfile={vi.fn()}
+        onExportProfile={vi.fn()}
+        onAllocateDns={vi.fn()}
+        onFlushDns={vi.fn()}
+        onClearLogs={vi.fn()}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('app.header.language.en') })
+    );
+    expect(onToggleLanguage).toHaveBeenCalledWith('en');
+
+    fireEvent.click(
+      screen.getByLabelText(i18n.t('settings.security.simple_shield_title'))
+    );
+    expect(onUpdateSecurityPolicy).toHaveBeenCalledWith({
+      killSwitchEnabled: false,
+      blockUdpOnTcpOnlyProxy: false,
+      strictDnsNoLocalFallback: false,
+      blockQuicUdp443: false,
+      blockEncryptedDnsBypass: false
+    });
+
+    rerender(
+      <SettingsView
+        diagnostics={diagnostics}
+        securityPolicy={{
+          killSwitchEnabled: true,
+          blockUdpOnTcpOnlyProxy: true,
+          strictDnsNoLocalFallback: true
+        }}
+        experienceMode="expert"
+        systemProxyEnabled={false}
+        fakeIps={[
+          {
+            fakeIp: '198.18.0.5',
+            domain: 'test.internal',
+            hits: 1,
+            expiresAt: '2026-11-15T10:00:00Z',
+            ttlRemainingSeconds: 300
+          }
+        ]}
+        logs={logs}
+        activePaletteDisplayName="Dracula"
+        activeAccent="Default"
+        language="fr"
+        onUpdateSecurityPolicy={onUpdateSecurityPolicy}
+        onSetInterceptionMode={vi.fn()}
+        onToggleSystemProxy={vi.fn().mockResolvedValue(undefined)}
+        onOpenThemeForge={vi.fn()}
+        onToggleLanguage={onToggleLanguage}
+        onOpenWizard={vi.fn()}
+        onOpenGlossary={vi.fn()}
+        onOpenLauncher={vi.fn()}
+        onImportProfile={vi.fn()}
+        onExportProfile={vi.fn()}
+        onAllocateDns={vi.fn()}
+        onFlushDns={vi.fn()}
+        onClearLogs={vi.fn()}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: new RegExp(i18n.t('settings.diagnostics.subtab_dns'))
+      })
+    );
+    expect(screen.getByText('198.18.0.5')).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: new RegExp(i18n.t('settings.diagnostics.subtab_logs'))
+      })
+    );
+    expect(screen.getByText('Relay listening')).toBeInTheDocument();
   });
 });

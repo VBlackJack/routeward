@@ -19,6 +19,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import './i18n';
 import { App } from './App';
+import { UI_CONFIG } from './config/constants';
 import { ThemeForgeProvider } from './theme/ThemeForgeContext';
 import { routewardClient } from './services/ipc';
 
@@ -33,7 +34,7 @@ function renderApp() {
 describe('App navigation and accessible modals', () => {
   beforeEach(() => {
     window.localStorage.clear();
-    window.localStorage.setItem('routeward_experience_mode', 'simple');
+    window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.EXPERIENCE_MODE, 'simple');
     vi.spyOn(routewardClient, 'startRealtimeStream').mockImplementation(() => {});
   });
 
@@ -42,25 +43,35 @@ describe('App navigation and accessible modals', () => {
     vi.restoreAllMocks();
   });
 
-  it('renders accessible tablist semantics and blocks expert tabs on Alt+5/Alt+6 in simple mode', () => {
+  it('renders 5 use-case tabs, keeps Simple mode calm, and supports Alt+1..5 navigation', () => {
     renderApp();
 
     const tablist = screen.getByRole('tablist');
     expect(tablist).toBeInTheDocument();
 
     const tabs = screen.getAllByRole('tab');
-    expect(tabs).toHaveLength(4);
+    expect(tabs).toHaveLength(5);
     expect(tabs[0]).toHaveAttribute('aria-selected', 'true');
 
-    fireEvent.keyDown(window, { key: '5', altKey: true });
-    expect(screen.getAllByRole('tab')[0]).toHaveAttribute('aria-selected', 'true');
+    // Bottom technical footer and ThemeForge header clutter are absent in Simple mode
+    expect(screen.queryByRole('contentinfo')).not.toBeInTheDocument();
 
-    fireEvent.keyDown(window, { key: '6', altKey: true });
-    expect(screen.getAllByRole('tab')[0]).toHaveAttribute('aria-selected', 'true');
+    // Alt+1..5 switches through all 5 tabs in both modes
+    fireEvent.keyDown(window, { key: '5', altKey: true });
+    expect(screen.getAllByRole('tab')[4]).toHaveAttribute('aria-selected', 'true');
+
+    fireEvent.keyDown(window, { key: '2', altKey: true });
+    expect(screen.getAllByRole('tab')[1]).toHaveAttribute('aria-selected', 'true');
+
+    // Switching to Advanced mode reveals the persistent technical footer
+    fireEvent.click(screen.getByRole('button', { pressed: false, name: /avanc|advanced/i }));
+    expect(screen.getByRole('contentinfo')).toBeInTheDocument();
   });
 
-  it('opens ThemeForge modal with ARIA dialog attributes and closes on Escape', () => {
+  it('opens ThemeForge modal from Settings tab with ARIA dialog attributes and closes on Escape', () => {
     renderApp();
+
+    fireEvent.keyDown(window, { key: '5', altKey: true });
 
     const themeButton = screen.getByRole('button', { name: /themeforge/i });
     fireEvent.click(themeButton);

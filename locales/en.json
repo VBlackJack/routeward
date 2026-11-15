@@ -25,12 +25,12 @@
       "tooltip": "Toggle Windows System Proxy Registry (127.0.0.1:10809)"
     },
     "experience_mode": {
-      "simple": "Simple Mode",
-      "expert": "Expert Mode",
-      "tooltip": "Switch between guided beginner interface and full SysAdmin engineering view"
+      "simple": "Simple",
+      "expert": "Advanced",
+      "tooltip": "Switch between the everyday use-case interface and full technical tools"
     },
     "help": {
-      "wizard_button": "Quick Setup Wizard",
+      "wizard_button": "Quick Setup",
       "glossary_button": "Glossary & Help"
     },
     "daemon_banner": {
@@ -48,7 +48,14 @@
       },
       "engine": {
         "running": "Interceptor Active",
-        "stopped": "Interceptor Paused"
+        "stopped": "Interceptor Paused",
+        "start": "Enable Protection",
+        "pause": "Pause"
+      },
+      "status": {
+        "protected": "Protected",
+        "paused": "Paused",
+        "disconnected": "Daemon offline"
       },
       "mode": {
         "hybrid": "Hybrid (Fake-IP + Driver/Relay)",
@@ -75,6 +82,21 @@
     },
     "nav": {
       "tablist_label": "Primary navigation tabs",
+      "home": {
+        "tab": "Home"
+      },
+      "apps": {
+        "tab": "My Apps & Sites"
+      },
+      "proxy": {
+        "tab": "My Proxy"
+      },
+      "activity": {
+        "tab": "Activity"
+      },
+      "settings": {
+        "tab": "Settings"
+      },
       "dashboard": {
         "tab": "Dashboard"
       },
@@ -142,6 +164,9 @@
         "imported": "Profile configuration imported",
         "import_error": "Invalid profile JSON file",
         "exported": "Profile exported to JSON"
+      },
+      "usecase": {
+        "applied": "Scenario preset applied"
       }
     }
   },
@@ -167,12 +192,31 @@
       "protected_title": "Everything is working - Your connection is protected",
       "protected_desc": "RouteWard is actively routing your applications according to your rules and preventing IP or DNS leaks.",
       "paused_title": "Protection paused - Applications are connecting directly",
-      "paused_desc": "The interception engine is currently stopped. Click 'Start Engine' to resume proxy routing.",
+      "paused_desc": "The interception engine is currently stopped. Click 'Enable Protection' to resume proxy routing.",
       "quick_wizard_cta": "3-Step Guided Setup",
       "choose_apps_cta": "Choose My Applications",
       "switch_expert_cta": "Show Advanced Diagnostics (Expert)",
       "status_badge_ok": "Shield Active",
       "status_badge_off": "Paused"
+    },
+    "simple": {
+      "metric_protected_apps": "Protected App Rules",
+      "metric_leaks_blocked": "Leaks & Blocks Stopped",
+      "metric_protected_traffic": "Total Traffic Handled",
+      "proxy_summary_label": "Active Proxy Server",
+      "no_proxy_configured": "No proxy server configured yet",
+      "configure_proxy_cta": "Set up a Proxy",
+      "test_proxy_cta": "Check Connection",
+      "use_cases_title": "What do you want to do today?",
+      "use_cases_subtitle": "Pick a ready-made scenario to configure your apps and leak protection in one click.",
+      "uc_privacy_title": "Private Browsing",
+      "uc_privacy_desc": "Hide your IP in web browsers and block background OS telemetry.",
+      "uc_work_title": "Remote Work & Dev Tools",
+      "uc_work_desc": "Protect browsers and work tools while keeping your local network direct.",
+      "uc_gaming_title": "Gaming & Video Calls",
+      "uc_gaming_desc": "Keep games direct for minimal lag while protecting your web browsers.",
+      "uc_strict_title": "Maximum Anti-Leak Lock",
+      "uc_strict_desc": "Arm Kill-Switch, DNS anti-leak, UDP guard, and encrypted DNS bypass block."
     },
     "tooltips": {
       "active_connections": "Number of apps on your computer currently exchanging data with the Internet.",
@@ -252,6 +296,20 @@
     }
   },
   "connections": {
+    "simple": {
+      "title": "App Network Activity",
+      "subtitle": "See how each application connects and change its routing in one click.",
+      "search_placeholder": "Search by app name or website...",
+      "filter_all": "All Apps",
+      "filter_proxied": "Protected",
+      "filter_blocked": "Blocked",
+      "route_proxy": "Use Proxy",
+      "route_direct": "Direct",
+      "route_blocked": "Block",
+      "count_connections": "connections",
+      "no_apps": "No application activity matches your filter yet.",
+      "switch_expert_cta": "Show raw sockets and PIDs (Advanced)"
+    },
     "toolbar": {
       "search": {
         "placeholder": "Filter by process, domain, IP, rule, or proxy..."
@@ -329,6 +387,15 @@
     }
   },
   "proxies": {
+    "simple": {
+      "title": "My Proxy Server",
+      "subtitle": "Add your proxy server or subscription link and verify that it responds cleanly.",
+      "add": "Add Proxy",
+      "empty": "No proxy configured yet. Add one to start routing your apps.",
+      "show_advanced_options": "Show protocol options (UDP / TLS)",
+      "hide_advanced_options": "Hide protocol options",
+      "active_badge": "Primary"
+    },
     "section": {
       "servers": {
         "title": "Upstream Proxy Servers",
@@ -412,6 +479,22 @@
     }
   },
   "rules": {
+    "simple": {
+      "title": "My Apps & Websites",
+      "subtitle": "Pick which apps or websites go through your proxy, connect directly, or stay blocked.",
+      "add_button": "Add an App or Site",
+      "custom_rules_title": "Custom App & Site Rules",
+      "custom_rules_empty": "No custom rule yet. Use the cards above or add an app/site.",
+      "type_app": "Application",
+      "type_site": "Website",
+      "target_app_label": "Application name (e.g. firefox.exe or spotify)",
+      "target_app_placeholder": "spotify.exe",
+      "target_site_label": "Website or domain (e.g. *.example.com)",
+      "target_site_placeholder": "*.example.com",
+      "action_label": "How should it connect?",
+      "show_advanced_options": "Show advanced rule fields (priority, CIDR, ports)",
+      "hide_advanced_options": "Back to simple form"
+    },
     "header": {
       "title": "Process & Destination Routing Rules",
       "subtitle": "Rules are evaluated in ascending priority order. First match wins.",
@@ -734,11 +817,53 @@
         "simple": "Your custom traffic laws: e.g., 'Firefox goes through Proxy', 'Steam connects Directly', and 'Windows Telemetry is Blocked'.",
         "expert": "Deterministic ascending-priority evaluator matching process globs, domain wildcards, IPv4/IPv6 CIDR subnets, and port ranges."
       },
-      "system_proxy": {
+        "system_proxy": {
         "term": "System Proxy vs App Launcher",
         "simple": "'System Proxy' configures all of Windows in 1 click. 'Run App via Proxy' launches a single chosen program inside the proxy tunnel.",
         "expert": "Toggles HKCU Internet Settings registry keys or spawns a child process with injected ALL_PROXY / HTTP_PROXY / HTTPS_PROXY environment variables."
       }
+    }
+  },
+  "settings": {
+    "header": {
+      "title": "Settings & Tools",
+      "subtitle": "Customize language, appearance, leak protection, and system diagnostics."
+    },
+    "general": {
+      "title": "General & Appearance",
+      "language_label": "Display Language",
+      "theme_label": "Color Theme",
+      "theme_open": "Customize ThemeForge",
+      "help_title": "Guided Help",
+      "help_desc": "Need a refresher? Relaunch the 3-step wizard or browse the plain-language glossary."
+    },
+    "security": {
+      "title": "Leak Protection",
+      "simple_shield_title": "All-in-One Anti-Leak Shield",
+      "simple_shield_desc": "Keeps your real IP hidden if the proxy disconnects, stops UDP leaks, and blocks DNS bypass.",
+      "simple_shield_on": "All protections active",
+      "simple_shield_off": "Partial protection",
+      "block_quic_title": "Block QUIC (UDP 443)",
+      "block_quic_desc": "Force browsers to use standard HTTPS TCP interception instead of QUIC UDP.",
+      "block_dot_title": "Block Encrypted DNS Bypass (Port 853)",
+      "block_dot_desc": "Prevent apps from bypassing Fake-IP DNS interception via external DoT/DoQ servers."
+    },
+    "system": {
+      "title": "System Integration & Profile",
+      "subtitle": "Advanced routing mode, Windows system proxy, CLI launcher, and JSON profile backup.",
+      "interception_mode_label": "Interception Engine Mode",
+      "system_proxy_label": "Windows System Proxy (HTTP Relay)",
+      "launcher_title": "Launch One Program via Proxy",
+      "launcher_desc": "Start an executable with ALL_PROXY and HTTPS_PROXY pre-configured.",
+      "profile_title": "Profile Backup (JSON)",
+      "profile_desc": "Import or export all your proxies, rules, and preferences."
+    },
+    "diagnostics": {
+      "title": "Technical Diagnostics",
+      "hide_title": "Hide diagnostics",
+      "subtab_overview": "Overview",
+      "subtab_dns": "Fake-IP DNS Cache",
+      "subtab_logs": "Event Logs"
     }
   }
 }

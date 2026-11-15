@@ -19,37 +19,35 @@ import { useTranslation } from 'react-i18next';
 import {
   Activity,
   AlertTriangle,
-  BookOpen,
   CheckCircle2,
-  Command,
-  Download,
-  FileText,
-  Globe,
-  Languages,
-  LayoutDashboard,
-  Network,
-  Palette,
+  Home,
   Power,
   RefreshCw,
-  Rocket,
   Server,
+  Settings,
   Shield,
   ShieldAlert,
   Sparkles,
   Terminal,
-  Upload,
   Wand2
 } from 'lucide-react';
-import { UI_CONFIG } from './config/constants';
+import { SYSTEM_CONSTANTS, UI_CONFIG } from './config/constants';
 import { generateClientId, routewardClient } from './services/ipc';
 import { useThemeForge } from './theme/ThemeForgeContext';
-import { InterceptionMode, ToastNotification } from './types/routeward';
-import { DashboardView } from './components/DashboardView';
+import {
+  InterceptionMode,
+  PortRange,
+  ToastNotification,
+  TransportProtocol
+} from './types/routeward';
+import {
+  DashboardUseCaseId,
+  DashboardView
+} from './components/DashboardView';
 import { ConnectionsView } from './components/ConnectionsView';
 import { ProxiesView } from './components/ProxiesView';
 import { RulesView } from './components/RulesView';
-import { DnsView } from './components/DnsView';
-import { LogsView } from './components/LogsView';
+import { SettingsView } from './components/SettingsView';
 import { ThemeForgeModal } from './components/ThemeForgeModal';
 import {
   CommandPaletteModal,
@@ -69,7 +67,7 @@ export const App: React.FC = () => {
   const { t, i18n } = useTranslation();
   const { activePalette, activeAccent } = useThemeForge();
 
-  const [activeTab, setActiveTab] = useState<NavTabId>('dashboard');
+  const [activeTab, setActiveTab] = useState<NavTabId>('home');
   const [experienceMode, setExperienceMode] = useState<ExperienceMode>(() => {
     const saved = window.localStorage.getItem(
       UI_CONFIG.STORAGE_KEYS.EXPERIENCE_MODE
@@ -87,9 +85,6 @@ export const App: React.FC = () => {
   const handleSetExperienceMode = (mode: ExperienceMode) => {
     setExperienceMode(mode);
     window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.EXPERIENCE_MODE, mode);
-    if (mode === 'simple' && (activeTab === 'dns' || activeTab === 'logs')) {
-      setActiveTab('dashboard');
-    }
   };
 
   const [profile, setProfile] = useState(() => routewardClient.getProfile());
@@ -105,7 +100,6 @@ export const App: React.FC = () => {
   const [fakeIps, setFakeIps] = useState(() => routewardClient.listFakeIps());
   const [logs, setLogs] = useState(() => routewardClient.listLogs());
 
-  const importInputRef = useRef<HTMLInputElement | null>(null);
   const tabRefs = useRef<Partial<Record<NavTabId, HTMLButtonElement | null>>>({});
 
   useEffect(() => {
@@ -149,13 +143,11 @@ export const App: React.FC = () => {
         setShowCommandPalette((prev) => !prev);
       } else if (e.altKey) {
         const map: Record<string, NavTabId> = {
-          '1': 'dashboard',
-          '2': 'connections',
-          '3': 'proxies',
-          '4': 'rules',
-          ...(experienceMode === 'expert'
-            ? { '5': 'dns' as const, '6': 'logs' as const }
-            : {})
+          '1': 'home',
+          '2': 'apps',
+          '3': 'proxy',
+          '4': 'activity',
+          '5': 'settings'
         };
         if (map[e.key]) {
           e.preventDefault();
@@ -165,12 +157,110 @@ export const App: React.FC = () => {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [experienceMode]);
+  }, []);
 
-  const handleToggleLanguage = () => {
-    const nextLang = i18n.language.startsWith('fr') ? 'en' : 'fr';
+  const handleSetLanguage = (nextLang: 'en' | 'fr') => {
     i18n.changeLanguage(nextLang);
     window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.LOCALE, nextLang);
+  };
+
+  const handleToggleLanguage = () => {
+    handleSetLanguage(i18n.language.startsWith('fr') ? 'en' : 'fr');
+  };
+
+  const handleToggleSystemProxy = async () => {
+    const next = !systemProxyEnabled;
+    try {
+      const applied = await routewardClient.setSystemProxy(next);
+      setSystemProxyEnabled(applied);
+      pushToast(
+        applied
+          ? t('app.toast.system.proxy_enabled')
+          : t('app.toast.system.proxy_disabled'),
+        applied ? 'success' : 'info'
+      );
+    } catch {
+      pushToast(t('app.toast.system.proxy_error'), 'error');
+    }
+  };
+
+  const handleApplyUseCase = async (useCase: DashboardUseCaseId) => {
+    const primaryProxyId = profile.proxies[0]?.id || 'proxy-socks5-primary';
+    const primaryChainId = profile.chains[0]?.id || primaryProxyId;
+
+    const applyPresetById = async (presetId: string) => {
+      const preset = SYSTEM_CONSTANTS.rulePresets.find((p) => p.id === presetId);
+      if (!preset) return;
+      const actType = preset.suggestedActionType as
+        | 'proxy'
+        | 'chain'
+        | 'direct'
+        | 'block';
+      const targetId =
+        actType === 'proxy'
+          ? primaryProxyId
+          : actType === 'chain'
+            ? primaryChainId
+            : undefined;
+      await routewardClient.upsertRule({
+        id: `rule-uc-${preset.id}`,
+        name: t(`${preset.i18nKey}.name`),
+        enabled: true,
+        priority: preset.priority,
+        processPatterns: [...preset.processPatterns],
+        domainPatterns: [...preset.domainPatterns],
+        ipCidrs: [...preset.ipCidrs],
+        portRanges: [...preset.portRanges] as PortRange[],
+        protocol: preset.protocol as TransportProtocol,
+        action: targetId ? { type: actType, targetId } : { type: actType }
+      });
+    };
+
+    if (useCase === 'privacy') {
+      await routewardClient.updateSecurityPolicy({
+        killSwitchEnabled: true,
+        strictDnsNoLocalFallback: true
+      });
+      await applyPresetById('preset-privacy-browsers');
+      await applyPresetById('preset-block-os-telemetry');
+      await applyPresetById('preset-rfc1918-direct');
+    } else if (useCase === 'work') {
+      await routewardClient.updateSecurityPolicy({
+        strictDnsNoLocalFallback: true
+      });
+      await applyPresetById('preset-dev-toolchains');
+      await applyPresetById('preset-rfc1918-direct');
+    } else if (useCase === 'gaming') {
+      const gamingApp = SYSTEM_CONSTANTS.visualAppCatalog.find(
+        (c) => c.id === 'app-gaming'
+      );
+      if (gamingApp) {
+        await routewardClient.upsertRule({
+          id: `rule-visual-${gamingApp.id}`,
+          name: t(`${gamingApp.i18nKey}.name`),
+          enabled: true,
+          priority: gamingApp.priority,
+          processPatterns: [...gamingApp.processPatterns],
+          domainPatterns: [],
+          ipCidrs: [],
+          portRanges: [],
+          protocol: 'any',
+          action: { type: 'direct' }
+        });
+      }
+      await applyPresetById('preset-privacy-browsers');
+    } else if (useCase === 'strict') {
+      await routewardClient.updateSecurityPolicy({
+        killSwitchEnabled: true,
+        blockUdpOnTcpOnlyProxy: true,
+        strictDnsNoLocalFallback: true,
+        blockQuicUdp443: true,
+        blockEncryptedDnsBypass: true
+      });
+      await applyPresetById('preset-block-os-telemetry');
+    }
+
+    pushToast(t('app.toast.usecase.applied'));
   };
 
   const handleExportProfile = () => {
@@ -185,10 +275,7 @@ export const App: React.FC = () => {
     pushToast(t('app.toast.profile.exported'), 'info');
   };
 
-  const handleImportProfile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
+  const handleImportProfileFile = (file: File) => {
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') {
@@ -216,47 +303,66 @@ export const App: React.FC = () => {
 
   const isEngineRunning = diagnostics.daemonConnected && diagnostics.running;
 
-  const allNavItems: Array<{
+  const navItems: Array<{
     id: NavTabId;
     icon: React.FC<{ className?: string }>;
-    expertOnly?: boolean;
   }> = [
-    { id: 'dashboard', icon: LayoutDashboard },
-    { id: 'connections', icon: Activity },
-    { id: 'proxies', icon: Server },
-    { id: 'rules', icon: Shield },
-    { id: 'dns', icon: Globe, expertOnly: true },
-    { id: 'logs', icon: FileText, expertOnly: true }
+    { id: 'home', icon: Home },
+    { id: 'apps', icon: Shield },
+    { id: 'proxy', icon: Server },
+    { id: 'activity', icon: Activity },
+    { id: 'settings', icon: Settings }
   ];
 
-  const navItems = allNavItems.filter(
-    (item) => experienceMode === 'expert' || !item.expertOnly
-  );
+  const statusPillClass = !diagnostics.daemonConnected
+    ? 'bg-tf-red/15 text-tf-red border-tf-red/40'
+    : isEngineRunning
+      ? 'bg-tf-green/15 text-tf-green border-tf-green/40'
+      : 'bg-tf-orange/15 text-tf-orange border-tf-orange/40';
+
+  const statusPillText = !diagnostics.daemonConnected
+    ? t('app.header.status.disconnected')
+    : isEngineRunning
+      ? t('app.header.status.protected')
+      : t('app.header.status.paused');
 
   return (
     <div className="flex min-h-screen flex-col bg-tf-bg text-tf-primary">
-      {/* Top Header */}
+      {/* Minimal Header (Logo + Status on Left; Mode, Quick Help, Protection CTA on Right) */}
       <header className="border-b border-tf-border bg-tf-surface px-6 py-3">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <RouteWardLogo size="md" />
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2.5">
                 <h1 className="text-base font-bold leading-tight text-tf-primary">
                   {t('app.header.brand.title')}
                 </h1>
-                <span className="rounded bg-tf-accent/15 px-1.5 py-0.5 font-mono text-[10px] font-bold text-tf-accent">
-                  {t('app.titlebar.native_badge')}
+                <span
+                  className={`flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-bold ${statusPillClass}`}
+                >
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      !diagnostics.daemonConnected
+                        ? 'bg-tf-red'
+                        : isEngineRunning
+                          ? 'bg-tf-green'
+                          : 'bg-tf-orange'
+                    }`}
+                  />
+                  {statusPillText}
                 </span>
               </div>
-              <p className="text-xs text-tf-secondary">
-                {t('app.header.brand.subtitle')}
-              </p>
+              {experienceMode === 'expert' && (
+                <p className="text-xs text-tf-secondary">
+                  {t('app.header.brand.subtitle')}
+                </p>
+              )}
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {/* Simple / Expert Experience Mode Switcher */}
+            {/* Simple / Advanced Experience Mode Switcher */}
             <div
               className="flex items-center rounded-tf-md border border-tf-border bg-tf-bg p-0.5"
               title={t('app.experience_mode.tooltip')}
@@ -289,174 +395,33 @@ export const App: React.FC = () => {
               </button>
             </div>
 
-            {/* Quick Setup Wizard Button */}
+            {/* Quick Setup Button */}
             <button
+              type="button"
               onClick={() => setShowWizardModal(true)}
-              className="tf-surface-alt flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-tf-accent hover:border-tf-accent"
-              title={t('app.help.wizard_button')}
+              className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-accent hover:border-tf-accent"
             >
               <Wand2 className="h-3.5 w-3.5" />
-              <span className="hidden xl:inline">
-                {t('app.help.wizard_button')}
-              </span>
+              <span>{t('app.help.wizard_button')}</span>
             </button>
 
-            {/* Glossary & Help Guide Button */}
-            <button
-              onClick={() => setShowGlossaryModal(true)}
-              className="tf-surface-alt flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-tf-secondary hover:border-tf-accent hover:text-tf-primary"
-              title={t('app.help.glossary_button')}
-            >
-              <BookOpen className="h-3.5 w-3.5 text-tf-accent" />
-              <span className="hidden xl:inline">
-                {t('app.help.glossary_button')}
-              </span>
-            </button>
-
-            {/* Process Launcher ("Run with RouteWard") */}
-            <button
-              onClick={() => setShowLauncherModal(true)}
-              className="tf-surface-alt flex items-center gap-1.5 border-tf-cyan/50 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan"
-            >
-              <Rocket className="h-3.5 w-3.5" />
-              <span className="hidden lg:inline">
-                {t('app.launcher.button')}
-              </span>
-            </button>
-
-            {/* 1-Click Windows System Proxy Toggle */}
+            {/* Primary Enable / Pause Protection CTA */}
             <button
               type="button"
-              aria-pressed={systemProxyEnabled}
-              onClick={async () => {
-                const next = !systemProxyEnabled;
-                try {
-                  const applied = await routewardClient.setSystemProxy(next);
-                  setSystemProxyEnabled(applied);
-                  pushToast(
-                    applied
-                      ? t('app.toast.system.proxy_enabled')
-                      : t('app.toast.system.proxy_disabled'),
-                    applied ? 'success' : 'info'
-                  );
-                } catch {
-                  pushToast(t('app.toast.system.proxy_error'), 'error');
-                }
-              }}
-              title={t('app.system_proxy.tooltip')}
-              className={`flex items-center gap-1.5 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
-                systemProxyEnabled
-                  ? 'border border-tf-cyan bg-tf-cyan/20 text-tf-cyan'
-                  : 'tf-surface-alt text-tf-secondary hover:text-tf-primary'
-              }`}
-            >
-              <Network className="h-3.5 w-3.5" />
-              <span className="hidden xl:inline">
-                {systemProxyEnabled
-                  ? t('app.system_proxy.active')
-                  : t('app.system_proxy.inactive')}
-              </span>
-            </button>
-
-            {/* Command Palette Button */}
-            <button
-              onClick={() => setShowCommandPalette(true)}
-              className="tf-surface-alt flex items-center gap-2 px-3 py-1.5 text-xs text-tf-secondary hover:border-tf-accent hover:text-tf-primary"
-            >
-              <Command className="h-3.5 w-3.5 text-tf-accent" />
-              <span className="hidden md:inline">
-                {t('app.header.command_palette.button')}
-              </span>
-              <kbd className="rounded bg-tf-bg px-1.5 py-0.5 font-mono text-[10px] font-bold text-tf-accent">
-                {t('app.header.command_palette.shortcut')}
-              </kbd>
-            </button>
-
-            {/* Interception Mode Selector (Expert Mode) */}
-            {experienceMode === 'expert' && (
-              <select
-                aria-label={t('app.experience_mode.expert')}
-                value={diagnostics.interceptionMode}
-                onChange={(e) => {
-                  void routewardClient.setInterceptionMode(
-                    e.target.value as InterceptionMode
-                  );
-                }}
-                className="tf-input px-2.5 py-1.5 text-xs font-medium"
-              >
-                <option value="hybrid">{t('app.header.mode.hybrid')}</option>
-                <option value="driver">{t('app.header.mode.driver')}</option>
-                <option value="relay">{t('app.header.mode.relay')}</option>
-              </select>
-            )}
-
-            {/* ThemeForge Button */}
-            <button
-              onClick={() => setShowThemeModal(true)}
-              className="tf-surface-alt flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-tf-primary hover:border-tf-accent"
-            >
-              <Palette className="h-3.5 w-3.5 text-tf-accent" />
-              <span>{t('app.header.theme.button')}:</span>
-              <span className="text-tf-accent">
-                {activePalette.displayName}
-                {activeAccent !== 'Default' ? ` (${activeAccent})` : ''}
-              </span>
-            </button>
-
-            {/* Import / Export Profile */}
-            <button
-              type="button"
-              onClick={() => importInputRef.current?.click()}
-              className="tf-surface-alt flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-tf-secondary hover:text-tf-primary"
-              title={t('app.header.profile.import')}
-              aria-label={t('app.header.profile.import')}
-            >
-              <Upload className="h-3.5 w-3.5" />
-            </button>
-            <input
-              ref={importInputRef}
-              type="file"
-              accept=".json"
-              className="hidden"
-              onChange={handleImportProfile}
-            />
-
-            <button
-              type="button"
-              onClick={handleExportProfile}
-              className="tf-surface-alt flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-tf-secondary hover:text-tf-primary"
-              title={t('app.header.profile.export')}
-              aria-label={t('app.header.profile.export')}
-            >
-              <Download className="h-3.5 w-3.5" />
-            </button>
-
-            {/* Language Switcher */}
-            <button
-              onClick={handleToggleLanguage}
-              className="tf-surface-alt flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold uppercase text-tf-primary hover:border-tf-accent"
-              title={t('app.header.language.switch')}
-            >
-              <Languages className="h-3.5 w-3.5 text-tf-accent" />
-              {i18n.language.slice(0, 2)}
-            </button>
-
-            {/* Start / Stop Engine */}
-            <button
               disabled={!diagnostics.daemonConnected}
               onClick={() => {
                 void routewardClient.toggleEngine(!isEngineRunning);
               }}
               className={`flex items-center gap-2 rounded-tf-md px-3.5 py-1.5 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
                 isEngineRunning
-                  ? 'border border-tf-green bg-tf-green/20 text-tf-green'
-                  : 'border border-tf-red bg-tf-red/20 text-tf-red'
+                  ? 'border border-tf-orange bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
+                  : 'bg-tf-green text-tf-bg hover:opacity-90'
               }`}
             >
               <Power className="h-3.5 w-3.5" />
               {isEngineRunning
-                ? t('app.header.engine.running')
-                : t('app.header.engine.stopped')}
+                ? t('app.header.engine.pause')
+                : t('app.header.engine.start')}
             </button>
           </div>
         </div>
@@ -566,50 +531,67 @@ export const App: React.FC = () => {
 
       {/* Main Content */}
       <main className="mx-auto w-full max-w-7xl flex-1 p-6">
-        {activeTab === 'dashboard' && (
+        {activeTab === 'home' && (
           <DashboardView
             telemetry={telemetry}
             diagnostics={diagnostics}
             dnsCount={fakeIps.length}
             securityPolicy={securityPolicy}
             experienceMode={experienceMode}
+            proxies={profile.proxies}
+            rules={profile.rules}
+            onToggleEngine={() => {
+              void routewardClient.toggleEngine(!isEngineRunning);
+            }}
+            onApplyUseCase={handleApplyUseCase}
+            onTestPrimaryProxy={(proxyId) => {
+              void routewardClient.testProxy(proxyId).then(() => {
+                pushToast(t('app.toast.proxy.tested'));
+              });
+            }}
+            onNavigateProxy={() => setActiveTab('proxy')}
             onUpdateSecurityPolicy={(partial) => {
               void routewardClient.updateSecurityPolicy(partial);
             }}
             onOpenWizard={() => setShowWizardModal(true)}
-            onNavigateRules={() => setActiveTab('rules')}
+            onNavigateRules={() => setActiveTab('apps')}
             onSwitchToExpert={() => handleSetExperienceMode('expert')}
           />
         )}
 
-        {activeTab === 'connections' && (
-          <ConnectionsView
-            connections={connections}
+        {activeTab === 'apps' && (
+          <RulesView
+            rules={profile.rules}
             proxies={profile.proxies}
-            onScanOsSockets={async () => {
-              await routewardClient.scanRealOsSockets();
-              pushToast(t('app.toast.connection.os_scanned'), 'info');
-            }}
-            onClearClosed={() => {
-              void routewardClient.clearClosedConnections();
-            }}
-            onTerminateConnection={(connId) => {
-              void routewardClient.terminateConnection(connId).then(() => {
-                pushToast(t('app.toast.connection.terminated'), 'warning');
-              });
-            }}
-            onQuickCreateRule={(rule) => {
+            chains={profile.chains}
+            experienceMode={experienceMode}
+            onEvaluateRule={(req) => routewardClient.evaluateRule(req)}
+            onAddRule={(rule) => {
               void routewardClient.upsertRule(rule).then(() => {
                 pushToast(t('app.toast.rule.created'));
+              });
+            }}
+            onToggleRule={(id) => {
+              void routewardClient.toggleRuleEnabled(id).then(() => {
+                pushToast(t('app.toast.rule.updated'), 'info');
+              });
+            }}
+            onReorderRule={(id, dir) => {
+              void routewardClient.reorderRulePriority(id, dir);
+            }}
+            onRemoveRule={(id) => {
+              void routewardClient.removeRule(id).then(() => {
+                pushToast(t('app.toast.rule.deleted'), 'warning');
               });
             }}
           />
         )}
 
-        {activeTab === 'proxies' && (
+        {activeTab === 'proxy' && (
           <ProxiesView
             proxies={profile.proxies}
             chains={profile.chains}
+            experienceMode={experienceMode}
             onTestProxy={async (id) => {
               await routewardClient.testProxy(id);
               pushToast(t('app.toast.proxy.tested'));
@@ -645,59 +627,74 @@ export const App: React.FC = () => {
           />
         )}
 
-        {activeTab === 'rules' && (
-          <RulesView
-            rules={profile.rules}
+        {activeTab === 'activity' && (
+          <ConnectionsView
+            connections={connections}
             proxies={profile.proxies}
-            chains={profile.chains}
             experienceMode={experienceMode}
-            onEvaluateRule={(req) => routewardClient.evaluateRule(req)}
-            onAddRule={(rule) => {
+            onScanOsSockets={async () => {
+              await routewardClient.scanRealOsSockets();
+              pushToast(t('app.toast.connection.os_scanned'), 'info');
+            }}
+            onClearClosed={() => {
+              void routewardClient.clearClosedConnections();
+            }}
+            onTerminateConnection={(connId) => {
+              void routewardClient.terminateConnection(connId).then(() => {
+                pushToast(t('app.toast.connection.terminated'), 'warning');
+              });
+            }}
+            onQuickCreateRule={(rule) => {
               void routewardClient.upsertRule(rule).then(() => {
                 pushToast(t('app.toast.rule.created'));
               });
             }}
-            onToggleRule={(id) => {
-              void routewardClient.toggleRuleEnabled(id).then(() => {
-                pushToast(t('app.toast.rule.updated'), 'info');
-              });
-            }}
-            onReorderRule={(id, dir) => {
-              void routewardClient.reorderRulePriority(id, dir);
-            }}
-            onRemoveRule={(id) => {
-              void routewardClient.removeRule(id).then(() => {
-                pushToast(t('app.toast.rule.deleted'), 'warning');
-              });
-            }}
+            onSwitchToExpert={() => handleSetExperienceMode('expert')}
           />
         )}
 
-        {activeTab === 'dns' && (
-          <DnsView
-            entries={fakeIps}
-            onAllocate={(dom) => {
+        {activeTab === 'settings' && (
+          <SettingsView
+            diagnostics={diagnostics}
+            securityPolicy={securityPolicy}
+            experienceMode={experienceMode}
+            systemProxyEnabled={systemProxyEnabled}
+            fakeIps={fakeIps}
+            logs={logs}
+            activePaletteDisplayName={activePalette.displayName}
+            activeAccent={activeAccent}
+            language={i18n.language.startsWith('fr') ? 'fr' : 'en'}
+            onUpdateSecurityPolicy={(partial) => {
+              void routewardClient.updateSecurityPolicy(partial);
+            }}
+            onSetInterceptionMode={(mode: InterceptionMode) => {
+              void routewardClient.setInterceptionMode(mode);
+            }}
+            onToggleSystemProxy={handleToggleSystemProxy}
+            onOpenThemeForge={() => setShowThemeModal(true)}
+            onToggleLanguage={handleSetLanguage}
+            onOpenWizard={() => setShowWizardModal(true)}
+            onOpenGlossary={() => setShowGlossaryModal(true)}
+            onOpenLauncher={() => setShowLauncherModal(true)}
+            onImportProfile={handleImportProfileFile}
+            onExportProfile={handleExportProfile}
+            onAllocateDns={(dom) => {
               void routewardClient.allocateFakeIp(dom);
             }}
-            onFlush={() => {
+            onFlushDns={() => {
               void routewardClient.flushFakeIps().then(() => {
                 pushToast(t('app.toast.dns.flushed'), 'info');
               });
             }}
-          />
-        )}
-
-        {activeTab === 'logs' && (
-          <LogsView
-            logs={logs}
-            onClear={() => {
+            onClearLogs={() => {
               void routewardClient.clearLogs();
             }}
           />
         )}
       </main>
 
-      {/* Persistent Status Bar */}
+      {/* Persistent Technical Status Bar (Expert Mode only) */}
+      {experienceMode === 'expert' && (
       <footer className="border-t border-tf-border bg-tf-surface px-6 py-2 text-[11px] text-tf-secondary">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4">
           <div className="flex flex-wrap items-center gap-4">
@@ -740,6 +737,7 @@ export const App: React.FC = () => {
           </div>
         </div>
       </footer>
+      )}
 
       {/* Floating ThemeForge Toasts */}
       {toasts.length > 0 && (
@@ -810,7 +808,6 @@ export const App: React.FC = () => {
 
       {showCommandPalette && (
         <CommandPaletteModal
-          experienceMode={experienceMode}
           onClose={() => setShowCommandPalette(false)}
           onNavigate={(tab) => setActiveTab(tab)}
           onToggleEngine={() => {

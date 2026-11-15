@@ -20,10 +20,14 @@ import {
   Activity,
   ArrowDownLeft,
   ArrowUpRight,
+  Briefcase,
   Cpu,
+  Gamepad2,
   Globe,
   Lock,
+  Power,
   Server,
+  Shield,
   ShieldAlert,
   ShieldCheck,
   Sparkles,
@@ -32,6 +36,8 @@ import {
 } from 'lucide-react';
 import { formatBytes } from '../services/ipc';
 import {
+  ProxyNode,
+  RoutingRule,
   SecurityPolicyConfig,
   SystemDiagnostics,
   TelemetrySnapshot
@@ -39,12 +45,20 @@ import {
 import { HelpTooltip } from './HelpTooltip';
 import { ExperienceMode } from './QuickSetupWizardModal';
 
+export type DashboardUseCaseId = 'privacy' | 'work' | 'gaming' | 'strict';
+
 interface DashboardViewProps {
   telemetry: TelemetrySnapshot;
   diagnostics: SystemDiagnostics;
   dnsCount: number;
   securityPolicy: SecurityPolicyConfig;
   experienceMode: ExperienceMode;
+  proxies?: ProxyNode[];
+  rules?: RoutingRule[];
+  onToggleEngine?: () => void;
+  onApplyUseCase?: (useCase: DashboardUseCaseId) => void;
+  onTestPrimaryProxy?: (proxyId: string) => void;
+  onNavigateProxy?: () => void;
   onUpdateSecurityPolicy: (partial: Partial<SecurityPolicyConfig>) => void;
   onOpenWizard: () => void;
   onNavigateRules: () => void;
@@ -57,12 +71,29 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   dnsCount,
   securityPolicy,
   experienceMode,
+  proxies = [],
+  rules = [],
+  onToggleEngine,
+  onApplyUseCase,
+  onTestPrimaryProxy,
+  onNavigateProxy,
   onUpdateSecurityPolicy,
   onOpenWizard,
   onNavigateRules,
   onSwitchToExpert
 }) => {
   const { t } = useTranslation();
+
+  const isEngineRunning = diagnostics.daemonConnected && diagnostics.running;
+  const primaryProxy = proxies.find((p) => p.enabled) ?? proxies[0] ?? null;
+  const protectedRuleCount = rules.filter(
+    (r) =>
+      r.enabled &&
+      (r.action.type === 'proxy' ||
+        r.action.type === 'chain' ||
+        r.action.type === 'block')
+  ).length;
+  const totalTrafficBytes = telemetry.totalRxBytes + telemetry.totalTxBytes;
 
   const totalActions =
     telemetry.proxiedCount + telemetry.directCount + telemetry.blockedCount || 1;
@@ -87,18 +118,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       {/* Reassuring Health Summary Banner (Always visible, front and center for beginners) */}
       <div
         className={`tf-card flex flex-wrap items-center justify-between gap-4 border-l-4 p-5 ${
-          diagnostics.running ? 'border-l-tf-green' : 'border-l-tf-red'
+          isEngineRunning ? 'border-l-tf-green' : 'border-l-tf-red'
         }`}
       >
         <div className="flex items-start gap-3.5">
           <div
             className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-tf-lg ${
-              diagnostics.running
+              isEngineRunning
                 ? 'bg-tf-green/20 text-tf-green'
                 : 'bg-tf-red/20 text-tf-red'
             }`}
           >
-            {diagnostics.running ? (
+            {isEngineRunning ? (
               <ShieldCheck className="h-6 w-6" />
             ) : (
               <ShieldAlert className="h-6 w-6" />
@@ -107,24 +138,24 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-bold text-tf-primary">
-                {diagnostics.running
+                {isEngineRunning
                   ? t('dashboard.health_banner.protected_title')
                   : t('dashboard.health_banner.paused_title')}
               </h2>
               <span
                 className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${
-                  diagnostics.running
+                  isEngineRunning
                     ? 'bg-tf-green/20 text-tf-green'
                     : 'bg-tf-red/20 text-tf-red'
                 }`}
               >
-                {diagnostics.running
+                {isEngineRunning
                   ? t('dashboard.health_banner.status_badge_ok')
                   : t('dashboard.health_banner.status_badge_off')}
               </span>
             </div>
             <p className="mt-1 max-w-2xl text-xs text-tf-secondary">
-              {diagnostics.running
+              {isEngineRunning
                 ? t('dashboard.health_banner.protected_desc')
                 : t('dashboard.health_banner.paused_desc')}
             </p>
@@ -132,6 +163,23 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {experienceMode === 'simple' && onToggleEngine && (
+            <button
+              type="button"
+              disabled={!diagnostics.daemonConnected}
+              onClick={onToggleEngine}
+              className={`flex items-center gap-2 rounded-tf-md px-4 py-2 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                isEngineRunning
+                  ? 'border border-tf-orange/40 bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
+                  : 'bg-tf-green text-tf-bg hover:opacity-90'
+              }`}
+            >
+              <Power className="h-3.5 w-3.5" />
+              {isEngineRunning
+                ? t('app.header.engine.pause')
+                : t('app.header.engine.start')}
+            </button>
+          )}
           <button
             onClick={onOpenWizard}
             className="tf-btn-accent flex items-center gap-2 px-3.5 py-2 text-xs"
@@ -149,7 +197,185 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </div>
 
-      {/* KPI Cards with Educational Tooltips */}
+      {experienceMode === 'simple' ? (
+        <>
+          {/* Active Proxy Status Summary Card */}
+          <div className="tf-card flex flex-wrap items-center justify-between gap-4 p-5">
+            <div className="flex items-center gap-3.5">
+              <div className="flex h-10 w-10 items-center justify-center rounded-tf-md bg-tf-cyan/15 text-tf-cyan">
+                <Server className="h-5 w-5" />
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-tf-secondary">
+                  {t('dashboard.simple.proxy_summary_label')}
+                </div>
+                {primaryProxy ? (
+                  <div className="mt-0.5 flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-bold text-tf-primary">
+                      {primaryProxy.name}
+                    </span>
+                    <span className="rounded-tf-sm bg-tf-surface-alt px-2 py-0.5 font-mono text-[11px] text-tf-cyan">
+                      {primaryProxy.protocol.toUpperCase()} - {primaryProxy.host}:
+                      {primaryProxy.port}
+                    </span>
+                    {primaryProxy.lastLatencyMs !== null && (
+                      <span className="rounded-tf-sm bg-tf-green/15 px-2 py-0.5 font-mono text-[11px] font-semibold text-tf-green">
+                        {primaryProxy.lastLatencyMs} ms
+                      </span>
+                    )}
+                    {primaryProxy.exitIp && (
+                      <span className="font-mono text-xs text-tf-secondary">
+                        ({primaryProxy.exitIp})
+                      </span>
+                    )}
+                  </div>
+                ) : (
+                  <div className="mt-0.5 text-sm font-semibold text-tf-orange">
+                    {t('dashboard.simple.no_proxy_configured')}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {primaryProxy && onTestPrimaryProxy && (
+                <button
+                  type="button"
+                  onClick={() => onTestPrimaryProxy(primaryProxy.id)}
+                  className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan"
+                >
+                  <Activity className="h-3.5 w-3.5" />
+                  {t('dashboard.simple.test_proxy_cta')}
+                </button>
+              )}
+              {onNavigateProxy && (
+                <button
+                  type="button"
+                  onClick={onNavigateProxy}
+                  className="tf-btn-primary flex items-center gap-1.5 px-3 py-1.5 text-xs"
+                >
+                  <Server className="h-3.5 w-3.5" />
+                  {t('dashboard.simple.configure_proxy_cta')}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* 3 Reassuring Human Metrics */}
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <div className="tf-card p-4">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wider text-tf-secondary">
+                  {t('dashboard.simple.metric_protected_apps')}
+                </span>
+                <Shield className="h-4 w-4 text-tf-accent" />
+              </div>
+              <div className="mt-2 text-2xl font-bold text-tf-primary">
+                {protectedRuleCount}
+              </div>
+            </div>
+
+            <div className="tf-card p-4">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wider text-tf-secondary">
+                  {t('dashboard.simple.metric_leaks_blocked')}
+                </span>
+                <ShieldAlert className="h-4 w-4 text-tf-green" />
+              </div>
+              <div className="mt-2 text-2xl font-bold text-tf-green">
+                {telemetry.blockedCount}
+              </div>
+            </div>
+
+            <div className="tf-card p-4">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wider text-tf-secondary">
+                  {t('dashboard.simple.metric_protected_traffic')}
+                </span>
+                <Globe className="h-4 w-4 text-tf-cyan" />
+              </div>
+              <div className="mt-2 text-2xl font-bold text-tf-cyan">
+                {formatBytes(totalTrafficBytes)}
+              </div>
+            </div>
+          </div>
+
+          {/* 4 Use-Case Scenario Preset Cards */}
+          <div className="tf-card p-5">
+            <h3 className="text-sm font-bold text-tf-primary">
+              {t('dashboard.simple.use_cases_title')}
+            </h3>
+            <p className="mt-0.5 text-xs text-tf-secondary">
+              {t('dashboard.simple.use_cases_subtitle')}
+            </p>
+            <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              {(
+                [
+                  {
+                    id: 'privacy' as DashboardUseCaseId,
+                    icon: ShieldCheck,
+                    color: 'text-tf-green',
+                    title: t('dashboard.simple.uc_privacy_title'),
+                    desc: t('dashboard.simple.uc_privacy_desc')
+                  },
+                  {
+                    id: 'work' as DashboardUseCaseId,
+                    icon: Briefcase,
+                    color: 'text-tf-cyan',
+                    title: t('dashboard.simple.uc_work_title'),
+                    desc: t('dashboard.simple.uc_work_desc')
+                  },
+                  {
+                    id: 'gaming' as DashboardUseCaseId,
+                    icon: Gamepad2,
+                    color: 'text-tf-orange',
+                    title: t('dashboard.simple.uc_gaming_title'),
+                    desc: t('dashboard.simple.uc_gaming_desc')
+                  },
+                  {
+                    id: 'strict' as DashboardUseCaseId,
+                    icon: Lock,
+                    color: 'text-tf-purple',
+                    title: t('dashboard.simple.uc_strict_title'),
+                    desc: t('dashboard.simple.uc_strict_desc')
+                  }
+                ]
+              ).map((card) => {
+                const CardIcon = card.icon;
+                return (
+                  <button
+                    key={card.id}
+                    type="button"
+                    onClick={() => onApplyUseCase?.(card.id)}
+                    className="tf-surface-alt flex flex-col items-start gap-2 rounded-tf-md p-4 text-left transition hover:border-tf-accent"
+                  >
+                    <CardIcon className={`h-5 w-5 ${card.color}`} />
+                    <div className="text-xs font-bold text-tf-primary">
+                      {card.title}
+                    </div>
+                    <p className="text-[11px] leading-relaxed text-tf-secondary">
+                      {card.desc}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="flex justify-center">
+            <button
+              type="button"
+              onClick={onSwitchToExpert}
+              className="tf-surface-alt flex items-center gap-2 px-4 py-2 text-xs font-medium text-tf-secondary hover:border-tf-cyan hover:text-tf-cyan"
+            >
+              <Terminal className="h-3.5 w-3.5" />
+              {t('dashboard.health_banner.switch_expert_cta')}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          {/* KPI Cards with Educational Tooltips */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div className="tf-card p-4">
           <div className="flex items-center justify-between">
@@ -505,61 +731,51 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </div>
 
-      {/* Subsystem Diagnostics (Shown in Expert Mode, or accessible via 1 click in Simple Mode) */}
-      {experienceMode === 'expert' ? (
-        <div className="tf-card p-5">
-          <div className="mb-3 flex items-center gap-2">
-            <Cpu className="h-4 w-4 text-tf-accent" />
-            <h3 className="text-sm font-bold text-tf-primary">
-              {t('dashboard.system.status.title')}
-            </h3>
+      {/* Subsystem Diagnostics (Expert Mode) */}
+      <div className="tf-card p-5">
+        <div className="mb-3 flex items-center gap-2">
+          <Cpu className="h-4 w-4 text-tf-accent" />
+          <h3 className="text-sm font-bold text-tf-primary">
+            {t('dashboard.system.status.title')}
+          </h3>
+        </div>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="tf-surface-alt p-3">
+            <div className="text-[11px] uppercase text-tf-secondary">
+              {t('dashboard.system.status.os_label')}
+            </div>
+            <div className="mt-1 font-mono text-sm font-bold text-tf-primary">
+              {diagnostics.osName}
+            </div>
           </div>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <div className="tf-surface-alt p-3">
-              <div className="text-[11px] uppercase text-tf-secondary">
-                {t('dashboard.system.status.os_label')}
-              </div>
-              <div className="mt-1 font-mono text-sm font-bold text-tf-primary">
-                {diagnostics.osName}
-              </div>
+          <div className="tf-surface-alt p-3">
+            <div className="text-[11px] uppercase text-tf-secondary">
+              {t('dashboard.system.status.relay_tcp_label')}
             </div>
-            <div className="tf-surface-alt p-3">
-              <div className="text-[11px] uppercase text-tf-secondary">
-                {t('dashboard.system.status.relay_tcp_label')}
-              </div>
-              <div className="mt-1 flex items-center gap-1.5 font-mono text-sm font-bold text-tf-cyan">
-                <Server className="h-3.5 w-3.5" />
-                {diagnostics.relayTcpEndpoint}
-              </div>
+            <div className="mt-1 flex items-center gap-1.5 font-mono text-sm font-bold text-tf-cyan">
+              <Server className="h-3.5 w-3.5" />
+              {diagnostics.relayTcpEndpoint}
             </div>
-            <div className="tf-surface-alt p-3">
-              <div className="text-[11px] uppercase text-tf-secondary">
-                {t('dashboard.system.status.relay_http_label')}
-              </div>
-              <div className="mt-1 font-mono text-sm font-bold text-tf-orange">
-                {diagnostics.relayHttpEndpoint}
-              </div>
+          </div>
+          <div className="tf-surface-alt p-3">
+            <div className="text-[11px] uppercase text-tf-secondary">
+              {t('dashboard.system.status.relay_http_label')}
             </div>
-            <div className="tf-surface-alt p-3">
-              <div className="text-[11px] uppercase text-tf-secondary">
-                {t('dashboard.system.status.dns_server_label')}
-              </div>
-              <div className="mt-1 font-mono text-sm font-bold text-tf-green">
-                {diagnostics.dnsEndpoint}
-              </div>
+            <div className="mt-1 font-mono text-sm font-bold text-tf-orange">
+              {diagnostics.relayHttpEndpoint}
+            </div>
+          </div>
+          <div className="tf-surface-alt p-3">
+            <div className="text-[11px] uppercase text-tf-secondary">
+              {t('dashboard.system.status.dns_server_label')}
+            </div>
+            <div className="mt-1 font-mono text-sm font-bold text-tf-green">
+              {diagnostics.dnsEndpoint}
             </div>
           </div>
         </div>
-      ) : (
-        <div className="flex justify-center">
-          <button
-            onClick={onSwitchToExpert}
-            className="tf-surface-alt flex items-center gap-2 px-4 py-2 text-xs font-medium text-tf-secondary hover:border-tf-cyan hover:text-tf-cyan"
-          >
-            <Terminal className="h-3.5 w-3.5" />
-            {t('dashboard.health_banner.switch_expert_cta')}
-          </button>
-        </div>
+      </div>
+        </>
       )}
     </div>
   );

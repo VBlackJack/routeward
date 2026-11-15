@@ -25,12 +25,12 @@
       "tooltip": "Activer / Désactiver le Proxy Système Windows (127.0.0.1:10809)"
     },
     "experience_mode": {
-      "simple": "Mode Simple",
-      "expert": "Mode Expert",
-      "tooltip": "Basculer entre l'interface simplifiée guidée (Débutant) et la vue ingénieur complète (SysAdmin)"
+      "simple": "Simple",
+      "expert": "Avancé",
+      "tooltip": "Basculer entre l'interface simplifiée par cas d'usage et les outils techniques complets"
     },
     "help": {
-      "wizard_button": "Assistant de Démarrage",
+      "wizard_button": "Aide rapide",
       "glossary_button": "Lexique & Aide"
     },
     "daemon_banner": {
@@ -48,7 +48,14 @@
       },
       "engine": {
         "running": "Intercepteur Actif",
-        "stopped": "Intercepteur en Pause"
+        "stopped": "Intercepteur en Pause",
+        "start": "Activer la protection",
+        "pause": "Mettre en pause"
+      },
+      "status": {
+        "protected": "Protégé",
+        "paused": "En pause",
+        "disconnected": "Service arrêté"
       },
       "mode": {
         "hybrid": "Hybride (Fake-IP + Pilote/Relais)",
@@ -75,6 +82,21 @@
     },
     "nav": {
       "tablist_label": "Onglets de navigation principaux",
+      "home": {
+        "tab": "Accueil"
+      },
+      "apps": {
+        "tab": "Mes Apps & Sites"
+      },
+      "proxy": {
+        "tab": "Mon Proxy"
+      },
+      "activity": {
+        "tab": "Activité"
+      },
+      "settings": {
+        "tab": "Réglages"
+      },
       "dashboard": {
         "tab": "Tableau de Bord"
       },
@@ -142,6 +164,9 @@
         "imported": "Profil de configuration importé",
         "import_error": "Fichier JSON de profil invalide",
         "exported": "Profil exporté au format JSON"
+      },
+      "usecase": {
+        "applied": "Scénario appliqué"
       }
     }
   },
@@ -167,12 +192,31 @@
       "protected_title": "Tout fonctionne - Votre connexion est protégée",
       "protected_desc": "RouteWard intercepte automatiquement le trafic de vos applications selon vos règles et empêche toute fuite d'adresse IP ou de DNS.",
       "paused_title": "Protection en pause - Vos applications se connectent en direct",
-      "paused_desc": "Le moteur d'interception est actuellement arrêté. Cliquez sur \"Démarrer\" pour réactiver le routage via votre proxy.",
+      "paused_desc": "Le moteur d'interception est actuellement arrêté. Cliquez sur \"Activer la protection\" pour réactiver le routage via votre proxy.",
       "quick_wizard_cta": "Configuration Guidée en 3 Clics",
       "choose_apps_cta": "Choisir mes Applications",
       "switch_expert_cta": "Voir les Diagnostics Avancés (Expert)",
       "status_badge_ok": "Bouclier Actif",
       "status_badge_off": "Inactif"
+    },
+    "simple": {
+      "metric_protected_apps": "Règles d'Apps Protégées",
+      "metric_leaks_blocked": "Fuites & Blocs Stoppés",
+      "metric_protected_traffic": "Trafic Total Traité",
+      "proxy_summary_label": "Serveur Proxy Actif",
+      "no_proxy_configured": "Aucun serveur proxy configuré",
+      "configure_proxy_cta": "Configurer un Proxy",
+      "test_proxy_cta": "Vérifier la Connexion",
+      "use_cases_title": "Que voulez-vous faire aujourd'hui ?",
+      "use_cases_subtitle": "Choisissez un scénario prêt à l'emploi pour configurer vos applications et votre protection en un clic.",
+      "uc_privacy_title": "Navigation Privée",
+      "uc_privacy_desc": "Masque votre IP dans les navigateurs web et bloque la télémétrie système.",
+      "uc_work_title": "Télétravail & Outils Dev",
+      "uc_work_desc": "Protège navigateurs et outils de travail tout en gardant votre réseau local en direct.",
+      "uc_gaming_title": "Jeux & Appels Vidéo",
+      "uc_gaming_desc": "Garde les jeux en direct pour une latence minimale tout en protégeant vos navigateurs.",
+      "uc_strict_title": "Verrouillage Anti-Fuite Maximal",
+      "uc_strict_desc": "Active Kill-Switch, DNS anti-fuite, garde UDP et blocage des contournements DNS chiffrés."
     },
     "tooltips": {
       "active_connections": "Nombre de programmes sur votre ordinateur qui échangent actuellement des données avec Internet.",
@@ -252,6 +296,20 @@
     }
   },
   "connections": {
+    "simple": {
+      "title": "Activité Réseau des Applications",
+      "subtitle": "Voyez comment chaque application se connecte et changez son routage en un clic.",
+      "search_placeholder": "Rechercher une application ou un site web...",
+      "filter_all": "Tout",
+      "filter_proxied": "Protégées",
+      "filter_blocked": "Bloquées",
+      "route_proxy": "Via Proxy",
+      "route_direct": "Direct",
+      "route_blocked": "Bloquer",
+      "count_connections": "connexions",
+      "no_apps": "Aucune activité d'application ne correspond à votre filtre.",
+      "switch_expert_cta": "Afficher les sockets bruts et PIDs (Avancé)"
+    },
     "toolbar": {
       "search": {
         "placeholder": "Filtrer par processus, domaine, IP, règle ou proxy..."
@@ -329,6 +387,15 @@
     }
   },
   "proxies": {
+    "simple": {
+      "title": "Mon Serveur Proxy",
+      "subtitle": "Ajoutez votre serveur proxy ou lien d'abonnement et vérifiez qu'il répond correctement.",
+      "add": "Ajouter un Proxy",
+      "empty": "Aucun proxy configuré pour le moment. Ajoutez-en un pour router vos applications.",
+      "show_advanced_options": "Afficher les options protocole (UDP / TLS)",
+      "hide_advanced_options": "Masquer les options protocole",
+      "active_badge": "Principal"
+    },
     "section": {
       "servers": {
         "title": "Serveurs Proxy en Amont",
@@ -412,6 +479,22 @@
     }
   },
   "rules": {
+    "simple": {
+      "title": "Mes Applications & Sites",
+      "subtitle": "Choisissez quelles applications ou sites passent par votre proxy, en direct, ou restent bloqués.",
+      "add_button": "Ajouter une App ou un Site",
+      "custom_rules_title": "Règles Personnalisées",
+      "custom_rules_empty": "Aucune règle personnalisée. Utilisez les cartes ci-dessus ou ajoutez une app/un site.",
+      "type_app": "Application",
+      "type_site": "Site Web",
+      "target_app_label": "Nom de l'application (ex. firefox.exe ou spotify)",
+      "target_app_placeholder": "spotify.exe",
+      "target_site_label": "Site web ou domaine (ex. *.exemple.com)",
+      "target_site_placeholder": "*.exemple.com",
+      "action_label": "Comment doit-elle se connecter ?",
+      "show_advanced_options": "Afficher les champs avancés (priorité, CIDR, ports)",
+      "hide_advanced_options": "Revenir au formulaire simple"
+    },
     "header": {
       "title": "Règles de Routage par Processus et Destination",
       "subtitle": "Les règles sont évaluées par ordre de priorité croissant. La première correspondance s'applique.",
@@ -739,6 +822,48 @@
         "simple": "Le \"Proxy Système\" configure tout Windows en 1 clic. Le \"Lanceur\" démarre uniquement un logiciel précis à travers le proxy.",
         "expert": "Modification du registre HKCU Internet Settings ou injection ciblée des variables d'environnement ALL_PROXY / HTTP_PROXY / HTTPS_PROXY sur le processus enfant."
       }
+    }
+  },
+  "settings": {
+    "header": {
+      "title": "Réglages & Outils",
+      "subtitle": "Personnalisez la langue, l'apparence, la protection anti-fuite et les diagnostics système."
+    },
+    "general": {
+      "title": "Général & Apparence",
+      "language_label": "Langue d'affichage",
+      "theme_label": "Thème de couleurs",
+      "theme_open": "Personnaliser ThemeForge",
+      "help_title": "Aide Guidée",
+      "help_desc": "Besoin d'un rappel ? Relancez l'assistant en 3 étapes ou consultez le lexique simplifié."
+    },
+    "security": {
+      "title": "Protection Anti-Fuite",
+      "simple_shield_title": "Bouclier Anti-Fuite Tout-en-Un",
+      "simple_shield_desc": "Garde votre vraie IP masquée si le proxy coupe, stoppe les fuites UDP et bloque les contournements DNS.",
+      "simple_shield_on": "Toutes protections actives",
+      "simple_shield_off": "Protection partielle",
+      "block_quic_title": "Bloquer QUIC (UDP 443)",
+      "block_quic_desc": "Force les navigateurs à utiliser le TCP HTTPS standard plutôt que QUIC UDP.",
+      "block_dot_title": "Bloquer Contournement DNS Chiffré (Port 853)",
+      "block_dot_desc": "Empêche les apps de contourner le DNS Fake-IP via des serveurs DoT/DoQ externes."
+    },
+    "system": {
+      "title": "Intégration Système & Profil",
+      "subtitle": "Mode d'interception avancé, proxy système Windows, lanceur CLI et sauvegarde JSON.",
+      "interception_mode_label": "Mode du Moteur d'Interception",
+      "system_proxy_label": "Proxy Système Windows (Relais HTTP)",
+      "launcher_title": "Lancer un Programme via Proxy",
+      "launcher_desc": "Démarre un exécutable avec ALL_PROXY et HTTPS_PROXY préconfigurés.",
+      "profile_title": "Sauvegarde de Profil (JSON)",
+      "profile_desc": "Importez ou exportez tous vos proxies, règles et préférences."
+    },
+    "diagnostics": {
+      "title": "Diagnostics Techniques",
+      "hide_title": "Masquer les diagnostics",
+      "subtab_overview": "Vue d'ensemble",
+      "subtab_dns": "Cache DNS Fake-IP",
+      "subtab_logs": "Journaux d'Événements"
     }
   }
 }
