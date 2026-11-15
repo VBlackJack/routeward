@@ -47,6 +47,7 @@ interface ConnectionsViewProps {
   onClearClosed: () => void;
   onTerminateConnection: (connectionId: string) => void;
   onQuickCreateRule: (rule: RoutingRule) => void;
+  onMissingProxy?: () => void;
   onSwitchToExpert?: () => void;
   onExportActivity?: (format: 'csv' | 'json') => void;
 }
@@ -73,6 +74,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
   onClearClosed,
   onTerminateConnection,
   onQuickCreateRule,
+  onMissingProxy,
   onSwitchToExpert,
   onExportActivity
 }) => {
@@ -169,7 +171,11 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
     conn: TrackedConnection,
     actionType: 'proxy' | 'direct' | 'block'
   ) => {
-    const primaryProxyId = proxies[0]?.id || 'proxy-socks5-primary';
+    const primaryProxyId = proxies.find((p) => p.enabled)?.id;
+    if (actionType === 'proxy' && !primaryProxyId) {
+      onMissingProxy?.();
+      return;
+    }
     onQuickCreateRule({
       id: generateClientId('rule-quick'),
       name: `${conn.processName} (${actionType.toUpperCase()})`,
@@ -181,9 +187,9 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
       portRanges: [],
       protocol: 'any',
       action:
-        actionType === 'proxy'
+        actionType === 'proxy' && primaryProxyId
           ? { type: 'proxy', targetId: primaryProxyId }
-          : { type: actionType }
+          : { type: actionType === 'proxy' ? 'direct' : actionType }
     });
   };
 

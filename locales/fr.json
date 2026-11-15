@@ -143,7 +143,8 @@
         "added": "Serveur proxy ajouté au profil",
         "imported_uris": "Serveurs proxies importés depuis la liste d'URI",
         "copied_uri": "URI du proxy copiée dans le presse-papiers",
-        "tested": "Test de latence et de santé du proxy terminé"
+        "tested": "Test de latence et de santé du proxy terminé",
+        "required_for_rule": "Ajoutez et activez d'abord un serveur proxy externe pour router un flux via proxy"
       },
       "connection": {
         "terminated": "Socket de connexion terminé",
@@ -165,7 +166,8 @@
         "process_launch_error": "Échec du lancement du processus via le proxy"
       },
       "wizard": {
-        "completed": "Configuration appliquée avec succès via l'Assistant"
+        "completed": "Configuration appliquée avec succès via l'Assistant",
+        "completed_direct_no_proxy": "Mode Filtrage Direct actif (aucun serveur proxy externe configuré pour le moment)"
       },
       "dns": {
         "flushed": "Cache DNS Fake-IP purgé"
@@ -184,7 +186,8 @@
         "import_error": "Fichier ou JSON FoxyProxy invalide"
       },
       "usecase": {
-        "applied": "Scénario appliqué"
+        "applied": "Scénario appliqué",
+        "applied_direct_no_proxy": "Règles de filtrage direct appliquées (ajoutez un proxy externe dans Serveur Proxy pour créer un tunnel)"
       },
       "engine": {
         "driver_missing": "Le pilote WinDivert est absent du dossier d'installation (exécutez tools/fetch-windivert.ps1)",
@@ -242,7 +245,10 @@
       "metric_protected_traffic": "Trafic Total Traité",
       "proxy_summary_label": "Serveur Proxy Actif",
       "no_proxy_configured": "Aucun serveur proxy configuré",
+      "direct_filter_mode_title": "Mode Filtrage Direct (Sans Proxy Externe)",
+      "direct_filter_mode_desc": "Le filtrage actif, le blocage des pisteurs et vos règles locales s'appliquent directement sur votre connexion Internet.",
       "configure_proxy_cta": "Configurer un Proxy",
+      "add_optional_proxy_cta": "Ajouter un Proxy Externe (Optionnel)",
       "test_proxy_cta": "Vérifier la Connexion",
       "use_cases_title": "Que voulez-vous faire aujourd'hui ?",
       "use_cases_subtitle": "Choisissez un scénario prêt à l'emploi pour configurer vos applications et votre protection en un clic.",
@@ -427,11 +433,15 @@
     }
   },
   "proxies": {
+    "external_explainer": {
+      "title": "RouteWard est un routeur de trafic, pas un serveur proxy intégré",
+      "desc": "Configurez ci-dessous votre propre serveur proxy externe SOCKS5, HTTP ou HTTPS (tunnel SSH, Tor, passerelle VPN ou proxy d'entreprise). Sans proxy actif, RouteWard fonctionne en Mode Filtrage Direct."
+    },
     "simple": {
       "title": "Mon Serveur Proxy",
       "subtitle": "Ajoutez votre serveur proxy ou lien d'abonnement et vérifiez qu'il répond correctement.",
       "add": "Ajouter un Proxy",
-      "empty": "Aucun proxy configuré pour le moment. Ajoutez-en un pour router vos applications.",
+      "empty": "Aucun proxy externe configuré pour le moment. Vous pouvez déjà filtrer et bloquer vos applications en direct, ou ajouter votre serveur proxy ci-dessus.",
       "show_advanced_options": "Afficher les options protocole (UDP / TLS)",
       "hide_advanced_options": "Masquer les options protocole",
       "active_badge": "Principal"
@@ -487,6 +497,7 @@
         "name_label": "Nom d'affichage",
         "protocol_label": "Protocole",
         "host_label": "Hôte / Adresse IP",
+        "host_placeholder": "proxy.example.com",
         "port_label": "Port",
         "username_label": "Identifiant (Optionnel)",
         "password_label": "Mot de passe (Optionnel)",
@@ -503,7 +514,7 @@
       "import_uri": {
         "title": "Import en Lot de Proxies (URI ou Abonnement Base64)",
         "subtitle": "Collez des URI de proxy (socks5://, http://, https://) ou une charge d'abonnement encodée en Base64",
-        "placeholder": "socks5://user:pass@127.0.0.1:1080#LocalSocks\nhttps://user:pass@edge.example.com:443?sni=edge.example.com#EdgeHttps",
+        "placeholder": "socks5://user:pass@proxy.example.com:1080#ExternalSocks\nhttps://user:pass@edge.example.com:443?sni=edge.example.com#EdgeHttps",
         "submit": "Importer les Proxies",
         "cancel": "Annuler"
       },
@@ -534,6 +545,12 @@
       "target_app_placeholder": "spotify.exe",
       "target_site_label": "Site web ou domaine (ex. *.exemple.com)",
       "target_site_placeholder": "*.exemple.com",
+      "quick_edge_chip": "Edge (msedge.exe)",
+      "optional_site_label": "Uniquement pour ces domaines (Optionnel, ex. meshcore.net, *.meshcore.net)",
+      "optional_site_placeholder": "meshcore.net, *.meshcore.net (laisser vide pour tous les sites)",
+      "optional_site_hint": "Astuce : laissez vide pour tout le trafic de l'application, ou saisissez des motifs comme *.meshcore.net pour ne router via proxy que ces domaines.",
+      "optional_app_label": "Uniquement pour ces applications (Optionnel, ex. msedge.exe)",
+      "optional_app_placeholder": "msedge.exe (laisser vide pour toutes les apps)",
       "action_label": "Comment doit-elle se connecter ?",
       "show_advanced_options": "Afficher les champs avancés (priorité, CIDR, ports)",
       "hide_advanced_options": "Revenir au formulaire simple"
@@ -570,8 +587,8 @@
     "visual_apps": {
       "section_title": "Mes Applications - Routage Visuel en 1 Clic",
       "section_subtitle": "Choisissez comment chaque catégorie d'application doit se connecter à Internet, sans avoir à connaître les noms de fichiers .exe ou les ports.",
-      "action_proxy": "Protéger via Proxy",
-      "action_direct": "Connexion Directe (Normal)",
+      "action_proxy": "Via Proxy Externe",
+      "action_direct": "Direct (Filtrage Seul)",
       "action_block": "Bloquer Internet",
       "browsers": {
         "name": "Navigateurs Web",
@@ -841,9 +858,11 @@
       "step1_gaming_title": "Jeux en Ligne & Performances",
       "step1_gaming_desc": "Laisser mes jeux en connexion directe ultra-rapide et router uniquement Discord/Navigateur.",
       "step2_title": "2. Quel serveur Proxy souhaitez-vous utiliser ?",
-      "step2_use_existing": "Utiliser le serveur proxy configuré par défaut",
+      "step2_use_existing": "Utiliser le serveur proxy externe configuré",
+      "step2_no_proxy_title": "Aucun proxy externe configuré - Mode Filtrage Direct prêt",
+      "step2_no_proxy_desc": "RouteWard n'embarque pas de serveur proxy interne. Poursuivez sans URI pour filtrer pisteurs et règles locales en direct, ou collez l'URI de votre propre proxy externe ci-dessous.",
       "step2_paste_uri": "Ou collez un lien de connexion (socks5://, http://, https:// ou abonnement Base64) :",
-      "step2_uri_placeholder": "socks5://127.0.0.1:1080#MonProxy",
+      "step2_uri_placeholder": "socks5://user:pass@proxy.example.com:1080#MonProxyExterne",
       "step3_title": "3. Niveau d'interface préféré",
       "step3_simple_title": "Mode Simple (Recommandé pour débuter)",
       "step3_simple_desc": "Explications claires, sélecteur d'applications par icônes et diagnostic visuel rassurant.",

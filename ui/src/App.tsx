@@ -368,23 +368,41 @@ export const App: React.FC = () => {
   };
 
   const handleApplyUseCase = async (useCase: DashboardUseCaseId) => {
-    const primaryProxyId = profile.proxies[0]?.id || 'proxy-socks5-primary';
-    const primaryChainId = profile.chains[0]?.id || primaryProxyId;
+    const enabledProxies = profile.proxies.filter((p) => p.enabled);
+    const hasEnabledProxy = enabledProxies.length > 0;
+    const enabledChains = hasEnabledProxy
+      ? profile.chains.filter(
+          (c) =>
+            c.enabled &&
+            c.proxyIds.some((pid) => enabledProxies.some((p) => p.id === pid))
+        )
+      : [];
+    const primaryProxyId = enabledProxies[0]?.id;
+    let skippedProxyRule = false;
 
     const applyPresetById = async (presetId: string) => {
       const preset = SYSTEM_CONSTANTS.rulePresets.find((p) => p.id === presetId);
       if (!preset) return;
-      const actType = preset.suggestedActionType as
+      let actType = preset.suggestedActionType as
         | 'proxy'
         | 'chain'
         | 'direct'
         | 'block';
-      const targetId =
-        actType === 'proxy'
-          ? primaryProxyId
-          : actType === 'chain'
-            ? primaryChainId
-            : undefined;
+      let targetId: string | undefined;
+      if (actType === 'proxy') {
+        targetId = primaryProxyId;
+      } else if (actType === 'chain') {
+        if (enabledChains[0]?.id) {
+          targetId = enabledChains[0].id;
+        } else if (primaryProxyId) {
+          actType = 'proxy';
+          targetId = primaryProxyId;
+        }
+      }
+      if ((actType === 'proxy' || actType === 'chain') && !targetId) {
+        skippedProxyRule = true;
+        return;
+      }
       await routewardClient.upsertRule({
         id: `rule-uc-${preset.id}`,
         name: t(`${preset.i18nKey}.name`),
@@ -443,7 +461,14 @@ export const App: React.FC = () => {
       await applyPresetById('preset-block-os-telemetry');
     }
 
-    pushToast(t('app.toast.usecase.applied'));
+    pushToast(
+      t(
+        skippedProxyRule
+          ? 'app.toast.usecase.applied_direct_no_proxy'
+          : 'app.toast.usecase.applied'
+      ),
+      skippedProxyRule ? 'info' : 'success'
+    );
   };
 
   const handleExportProfile = () => {
@@ -803,6 +828,10 @@ export const App: React.FC = () => {
               }
             }}
             onListSystemApps={() => routewardClient.listSystemApplications()}
+            onMissingProxy={() => {
+              pushToast(t('app.toast.proxy.required_for_rule'), 'warning');
+              setActiveTab('proxy');
+            }}
           />
         )}
 
@@ -867,6 +896,10 @@ export const App: React.FC = () => {
               void routewardClient.upsertRule(rule).then(() => {
                 pushToast(t('app.toast.rule.created'));
               });
+            }}
+            onMissingProxy={() => {
+              pushToast(t('app.toast.proxy.required_for_rule'), 'warning');
+              setActiveTab('proxy');
             }}
             onSwitchToExpert={() => handleSetExperienceMode('expert')}
             onExportActivity={(fmt) => {
@@ -1013,15 +1046,25 @@ export const App: React.FC = () => {
           proxies={profile.proxies}
           chains={profile.chains}
           currentMode={experienceMode}
-          onImportUris={(text) => routewardClient.importProxyUris(text)}
+          onImportUris={async (text) => {
+            await routewardClient.importProxyUris(text);
+            return routewardClient.getProfile().proxies;
+          }}
           onAddRule={(rule) => routewardClient.upsertRule(rule)}
           onSelectMode={(mode) => handleSetExperienceMode(mode)}
-          onComplete={() => {
+          onComplete={(hasEnabledProxy) => {
             window.localStorage.setItem(
               UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED,
               'true'
             );
-            pushToast(t('app.toast.wizard.completed'));
+            pushToast(
+              t(
+                hasEnabledProxy === false
+                  ? 'app.toast.wizard.completed_direct_no_proxy'
+                  : 'app.toast.wizard.completed'
+              ),
+              hasEnabledProxy === false ? 'info' : 'success'
+            );
           }}
           onClose={() => {
             window.localStorage.setItem(

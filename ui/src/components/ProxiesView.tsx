@@ -82,8 +82,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   onRemoveChain
 }) => {
   const { t } = useTranslation();
-  const primaryProxyId =
-    (proxies.find((p) => p.enabled) ?? proxies[0] ?? null)?.id ?? null;
+  const primaryProxyId = proxies.find((p) => p.enabled)?.id ?? null;
   const importTitleId = useId();
   const proxyTitleId = useId();
   const chainTitleId = useId();
@@ -99,7 +98,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [replacingPassword, setReplacingPassword] = useState(true);
   const [name, setName] = useState('');
   const [protocol, setProtocol] = useState<ProxyProtocol>('socks5');
-  const [host, setHost] = useState('127.0.0.1');
+  const [host, setHost] = useState('');
   const [port, setPort] = useState<number>(UI_CONFIG.DEFAULT_PROXY_PORT);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -128,7 +127,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setReplacingPassword(true);
     setName('');
     setProtocol('socks5');
-    setHost('127.0.0.1');
+    setHost('');
     setPort(UI_CONFIG.DEFAULT_PROXY_PORT);
     setUsername('');
     setPassword('');
@@ -270,7 +269,16 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
           </div>
         </div>
 
-        {experienceMode === 'simple' && proxies.length === 0 ? (
+        <div className="rounded-tf-md border border-tf-cyan/30 bg-tf-cyan/10 p-4 text-xs">
+          <div className="font-bold text-tf-primary">
+            {t('proxies.external_explainer.title')}
+          </div>
+          <p className="mt-1 text-tf-secondary">
+            {t('proxies.external_explainer.desc')}
+          </p>
+        </div>
+
+        {proxies.length === 0 ? (
           <div className="tf-card p-6 text-center text-xs text-tf-secondary">
             {t('proxies.simple.empty')}
           </div>
@@ -588,6 +596,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   required
                   value={host}
                   onChange={(e) => setHost(e.target.value)}
+                  placeholder={t('proxies.modal.add_proxy.host_placeholder')}
                   className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
                 />
               </div>

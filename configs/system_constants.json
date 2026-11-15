@@ -305,7 +305,7 @@
         "vivaldi.exe",
         "opera.exe"
       ],
-      "defaultAction": "proxy"
+      "defaultAction": "direct"
     },
     {
       "id": "app-messaging",
@@ -321,7 +321,7 @@
         "signal-desktop",
         "Slack.exe"
       ],
-      "defaultAction": "proxy"
+      "defaultAction": "direct"
     },
     {
       "id": "app-gaming",
@@ -354,7 +354,7 @@
         "python.exe",
         "docker.exe"
       ],
-      "defaultAction": "proxy"
+      "defaultAction": "direct"
     },
     {
       "id": "app-media",
