@@ -84,3 +84,42 @@ npm run build
 Set-Location ..
 cargo build -p routeward-desktop
 ```
+
+## 7. `WinDivert.dll` Missing After Installing the Windows `.msi`
+
+**Symptom**:
+The `.msi` installer succeeded, but launching routing fails because `WinDivert.dll` is not present in the installation folder (typical when built without `-IncludeWinDivert`).
+
+**Resolution**:
+Run the bundled `fetch-windivert.ps1` script from an elevated PowerShell prompt to download and verify WinDivert directly into `C:\Program Files\RouteWard\`:
+
+```powershell
+& "C:\Program Files\RouteWard\fetch-windivert.ps1" -OutputDirectory "C:\Program Files\RouteWard"
+```
+
+## 8. Local PAC Server (`http://127.0.0.1:10811/proxy.pac`) or Edge Routing Issues
+
+**Symptom**:
+Microsoft Edge or WinINET applications still connect directly (or fail to fetch the PAC script) after enabling system PAC mode or importing FoxyProxy patterns.
+
+**Resolution**:
+1. Confirm the daemon is running so `http://127.0.0.1:10811/proxy.pac` returns HTTP `200`.
+2. Ensure Windows `AutoConfigURL` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` uses the loopback `http://127.0.0.1:<port>/...` URL (RouteWard rejects non-loopback URLs).
+3. Review `!` exclusion patterns (`preset-edge-foxyproxy` excludes `localhost`, `*.local`, `*.lan`, `*.internal`, and RFC1918 CIDRs) and rule priority order, or disable system PAC in Settings to clear `AutoConfigURL`.
+
+## 9. Corporate HTTPS Proxy Failures (`407 Negotiate` / `NTLM` or Self-Signed CA)
+
+**Symptom**:
+Connections through an upstream `http` or `https` proxy fail with authentication errors (`407 Proxy Authentication Required`) or TLS certificate validation errors in Activity `errorDetail`.
+
+**Resolution**:
+- **Windows SSPI (`Negotiate` / `NTLM`)**: Leave username and password empty on the upstream node to authenticate with the active Windows session, or supply explicit credentials if basic authentication is required.
+- **Self-signed inspection proxies**: Enable `tlsSkipVerify` on the `https` proxy node only when connecting to a trusted enterprise proxy whose root CA is not in the system trust store.
+
+## 10. Named Profiles Permission Error (`profiles/` Directory)
+
+**Symptom**:
+Listing, saving, or switching named profiles fails when running with elevated privileges.
+
+**Resolution**:
+Verify that `%ProgramData%\RouteWard\profiles` (Windows) or `/etc/routeward/profiles` (Linux) is a regular directory rather than a symlink, and ensure its ownership and ACLs grant access only to the daemon account (`Administrators` / `SYSTEM` on Windows, `root` on Linux).

@@ -84,3 +84,42 @@ npm run build
 Set-Location ..
 cargo build -p routeward-desktop
 ```
+
+## 7. `WinDivert.dll` introuvable après installation via le `.msi` Windows
+
+**Symptôme** :
+L'installateur `.msi` s'est terminé sans erreur, mais l'interception échoue car `WinDivert.dll` est absent du dossier d'installation (cas standard lorsque le `.msi` est compilé sans `-IncludeWinDivert`).
+
+**Solution** :
+Exécuter le script `fetch-windivert.ps1` fourni dans le dossier d'installation depuis un PowerShell administrateur afin de télécharger et vérifier WinDivert dans `C:\Program Files\RouteWard\` :
+
+```powershell
+& "C:\Program Files\RouteWard\fetch-windivert.ps1" -OutputDirectory "C:\Program Files\RouteWard"
+```
+
+## 8. Serveur PAC local (`http://127.0.0.1:10811/proxy.pac`) ou routage Microsoft Edge
+
+**Symptôme** :
+Microsoft Edge ou les applications WinINET contournent toujours le proxy (ou échouent à charger le script PAC) après activation du PAC système ou import FoxyProxy.
+
+**Solution** :
+1. Vérifier que le daemon est démarré afin que `http://127.0.0.1:10811/proxy.pac` réponde HTTP `200`.
+2. Contrôler que `AutoConfigURL` dans `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` pointe vers une URL loopback `http://127.0.0.1:<port>/...` (RouteWard refuse les URL non loopback).
+3. Vérifier les exclusions `!` (`preset-edge-foxyproxy` exclut `localhost`, `*.local`, `*.lan`, `*.internal` et les plages RFC1918) et l'ordre de priorité des règles, ou désactiver le PAC système dans les Paramètres pour supprimer `AutoConfigURL`.
+
+## 9. Erreurs sur Proxy HTTPS d'entreprise (`407 Negotiate` / `NTLM` ou CA auto-signée)
+
+**Symptôme** :
+Les flux routés via un noeud `http` ou `https` échouent avec une erreur `407 Proxy Authentication Required` ou une erreur de certificat TLS visible dans `errorDetail` de l'Activité.
+
+**Solution** :
+- **SSPI Windows (`Negotiate` / `NTLM`)** : Laisser les champs utilisateur et mot de passe vides sur le noeud pour utiliser la session Windows active, ou renseigner des identifiants explicites si le proxy exige une authentification basique.
+- **Certificat d'inspection auto-signé** : Activer `tlsSkipVerify` sur le noeud proxy `https` uniquement pour un proxy d'entreprise de confiance dont l'autorité racine n'est pas installée sur le poste.
+
+## 10. Erreur de permission sur les profils nommés (dossier `profiles/`)
+
+**Symptôme** :
+Le listage, la sauvegarde ou le basculement des profils nommés échoue lorsque le daemon tourne avec privilèges élevés.
+
+**Solution** :
+Vérifier que `%ProgramData%\RouteWard\profiles` (Windows) ou `/etc/routeward/profiles` (Linux) est un répertoire standard et non un lien symbolique, puis contrôler que son propriétaire et ses ACL restreignent l'accès au compte du daemon (`Administrators` / `SYSTEM` sous Windows, `root` sous Linux).
