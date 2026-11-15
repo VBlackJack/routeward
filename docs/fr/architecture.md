@@ -64,7 +64,7 @@ RouteWard est organisé en workspace Rust comprenant trois crates (`routeward-co
 - **Groupes intelligents (`Failover`, `LowestLatency`, `LoadBalance`)** : Les groupes basculent uniquement vers un autre noeud proxy actif du même groupe (`ProxyConnector::connect_group`). Si tous les noeuds du groupe échouent et que `killSwitchEnabled` vaut `true`, le flux est bloqué et ne sort jamais en `Direct`.
 - **Fail-open à l'arrêt ou au crash du daemon conservé** : L'arrêt de l'interception (`ctl stop`) ou le crash du daemon (`SIGKILL` / `Stop-Process -Force`) retire les règles d'interception OS et laisse passer le trafic en direct (fail-open), sans changement par rapport aux jalons 1 à 3.
 - **Contournement DNS en environnement Active Directory / Split-Horizon (`dnsConfig.bypassDomains`)** : Dans les environnements Active Directory et d'entreprise, la liste `dnsConfig.bypassDomains` permet de configurer les suffixes de domaine internes, zones privées et zones inverses (par exemple `*.ad.entreprise.tld`, `*.internal`, `*.local`, `10.in-addr.arpa`, `168.192.in-addr.arpa`, `*.ip6.arpa`) qui sont résolus en direct sans attribution Fake-IP ni passage par le proxy distant.
-- **Non implémenté à ce stade** : Interception IPv6 (Lot 4.3).
+- **Différé au Lot 4.0 (Implémenté ci-dessous)** : Capture DNS transparente (Lot 4.1), relais UDP (Lot 4.2) et interception double pile IPv6 (Lot 4.3).
 
 ### État du Milestone 4 - Lot 4.0.1 (Fermeture des Fuites Indirectes)
 - **Politique d'expiration de `PendingSynQueue` sous Windows (`routeward-core::interceptor::nat` & `windivert`)** :
@@ -152,7 +152,7 @@ RouteWard est organisé en workspace Rust comprenant trois crates (`routeward-co
   - **`TransparentNatTable` (`routeward-core::interceptor::nat`)** : Généralise les tables NAT inverses (`IpAddr`), les files d'attente SYN/UDP (`PendingSynQueue<T, M>`, `PendingUdpQueue<T, M>`), les sommes de contrôle et la forge synthétique ICMPv6 Port Unreachable / réponses UDP IPv6 aux côtés d'IPv4.
   - **Linux (`NftablesInterceptor` dans `routeward-core::interceptor::nftables`)** : Installe symétriquement `table ip routeward` et `table ip6 routeward` (y compris `ip -6 rule` / `ip -6 route` locaux vers `::1:10854`), interroge `SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST` (`query_original_dst_any`) ainsi que `IPV6_ORIGDSTADDR`, et nettoie atomiquement l'état IPv4 et IPv6 lors d'un `reload`, `stop`, déclenchement du watchdog ou `routeward cleanup`.
   - **Windows (`WinDivertInterceptor` dans `routeward-core::interceptor::windivert`)** : Intercepte et réfléchit les paquets sortants IPv6 (TCP SYN, UDP, QUIC `UDP 443`, DNS) via des filtres `WinDivert` double pile et des files d'attente IPv6 dédiées.
-  - **Écouteurs Double Pile du Contrôleur (`routeward-core::interceptor::controller`)** : Lie explicitement des sockets `0.0.0.0` et `[::]` (`IPV6_V6ONLY = 1`) pour le DNS UDP/TCP, le relais TCP transparent, le relais UDP TPROXY et les écouteurs SOCKS5/HTTP, ainsi que des pools directs UDP séparés IPv4/IPv6 (`acquire_direct_udp_socket`) et le formatage `[ipv6]:port` pour l'amorçage des proxys.
+  - **Écouteurs Double Pile du Contrôleur (`routeward-core::interceptor::controller`)** : Lie explicitement des sockets `0.0.0.0` et `[::]` (`IPV6_V6ONLY = 1`) pour le DNS UDP/TCP, le relais TCP transparent, le relais UDP TPROXY et les écouteurs SOCKS5/HTTP (sous Windows, `bind_udp_v6_only` crée un socket Winsock `SOCK_DGRAM` brut et applique `SO_REUSEADDR` et `IPV6_V6ONLY = 1` avant `bind` afin d'éviter l'erreur `WSAEINVAL` 10022), ainsi que des pools directs UDP séparés IPv4/IPv6 (`acquire_direct_udp_socket`) et le formatage `[ipv6]:port` pour l'amorçage des proxys.
 - **Linux `NETLINK_SOCK_DIAG` & Attribution de Processus Double Pile (`routeward-core::process`)** :
   - Interroge directement `AF_NETLINK` (`NETLINK_SOCK_DIAG`) pour une recherche d'inode exacte sur une socket unique en `AF_INET` et `AF_INET6` (`build_inet_diag_request` / `parse_inet_diag_response_inode`), avec repli automatique sur `/proc/net/{tcp,udp,tcp6,udp6}` si `NETLINK_SOCK_DIAG` est restreint.
   - Sous Windows, IP Helper interroge également `AF_INET6` (`MIB_TCP6TABLE_OWNER_PID` / `MIB_UDP6TABLE_OWNER_PID`).
@@ -160,6 +160,7 @@ RouteWard est organisé en workspace Rust comprenant trois crates (`routeward-co
   - Découpage de `crates/routeward-core/src/interceptor` en sous-modules ciblés (`controller.rs`, `tcp_relay.rs`, `udp_relay.rs`, `dns_handler.rs`, `nat.rs`, `nftables.rs`, `windivert.rs`, `tests.rs`).
   - Découpage de l'API loopback et du pont bureau dans `apps/desktop/src` (`security.rs`, `sse.rs`, `routes.rs`, `lib.rs`, `tests.rs`).
   - Découpage de `ui/src/services` (`uri.ts` avec support `[ipv6]:port`, `sse.ts`, `ipc.ts`) accompagné des tests de vues Vitest (`ui/src/components/Views.test.tsx`).
+  - Validation bout-en-bout sur les suites OS double pile (`36` scénarios dans `tests/linux/run-scenarios.sh` et `21` scénarios dans `tests/windows/Invoke-RouteWardTests.ps1`, appuyés par `crates/routeward-core/examples/socks5_udp_test_server.rs` avec `--map-target` et `--udp-echo-bind`).
 
 ## Diagramme des Composants
 
