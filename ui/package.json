@@ -1,7 +1,7 @@
 {
   "name": "routeward-ui",
   "private": true,
-  "version": "2026.1022.0",
+  "version": "2026.1115.0",
   "license": "Apache-2.0",
   "author": "Julien Bombled",
   "type": "module",

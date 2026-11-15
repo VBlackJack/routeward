@@ -1,0 +1,16 @@
+# Changelog
+
+All notable changes to RouteWard are documented in this file.
+Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
+
+## [v2026.1115.00] - 2026-11-15
+
+### Added
+- Transparent process-aware TCP, UDP, and DNS interception across Windows (WinDivert 2.2.2) and Linux (`nftables` / `TPROXY` / `SO_MARK` / `NETLINK_SOCK_DIAG`), with dual-stack IPv4 and IPv6 support.
+- Multi-protocol upstream proxy support: SOCKS5 (with UDP ASSOCIATE and username/password authentication), SOCKS4 and SOCKS4a, HTTP CONNECT, and HTTPS CONNECT (TLS with configurable `tlsSkipVerify`), plus Windows SSPI (`Negotiate` / `NTLM`) authentication.
+- Ordered multi-hop proxy chains and failover proxy groups (`Chain` and `Group` actions), with runtime kill switch (`securityPolicy.killSwitchEnabled`) and strict fail-closed DNS handling (Fake-IP `198.18.0.0/15`, DNS-over-TCP via SOCKS5, Active Directory suffix bypass, and QUIC/LLMNR/mDNS/NetBIOS leakage guards).
+- TLS SNI inspection (port 443) and plaintext HTTP `Host:` inspection (`httpHostInspectPorts`) with `!pattern` exclusion support for domains, processes, and CIDRs.
+- Local dynamic PAC server (`http://127.0.0.1:10811/proxy.pac`), Windows `AutoConfigURL` integration, `preset-edge-foxyproxy` rule preset, and FoxyProxy JSON importer for pattern-based Edge/browser routing without a browser extension.
+- Privileged daemon architecture (`routeward daemon` and `routeward service`) with Windows SCM service registration, Linux Unix domain socket (`SO_PEERCRED`), Windows Named Pipe (`SDDL` ACL), `routeward ctl` CLI, and `routeward cleanup`.
+- Desktop GUI (`routeward-desktop` with `tao` + `wry`) featuring 5 use-case tabs, Simple and Expert modes, visual System App Picker, ThemeForge color palettes, EN/FR i18n, live SSE telemetry stream with `errorDetail` and CSV/JSON export, system tray profile switcher, and named multi-profile storage.
+- Windows portable ZIP and WiX v6 `.msi` installer (`packaging/windows/build-msi.ps1`), plus Debian `.deb` packaging script (`packaging/linux/build-deb.sh`).
