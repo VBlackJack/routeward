@@ -118,11 +118,22 @@ fn parse_args() -> ServerConfig {
             "--disable-udp-associate" | "--refuse-udp-associate" => {
                 disable_udp_associate = true;
             }
-            "--map-domain" => {
+            "--map-domain" | "--map-target" => {
                 if let Some(val) = args.next() {
                     if let Some((dom, ip_str)) = val.split_once('=') {
-                        if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                            domain_map.insert(dom.trim().to_ascii_lowercase(), ip);
+                        let clean_key = dom
+                            .trim()
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .trim_end_matches('.')
+                            .to_ascii_lowercase();
+                        let clean_ip = ip_str.trim().trim_start_matches('[').trim_end_matches(']');
+                        if let Ok(ip) = clean_ip.parse::<IpAddr>() {
+                            let canonical_key = clean_key
+                                .parse::<IpAddr>()
+                                .map(|k| k.to_string().to_ascii_lowercase())
+                                .unwrap_or(clean_key);
+                            domain_map.insert(canonical_key, ip);
                         }
                     }
                 }
@@ -155,12 +166,17 @@ async fn resolve_target_addr(
     port: u16,
     domain_map: &HashMap<String, IpAddr>,
 ) -> Option<SocketAddr> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Some(SocketAddr::new(ip, port));
-    }
-    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let normalized = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if let Some(&mapped_ip) = domain_map.get(&normalized) {
         return Some(SocketAddr::new(mapped_ip, port));
+    }
+    if let Ok(ip) = normalized.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
     }
     lookup_host((normalized.as_str(), port))
         .await
@@ -378,14 +394,26 @@ async fn handle_client(
                     };
 
                     let (target_label, resolved_dst) = match &socks_target {
-                        Socks5UdpTarget::Ipv4(ip, port) => (
-                            format!("Ipv4({ip}:{port})"),
-                            Some(SocketAddr::new(IpAddr::V4(*ip), *port)),
-                        ),
-                        Socks5UdpTarget::Ipv6(ip, port) => (
-                            format!("Ipv6({ip}:{port})"),
-                            Some(SocketAddr::new(IpAddr::V6(*ip), *port)),
-                        ),
+                        Socks5UdpTarget::Ipv4(ip, port) => {
+                            let mapped = domain_map_worker
+                                .get(&ip.to_string())
+                                .copied()
+                                .unwrap_or(IpAddr::V4(*ip));
+                            (
+                                format!("Ipv4({ip}:{port})"),
+                                Some(SocketAddr::new(mapped, *port)),
+                            )
+                        }
+                        Socks5UdpTarget::Ipv6(ip, port) => {
+                            let mapped = domain_map_worker
+                                .get(&ip.to_string().to_ascii_lowercase())
+                                .copied()
+                                .unwrap_or(IpAddr::V6(*ip));
+                            (
+                                format!("Ipv6({ip}:{port})"),
+                                Some(SocketAddr::new(mapped, *port)),
+                            )
+                        }
                         Socks5UdpTarget::Domain(dom, port) => (
                             format!("Domain({dom}:{port})"),
                             resolve_target_addr(dom, *port, &domain_map_worker).await,

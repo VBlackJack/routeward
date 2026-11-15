@@ -583,24 +583,56 @@ impl RouteWardController {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::io::AsRawSocket;
+            use std::os::windows::io::{AsRawSocket, FromRawSocket};
             use windows_sys::Win32::Networking::WinSock::{
-                setsockopt, IPPROTO_IPV6, IPV6_V6ONLY, SOCKET_ERROR,
+                bind, setsockopt, socket, AF_INET6, IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET,
+                IPPROTO_IPV6, IPPROTO_UDP, IPV6_V6ONLY, SOCKADDR, SOCKADDR_IN6, SOCKADDR_IN6_0,
+                SOCKET_ERROR, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR,
             };
-            let std_sock =
-                std::net::UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)))?;
+            // Trigger Rust std Winsock initialization before raw socket() calls.
+            let _ = tokio::net::TcpSocket::new_v6();
+            let raw = unsafe { socket(AF_INET6 as i32, SOCK_DGRAM, IPPROTO_UDP) };
+            if raw == INVALID_SOCKET {
+                return Err(std::io::Error::last_os_error());
+            }
+            let std_sock = unsafe { std::net::UdpSocket::from_raw_socket(raw as _) };
             let on: i32 = 1;
-            let rc = unsafe {
-                setsockopt(
-                    std_sock.as_raw_socket() as usize,
+            let raw_handle = std_sock.as_raw_socket() as _;
+            unsafe {
+                let _ = setsockopt(
+                    raw_handle,
+                    SOL_SOCKET,
+                    SO_REUSEADDR,
+                    &on as *const i32 as *const u8,
+                    std::mem::size_of::<i32>() as i32,
+                );
+                let rc = setsockopt(
+                    raw_handle,
                     IPPROTO_IPV6,
                     IPV6_V6ONLY,
                     &on as *const i32 as *const u8,
                     std::mem::size_of::<i32>() as i32,
-                )
-            };
-            if rc == SOCKET_ERROR {
-                return Err(std::io::Error::last_os_error());
+                );
+                if rc == SOCKET_ERROR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let addr = SOCKADDR_IN6 {
+                    sin6_family: AF_INET6,
+                    sin6_port: port.to_be(),
+                    sin6_flowinfo: 0,
+                    sin6_addr: IN6_ADDR {
+                        u: IN6_ADDR_0 { Byte: ip.octets() },
+                    },
+                    Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: 0 },
+                };
+                let brc = bind(
+                    raw_handle,
+                    &addr as *const SOCKADDR_IN6 as *const SOCKADDR,
+                    std::mem::size_of::<SOCKADDR_IN6>() as i32,
+                );
+                if brc == SOCKET_ERROR {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             std_sock.set_nonblocking(true)?;
             UdpSocket::from_std(std_sock)

@@ -1901,11 +1901,14 @@ async fn final_anti_fake_ip_egress_guard_blocks_tcp_and_udp_on_both_backends() {
 #[tokio::test]
 async fn ipv6_dual_stack_transparent_tcp_and_udp_interception() {
     // 1. Separate IPv4 + IPV6_V6ONLY=1 listeners coexist on loopback port when IPv6 is available
+    let has_ipv6_loopback = std::net::TcpListener::bind("[::1]:0").is_ok();
     let Ok(v4_tcp) = std::net::TcpListener::bind("127.0.0.1:0") else {
         return;
     };
     let shared_port = v4_tcp.local_addr().expect("v4_tcp local_addr").port();
-    if let Ok(v6_tcp) = RouteWardController::bind_tcp_v6_only(Ipv6Addr::LOCALHOST, shared_port) {
+    if has_ipv6_loopback {
+        let v6_tcp = RouteWardController::bind_tcp_v6_only(Ipv6Addr::LOCALHOST, shared_port)
+            .expect("bind_tcp_v6_only alongside IPv4 listener");
         assert_eq!(v6_tcp.local_addr().expect("v6 local").port(), shared_port);
         drop(v6_tcp);
     }
@@ -1915,8 +1918,9 @@ async fn ipv6_dual_stack_transparent_tcp_and_udp_interception() {
         return;
     };
     let shared_udp_port = v4_udp.local_addr().expect("v4_udp local_addr").port();
-    if let Ok(v6_udp) = RouteWardController::bind_udp_v6_only(Ipv6Addr::LOCALHOST, shared_udp_port)
-    {
+    if has_ipv6_loopback {
+        let v6_udp = RouteWardController::bind_udp_v6_only(Ipv6Addr::LOCALHOST, shared_udp_port)
+            .expect("bind_udp_v6_only alongside IPv4 listener");
         assert_eq!(
             v6_udp.local_addr().expect("v6 udp local").port(),
             shared_udp_port
