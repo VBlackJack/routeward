@@ -59,6 +59,7 @@ fn make_proxy_node(
         auth,
         udp_enabled: false,
         tls: false,
+        tls_skip_verify: false,
         sni: None,
         enabled: true,
         last_latency_ms: Some(15),
@@ -1467,6 +1468,7 @@ async fn forward_udp_datagram_evaluates_rules_per_datagram_and_enforces_fragment
         port: socks_tcp_addr.port(),
         auth: None,
         tls: false,
+        tls_skip_verify: false,
         sni: None,
         udp_enabled: true,
         enabled: true,
@@ -1983,6 +1985,7 @@ async fn ipv6_dual_stack_transparent_tcp_and_udp_interception() {
         auth: None,
         udp_enabled: true,
         tls: false,
+        tls_skip_verify: false,
         sni: None,
         enabled: true,
         last_latency_ms: None,
@@ -2077,4 +2080,65 @@ async fn ipv6_dual_stack_transparent_tcp_and_udp_interception() {
         .expect("IPv6 Direct UDP forward must succeed");
     assert_eq!(udp_reply, b"PONG_V6");
     echo_task.await.expect("echo_task join");
+}
+
+#[test]
+fn named_profiles_save_list_switch_and_delete() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "routeward_profiles_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_root).expect("create temp root");
+    let temp_profile_path = temp_root
+        .join("profile.json")
+        .to_string_lossy()
+        .into_owned();
+    let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+    constants.ipc.windows_profile_path = temp_profile_path.clone();
+    constants.ipc.linux_profile_path = temp_profile_path;
+
+    let mut profile_a = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+    profile_a.name = "Work Office".to_string();
+    profile_a.profile_id = "work-office".to_string();
+
+    let controller = RouteWardController::new(constants, profile_a, "en");
+    let summaries = controller
+        .save_named_profile(Some("work-office"), Some("Work Office"))
+        .expect("save work-office profile");
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0].active);
+    assert_eq!(summaries[0].profile_id, "work-office");
+
+    let mut profile_b = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+    profile_b.name = "Home Direct".to_string();
+    profile_b.profile_id = "home-direct".to_string();
+    profile_b.rules.clear();
+    controller.replace_profile(profile_b);
+    let summaries = controller
+        .save_named_profile(Some("home-direct"), Some("Home Direct"))
+        .expect("save home-direct profile");
+    assert_eq!(summaries.len(), 2);
+
+    let switched = controller
+        .switch_named_profile("work-office")
+        .expect("switch to work-office");
+    assert_eq!(switched.profile_id, "work-office");
+    assert_eq!(controller.profile.read().name, "Work Office");
+
+    assert!(
+        controller.delete_named_profile("work-office").is_err(),
+        "deleting the currently active profile must fail"
+    );
+
+    let after_delete = controller
+        .delete_named_profile("home-direct")
+        .expect("delete inactive profile");
+    assert_eq!(after_delete.len(), 1);
+    assert_eq!(after_delete[0].profile_id, "work-office");
+
+    let _ = std::fs::remove_dir_all(&temp_root);
 }

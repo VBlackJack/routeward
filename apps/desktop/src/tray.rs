@@ -34,8 +34,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, EndMenu, GetCursorPos, GetMessageW, LoadIconW, PostMessageW, PostQuitMessage,
     RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetMenuDefaultItem,
-    TrackPopupMenu, TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, IDI_APPLICATION, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
+    TrackPopupMenu, TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, IDI_APPLICATION, MF_CHECKED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
     WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NULL, WM_RBUTTONUP,
     WNDCLASSW, WS_OVERLAPPED,
 };
@@ -51,6 +51,8 @@ const IDM_STATUS: u32 = 1000;
 const IDM_SHOW: u32 = 1001;
 const IDM_TOGGLE: u32 = 1002;
 const IDM_QUIT: u32 = 1003;
+const IDM_PROFILE_BASE: u32 = 2000;
+const MAX_TRAY_PROFILES: usize = 20;
 
 fn to_wide_null(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(once(0)).collect()
@@ -204,6 +206,23 @@ impl TrayWindowState {
                 MF_STRING | MF_GRAYED
             };
             AppendMenuW(menu, toggle_flags, IDM_TOGGLE as usize, toggle_w.as_ptr());
+            if snap.daemon_connected && !snap.profiles.is_empty() {
+                AppendMenuW(menu, MF_SEPARATOR, 0, null());
+                for (idx, (pid, pname)) in snap.profiles.iter().take(MAX_TRAY_PROFILES).enumerate()
+                {
+                    let label_w = to_wide_null(pname);
+                    let mut flags = MF_STRING;
+                    if pid == &snap.active_profile_id {
+                        flags |= MF_CHECKED;
+                    }
+                    AppendMenuW(
+                        menu,
+                        flags,
+                        (IDM_PROFILE_BASE + idx as u32) as usize,
+                        label_w.as_ptr(),
+                    );
+                }
+            }
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             AppendMenuW(menu, MF_STRING, IDM_QUIT as usize, quit_w.as_ptr());
             SetMenuDefaultItem(menu, IDM_SHOW, 0);
@@ -229,6 +248,12 @@ impl TrayWindowState {
                 IDM_SHOW => (self.command_cb)(DesktopWindowCommand::ShowWindow),
                 IDM_TOGGLE => (self.command_cb)(DesktopWindowCommand::ToggleEngine),
                 IDM_QUIT => (self.command_cb)(DesktopWindowCommand::Quit),
+                id if id >= IDM_PROFILE_BASE
+                    && id < IDM_PROFILE_BASE + MAX_TRAY_PROFILES as u32 =>
+                {
+                    let idx = (id - IDM_PROFILE_BASE) as usize;
+                    (self.command_cb)(DesktopWindowCommand::SwitchProfile(idx));
+                }
                 _ => {}
             }
         }
@@ -470,6 +495,8 @@ mod tests {
             daemon_connected: false,
             running: false,
             locale: "fr".to_string(),
+            active_profile_id: "default".to_string(),
+            profiles: Vec::new(),
         });
         assert!(!offline.toggle_enabled);
         assert!(offline.status_line.contains("arrêté"));
@@ -478,6 +505,8 @@ mod tests {
             daemon_connected: true,
             running: true,
             locale: "en".to_string(),
+            active_profile_id: "default".to_string(),
+            profiles: Vec::new(),
         });
         assert!(protected_en.toggle_enabled);
         assert!(protected_en.status_line.contains("Protected"));

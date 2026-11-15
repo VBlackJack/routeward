@@ -72,6 +72,14 @@ pub struct ActiveOsSocket {
     pub remote_port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemApplicationEntry {
+    pub name: String,
+    pub executable_path: String,
+    pub running: bool,
+}
+
 impl ProcessIdentity {
     /// Returns `true` if no concrete process executable could be attributed (`pid == 0`, `"system"`, or `"pid:<n>"`).
     pub fn is_unattributed(&self) -> bool {
@@ -353,6 +361,218 @@ impl ProcessResolver {
             .find(|s| !s.is_empty())
             .unwrap_or(UNKNOWN_PROCESS_NAME)
             .to_string()
+    }
+
+    pub fn list_system_applications(&self) -> Vec<SystemApplicationEntry> {
+        let mut by_name: std::collections::HashMap<String, SystemApplicationEntry> =
+            std::collections::HashMap::new();
+
+        for (name, exe_path) in self.enumerate_running_processes() {
+            let key = name.to_ascii_lowercase();
+            if Self::is_skipped_helper_exe(&key) {
+                continue;
+            }
+            by_name.entry(key).or_insert(SystemApplicationEntry {
+                name,
+                executable_path: exe_path,
+                running: true,
+            });
+        }
+
+        for (name, exe_path) in Self::scan_installed_application_exes(150) {
+            let key = name.to_ascii_lowercase();
+            if Self::is_skipped_helper_exe(&key) {
+                continue;
+            }
+            by_name.entry(key).or_insert(SystemApplicationEntry {
+                name,
+                executable_path: exe_path,
+                running: false,
+            });
+        }
+
+        let mut list: Vec<SystemApplicationEntry> = by_name.into_values().collect();
+        list.sort_by(|a, b| {
+            b.running.cmp(&a.running).then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
+        });
+        list
+    }
+
+    fn is_skipped_helper_exe(lower_name: &str) -> bool {
+        lower_name.is_empty()
+            || lower_name == UNKNOWN_PROCESS_NAME
+            || lower_name.starts_with("pid:")
+            || lower_name.starts_with("unins")
+            || lower_name.contains("crashpad")
+            || lower_name.contains("helper")
+            || lower_name == "setup.exe"
+    }
+
+    #[cfg(windows)]
+    fn enumerate_running_processes(&self) -> Vec<(String, String)> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+
+        let mut out = Vec::new();
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+            return out;
+        }
+
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        if unsafe { Process32FirstW(snap, &mut entry) } != 0 {
+            loop {
+                if entry.th32ProcessID > 4 {
+                    let end = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    let fallback_name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                    let resolved = self.resolve_by_pid(entry.th32ProcessID);
+                    let is_unattributed = resolved.is_unattributed();
+                    let name = if is_unattributed {
+                        fallback_name.clone()
+                    } else {
+                        resolved.name
+                    };
+                    let exe_path = if is_unattributed {
+                        fallback_name
+                    } else {
+                        resolved.executable_path
+                    };
+                    if !name.is_empty() {
+                        out.push((name, exe_path));
+                    }
+                }
+                if unsafe { Process32NextW(snap, &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
+
+        unsafe {
+            CloseHandle(snap);
+        }
+        out
+    }
+
+    #[cfg(not(windows))]
+    fn enumerate_running_processes(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if pid == 0 {
+                continue;
+            }
+            let id = self.resolve_by_pid(pid);
+            if !id.is_unattributed() {
+                out.push((id.name, id.executable_path));
+            }
+        }
+        out
+    }
+
+    #[cfg(windows)]
+    fn scan_installed_application_exes(max_entries: usize) -> Vec<(String, String)> {
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Ok(val) = std::env::var(env_key) {
+                roots.push(std::path::PathBuf::from(val));
+            }
+        }
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            roots.push(std::path::PathBuf::from(local_app_data).join("Programs"));
+        }
+
+        let mut out = Vec::new();
+        for root in roots {
+            Self::scan_exe_dir_bounded(&root, 0, 2, max_entries, &mut out);
+            if out.len() >= max_entries {
+                break;
+            }
+        }
+        out
+    }
+
+    #[cfg(not(windows))]
+    fn scan_exe_dir_bounded(
+        _dir: &std::path::Path,
+        _depth: usize,
+        _max_depth: usize,
+        _max_entries: usize,
+        _out: &mut Vec<(String, String)>,
+    ) {
+    }
+
+    #[cfg(windows)]
+    fn scan_exe_dir_bounded(
+        dir: &std::path::Path,
+        depth: usize,
+        max_depth: usize,
+        max_entries: usize,
+        out: &mut Vec<(String, String)>,
+    ) {
+        if depth > max_depth || out.len() >= max_entries {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            if out.len() >= max_entries {
+                break;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                Self::scan_exe_dir_bounded(&path, depth + 1, max_depth, max_entries, out);
+            } else if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("exe"))
+                .unwrap_or(false)
+            {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    out.push((name.to_string(), path.to_string_lossy().into_owned()));
+                }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn scan_installed_application_exes(max_entries: usize) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for dir in ["/usr/bin", "/usr/local/bin"] {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                if out.len() >= max_entries {
+                    return out;
+                }
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        out.push((name.to_string(), path.to_string_lossy().into_owned()));
+                    }
+                }
+            }
+        }
+        out
     }
 
     #[cfg(windows)]
@@ -1012,5 +1232,38 @@ mod tests {
             ProcessResolver::parse_proc_net_udp6_inode(udp6_sample, 0x14E9).unwrap(),
             554433
         );
+    }
+
+    #[test]
+    fn lists_system_applications_sorted_and_deduplicated() {
+        let resolver = ProcessResolver::new(5000);
+        let apps = resolver.list_system_applications();
+        assert!(
+            !apps.is_empty(),
+            "at least the running test executable must be listed"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for window in apps.windows(2) {
+            let a = &window[0];
+            let b = &window[1];
+            assert!(
+                (!a.running && !b.running) || (a.running >= b.running),
+                "running entries should sort before installed-only entries: {a:?} vs {b:?}"
+            );
+            if a.running == b.running {
+                assert!(
+                    a.name.to_ascii_lowercase() <= b.name.to_ascii_lowercase(),
+                    "entries should be sorted alphabetically within running group: {a:?} vs {b:?}"
+                );
+            }
+        }
+        for app in &apps {
+            let key = app.name.to_ascii_lowercase();
+            assert!(
+                seen.insert(key),
+                "duplicate application entry returned: {}",
+                app.name
+            );
+        }
     }
 }

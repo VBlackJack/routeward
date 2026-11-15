@@ -66,6 +66,8 @@ pub struct TrackedConnection {
     pub tx_bytes: u64,
     pub status: ConnectionStatus,
     pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -558,6 +560,7 @@ mod tests {
             tx_bytes: 0,
             status: ConnectionStatus::Active,
             started_at: Utc::now(),
+            error_detail: None,
         };
         hub.record_connection(tracked, true);
 

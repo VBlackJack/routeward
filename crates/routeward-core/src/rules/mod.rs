@@ -138,57 +138,167 @@ impl RuleEngine {
                 .unwrap_or(&req.process_name)
                 .to_lowercase();
 
-            let proc_matched = rule.process_patterns.iter().any(|pattern| {
-                let pat = pattern.trim().to_lowercase();
-                Self::wildcard_match(&pat, &basename) || Self::wildcard_match(&pat, &full_path)
-            });
-
-            if !proc_matched {
+            if !Self::matches_process_patterns_both(&rule.process_patterns, &basename, &full_path) {
                 return false;
             }
         }
 
-        let has_domain_criteria = !rule.domain_patterns.is_empty();
-        let has_ip_criteria = !rule.ip_cidrs.is_empty();
+        let has_domain_criteria = rule.domain_patterns.iter().any(|p| !p.trim().is_empty());
+        let has_ip_criteria = rule.ip_cidrs.iter().any(|p| !p.trim().is_empty());
 
         if has_domain_criteria || has_ip_criteria {
-            let mut destination_matched = false;
+            let dom_norm = effective_domain.map(|d| d.trim_end_matches('.').to_lowercase());
 
-            if has_domain_criteria {
-                if let Some(domain) = effective_domain {
-                    let dom = domain.trim_end_matches('.').to_lowercase();
-                    if rule
-                        .domain_patterns
-                        .iter()
-                        .any(|pat| Self::domain_match(pat, &dom))
-                    {
-                        destination_matched = true;
-                    }
+            // 1. Check explicit exclusions first: any matching '!' pattern vetoes the rule.
+            if let Some(ref dom) = dom_norm {
+                if Self::matches_any_negated(&rule.domain_patterns, |pat| {
+                    Self::domain_match(pat, dom)
+                }) {
+                    return false;
+                }
+            }
+            if let Some(ip) = target_ip {
+                if Self::matches_any_negated(&rule.ip_cidrs, |pat| Self::ip_match(pat, ip)) {
+                    return false;
                 }
             }
 
-            if !destination_matched && has_ip_criteria {
-                if let Some(ip) = target_ip {
-                    if rule.ip_cidrs.iter().any(|cidr_str| {
-                        IpNet::from_str(cidr_str.trim())
-                            .map(|net| net.contains(ip))
-                            .unwrap_or_else(|_| {
-                                IpAddr::from_str(cidr_str.trim())
-                                    .map(|exact| &exact == ip)
-                                    .unwrap_or(false)
-                            })
-                    }) {
-                        destination_matched = true;
+            // 2. Check positive patterns (if any exist across domain/IP criteria).
+            let has_pos_domain = Self::has_positive_patterns(&rule.domain_patterns);
+            let has_pos_ip = Self::has_positive_patterns(&rule.ip_cidrs);
+
+            if has_pos_domain || has_pos_ip {
+                let mut destination_matched = false;
+                if has_pos_domain {
+                    if let Some(ref dom) = dom_norm {
+                        if Self::matches_any_positive(&rule.domain_patterns, |pat| {
+                            Self::domain_match(pat, dom)
+                        }) {
+                            destination_matched = true;
+                        }
                     }
                 }
-            }
-
-            if !destination_matched {
-                return false;
+                if !destination_matched && has_pos_ip {
+                    if let Some(ip) = target_ip {
+                        if Self::matches_any_positive(&rule.ip_cidrs, |pat| Self::ip_match(pat, ip))
+                        {
+                            destination_matched = true;
+                        }
+                    }
+                }
+                if !destination_matched {
+                    return false;
+                }
             }
         }
 
         true
+    }
+
+    pub fn matches_process_patterns(patterns: &[String], candidate_process: &str) -> bool {
+        let basename = ProcessResolver::extract_basename(candidate_process).to_lowercase();
+        let full_path = candidate_process.to_lowercase();
+        Self::matches_process_patterns_both(patterns, &basename, &full_path)
+    }
+
+    fn matches_process_patterns_both(patterns: &[String], basename: &str, full_path: &str) -> bool {
+        Self::evaluate_pattern_list(patterns, |pat| {
+            let low = pat.to_lowercase();
+            Self::wildcard_match(&low, basename) || Self::wildcard_match(&low, full_path)
+        })
+        .unwrap_or(true)
+    }
+
+    pub fn strip_negation(raw: &str) -> Option<(bool, &str)> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(rest) = trimmed.strip_prefix('!') {
+            let inner = rest.trim();
+            if inner.is_empty() {
+                None
+            } else {
+                Some((true, inner))
+            }
+        } else {
+            Some((false, trimmed))
+        }
+    }
+
+    fn has_positive_patterns(patterns: &[String]) -> bool {
+        patterns
+            .iter()
+            .filter_map(|p| Self::strip_negation(p))
+            .any(|(is_neg, _)| !is_neg)
+    }
+
+    fn matches_any_negated<F>(patterns: &[String], mut matcher: F) -> bool
+    where
+        F: FnMut(&str) -> bool,
+    {
+        patterns
+            .iter()
+            .filter_map(|p| Self::strip_negation(p))
+            .filter(|(is_neg, _)| *is_neg)
+            .any(|(_, pat)| matcher(pat))
+    }
+
+    fn matches_any_positive<F>(patterns: &[String], mut matcher: F) -> bool
+    where
+        F: FnMut(&str) -> bool,
+    {
+        patterns
+            .iter()
+            .filter_map(|p| Self::strip_negation(p))
+            .filter(|(is_neg, _)| !*is_neg)
+            .any(|(_, pat)| matcher(pat))
+    }
+
+    fn evaluate_pattern_list<F>(patterns: &[String], mut matcher: F) -> Option<bool>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut any_valid = false;
+        let mut has_positive = false;
+        let mut matched_positive = false;
+
+        for raw in patterns {
+            let Some((is_neg, pat)) = Self::strip_negation(raw) else {
+                continue;
+            };
+            any_valid = true;
+            if is_neg {
+                if matcher(pat) {
+                    return Some(false);
+                }
+            } else {
+                has_positive = true;
+                if !matched_positive && matcher(pat) {
+                    matched_positive = true;
+                }
+            }
+        }
+
+        if !any_valid {
+            None
+        } else if has_positive {
+            Some(matched_positive)
+        } else {
+            // Negative-only list and none of the exclusions matched.
+            Some(true)
+        }
+    }
+
+    fn ip_match(cidr_or_ip: &str, ip: &IpAddr) -> bool {
+        let trimmed = cidr_or_ip.trim();
+        IpNet::from_str(trimmed)
+            .map(|net| net.contains(ip))
+            .unwrap_or_else(|_| {
+                IpAddr::from_str(trimmed)
+                    .map(|exact| &exact == ip)
+                    .unwrap_or(false)
+            })
     }
 
     fn get_or_compile_regex(raw_regex: &str) -> Option<Regex> {
@@ -229,7 +339,7 @@ impl RuleEngine {
             .replace("\\*", ".*")
             .replace("\\?", ".");
         let anchored = format!("^{escaped}$");
-        Regex::new(&anchored)
+        Self::get_or_compile_regex(&anchored)
             .map(|re| re.is_match(candidate))
             .unwrap_or(false)
     }
@@ -302,5 +412,123 @@ mod tests {
         ));
         // Invalid regex must safely return false instead of panicking
         assert!(!RuleEngine::domain_match("regex:[unclosed", "example.com"));
+    }
+
+    #[test]
+    fn supports_negated_domain_process_and_ip_patterns() {
+        let rules = vec![
+            crate::config::RoutingRule {
+                id: "edge-except-local".to_string(),
+                name: "Edge except internal".to_string(),
+                enabled: true,
+                priority: 10,
+                process_patterns: vec!["msedge.exe".to_string(), "!legacy.exe".to_string()],
+                domain_patterns: vec![
+                    "*.corp.example".to_string(),
+                    "!intranet.corp.example".to_string(),
+                    "!regex:^dev-[0-9]+\\.corp\\.example$".to_string(),
+                ],
+                ip_cidrs: vec!["!10.0.0.0/8".to_string()],
+                port_ranges: vec![],
+                protocol: TransportProtocol::Tcp,
+                action: RuleAction::Proxy {
+                    target_id: "corp-proxy".to_string(),
+                },
+            },
+            crate::config::RoutingRule {
+                id: "all-except-system".to_string(),
+                name: "All non-excluded processes".to_string(),
+                enabled: true,
+                priority: 20,
+                process_patterns: vec!["!svchost.exe".to_string()],
+                domain_patterns: vec!["!*.local".to_string()],
+                ip_cidrs: vec![],
+                port_ranges: vec![],
+                protocol: TransportProtocol::Tcp,
+                action: RuleAction::Proxy {
+                    target_id: "default-proxy".to_string(),
+                },
+            },
+        ];
+
+        // Edge -> app.corp.example -> matches rule 1
+        let ok_req = ConnectionRequest {
+            process_name: "msedge.exe".to_string(),
+            process_path: None,
+            target_host: "app.corp.example".to_string(),
+            target_ip: Some("203.0.113.5".to_string()),
+            target_port: 443,
+            protocol: TransportProtocol::Tcp,
+        };
+        let eval_ok = RuleEngine::evaluate(&ok_req, &rules, &RuleAction::Direct, None);
+        assert_eq!(
+            eval_ok.action,
+            RuleAction::Proxy {
+                target_id: "corp-proxy".to_string()
+            }
+        );
+
+        // Edge -> intranet.corp.example -> excluded from rule 1, falls through to rule 2
+        let excluded_dom = ConnectionRequest {
+            target_host: "intranet.corp.example".to_string(),
+            ..ok_req.clone()
+        };
+        let eval_excluded = RuleEngine::evaluate(&excluded_dom, &rules, &RuleAction::Direct, None);
+        assert_eq!(
+            eval_excluded.action,
+            RuleAction::Proxy {
+                target_id: "default-proxy".to_string()
+            }
+        );
+
+        // Edge -> dev-7.corp.example -> excluded by !regex:
+        let excluded_re = ConnectionRequest {
+            target_host: "dev-7.corp.example".to_string(),
+            ..ok_req.clone()
+        };
+        let eval_re = RuleEngine::evaluate(&excluded_re, &rules, &RuleAction::Direct, None);
+        assert_eq!(
+            eval_re.action,
+            RuleAction::Proxy {
+                target_id: "default-proxy".to_string()
+            }
+        );
+
+        // Edge -> app.corp.example with private 10.1.2.3 IP -> excluded from rule 1 by !10.0.0.0/8
+        let excluded_ip = ConnectionRequest {
+            target_ip: Some("10.1.2.3".to_string()),
+            ..ok_req.clone()
+        };
+        let eval_ip = RuleEngine::evaluate(&excluded_ip, &rules, &RuleAction::Direct, None);
+        assert_eq!(
+            eval_ip.action,
+            RuleAction::Proxy {
+                target_id: "default-proxy".to_string()
+            }
+        );
+
+        // Negative-only process & domain exclusions on rule 2: svchost.exe falls back to Direct
+        let svchost_req = ConnectionRequest {
+            process_name: "svchost.exe".to_string(),
+            process_path: None,
+            target_host: "api.example.org".to_string(),
+            target_ip: None,
+            target_port: 443,
+            protocol: TransportProtocol::Tcp,
+        };
+        let eval_svc = RuleEngine::evaluate(&svchost_req, &rules, &RuleAction::Direct, None);
+        assert_eq!(eval_svc.action, RuleAction::Direct);
+
+        // *.local excluded on rule 2 -> falls back to Direct
+        let local_req = ConnectionRequest {
+            process_name: "curl.exe".to_string(),
+            process_path: None,
+            target_host: "printer.local".to_string(),
+            target_ip: None,
+            target_port: 80,
+            protocol: TransportProtocol::Tcp,
+        };
+        let eval_local = RuleEngine::evaluate(&local_req, &rules, &RuleAction::Direct, None);
+        assert_eq!(eval_local.action, RuleAction::Direct);
     }
 }

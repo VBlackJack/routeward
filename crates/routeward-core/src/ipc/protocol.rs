@@ -102,6 +102,26 @@ pub enum IpcCommand {
         domain: String,
     },
     FlushFakeIps,
+    ImportFoxyProxyJson {
+        json: String,
+        #[serde(default, rename = "processPatterns")]
+        process_patterns: Vec<String>,
+    },
+    ListProfiles,
+    SaveNamedProfile {
+        #[serde(default, rename = "profileId")]
+        profile_id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    SwitchProfile {
+        #[serde(rename = "profileId")]
+        profile_id: String,
+    },
+    DeleteProfile {
+        #[serde(rename = "profileId")]
+        profile_id: String,
+    },
     Subscribe,
 }
 

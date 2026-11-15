@@ -15,12 +15,11 @@
  */
 
 use crate::config::{ProxyNode, ProxyProtocol, SystemConstants};
-use crate::proxy::ProxyConnector;
+use crate::proxy::{tls, AsyncTunnelStream, ProxyConnector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 const EXIT_IP_JSON_KEY: &str = "ip";
@@ -42,11 +41,15 @@ pub struct ProxyChecker;
 impl ProxyChecker {
     pub async fn test_proxy(node: &ProxyNode, constants: &SystemConstants) -> ProxyHealthReport {
         let probe_timeout = Duration::from_millis(constants.checker.probe_timeout_ms);
-        let addr = format!("{}:{}", node.host, node.port);
+        let addr = ProxyConnector::format_host_port(&node.host, node.port);
         let start = Instant::now();
 
-        let tcp_result = timeout(probe_timeout, TcpStream::connect(&addr)).await;
-        let mut stream = match tcp_result {
+        let tcp_result = timeout(
+            probe_timeout,
+            ProxyConnector::connect_tcp_marked(&addr, constants.network.linux_fwmark),
+        )
+        .await;
+        let tcp_stream = match tcp_result {
             Ok(Ok(s)) => s,
             Ok(Err(io_err)) => {
                 return ProxyHealthReport {
@@ -70,6 +73,40 @@ impl ProxyChecker {
             }
         };
 
+        let mut stream: Box<dyn AsyncTunnelStream> = if ProxyConnector::requires_tls(node) {
+            let server_name = tls::resolve_tls_server_name(node, None);
+            match timeout(
+                probe_timeout,
+                tls::wrap_client_stream(tcp_stream, &server_name, node.tls_skip_verify),
+            )
+            .await
+            {
+                Ok(Ok(tls_stream)) => tls_stream,
+                Ok(Err(tls_err)) => {
+                    return ProxyHealthReport {
+                        proxy_id: node.id.clone(),
+                        reachable: false,
+                        latency_ms: None,
+                        udp_supported: false,
+                        exit_ip: None,
+                        error_detail: Some(tls_err.to_string()),
+                    };
+                }
+                Err(_) => {
+                    return ProxyHealthReport {
+                        proxy_id: node.id.clone(),
+                        reachable: false,
+                        latency_ms: None,
+                        udp_supported: false,
+                        exit_ip: None,
+                        error_detail: Some("TLS handshake timeout".to_string()),
+                    };
+                }
+            }
+        } else {
+            Box::new(tcp_stream)
+        };
+
         let tcp_latency = start.elapsed().as_millis().max(1) as u64;
 
         let exit_ip = Self::try_resolve_exit_ip(&mut stream, node, constants).await;
@@ -91,8 +128,8 @@ impl ProxyChecker {
         }
     }
 
-    async fn try_resolve_exit_ip(
-        stream: &mut TcpStream,
+    async fn try_resolve_exit_ip<S: AsyncTunnelStream>(
+        stream: &mut S,
         node: &ProxyNode,
         constants: &SystemConstants,
     ) -> Option<String> {
@@ -140,11 +177,27 @@ impl ProxyChecker {
 
     async fn probe_socks5_udp(node: &ProxyNode, constants: &SystemConstants) -> Option<bool> {
         let probe_timeout = Duration::from_millis(constants.checker.probe_timeout_ms);
-        let addr = format!("{}:{}", node.host, node.port);
-        let mut stream = timeout(probe_timeout, TcpStream::connect(&addr))
+        let addr = ProxyConnector::format_host_port(&node.host, node.port);
+        let tcp_stream = timeout(
+            probe_timeout,
+            ProxyConnector::connect_tcp_marked(&addr, constants.network.linux_fwmark),
+        )
+        .await
+        .ok()?
+        .ok()?;
+
+        let mut stream: Box<dyn AsyncTunnelStream> = if ProxyConnector::requires_tls(node) {
+            let server_name = tls::resolve_tls_server_name(node, None);
+            timeout(
+                probe_timeout,
+                tls::wrap_client_stream(tcp_stream, &server_name, node.tls_skip_verify),
+            )
             .await
             .ok()?
-            .ok()?;
+            .ok()?
+        } else {
+            Box::new(tcp_stream)
+        };
 
         let assoc = timeout(
             probe_timeout,
@@ -194,6 +247,7 @@ mod tests {
             port,
             auth: None,
             tls: false,
+            tls_skip_verify: false,
             sni: None,
             udp_enabled: true,
             enabled: true,

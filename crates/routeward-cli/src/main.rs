@@ -28,6 +28,7 @@ use routeward_core::interceptor::RouteWardController;
 use routeward_core::ipc::protocol::IpcCommand;
 use routeward_core::ipc::{wait_for_shutdown_signal, DaemonIpcService, IpcClient};
 use routeward_core::logger::FileLogger;
+use routeward_core::pac::PacGenerator;
 use routeward_core::rules::ConnectionRequest;
 use routeward_core::system::windows_service::{
     install_windows_service, query_windows_service_status, run_windows_service_dispatcher,
@@ -35,6 +36,7 @@ use routeward_core::system::windows_service::{
 };
 use routeward_core::telemetry::LogLevel;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -466,9 +468,12 @@ async fn run_daemon_host(
     );
 
     let (local_shutdown_tx, accept_shutdown) = watch::channel(false);
+    let pac_shutdown = local_shutdown_tx.subscribe();
     let mut accept_handle = tokio::spawn(async move {
         let _ = service.run_accept_loop_until(accept_shutdown).await;
     });
+    let mut pac_handle =
+        PacGenerator::spawn_pac_http_server(Arc::new(controller.clone()), pac_shutdown);
 
     let wait_signals = ShutdownSignals::register();
     let external_wait = async {
@@ -492,6 +497,7 @@ async fn run_daemon_host(
 
     let _ = local_shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), &mut accept_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), &mut pac_handle).await;
     if controller.is_running() {
         controller.stop_engine();
     }

@@ -25,6 +25,7 @@ use crate::ipc::protocol::{
     IpcRequest, IpcResponse, ReadLineOutcome,
 };
 use crate::ipc::transport::{connect_ipc_stream, IpcServer, IpcStream, PeerIdentity};
+use crate::pac::FoxyProxyImporter;
 use crate::telemetry::LogLevel;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -359,6 +360,62 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
             controller.dns.flush();
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
+        IpcCommand::ImportFoxyProxyJson {
+            json,
+            process_patterns,
+        } => {
+            let next_priority = controller
+                .profile
+                .read()
+                .rules
+                .iter()
+                .map(|r| r.priority)
+                .min()
+                .unwrap_or(20)
+                .max(10);
+            match FoxyProxyImporter::parse(&json, process_patterns, next_priority) {
+                Ok(mut imported) => {
+                    for proxy in &imported.proxies {
+                        controller.upsert_proxy(proxy.clone());
+                    }
+                    for rule in &imported.rules {
+                        controller.upsert_rule(rule.clone());
+                    }
+                    if let Err(err) = controller.save_profile_default() {
+                        return IpcResponse::error(Some(id), err.to_string());
+                    }
+                    imported.proxies = imported
+                        .proxies
+                        .into_iter()
+                        .map(|p| p.redacted_for_ipc())
+                        .collect();
+                    IpcResponse::success(id, &imported)
+                }
+                Err(err) => IpcResponse::error(Some(id), err.to_string()),
+            }
+        }
+        IpcCommand::ListProfiles => match controller.list_named_profiles() {
+            Ok(list) => IpcResponse::success(id, &list),
+            Err(err) => IpcResponse::error(Some(id), err.to_string()),
+        },
+        IpcCommand::SaveNamedProfile { profile_id, name } => {
+            match controller.save_named_profile(profile_id.as_deref(), name.as_deref()) {
+                Ok(list) => IpcResponse::success(id, &list),
+                Err(err) => IpcResponse::error(Some(id), err.to_string()),
+            }
+        }
+        IpcCommand::SwitchProfile { profile_id } => {
+            match controller.switch_named_profile(&profile_id) {
+                Ok(prof) => IpcResponse::success(id, &prof),
+                Err(err) => IpcResponse::error(Some(id), err.to_string()),
+            }
+        }
+        IpcCommand::DeleteProfile { profile_id } => {
+            match controller.delete_named_profile(&profile_id) {
+                Ok(list) => IpcResponse::success(id, &list),
+                Err(err) => IpcResponse::error(Some(id), err.to_string()),
+            }
+        }
         IpcCommand::Subscribe => {
             IpcResponse::success(id, &serde_json::json!({ "subscribed": true }))
         }
@@ -546,6 +603,7 @@ mod tests {
             auth: Some(ProxyCredentials::new("alice", "top_secret_pw_99")),
             udp_enabled: true,
             tls: false,
+            tls_skip_verify: false,
             sni: None,
             enabled: true,
             last_latency_ms: None,

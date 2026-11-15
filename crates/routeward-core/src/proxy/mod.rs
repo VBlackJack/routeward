@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
+pub mod http_host;
+pub mod ntlm;
 pub mod sni;
+pub mod tls;
 pub mod udp;
 pub mod uri;
 
@@ -25,6 +28,9 @@ use crate::error::{
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use ntlm::{
+    extract_challenge_token, select_sspi_scheme, sspi_step_async, SspiClientSession, SspiScheme,
+};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
@@ -33,12 +39,187 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 const HTTP_HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
-const MAX_HTTP_RESPONSE_HEADER_BYTES: usize = 4096;
+const MAX_HTTP_RESPONSE_HEADER_BYTES: usize = 8192;
+const MAX_HTTP_BODY_DRAIN_BYTES: usize = 65536;
+const MAX_HTTP_AUTH_ATTEMPTS: usize = 4;
+const SOCKS4A_SENTINEL_IPV4: [u8; 4] = [0, 0, 0, 1];
+const MAX_SOCKS4A_DOMAIN_LEN: usize = 255;
 
 pub trait AsyncTunnelStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncTunnelStream for T {}
 
 pub struct ProxyConnector;
+
+enum HttpConnectOutcome {
+    Connected,
+    ContinueSameStream,
+    ReconnectRequired,
+}
+
+struct ParsedHttpResponse {
+    status_code: u16,
+    status_line: String,
+    proxy_auth_challenges: Vec<String>,
+    content_length: Option<usize>,
+    is_chunked: bool,
+    connection_close: bool,
+}
+
+fn initial_basic_auth_header(node: &ProxyNode) -> Option<String> {
+    let creds = node.auth.as_ref()?;
+    let pass = creds.password_str();
+    if creds.username.is_empty() && pass.is_empty() {
+        return None;
+    }
+    let token = BASE64_STANDARD.encode(format!("{}:{pass}", creds.username));
+    Some(format!("Proxy-Authorization: Basic {token}\r\n"))
+}
+
+async fn read_http_response_headers<S: AsyncTunnelStream>(
+    stream: &mut S,
+) -> RouteWardResult<ParsedHttpResponse> {
+    let mut response_buf = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    let mut header_complete = false;
+    while response_buf.len() < MAX_HTTP_RESPONSE_HEADER_BYTES {
+        stream.read_exact(&mut byte).await?;
+        response_buf.push(byte[0]);
+        if response_buf.ends_with(HTTP_HEADER_TERMINATOR) {
+            header_complete = true;
+            break;
+        }
+    }
+    if !header_complete {
+        return Err(RouteWardError::ProtocolHandshake {
+            key: ERR_KEY_HANDSHAKE_FAILED,
+            detail: "HTTP CONNECT response header exceeded maximum allowed size".to_string(),
+        });
+    }
+
+    let response_str = String::from_utf8_lossy(&response_buf);
+    let mut lines = response_str.split("\r\n");
+    let status_line = lines.next().unwrap_or("HTTP Error").trim().to_string();
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    let mut proxy_auth_challenges = Vec::new();
+    let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
+    let mut connection_close = false;
+
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, val)) = line.split_once(':') {
+            let trimmed_name = name.trim();
+            let trimmed_val = val.trim();
+            if trimmed_name.eq_ignore_ascii_case("Proxy-Authenticate") {
+                proxy_auth_challenges.push(trimmed_val.to_string());
+            } else if trimmed_name.eq_ignore_ascii_case("Content-Length") {
+                if let Ok(len) = trimmed_val.parse::<usize>() {
+                    content_length = Some(len);
+                }
+            } else if trimmed_name.eq_ignore_ascii_case("Transfer-Encoding")
+                && trimmed_val.to_ascii_lowercase().contains("chunked")
+            {
+                is_chunked = true;
+            } else if (trimmed_name.eq_ignore_ascii_case("Connection")
+                || trimmed_name.eq_ignore_ascii_case("Proxy-Connection"))
+                && trimmed_val.to_ascii_lowercase().contains("close")
+            {
+                connection_close = true;
+            }
+        }
+    }
+
+    Ok(ParsedHttpResponse {
+        status_code,
+        status_line,
+        proxy_auth_challenges,
+        content_length,
+        is_chunked,
+        connection_close,
+    })
+}
+
+async fn read_crlf_line<S: AsyncTunnelStream>(stream: &mut S) -> RouteWardResult<String> {
+    let mut line = Vec::with_capacity(64);
+    let mut b = [0u8; 1];
+    while line.len() < 1024 {
+        stream.read_exact(&mut b).await?;
+        line.push(b[0]);
+        if line.ends_with(b"\r\n") {
+            return Ok(String::from_utf8_lossy(&line[..line.len() - 2]).to_string());
+        }
+    }
+    Err(RouteWardError::ProtocolHandshake {
+        key: ERR_KEY_HANDSHAKE_FAILED,
+        detail: "HTTP chunked response line exceeded limit".to_string(),
+    })
+}
+
+async fn drain_http_body<S: AsyncTunnelStream>(
+    stream: &mut S,
+    parsed: &ParsedHttpResponse,
+) -> RouteWardResult<()> {
+    if parsed.is_chunked {
+        let mut total_drained = 0usize;
+        loop {
+            let size_line = read_crlf_line(stream).await?;
+            let size_hex = size_line.split(';').next().unwrap_or("").trim();
+            let chunk_len = usize::from_str_radix(size_hex, 16).map_err(|_| {
+                RouteWardError::ProtocolHandshake {
+                    key: ERR_KEY_HANDSHAKE_FAILED,
+                    detail: "Invalid chunked body size in 407 response".to_string(),
+                }
+            })?;
+            if chunk_len == 0 {
+                // Consume trailing headers until empty line
+                loop {
+                    let trailer = read_crlf_line(stream).await?;
+                    if trailer.is_empty() {
+                        break;
+                    }
+                }
+                break;
+            }
+            total_drained = total_drained.saturating_add(chunk_len);
+            if total_drained > MAX_HTTP_BODY_DRAIN_BYTES {
+                return Err(RouteWardError::ProtocolHandshake {
+                    key: ERR_KEY_HANDSHAKE_FAILED,
+                    detail: "407 chunked response body exceeded maximum drain size".to_string(),
+                });
+            }
+            let mut sink = vec![0u8; chunk_len];
+            stream.read_exact(&mut sink).await?;
+            let mut crlf = [0u8; 2];
+            stream.read_exact(&mut crlf).await?;
+        }
+    } else if let Some(len) = parsed.content_length {
+        if len > MAX_HTTP_BODY_DRAIN_BYTES {
+            return Err(RouteWardError::ProtocolHandshake {
+                key: ERR_KEY_HANDSHAKE_FAILED,
+                detail: "407 Content-Length exceeded maximum drain size".to_string(),
+            });
+        }
+        if len > 0 {
+            let mut sink = vec![0u8; len];
+            stream.read_exact(&mut sink).await?;
+        }
+    }
+    Ok(())
+}
+
+fn format_sspi_auth_header(scheme: SspiScheme, token_b64: &str) -> String {
+    format!(
+        "Proxy-Authorization: {} {token_b64}\r\n",
+        scheme.as_header_scheme()
+    )
+}
 
 impl ProxyConnector {
     /// Applies `SO_MARK` (`fwmark`) to an existing `UdpSocket` on Linux (no-op on other platforms)
@@ -111,32 +292,78 @@ impl ProxyConnector {
         }
     }
 
+    pub fn requires_tls(node: &ProxyNode) -> bool {
+        node.tls || matches!(node.protocol, ProxyProtocol::Https)
+    }
+
     pub async fn connect_single(
         node: &ProxyNode,
         target_host: &str,
         target_port: u16,
         constants: &SystemConstants,
-    ) -> RouteWardResult<TcpStream> {
+    ) -> RouteWardResult<Box<dyn AsyncTunnelStream>> {
+        Self::connect_single_with_spn(node, None, target_host, target_port, constants).await
+    }
+
+    pub async fn connect_single_with_spn(
+        node: &ProxyNode,
+        spn_host_override: Option<&str>,
+        target_host: &str,
+        target_port: u16,
+        constants: &SystemConstants,
+    ) -> RouteWardResult<Box<dyn AsyncTunnelStream>> {
         let connect_timeout = Duration::from_millis(constants.network.tcp_connect_timeout_ms);
         let handshake_timeout = Duration::from_millis(constants.network.proxy_handshake_timeout_ms);
         let fwmark = constants.network.linux_fwmark;
-
         let proxy_addr = Self::format_host_port(&node.host, node.port);
-        let mut stream = timeout(
-            connect_timeout,
-            Self::connect_tcp_marked(&proxy_addr, fwmark),
-        )
-        .await
-        .map_err(|_| RouteWardError::ConnectionTimeout {
-            key: ERR_KEY_CONNECTION_TIMEOUT,
-        })?
-        .map_err(RouteWardError::Io)?;
+        let effective_spn = spn_host_override
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| node.sni.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+            .unwrap_or(node.host.as_str());
+
+        if matches!(node.protocol, ProxyProtocol::Http | ProxyProtocol::Https) {
+            return Self::connect_http_single_with_reconnect(
+                node,
+                &proxy_addr,
+                effective_spn,
+                target_host,
+                target_port,
+                constants,
+            )
+            .await;
+        }
+
+        let mut stream: Box<dyn AsyncTunnelStream> = Box::new(
+            timeout(
+                connect_timeout,
+                Self::connect_tcp_marked(&proxy_addr, fwmark),
+            )
+            .await
+            .map_err(|_| RouteWardError::ConnectionTimeout {
+                key: ERR_KEY_CONNECTION_TIMEOUT,
+            })?
+            .map_err(RouteWardError::Io)?,
+        );
+
+        if Self::requires_tls(node) {
+            let sni_host = tls::resolve_tls_server_name(node, spn_host_override);
+            stream = timeout(
+                handshake_timeout,
+                tls::wrap_client_stream(stream, &sni_host, node.tls_skip_verify),
+            )
+            .await
+            .map_err(|_| RouteWardError::ConnectionTimeout {
+                key: ERR_KEY_CONNECTION_TIMEOUT,
+            })??;
+        }
 
         timeout(
             handshake_timeout,
-            Self::negotiate_hop(
+            Self::negotiate_hop_with_spn(
                 &mut stream,
                 node,
+                Some(effective_spn),
                 target_host,
                 target_port,
                 &constants.protocols,
@@ -150,12 +377,110 @@ impl ProxyConnector {
         Ok(stream)
     }
 
+    async fn open_single_transport(
+        node: &ProxyNode,
+        proxy_addr: &str,
+        spn_host_override: Option<&str>,
+        constants: &SystemConstants,
+    ) -> RouteWardResult<Box<dyn AsyncTunnelStream>> {
+        let connect_timeout = Duration::from_millis(constants.network.tcp_connect_timeout_ms);
+        let handshake_timeout = Duration::from_millis(constants.network.proxy_handshake_timeout_ms);
+        let mut stream: Box<dyn AsyncTunnelStream> = Box::new(
+            timeout(
+                connect_timeout,
+                Self::connect_tcp_marked(proxy_addr, constants.network.linux_fwmark),
+            )
+            .await
+            .map_err(|_| RouteWardError::ConnectionTimeout {
+                key: ERR_KEY_CONNECTION_TIMEOUT,
+            })?
+            .map_err(RouteWardError::Io)?,
+        );
+
+        if Self::requires_tls(node) {
+            let sni_host = tls::resolve_tls_server_name(node, spn_host_override);
+            stream = timeout(
+                handshake_timeout,
+                tls::wrap_client_stream(stream, &sni_host, node.tls_skip_verify),
+            )
+            .await
+            .map_err(|_| RouteWardError::ConnectionTimeout {
+                key: ERR_KEY_CONNECTION_TIMEOUT,
+            })??;
+        }
+
+        Ok(stream)
+    }
+
+    async fn connect_http_single_with_reconnect(
+        node: &ProxyNode,
+        proxy_addr: &str,
+        effective_spn: &str,
+        target_host: &str,
+        target_port: u16,
+        constants: &SystemConstants,
+    ) -> RouteWardResult<Box<dyn AsyncTunnelStream>> {
+        let handshake_timeout = Duration::from_millis(constants.network.proxy_handshake_timeout_ms);
+        let mut sspi_session: Option<SspiClientSession> = None;
+        let mut pending_auth_header: Option<String> = initial_basic_auth_header(node);
+
+        for _attempt in 0..MAX_HTTP_AUTH_ATTEMPTS {
+            let mut stream =
+                Self::open_single_transport(node, proxy_addr, Some(effective_spn), constants)
+                    .await?;
+            let mut should_reconnect = false;
+            for _step in 0..MAX_HTTP_AUTH_ATTEMPTS {
+                match timeout(
+                    handshake_timeout,
+                    Self::negotiate_http_connect_step(
+                        &mut stream,
+                        node,
+                        effective_spn,
+                        target_host,
+                        target_port,
+                        &mut pending_auth_header,
+                        &mut sspi_session,
+                    ),
+                )
+                .await
+                .map_err(|_| RouteWardError::ConnectionTimeout {
+                    key: ERR_KEY_CONNECTION_TIMEOUT,
+                })?? {
+                    HttpConnectOutcome::Connected => return Ok(stream),
+                    HttpConnectOutcome::ContinueSameStream => continue,
+                    HttpConnectOutcome::ReconnectRequired => {
+                        should_reconnect = true;
+                        break;
+                    }
+                }
+            }
+            if !should_reconnect {
+                break;
+            }
+        }
+
+        Err(RouteWardError::AuthenticationRejected {
+            key: ERR_KEY_AUTH_REJECTED,
+        })
+    }
+
     pub async fn connect_chain(
         hops: &[ProxyNode],
         target_host: &str,
         target_port: u16,
         constants: &SystemConstants,
-    ) -> RouteWardResult<TcpStream> {
+    ) -> RouteWardResult<Box<dyn AsyncTunnelStream>> {
+        let with_spns: Vec<(ProxyNode, Option<String>)> =
+            hops.iter().map(|h| (h.clone(), None)).collect();
+        Self::connect_chain_with_spns(&with_spns, target_host, target_port, constants).await
+    }
+
+    pub async fn connect_chain_with_spns(
+        hops: &[(ProxyNode, Option<String>)],
+        target_host: &str,
+        target_port: u16,
+        constants: &SystemConstants,
+    ) -> RouteWardResult<Box<dyn AsyncTunnelStream>> {
         if hops.is_empty() {
             return Err(RouteWardError::EmptyProxyChain {
                 key: ERR_KEY_CHAIN_EMPTY,
@@ -166,31 +491,48 @@ impl ProxyConnector {
         let handshake_timeout = Duration::from_millis(constants.network.proxy_handshake_timeout_ms);
         let fwmark = constants.network.linux_fwmark;
 
-        let first_hop = &hops[0];
+        let (first_hop, first_spn) = &hops[0];
         let entry_addr = Self::format_host_port(&first_hop.host, first_hop.port);
-        let mut stream = timeout(
-            connect_timeout,
-            Self::connect_tcp_marked(&entry_addr, fwmark),
-        )
-        .await
-        .map_err(|_| RouteWardError::ConnectionTimeout {
-            key: ERR_KEY_CONNECTION_TIMEOUT,
-        })?
-        .map_err(RouteWardError::Io)?;
+        let mut stream: Box<dyn AsyncTunnelStream> = Box::new(
+            timeout(
+                connect_timeout,
+                Self::connect_tcp_marked(&entry_addr, fwmark),
+            )
+            .await
+            .map_err(|_| RouteWardError::ConnectionTimeout {
+                key: ERR_KEY_CONNECTION_TIMEOUT,
+            })?
+            .map_err(RouteWardError::Io)?,
+        );
+
+        if Self::requires_tls(first_hop) {
+            let sni_host = tls::resolve_tls_server_name(first_hop, first_spn.as_deref());
+            stream = timeout(
+                handshake_timeout,
+                tls::wrap_client_stream(stream, &sni_host, first_hop.tls_skip_verify),
+            )
+            .await
+            .map_err(|_| RouteWardError::ConnectionTimeout {
+                key: ERR_KEY_CONNECTION_TIMEOUT,
+            })??;
+        }
 
         for idx in 0..hops.len() {
-            let current_hop = &hops[idx];
-            let (next_host, next_port) = if idx + 1 < hops.len() {
-                (hops[idx + 1].host.as_str(), hops[idx + 1].port)
+            let (current_hop, current_spn) = &hops[idx];
+            let (next_host, next_port, next_hop_opt) = if idx + 1 < hops.len() {
+                let (next_node, next_spn) = &hops[idx + 1];
+                let connect_target = next_spn.as_deref().unwrap_or(&next_node.host);
+                (connect_target, next_node.port, Some((next_node, next_spn)))
             } else {
-                (target_host, target_port)
+                (target_host, target_port, None)
             };
 
             timeout(
                 handshake_timeout,
-                Self::negotiate_hop(
+                Self::negotiate_hop_with_spn(
                     &mut stream,
                     current_hop,
+                    current_spn.as_deref(),
                     next_host,
                     next_port,
                     &constants.protocols,
@@ -200,6 +542,20 @@ impl ProxyConnector {
             .map_err(|_| RouteWardError::ConnectionTimeout {
                 key: ERR_KEY_CONNECTION_TIMEOUT,
             })??;
+
+            if let Some((next_hop, next_spn)) = next_hop_opt {
+                if Self::requires_tls(next_hop) {
+                    let sni_host = tls::resolve_tls_server_name(next_hop, next_spn.as_deref());
+                    stream = timeout(
+                        handshake_timeout,
+                        tls::wrap_client_stream(stream, &sni_host, next_hop.tls_skip_verify),
+                    )
+                    .await
+                    .map_err(|_| RouteWardError::ConnectionTimeout {
+                        key: ERR_KEY_CONNECTION_TIMEOUT,
+                    })??;
+                }
+            }
         }
 
         Ok(stream)
@@ -212,8 +568,30 @@ impl ProxyConnector {
         target_host: &str,
         target_port: u16,
         constants: &SystemConstants,
-    ) -> RouteWardResult<TcpStream> {
-        let enabled_hops: Vec<ProxyNode> = hops.iter().filter(|n| n.enabled).cloned().collect();
+    ) -> RouteWardResult<Box<dyn AsyncTunnelStream>> {
+        let with_spns: Vec<(ProxyNode, Option<String>)> =
+            hops.iter().map(|h| (h.clone(), None)).collect();
+        Self::connect_group_with_spns(
+            strategy,
+            &with_spns,
+            round_robin_index,
+            target_host,
+            target_port,
+            constants,
+        )
+        .await
+    }
+
+    pub async fn connect_group_with_spns(
+        strategy: ChainStrategy,
+        hops: &[(ProxyNode, Option<String>)],
+        round_robin_index: usize,
+        target_host: &str,
+        target_port: u16,
+        constants: &SystemConstants,
+    ) -> RouteWardResult<Box<dyn AsyncTunnelStream>> {
+        let enabled_hops: Vec<(ProxyNode, Option<String>)> =
+            hops.iter().filter(|(n, _)| n.enabled).cloned().collect();
         if enabled_hops.is_empty() {
             return Err(RouteWardError::EmptyProxyChain {
                 key: ERR_KEY_CHAIN_EMPTY,
@@ -222,12 +600,21 @@ impl ProxyConnector {
 
         match strategy {
             ChainStrategy::Sequence => {
-                Self::connect_chain(&enabled_hops, target_host, target_port, constants).await
+                Self::connect_chain_with_spns(&enabled_hops, target_host, target_port, constants)
+                    .await
             }
             ChainStrategy::Failover => {
                 let mut last_err = None;
-                for node in &enabled_hops {
-                    match Self::connect_single(node, target_host, target_port, constants).await {
+                for (node, spn) in &enabled_hops {
+                    match Self::connect_single_with_spn(
+                        node,
+                        spn.as_deref(),
+                        target_host,
+                        target_port,
+                        constants,
+                    )
+                    .await
+                    {
                         Ok(stream) => return Ok(stream),
                         Err(err) => last_err = Some(err),
                     }
@@ -238,10 +625,18 @@ impl ProxyConnector {
             }
             ChainStrategy::LowestLatency => {
                 let mut sorted = enabled_hops;
-                sorted.sort_by_key(|n| n.last_latency_ms.unwrap_or(u64::MAX));
+                sorted.sort_by_key(|(n, _)| n.last_latency_ms.unwrap_or(u64::MAX));
                 let mut last_err = None;
-                for node in &sorted {
-                    match Self::connect_single(node, target_host, target_port, constants).await {
+                for (node, spn) in &sorted {
+                    match Self::connect_single_with_spn(
+                        node,
+                        spn.as_deref(),
+                        target_host,
+                        target_port,
+                        constants,
+                    )
+                    .await
+                    {
                         Ok(stream) => return Ok(stream),
                         Err(err) => last_err = Some(err),
                     }
@@ -255,8 +650,10 @@ impl ProxyConnector {
                 let mut last_err = None;
                 for offset in 0..count {
                     let idx = (round_robin_index + offset) % count;
-                    match Self::connect_single(
-                        &enabled_hops[idx],
+                    let (ref node, ref spn) = enabled_hops[idx];
+                    match Self::connect_single_with_spn(
+                        node,
+                        spn.as_deref(),
                         target_host,
                         target_port,
                         constants,
@@ -281,6 +678,17 @@ impl ProxyConnector {
         target_port: u16,
         proto: &ProtocolConstants,
     ) -> RouteWardResult<()> {
+        Self::negotiate_hop_with_spn(stream, node, None, target_host, target_port, proto).await
+    }
+
+    pub async fn negotiate_hop_with_spn<S: AsyncTunnelStream>(
+        stream: &mut S,
+        node: &ProxyNode,
+        spn_host: Option<&str>,
+        target_host: &str,
+        target_port: u16,
+        proto: &ProtocolConstants,
+    ) -> RouteWardResult<()> {
         match node.protocol {
             ProxyProtocol::Socks5 => Self::negotiate_socks5(
                 stream,
@@ -292,10 +700,118 @@ impl ProxyConnector {
             )
             .await
             .map(|_| ()),
+            ProxyProtocol::Socks4 => {
+                Self::negotiate_socks4(stream, node, target_host, target_port, proto).await
+            }
             ProxyProtocol::Http | ProxyProtocol::Https => {
-                Self::negotiate_http_connect(stream, node, target_host, target_port, proto).await
+                let effective_spn = spn_host
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or(node.sni.as_deref())
+                    .unwrap_or(node.host.as_str());
+                Self::negotiate_http_connect_with_spn(
+                    stream,
+                    node,
+                    effective_spn,
+                    target_host,
+                    target_port,
+                    proto,
+                )
+                .await
             }
         }
+    }
+
+    pub async fn negotiate_socks4<S: AsyncTunnelStream>(
+        stream: &mut S,
+        node: &ProxyNode,
+        target_host: &str,
+        target_port: u16,
+        proto: &ProtocolConstants,
+    ) -> RouteWardResult<()> {
+        let clean_host = target_host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        if clean_host.is_empty() || clean_host.as_bytes().contains(&0) {
+            return Err(RouteWardError::ProtocolHandshake {
+                key: ERR_KEY_HANDSHAKE_FAILED,
+                detail: "Invalid SOCKS4 target host".to_string(),
+            });
+        }
+
+        let userid = node
+            .auth
+            .as_ref()
+            .map(|a| a.username.as_str())
+            .unwrap_or("");
+        if userid.as_bytes().contains(&0) {
+            return Err(RouteWardError::ProtocolHandshake {
+                key: ERR_KEY_HANDSHAKE_FAILED,
+                detail: "SOCKS4 user ID must not contain NUL bytes".to_string(),
+            });
+        }
+
+        if let Some(creds) = &node.auth {
+            if !creds.password_str().is_empty() {
+                tracing::warn!(
+                    target: "routeward::proxy::socks4",
+                    "SOCKS4/4a ignores proxy password field; only USERID is sent on the wire"
+                );
+            }
+        }
+
+        let parsed_ip = IpAddr::from_str(clean_host).ok();
+        if matches!(parsed_ip, Some(IpAddr::V6(_))) {
+            return Err(RouteWardError::ProtocolHandshake {
+                key: ERR_KEY_HANDSHAKE_FAILED,
+                detail: format!("SOCKS4 does not support IPv6 targets ({clean_host})"),
+            });
+        }
+
+        let mut req = Vec::with_capacity(16 + userid.len() + clean_host.len());
+        req.push(proto.socks4_version);
+        req.push(proto.socks4_cmd_connect);
+        req.extend_from_slice(&target_port.to_be_bytes());
+
+        match parsed_ip {
+            Some(IpAddr::V4(v4)) => {
+                req.extend_from_slice(&v4.octets());
+                req.extend_from_slice(userid.as_bytes());
+                req.push(0);
+            }
+            None => {
+                if clean_host.len() > MAX_SOCKS4A_DOMAIN_LEN {
+                    return Err(RouteWardError::ProtocolHandshake {
+                        key: ERR_KEY_HANDSHAKE_FAILED,
+                        detail: "SOCKS4a domain exceeds 255 bytes".to_string(),
+                    });
+                }
+                req.extend_from_slice(&SOCKS4A_SENTINEL_IPV4);
+                req.extend_from_slice(userid.as_bytes());
+                req.push(0);
+                req.extend_from_slice(clean_host.as_bytes());
+                req.push(0);
+            }
+            Some(IpAddr::V6(_)) => unreachable!(),
+        }
+
+        stream.write_all(&req).await?;
+        let mut resp = [0u8; 8];
+        stream.read_exact(&mut resp).await?;
+        if resp[0] != proto.socks4_reply_version {
+            return Err(RouteWardError::ProtocolHandshake {
+                key: ERR_KEY_HANDSHAKE_FAILED,
+                detail: format!("Unexpected SOCKS4 reply version 0x{:02X}", resp[0]),
+            });
+        }
+        if resp[1] != proto.socks4_reply_granted {
+            return Err(RouteWardError::ProtocolHandshake {
+                key: ERR_KEY_HANDSHAKE_FAILED,
+                detail: format!("SOCKS4 request rejected with code {}", resp[1]),
+            });
+        }
+        Ok(())
     }
 
     pub async fn negotiate_socks5<S: AsyncTunnelStream>(
@@ -436,56 +952,135 @@ impl ProxyConnector {
         node: &ProxyNode,
         target_host: &str,
         target_port: u16,
-        proto: &ProtocolConstants,
+        _proto: &ProtocolConstants,
     ) -> RouteWardResult<()> {
-        let auth_header = if let Some(creds) = &node.auth {
-            let pass = creds.password_str();
-            if !creds.username.is_empty() || !pass.is_empty() {
-                let token = BASE64_STANDARD.encode(format!("{}:{pass}", creds.username));
-                format!("Proxy-Authorization: Basic {token}\r\n")
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
+        let spn = node.sni.as_deref().unwrap_or(&node.host);
+        Self::negotiate_http_connect_with_spn(stream, node, spn, target_host, target_port, _proto)
+            .await
+    }
 
+    pub async fn negotiate_http_connect_with_spn<S: AsyncTunnelStream>(
+        stream: &mut S,
+        node: &ProxyNode,
+        effective_spn: &str,
+        target_host: &str,
+        target_port: u16,
+        _proto: &ProtocolConstants,
+    ) -> RouteWardResult<()> {
+        let mut sspi_session: Option<SspiClientSession> = None;
+        let mut pending_auth_header = initial_basic_auth_header(node);
+
+        for _ in 0..MAX_HTTP_AUTH_ATTEMPTS {
+            match Self::negotiate_http_connect_step(
+                stream,
+                node,
+                effective_spn,
+                target_host,
+                target_port,
+                &mut pending_auth_header,
+                &mut sspi_session,
+            )
+            .await?
+            {
+                HttpConnectOutcome::Connected => return Ok(()),
+                HttpConnectOutcome::ContinueSameStream => continue,
+                HttpConnectOutcome::ReconnectRequired => {
+                    return Err(RouteWardError::AuthenticationRejected {
+                        key: ERR_KEY_AUTH_REJECTED,
+                    });
+                }
+            }
+        }
+
+        Err(RouteWardError::AuthenticationRejected {
+            key: ERR_KEY_AUTH_REJECTED,
+        })
+    }
+
+    async fn negotiate_http_connect_step<S: AsyncTunnelStream>(
+        stream: &mut S,
+        node: &ProxyNode,
+        effective_spn: &str,
+        target_host: &str,
+        target_port: u16,
+        pending_auth_header: &mut Option<String>,
+        sspi_session: &mut Option<SspiClientSession>,
+    ) -> RouteWardResult<HttpConnectOutcome> {
         let host_port = Self::format_host_port(target_host, target_port);
+        let auth_hdr = pending_auth_header.take().unwrap_or_default();
         let request = format!(
-            "CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n{auth_header}Proxy-Connection: Keep-Alive\r\n\r\n"
+            "CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n{auth_hdr}Proxy-Connection: Keep-Alive\r\n\r\n"
         );
         stream.write_all(request.as_bytes()).await?;
 
-        let mut response_buf = Vec::with_capacity(256);
-        let mut byte = [0u8; 1];
-        let mut header_complete = false;
-        while response_buf.len() < MAX_HTTP_RESPONSE_HEADER_BYTES {
-            stream.read_exact(&mut byte).await?;
-            response_buf.push(byte[0]);
-            if response_buf.ends_with(HTTP_HEADER_TERMINATOR) {
-                header_complete = true;
-                break;
-            }
-        }
-        if !header_complete {
-            return Err(RouteWardError::ProtocolHandshake {
-                key: ERR_KEY_HANDSHAKE_FAILED,
-                detail: "HTTP CONNECT response header exceeded maximum allowed size".to_string(),
-            });
+        let parsed = read_http_response_headers(stream).await?;
+        if (200..300).contains(&parsed.status_code) {
+            return Ok(HttpConnectOutcome::Connected);
         }
 
-        let response_str = String::from_utf8_lossy(&response_buf);
-        if response_str.starts_with(&proto.http_success_status_prefix)
-            || response_str.starts_with(&proto.http_alt_success_status_prefix)
-        {
-            Ok(())
-        } else {
-            let status_line = response_str.lines().next().unwrap_or("HTTP Error");
-            Err(RouteWardError::ProtocolHandshake {
-                key: ERR_KEY_HANDSHAKE_FAILED,
-                detail: status_line.to_string(),
-            })
+        if parsed.status_code == 407 {
+            let Some(scheme) = select_sspi_scheme(&parsed.proxy_auth_challenges) else {
+                tracing::warn!(
+                    target: "routeward::proxy::http_connect",
+                    "HTTP proxy rejected CONNECT with 407: {}",
+                    parsed.status_line
+                );
+                return Err(RouteWardError::AuthenticationRejected {
+                    key: ERR_KEY_AUTH_REJECTED,
+                });
+            };
+
+            let challenge_token = extract_challenge_token(&parsed.proxy_auth_challenges, scheme);
+            if !parsed.connection_close {
+                drain_http_body(stream, &parsed).await?;
+            }
+
+            let spn_owned = effective_spn.to_string();
+            let creds_opt = node.auth.clone();
+            let sess = match sspi_session.take() {
+                Some(existing) if !parsed.connection_close || challenge_token.is_some() => existing,
+                _ => {
+                    tokio::task::spawn_blocking(move || {
+                        SspiClientSession::acquire(scheme, &spn_owned, creds_opt.as_ref())
+                    })
+                    .await
+                    .map_err(|err| {
+                        tracing::warn!(target: "routeward::proxy::sspi", "SSPI acquire join error: {err}");
+                        RouteWardError::AuthenticationRejected {
+                            key: ERR_KEY_AUTH_REJECTED,
+                        }
+                    })??
+                }
+            };
+
+            let had_challenge = challenge_token.is_some();
+            let (updated_sess, token_b64, _complete) =
+                sspi_step_async(sess, challenge_token).await?;
+
+            if parsed.connection_close {
+                if had_challenge {
+                    // Proxy dropped the connection during/after a Type 2 challenge: do not replay
+                    // a Type 3 token on a new TCP socket; reset state for a clean retry.
+                    *sspi_session = None;
+                    *pending_auth_header = None;
+                } else {
+                    // Proxy closed the unauthenticated 407 socket right before accepting Type 1:
+                    // keep the SSPI context and Type 1 token so Type 2 completes on the next socket.
+                    *sspi_session = Some(updated_sess);
+                    *pending_auth_header = Some(format_sspi_auth_header(scheme, &token_b64));
+                }
+                return Ok(HttpConnectOutcome::ReconnectRequired);
+            }
+
+            *sspi_session = Some(updated_sess);
+            *pending_auth_header = Some(format_sspi_auth_header(scheme, &token_b64));
+            return Ok(HttpConnectOutcome::ContinueSameStream);
         }
+
+        Err(RouteWardError::ProtocolHandshake {
+            key: ERR_KEY_HANDSHAKE_FAILED,
+            detail: parsed.status_line,
+        })
     }
 
     pub fn format_host_port(host: &str, port: u16) -> String {
@@ -541,6 +1136,7 @@ mod tests {
             port: 1080,
             auth: Some(ProxyCredentials::new("u".repeat(256), "secret")),
             tls: false,
+            tls_skip_verify: false,
             sni: None,
             udp_enabled: false,
             enabled: true,
@@ -580,6 +1176,7 @@ mod tests {
             port: 8080,
             auth: None,
             tls: false,
+            tls_skip_verify: false,
             sni: None,
             udp_enabled: false,
             enabled: true,
@@ -622,6 +1219,7 @@ mod tests {
             port: 8080,
             auth: None,
             tls: false,
+            tls_skip_verify: false,
             sni: None,
             udp_enabled: false,
             enabled: true,
@@ -648,5 +1246,76 @@ mod tests {
         let sent_req = server_task.await.unwrap();
         assert!(sent_req
             .starts_with("CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n"));
+    }
+
+    #[tokio::test]
+    async fn socks4_and_socks4a_wire_handshake_and_ipv6_rejection() {
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let node = ProxyNode {
+            id: "test-socks4".to_string(),
+            name: "SOCKS4".to_string(),
+            protocol: ProxyProtocol::Socks4,
+            host: "127.0.0.1".to_string(),
+            port: 1080,
+            auth: Some(ProxyCredentials::new("edgeuser", "")),
+            tls: false,
+            tls_skip_verify: false,
+            sni: None,
+            udp_enabled: false,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        };
+
+        let (mut client, mut server) = duplex(256);
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let n = tokio::io::AsyncReadExt::read(&mut server, &mut buf)
+                .await
+                .unwrap();
+            server
+                .write_all(&[0x00, 90, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            buf[..n].to_vec()
+        });
+
+        ProxyConnector::negotiate_socks4(&mut client, &node, "edge.example.com", 443, &proto)
+            .await
+            .expect("SOCKS4a domain connect should succeed");
+        let packet = server_task.await.unwrap();
+        assert_eq!(packet[0], 4);
+        assert_eq!(packet[1], 1);
+        assert_eq!(&packet[2..4], &443u16.to_be_bytes());
+        assert_eq!(&packet[4..8], &[0, 0, 0, 1]);
+        assert!(packet[8..].starts_with(b"edgeuser\0edge.example.com\0"));
+
+        let (mut c6, _) = duplex(64);
+        let err = ProxyConnector::negotiate_socks4(&mut c6, &node, "2001:db8::1", 443, &proto)
+            .await
+            .expect_err("SOCKS4 must reject IPv6 targets");
+        assert!(err.to_string().contains("IPv6"));
+    }
+
+    #[tokio::test]
+    async fn http_connect_drains_407_chunked_body_and_handles_200_keepalive() {
+        let resp = ParsedHttpResponse {
+            status_code: 407,
+            status_line: "HTTP/1.1 407 Proxy Authentication Required".to_string(),
+            proxy_auth_challenges: vec!["NTLM".to_string()],
+            content_length: None,
+            is_chunked: true,
+            connection_close: false,
+        };
+        let (mut client, mut server) = duplex(512);
+        tokio::spawn(async move {
+            let _ = server.write_all(b"5\r\nhello\r\n0\r\n\r\nNEXT").await;
+        });
+        drain_http_body(&mut client, &resp)
+            .await
+            .expect("drain chunked 407 body cleanly");
+        let mut tail = [0u8; 4];
+        client.read_exact(&mut tail).await.unwrap();
+        assert_eq!(&tail, b"NEXT");
     }
 }

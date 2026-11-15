@@ -25,6 +25,78 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub const HTTP_REQ_BUFFER_BYTES: usize = 65536;
+const HTTP_MAX_HEADER_BYTES: usize = 16384;
+const HTTP_MAX_BODY_BYTES: usize = 1024 * 1024;
+const HTTP_READ_TIMEOUT_MS: u64 = 2000;
+
+async fn read_bounded_http_request(stream: &mut TcpStream) -> Result<String, u16> {
+    let mut raw = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let header_end;
+
+    loop {
+        let read_res = tokio::time::timeout(
+            std::time::Duration::from_millis(HTTP_READ_TIMEOUT_MS),
+            stream.read(&mut chunk),
+        )
+        .await;
+        let n = match read_res {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) | Err(_) => break,
+        };
+        if raw.len().saturating_add(n) > HTTP_MAX_HEADER_BYTES + HTTP_MAX_BODY_BYTES {
+            return Err(413);
+        }
+        raw.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end = Some(pos);
+            let headers_text = String::from_utf8_lossy(&raw[..pos]);
+            let content_length = headers_text
+                .lines()
+                .skip(1)
+                .find_map(|line| {
+                    let (name, val) = line.split_once(':')?;
+                    if name.trim().eq_ignore_ascii_case("Content-Length") {
+                        val.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            if content_length > HTTP_MAX_BODY_BYTES {
+                return Err(413);
+            }
+            let target_len = pos + 4 + content_length;
+            while raw.len() < target_len {
+                let body_read = tokio::time::timeout(
+                    std::time::Duration::from_millis(HTTP_READ_TIMEOUT_MS),
+                    stream.read(&mut chunk),
+                )
+                .await;
+                match body_read {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(bn)) => {
+                        raw.extend_from_slice(&chunk[..bn]);
+                        if raw.len() > HTTP_MAX_HEADER_BYTES + HTTP_MAX_BODY_BYTES {
+                            return Err(413);
+                        }
+                    }
+                }
+            }
+            let _ = header_end;
+            break;
+        }
+        if raw.len() > HTTP_MAX_HEADER_BYTES {
+            return Err(413);
+        }
+    }
+
+    if raw.is_empty() {
+        return Err(400);
+    }
+    Ok(String::from_utf8_lossy(&raw).into_owned())
+}
 
 #[derive(Debug, Deserialize)]
 struct LaunchProcessRequest {
@@ -36,6 +108,27 @@ struct LaunchProcessRequest {
 #[derive(Debug, Deserialize)]
 struct SystemProxyRequest {
     enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportFoxyProxyRequest {
+    json: String,
+    #[serde(default, rename = "processPatterns")]
+    process_patterns: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveProfileRequest {
+    #[serde(default, rename = "profileId")]
+    profile_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileIdRequest {
+    #[serde(rename = "profileId")]
+    profile_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,6 +519,182 @@ pub async fn handle_api_route(
         return Some((200, json_ct, json));
     }
 
+    if path.starts_with("/api/system/pac") {
+        if method == "POST" {
+            match serde_json::from_str::<SystemProxyRequest>(body_str) {
+                Ok(parsed) => match bridge.set_system_pac(parsed.enabled) {
+                    Ok((enabled, pac_url)) => {
+                        let json = serde_json::to_vec(&serde_json::json!({
+                            "enabled": enabled,
+                            "pacUrl": pac_url,
+                        }))
+                        .unwrap_or_default();
+                        return Some((200, json_ct, json));
+                    }
+                    Err(err) => {
+                        let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
+                            .unwrap_or_default();
+                        return Some((500, json_ct, json));
+                    }
+                },
+                Err(err) => {
+                    let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                        .unwrap_or_default();
+                    return Some((400, json_ct, json));
+                }
+            }
+        }
+        let (enabled, pac_url) = bridge.get_system_pac_status();
+        let json = serde_json::to_vec(&serde_json::json!({
+            "enabled": enabled,
+            "pacUrl": pac_url,
+        }))
+        .unwrap_or_default();
+        return Some((200, json_ct, json));
+    }
+
+    if path.starts_with("/api/system/autostart") {
+        if method == "POST" {
+            match serde_json::from_str::<SystemProxyRequest>(body_str) {
+                Ok(parsed) => match bridge.set_autostart(parsed.enabled) {
+                    Ok(enabled) => {
+                        let json = serde_json::to_vec(&serde_json::json!({ "enabled": enabled }))
+                            .unwrap_or_default();
+                        return Some((200, json_ct, json));
+                    }
+                    Err(err) => {
+                        let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
+                            .unwrap_or_default();
+                        return Some((500, json_ct, json));
+                    }
+                },
+                Err(err) => {
+                    let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                        .unwrap_or_default();
+                    return Some((400, json_ct, json));
+                }
+            }
+        }
+        let enabled = bridge.get_autostart_status();
+        let json =
+            serde_json::to_vec(&serde_json::json!({ "enabled": enabled })).unwrap_or_default();
+        return Some((200, json_ct, json));
+    }
+
+    if path.starts_with("/api/import/foxyproxy") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        match serde_json::from_str::<ImportFoxyProxyRequest>(body_str) {
+            Ok(parsed) => match bridge
+                .import_foxyproxy_json(parsed.json, parsed.process_patterns)
+                .await
+            {
+                Ok(report) => {
+                    let json = serde_json::to_vec(&report).unwrap_or_default();
+                    return Some((200, json_ct, json));
+                }
+                Err(err) => {
+                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
+                        .unwrap_or_default();
+                    return Some((400, json_ct, json));
+                }
+            },
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                    .unwrap_or_default();
+                return Some((400, json_ct, json));
+            }
+        }
+    }
+
+    if path.starts_with("/api/profiles/save") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        match serde_json::from_str::<SaveProfileRequest>(body_str) {
+            Ok(parsed) => match bridge
+                .save_named_profile(parsed.profile_id, parsed.name)
+                .await
+            {
+                Ok(list) => {
+                    let json = serde_json::to_vec(&list).unwrap_or_default();
+                    return Some((200, json_ct, json));
+                }
+                Err(err) => {
+                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
+                        .unwrap_or_default();
+                    return Some((400, json_ct, json));
+                }
+            },
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                    .unwrap_or_default();
+                return Some((400, json_ct, json));
+            }
+        }
+    }
+
+    if path.starts_with("/api/profiles/switch") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        match serde_json::from_str::<ProfileIdRequest>(body_str) {
+            Ok(parsed) => match bridge.switch_profile(parsed.profile_id).await {
+                Ok(prof) => {
+                    let json = serde_json::to_vec(&prof).unwrap_or_default();
+                    return Some((200, json_ct, json));
+                }
+                Err(err) => {
+                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
+                        .unwrap_or_default();
+                    return Some((400, json_ct, json));
+                }
+            },
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                    .unwrap_or_default();
+                return Some((400, json_ct, json));
+            }
+        }
+    }
+
+    if path.starts_with("/api/profiles/delete") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        match serde_json::from_str::<ProfileIdRequest>(body_str) {
+            Ok(parsed) => match bridge.delete_profile(parsed.profile_id).await {
+                Ok(list) => {
+                    let json = serde_json::to_vec(&list).unwrap_or_default();
+                    return Some((200, json_ct, json));
+                }
+                Err(err) => {
+                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
+                        .unwrap_or_default();
+                    return Some((400, json_ct, json));
+                }
+            },
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                    .unwrap_or_default();
+                return Some((400, json_ct, json));
+            }
+        }
+    }
+
+    if path.starts_with("/api/profiles") {
+        let list = bridge.list_profiles().await;
+        let json = serde_json::to_vec(&list).unwrap_or_default();
+        return Some((200, json_ct, json));
+    }
+
+    if path.starts_with("/api/system/apps") {
+        let apps = bridge.list_system_applications().await;
+        let json = serde_json::to_vec(&apps).unwrap_or_default();
+        return Some((200, json_ct, json));
+    }
+
     if path.starts_with("/api/system-proxy") {
         match serde_json::from_str::<SystemProxyRequest>(body_str) {
             Ok(parsed) => match bridge.set_system_proxy(parsed.enabled) {
@@ -537,12 +806,22 @@ pub async fn serve_loopback_http_connection<FStatic>(
     FStatic: FnOnce(&str) -> (&'static str, &'static [u8]),
 {
     let _ = stream.set_nodelay(true);
-    let mut buf = vec![0u8; HTTP_REQ_BUFFER_BYTES];
-    let n = stream.read(&mut buf).await.unwrap_or(0);
-    if n == 0 {
-        return;
-    }
-    let req = String::from_utf8_lossy(&buf[..n]);
+    let req = match read_bounded_http_request(&mut stream).await {
+        Ok(r) => r,
+        Err(413) => {
+            let body = b"{\"error\":\"payload_too_large\"}";
+            let resp = format!(
+                "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+            let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
+            return;
+        }
+        Err(_) => return,
+    };
 
     let (method, path) = match validate_loopback_http_request_with_method(
         &req,

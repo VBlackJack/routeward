@@ -112,6 +112,52 @@ impl IpcConstants {
             Ok(std::path::PathBuf::from(&self.linux_profile_path))
         }
     }
+
+    pub fn resolve_daemon_profiles_dir(&self) -> RouteWardResult<std::path::PathBuf> {
+        let primary = self.resolve_daemon_profile_path()?;
+        let parent = primary
+            .parent()
+            .ok_or_else(|| RouteWardError::ConfigError {
+                key: ERR_KEY_CONFIG_LOAD,
+                detail: "Invalid daemon profile path".to_string(),
+            })?;
+        Ok(parent.join("profiles"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSummary {
+    pub profile_id: String,
+    pub name: String,
+    pub proxy_count: usize,
+    pub rule_count: usize,
+    pub active: bool,
+}
+
+pub fn is_valid_profile_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 48
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+pub fn slugify_profile_id(raw: &str) -> String {
+    let mut slug = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if (ch == '-' || ch == '_' || ch.is_whitespace()) && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let trimmed = slug.trim_matches('-').chars().take(48).collect::<String>();
+    if is_valid_profile_slug(&trimmed) {
+        trimmed
+    } else {
+        "custom-profile".to_string()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +168,8 @@ pub struct NetworkConstants {
     pub default_relay_tcp_port: u16,
     pub default_relay_http_port: u16,
     pub default_transparent_tcp_port: u16,
+    #[serde(default = "default_pac_port")]
+    pub default_pac_port: u16,
     pub default_dns_listen_port: u16,
     #[serde(default = "default_local_name_inspect_port")]
     pub default_local_name_inspect_port: u16,
@@ -177,6 +225,28 @@ pub struct NetworkConstants {
     pub tls_sni_peek_timeout_ms: u64,
     #[serde(default = "default_tls_sni_max_bytes")]
     pub tls_sni_max_bytes: usize,
+    #[serde(default = "default_http_host_inspect_ports")]
+    pub http_host_inspect_ports: Vec<u16>,
+    #[serde(default = "default_http_host_peek_timeout_ms")]
+    pub http_host_peek_timeout_ms: u64,
+    #[serde(default = "default_http_host_max_bytes")]
+    pub http_host_max_bytes: usize,
+}
+
+fn default_pac_port() -> u16 {
+    10811
+}
+
+fn default_http_host_inspect_ports() -> Vec<u16> {
+    vec![80, 8080, 8000, 8888]
+}
+
+fn default_http_host_peek_timeout_ms() -> u64 {
+    200
+}
+
+fn default_http_host_max_bytes() -> usize {
+    4096
 }
 
 fn default_linux_fwmark() -> u32 {
@@ -509,6 +579,14 @@ pub struct ProtocolConstants {
     pub socks5_reply_general_failure: u8,
     #[serde(default = "default_socks5_reply_command_not_supported")]
     pub socks5_reply_command_not_supported: u8,
+    #[serde(default = "default_socks4_version")]
+    pub socks4_version: u8,
+    #[serde(default = "default_socks4_cmd_connect")]
+    pub socks4_cmd_connect: u8,
+    #[serde(default = "default_socks4_reply_version")]
+    pub socks4_reply_version: u8,
+    #[serde(default = "default_socks4_reply_granted")]
+    pub socks4_reply_granted: u8,
     pub http_success_status_prefix: String,
     pub http_alt_success_status_prefix: String,
 }
@@ -519,6 +597,22 @@ fn default_socks5_reply_general_failure() -> u8 {
 
 fn default_socks5_reply_command_not_supported() -> u8 {
     7
+}
+
+fn default_socks4_version() -> u8 {
+    4
+}
+
+fn default_socks4_cmd_connect() -> u8 {
+    1
+}
+
+fn default_socks4_reply_version() -> u8 {
+    0
+}
+
+fn default_socks4_reply_granted() -> u8 {
+    90
 }
 
 impl SystemConstants {
@@ -553,6 +647,7 @@ pub enum InterceptionMode {
 #[serde(rename_all = "lowercase")]
 pub enum ProxyProtocol {
     Socks5,
+    Socks4,
     Http,
     Https,
 }
@@ -625,6 +720,8 @@ pub struct ProxyNode {
     pub auth: Option<ProxyCredentials>,
     pub udp_enabled: bool,
     pub tls: bool,
+    #[serde(default)]
+    pub tls_skip_verify: bool,
     pub sni: Option<String>,
     pub enabled: bool,
     pub last_latency_ms: Option<u64>,

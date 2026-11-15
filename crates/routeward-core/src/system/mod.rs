@@ -28,6 +28,10 @@ const DEFAULT_NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
 
 #[cfg(windows)]
 const WIN_INET_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+#[cfg(windows)]
+const WIN_RUN_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
+const AUTOSTART_VALUE_NAME: &str = "RouteWardDesktop";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +98,146 @@ impl SystemProxyManager {
         }
     }
 
+    pub fn is_valid_local_pac_url(pac_url: &str) -> bool {
+        let trimmed = pac_url.trim();
+        let Some(rest) = trimmed.strip_prefix("http://") else {
+            return false;
+        };
+        if trimmed.len() > 256
+            || trimmed
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '@' | '?' | '#' | '\\'))
+        {
+            return false;
+        }
+        let authority = rest.split('/').next().unwrap_or("");
+        let Some((host, port_str)) = authority.split_once(':') else {
+            return false;
+        };
+        if !host.eq_ignore_ascii_case("127.0.0.1") && !host.eq_ignore_ascii_case("localhost") {
+            return false;
+        }
+        matches!(port_str.parse::<u16>(), Ok(p) if p > 0)
+    }
+
+    pub fn set_system_pac(enable: bool, pac_url: &str) -> RouteWardResult<bool> {
+        if enable && !Self::is_valid_local_pac_url(pac_url) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PAC URL must use loopback http://127.0.0.1:<port>/...",
+            )
+            .into());
+        }
+        #[cfg(windows)]
+        {
+            if enable {
+                Self::run_reg_add(&[
+                    "add",
+                    WIN_INET_REG_PATH,
+                    "/v",
+                    "AutoConfigURL",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    pac_url.trim(),
+                    "/f",
+                ])?;
+            } else {
+                let _ = Command::new("reg")
+                    .args(["delete", WIN_INET_REG_PATH, "/v", "AutoConfigURL", "/f"])
+                    .output();
+            }
+            Ok(enable)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pac_url;
+            Ok(enable)
+        }
+    }
+
+    pub fn get_system_pac_url() -> Option<String> {
+        #[cfg(windows)]
+        {
+            let output = Command::new("reg")
+                .args(["query", WIN_INET_REG_PATH, "/v", "AutoConfigURL"])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(idx) = line.find("REG_SZ") {
+                    let val = line[idx + "REG_SZ".len()..].trim();
+                    if !val.is_empty() {
+                        return Some(val.to_string());
+                    }
+                }
+            }
+            None
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    pub fn is_autostart_enabled() -> bool {
+        #[cfg(windows)]
+        {
+            let Ok(output) = Command::new("reg")
+                .args(["query", WIN_RUN_REG_PATH, "/v", AUTOSTART_VALUE_NAME])
+                .output()
+            else {
+                return false;
+            };
+            output.status.success()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    pub fn set_autostart(enable: bool, exe_path: &str) -> RouteWardResult<bool> {
+        #[cfg(windows)]
+        {
+            if enable {
+                let trimmed = exe_path.trim().trim_matches('"');
+                if trimmed.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Autostart executable path cannot be empty",
+                    )
+                    .into());
+                }
+                let quoted = format!("\"{trimmed}\"");
+                Self::run_reg_add(&[
+                    "add",
+                    WIN_RUN_REG_PATH,
+                    "/v",
+                    AUTOSTART_VALUE_NAME,
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    &quoted,
+                    "/f",
+                ])?;
+            } else {
+                let _ = Command::new("reg")
+                    .args(["delete", WIN_RUN_REG_PATH, "/v", AUTOSTART_VALUE_NAME, "/f"])
+                    .output();
+            }
+            Ok(enable)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = exe_path;
+            Ok(enable)
+        }
+    }
+
     pub fn spawn_process_with_proxy(
         executable_path: &str,
         args: &[String],
@@ -148,5 +292,30 @@ mod tests {
         )
         .expect_err("empty executable path must return error");
         assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn validates_loopback_pac_urls_strictly() {
+        assert!(SystemProxyManager::is_valid_local_pac_url(
+            "http://127.0.0.1:10811/proxy.pac"
+        ));
+        assert!(SystemProxyManager::is_valid_local_pac_url(
+            "http://localhost:10811/proxy.pac"
+        ));
+        assert!(!SystemProxyManager::is_valid_local_pac_url(
+            "https://evil.example/proxy.pac"
+        ));
+        assert!(!SystemProxyManager::is_valid_local_pac_url(
+            "http://127.0.0.1:10811/proxy.pac\" & calc"
+        ));
+        assert!(!SystemProxyManager::is_valid_local_pac_url(
+            "http://127.0.0.1:10811@evil.example/proxy.pac"
+        ));
+        assert!(!SystemProxyManager::is_valid_local_pac_url(
+            "http://localhost:80.evil.example/proxy.pac"
+        ));
+        assert!(!SystemProxyManager::is_valid_local_pac_url(
+            "http://127.0.0.1:0/proxy.pac"
+        ));
     }
 }

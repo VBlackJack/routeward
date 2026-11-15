@@ -5,6 +5,7 @@
     "defaultRelayTcpPort": 10808,
     "defaultRelayHttpPort": 10809,
     "defaultTransparentTcpPort": 10810,
+    "defaultPacPort": 10811,
     "defaultDnsListenPort": 10853,
     "defaultLocalNameInspectPort": 10854,
     "quicDefaultPort": 443,
@@ -40,7 +41,10 @@
     "linuxNftChainName": "output",
     "tlsSniDefaultPort": 443,
     "tlsSniPeekTimeoutMs": 200,
-    "tlsSniMaxBytes": 4096
+    "tlsSniMaxBytes": 4096,
+    "httpHostInspectPorts": [80, 8080, 8000, 8888],
+    "httpHostPeekTimeoutMs": 200,
+    "httpHostMaxBytes": 4096
   },
   "dns": {
     "fakeIpCidr": "198.18.0.0/15",
@@ -143,6 +147,10 @@
     "socks5ReplySucceeded": 0,
     "socks5ReplyGeneralFailure": 1,
     "socks5ReplyCommandNotSupported": 7,
+    "socks4Version": 4,
+    "socks4CmdConnect": 1,
+    "socks4ReplyVersion": 0,
+    "socks4ReplyGranted": 90,
     "httpSuccessStatusPrefix": "HTTP/1.1 200",
     "httpAltSuccessStatusPrefix": "HTTP/1.0 200"
   },
@@ -247,6 +255,33 @@
       "portRanges": [],
       "protocol": "any",
       "suggestedActionType": "direct"
+    },
+    {
+      "id": "preset-edge-foxyproxy",
+      "i18nKey": "rules.presets.edge_foxyproxy",
+      "priority": 14,
+      "processPatterns": [
+        "msedge.exe",
+        "msedge"
+      ],
+      "domainPatterns": [
+        "!localhost",
+        "!*.local",
+        "!*.lan",
+        "!*.internal"
+      ],
+      "ipCidrs": [
+        "!127.0.0.0/8",
+        "!10.0.0.0/8",
+        "!172.16.0.0/12",
+        "!192.168.0.0/16"
+      ],
+      "portRanges": [
+        { "start": 80, "end": 80 },
+        { "start": 443, "end": 443 }
+      ],
+      "protocol": "tcp",
+      "suggestedActionType": "proxy"
     }
   ],
   "visualAppCatalog": [

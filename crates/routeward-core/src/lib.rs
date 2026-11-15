@@ -22,6 +22,7 @@ pub mod i18n;
 pub mod interceptor;
 pub mod ipc;
 pub mod logger;
+pub mod pac;
 pub mod process;
 pub mod proxy;
 pub mod rules;

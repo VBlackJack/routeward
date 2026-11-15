@@ -301,6 +301,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = b.toggle_engine(!running).await;
                     });
                 }
+                DesktopWindowCommand::SwitchProfile(idx) => {
+                    let b = Arc::clone(&bridge_for_loop);
+                    rt_for_loop.spawn(async move {
+                        b.switch_profile_by_index(idx).await;
+                    });
+                }
                 DesktopWindowCommand::Quit => {
                     #[cfg(target_os = "windows")]
                     tray_handle.lock().shutdown();

@@ -23,9 +23,10 @@ use crate::config::{ProxyNode, RuleAction, TransportProtocol};
 use crate::error::{
     RouteWardError, RouteWardResult, ERR_KEY_HANDSHAKE_FAILED, ERR_KEY_PROXY_NOT_FOUND,
 };
+use crate::proxy::http_host::HttpHostExtractor;
 use crate::proxy::sni::TlsSniExtractor;
 use crate::proxy::udp::{decode_socks5_udp_datagram, encode_socks5_udp_datagram};
-use crate::proxy::ProxyConnector;
+use crate::proxy::{AsyncTunnelStream, ProxyConnector};
 use crate::rules::ConnectionRequest;
 use crate::telemetry::{ConnectionStatus, LogLevel, TrackedConnection};
 use chrono::Utc;
@@ -212,6 +213,7 @@ impl RouteWardController {
                 tx_bytes: 0,
                 status: ConnectionStatus::Blocked,
                 started_at: Utc::now(),
+                error_detail: None,
             };
             self.telemetry.record_connection(blocked_conn, false);
             Self::send_socks5_failure_and_close(&mut client, proto).await;
@@ -263,6 +265,7 @@ impl RouteWardController {
                             tx_bytes: 0,
                             status: ConnectionStatus::Blocked,
                             started_at: Utc::now(),
+                            error_detail: Some(err.to_string()),
                         },
                         false,
                     );
@@ -332,6 +335,7 @@ impl RouteWardController {
             tx_bytes: 0,
             status: ConnectionStatus::Active,
             started_at: Utc::now(),
+            error_detail: None,
         };
         self.telemetry.record_connection(tracked, is_proxied);
         let _ = self
@@ -404,6 +408,63 @@ impl RouteWardController {
         }
     }
 
+    /// Peeks at the initial bytes of a plaintext HTTP TCP stream on inspected ports to extract
+    /// the `Host:` header hostname without consuming bytes from the socket receive buffer.
+    pub(super) async fn peek_http_host_header(&self, client: &TcpStream) -> Option<String> {
+        let max_bytes = self.constants.network.http_host_max_bytes.clamp(64, 16384);
+        let timeout_dur =
+            Duration::from_millis(self.constants.network.http_host_peek_timeout_ms.max(10));
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        let mut buf = vec![0u8; max_bytes];
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            let peeked = match tokio::time::timeout(remaining, client.peek(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return None,
+                Ok(Ok(n)) => n,
+            };
+
+            let slice = &buf[..peeked];
+            if !HttpHostExtractor::looks_like_http_request(slice) {
+                return None;
+            }
+            if let Some(host) = HttpHostExtractor::extract_host(slice) {
+                return Some(host);
+            }
+
+            let headers_complete = slice.windows(4).any(|w| w == b"\r\n\r\n")
+                || slice.windows(2).any(|w| w == b"\n\n");
+            if headers_complete || peeked >= max_bytes {
+                return None;
+            }
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    pub(super) async fn peek_initial_domain(
+        &self,
+        client: &TcpStream,
+        target_port: u16,
+    ) -> Option<String> {
+        if target_port == self.constants.network.tls_sni_default_port {
+            self.peek_tls_client_hello_sni(client).await
+        } else if self
+            .constants
+            .network
+            .http_host_inspect_ports
+            .contains(&target_port)
+        {
+            self.peek_http_host_header(client).await
+        } else {
+            None
+        }
+    }
+
     pub async fn handle_transparent_tcp_client(
         &self,
         mut client: TcpStream,
@@ -431,24 +492,22 @@ impl RouteWardController {
             let is_fake_ip = self.is_in_fake_subnet_any(&session.orig_dst_ip);
             let mut resolved_domain = self.resolve_fake_ip_any(&session.orig_dst_ip);
 
-            // Point 5: When destination is not a Fake-IP and port is 443, extract TLS ClientHello SNI
+            // When destination is not a Fake-IP, inspect TLS ClientHello SNI or HTTP Host header
             // and re-evaluate domain routing rules.
-            if !is_fake_ip
-                && resolved_domain.is_none()
-                && target_port == self.constants.network.tls_sni_default_port
-            {
-                if let Some(sni_domain) = self.peek_tls_client_hello_sni(&client).await {
+            if !is_fake_ip && resolved_domain.is_none() {
+                if let Some(inspected_domain) = self.peek_initial_domain(&client, target_port).await
+                {
                     let eval = self.evaluate_rule(&ConnectionRequest {
                         process_name: session.process_name.clone(),
                         process_path: Some(session.process_path.clone()),
-                        target_host: sni_domain.clone(),
+                        target_host: inspected_domain.clone(),
                         target_ip: Some(target_host.clone()),
                         target_port,
                         protocol: TransportProtocol::Tcp,
                     });
                     session.action = eval.action;
                     session.matched_rule_name = eval.matched_rule_name;
-                    resolved_domain = Some(sni_domain);
+                    resolved_domain = Some(inspected_domain);
                 }
             }
 
@@ -485,6 +544,7 @@ impl RouteWardController {
                         tx_bytes: 0,
                         status: ConnectionStatus::Blocked,
                         started_at: Utc::now(),
+                        error_detail: None,
                     },
                     false,
                 );
@@ -552,6 +612,7 @@ impl RouteWardController {
                                 tx_bytes: 0,
                                 status: ConnectionStatus::Blocked,
                                 started_at: Utc::now(),
+                                error_detail: Some(err.to_string()),
                             },
                             false,
                         );
@@ -649,6 +710,7 @@ impl RouteWardController {
                 tx_bytes: 0,
                 status: ConnectionStatus::Active,
                 started_at: Utc::now(),
+                error_detail: None,
             };
             self.telemetry.record_connection(tracked, is_proxied);
 
@@ -677,12 +739,11 @@ impl RouteWardController {
                 }
 
                 let is_fake_ip = self.is_in_fake_subnet_any(&orig_dst_ip);
-                let sni_domain =
-                    if !is_fake_ip && target_port == self.constants.network.tls_sni_default_port {
-                        self.peek_tls_client_hello_sni(&client).await
-                    } else {
-                        None
-                    };
+                let sni_domain = if !is_fake_ip {
+                    self.peek_initial_domain(&client, target_port).await
+                } else {
+                    None
+                };
 
                 let attribution = self
                     .process_resolver
@@ -788,6 +849,7 @@ impl RouteWardController {
                             tx_bytes: 0,
                             status: ConnectionStatus::Blocked,
                             started_at: Utc::now(),
+                            error_detail: None,
                         },
                         false,
                     );
@@ -837,6 +899,7 @@ impl RouteWardController {
                                     tx_bytes: 0,
                                     status: ConnectionStatus::Blocked,
                                     started_at: Utc::now(),
+                                    error_detail: Some(err.to_string()),
                                 },
                                 false,
                             );
@@ -916,6 +979,7 @@ impl RouteWardController {
                     tx_bytes: 0,
                     status: ConnectionStatus::Active,
                     started_at: Utc::now(),
+                    error_detail: None,
                 };
                 self.telemetry.record_connection(tracked, is_proxied);
                 let _ = self
@@ -942,7 +1006,7 @@ impl RouteWardController {
         action: &RuleAction,
         target_host: &str,
         target_port: u16,
-    ) -> RouteWardResult<TcpStream> {
+    ) -> RouteWardResult<Box<dyn AsyncTunnelStream>> {
         let effective_host = if let Ok(IpAddr::V4(v4)) = target_host.parse::<IpAddr>() {
             if self.dns.is_in_fake_subnet(&v4) {
                 if let Some(dom) = self.dns.resolve_fake_ip(&v4) {
@@ -974,6 +1038,7 @@ impl RouteWardController {
                     )?;
                     self.connect_direct_tcp_protected(SocketAddr::new(ip, target_port))
                         .await
+                        .map(|s| Box::new(s) as Box<dyn AsyncTunnelStream>)
                         .map_err(RouteWardError::Io)
                 } else {
                     let resolved_ip = self.resolve_host_direct_ipv4(&effective_host).await?;
@@ -988,6 +1053,7 @@ impl RouteWardController {
                         target_port,
                     ))
                     .await
+                    .map(|s| Box::new(s) as Box<dyn AsyncTunnelStream>)
                     .map_err(RouteWardError::Io)
                 }
             }
@@ -1003,10 +1069,12 @@ impl RouteWardController {
                             proxy_id: target_id.clone(),
                         })?
                 };
-                let resolved_node = self.prepare_proxy_node_with_bootstrap(node).await?;
+                let (resolved_node, spn_host) =
+                    self.prepare_proxy_node_with_bootstrap_and_spn(node).await?;
                 let _self_guard = self.register_self_proxy_connect_hint(&resolved_node);
-                ProxyConnector::connect_single(
+                ProxyConnector::connect_single_with_spn(
                     &resolved_node,
+                    spn_host.as_deref(),
                     &effective_host,
                     target_port,
                     &self.constants,
@@ -1034,12 +1102,19 @@ impl RouteWardController {
                 };
                 let mut resolved_hops = Vec::with_capacity(hops.len());
                 for hop in hops {
-                    match self.prepare_proxy_node_with_bootstrap(hop.clone()).await {
+                    match self
+                        .prepare_proxy_node_with_bootstrap_and_spn(hop.clone())
+                        .await
+                    {
                         Ok(resolved) => resolved_hops.push(resolved),
-                        Err(_) => resolved_hops.push(hop),
+                        Err(_) => {
+                            let fallback_spn =
+                                (hop.host.parse::<IpAddr>().is_err()).then(|| hop.host.clone());
+                            resolved_hops.push((hop, fallback_spn));
+                        }
                     }
                 }
-                ProxyConnector::connect_group(
+                ProxyConnector::connect_group_with_spns(
                     strategy,
                     &resolved_hops,
                     0,
@@ -1080,10 +1155,19 @@ impl RouteWardController {
 
     pub(super) async fn prepare_proxy_node_with_bootstrap(
         &self,
-        mut node: ProxyNode,
+        node: ProxyNode,
     ) -> RouteWardResult<ProxyNode> {
+        self.prepare_proxy_node_with_bootstrap_and_spn(node)
+            .await
+            .map(|(resolved, _)| resolved)
+    }
+
+    pub(super) async fn prepare_proxy_node_with_bootstrap_and_spn(
+        &self,
+        mut node: ProxyNode,
+    ) -> RouteWardResult<(ProxyNode, Option<String>)> {
         if node.host.parse::<IpAddr>().is_ok() {
-            return Ok(node);
+            return Ok((node, None));
         }
         let orig_host = node.host.clone();
         let ips = self.resolve_host_direct_ipv4_all(&orig_host).await?;
@@ -1116,10 +1200,10 @@ impl RouteWardController {
             );
         }
 
-        if node.tls && node.sni.is_none() {
-            node.sni = Some(orig_host);
+        if ProxyConnector::requires_tls(&node) && node.sni.is_none() {
+            node.sni = Some(orig_host.clone());
         }
         node.host = first_ip.to_string();
-        Ok(node)
+        Ok((node, Some(orig_host)))
     }
 }

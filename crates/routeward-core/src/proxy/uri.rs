@@ -22,9 +22,13 @@ use uuid::Uuid;
 
 const SCHEME_SEPARATOR: &str = "://";
 const SCHEME_SOCKS5: &str = "socks5";
+const SCHEME_SOCKS4: &str = "socks4";
+const SCHEME_SOCKS4A: &str = "socks4a";
 const SCHEME_HTTP: &str = "http";
 const SCHEME_HTTPS: &str = "https";
 const QUERY_KEY_SNI: &str = "sni";
+const QUERY_KEY_TLS_SKIP_VERIFY: &str = "tlsSkipVerify";
+const QUERY_KEY_INSECURE: &str = "insecure";
 
 pub struct ProxyUriCodec;
 
@@ -67,6 +71,7 @@ impl ProxyUriCodec {
 
         let protocol = match scheme.as_str() {
             SCHEME_SOCKS5 => ProxyProtocol::Socks5,
+            SCHEME_SOCKS4 | SCHEME_SOCKS4A => ProxyProtocol::Socks4,
             SCHEME_HTTP => ProxyProtocol::Http,
             SCHEME_HTTPS => ProxyProtocol::Https,
             _ => {
@@ -94,11 +99,17 @@ impl ProxyUriCodec {
         });
 
         let mut sni: Option<String> = None;
+        let mut tls_skip_verify = false;
         if let Some(q) = query_part {
             for pair in q.split('&') {
                 if let Some((k, v)) = pair.split_once('=') {
                     if k.eq_ignore_ascii_case(QUERY_KEY_SNI) {
                         sni = Some(Self::percent_decode(v));
+                    } else if k.eq_ignore_ascii_case(QUERY_KEY_TLS_SKIP_VERIFY)
+                        || k.eq_ignore_ascii_case(QUERY_KEY_INSECURE)
+                    {
+                        tls_skip_verify =
+                            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
                     }
                 }
             }
@@ -120,6 +131,7 @@ impl ProxyUriCodec {
             auth,
             udp_enabled,
             tls,
+            tls_skip_verify,
             sni,
             enabled: true,
             last_latency_ms: None,
@@ -130,6 +142,7 @@ impl ProxyUriCodec {
     pub fn to_uri(node: &ProxyNode) -> String {
         let scheme = match node.protocol {
             ProxyProtocol::Socks5 => SCHEME_SOCKS5,
+            ProxyProtocol::Socks4 => SCHEME_SOCKS4,
             ProxyProtocol::Http => SCHEME_HTTP,
             ProxyProtocol::Https => SCHEME_HTTPS,
         };
@@ -145,17 +158,29 @@ impl ProxyUriCodec {
             _ => String::new(),
         };
 
-        let query = node
-            .sni
-            .as_ref()
-            .filter(|s| !s.is_empty())
-            .map(|s| format!("?sni={}", Self::percent_encode(s)))
-            .unwrap_or_default();
+        let mut params = Vec::new();
+        if let Some(s) = node.sni.as_ref().filter(|s| !s.is_empty()) {
+            params.push(format!("{}={}", QUERY_KEY_SNI, Self::percent_encode(s)));
+        }
+        if node.tls_skip_verify {
+            params.push(format!("{QUERY_KEY_TLS_SKIP_VERIFY}=1"));
+        }
+        let query = if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        };
+
+        let host_part = if node.host.contains(':') && !node.host.starts_with('[') {
+            format!("[{}]", node.host)
+        } else {
+            node.host.clone()
+        };
 
         let frag = Self::percent_encode(&node.name);
         format!(
-            "{scheme}://{auth_prefix}{}:{}{query}#{frag}",
-            node.host, node.port
+            "{scheme}://{auth_prefix}{host_part}:{}{query}#{frag}",
+            node.port
         )
     }
 

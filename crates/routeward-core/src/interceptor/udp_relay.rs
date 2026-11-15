@@ -158,6 +158,7 @@ impl RouteWardController {
                         tx_bytes: 0,
                         status: ConnectionStatus::Blocked,
                         started_at: Utc::now(),
+                        error_detail: None,
                     },
                     false,
                 );
@@ -239,6 +240,7 @@ impl RouteWardController {
                                     tx_bytes: 0,
                                     status: ConnectionStatus::Blocked,
                                     started_at: Utc::now(),
+                                    error_detail: None,
                                 },
                                 false,
                             );
@@ -292,6 +294,7 @@ impl RouteWardController {
                         tx_bytes: payload.len() as u64,
                         status: ConnectionStatus::Active,
                         started_at: Utc::now(),
+                        error_detail: None,
                     },
                     false,
                 );
@@ -385,6 +388,7 @@ impl RouteWardController {
                                 tx_bytes: payload.len() as u64,
                                 status: ConnectionStatus::Active,
                                 started_at: Utc::now(),
+                                error_detail: None,
                             },
                             true,
                         );
@@ -421,6 +425,7 @@ impl RouteWardController {
                                     tx_bytes: 0,
                                     status: ConnectionStatus::Blocked,
                                     started_at: Utc::now(),
+                                    error_detail: None,
                                 },
                                 false,
                             );
@@ -518,6 +523,7 @@ impl RouteWardController {
                                 tx_bytes: payload.len() as u64,
                                 status: ConnectionStatus::Active,
                                 started_at: Utc::now(),
+                                error_detail: None,
                             },
                             true,
                         );
@@ -553,6 +559,7 @@ impl RouteWardController {
                                     tx_bytes: 0,
                                     status: ConnectionStatus::Blocked,
                                     started_at: Utc::now(),
+                                    error_detail: None,
                                 },
                                 false,
                             );
@@ -611,6 +618,7 @@ impl RouteWardController {
                             tx_bytes: 0,
                             status: ConnectionStatus::Blocked,
                             started_at: Utc::now(),
+                            error_detail: None,
                         },
                         false,
                     );
@@ -722,6 +730,7 @@ impl RouteWardController {
                     tx_bytes: 0,
                     status: ConnectionStatus::Blocked,
                     started_at: Utc::now(),
+                    error_detail: None,
                 },
                 false,
             );

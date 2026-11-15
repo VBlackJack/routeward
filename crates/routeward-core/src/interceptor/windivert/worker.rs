@@ -245,6 +245,7 @@ impl WinDivertInterceptor {
                             tx_bytes: 0,
                             status: ConnectionStatus::Blocked,
                             started_at: Utc::now(),
+                            error_detail: None,
                         },
                         false,
                     );
@@ -253,17 +254,22 @@ impl WinDivertInterceptor {
                 }
                 RuleAction::Direct => {
                     let is_fake_ip = ctrl.dns.is_in_fake_subnet(&meta.dst_ip);
-                    let needs_sni_inspection = !is_fake_ip
-                        && meta.dst_port == ctrl.constants.network.tls_sni_default_port
+                    let needs_payload_inspection = !is_fake_ip
+                        && (meta.dst_port == ctrl.constants.network.tls_sni_default_port
+                            || ctrl
+                                .constants
+                                .network
+                                .http_host_inspect_ports
+                                .contains(&meta.dst_port))
                         && ctrl.has_enabled_domain_rules();
-                    if is_fake_ip || needs_sni_inspection {
+                    if is_fake_ip || needs_payload_inspection {
                         ctrl.telemetry.push_log(
                             LogLevel::Info,
                             COMPONENT_WINDIVERT,
                             format!(
-                                "Reflecting Direct SYN (fakeIp={}, sniInspect={}) PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} [rule=\"{}\"]",
+                                "Reflecting Direct SYN (fakeIp={}, payloadInspect={}) PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} [rule=\"{}\"]",
                                 is_fake_ip,
-                                needs_sni_inspection,
+                                needs_payload_inspection,
                                 proc_id.pid,
                                 proc_id.name,
                                 proc_id.executable_path,
@@ -419,6 +425,7 @@ impl WinDivertInterceptor {
                         tx_bytes: meta.payload_len as u64,
                         status: ConnectionStatus::Active,
                         started_at: Utc::now(),
+                        error_detail: None,
                     },
                     true,
                 );
@@ -675,15 +682,23 @@ impl WinDivertInterceptor {
                             tx_bytes: 0,
                             status: ConnectionStatus::Blocked,
                             started_at: Utc::now(),
+                            error_detail: None,
                         },
                         false,
                     );
                     return;
                 }
                 RuleAction::Direct => {
-                    let needs_sni = meta.dst_port == ctrl.constants.network.tls_sni_default_port
+                    let is_fake_ip = ctrl.is_in_fake_subnet_any(&IpAddr::V6(meta.dst_ip));
+                    let needs_payload_inspection = !is_fake_ip
+                        && (meta.dst_port == ctrl.constants.network.tls_sni_default_port
+                            || ctrl
+                                .constants
+                                .network
+                                .http_host_inspect_ports
+                                .contains(&meta.dst_port))
                         && ctrl.has_enabled_domain_rules();
-                    if needs_sni {
+                    if needs_payload_inspection {
                         ctrl.nat_table.insert_session(NatSessionEntry {
                             client_ip: IpAddr::V6(meta.src_ip),
                             client_port: meta.src_port,
@@ -808,6 +823,7 @@ impl WinDivertInterceptor {
                     tx_bytes: meta.payload_len as u64,
                     status: ConnectionStatus::Active,
                     started_at: Utc::now(),
+                    error_detail: None,
                 },
                 true,
             );
@@ -914,6 +930,7 @@ impl WinDivertInterceptor {
                 tx_bytes: 0,
                 status: ConnectionStatus::Blocked,
                 started_at: Utc::now(),
+                error_detail: None,
             },
             false,
         );
@@ -960,6 +977,7 @@ impl WinDivertInterceptor {
                 tx_bytes: 0,
                 status: ConnectionStatus::Blocked,
                 started_at: Utc::now(),
+                error_detail: None,
             },
             false,
         );
@@ -1402,6 +1420,7 @@ impl WinDivertInterceptor {
                                             tx_bytes: 0,
                                             status: ConnectionStatus::Blocked,
                                             started_at: Utc::now(),
+                                            error_detail: None,
                                         },
                                         false,
                                     );
@@ -1441,6 +1460,7 @@ impl WinDivertInterceptor {
                                         tx_bytes: 0,
                                         status: ConnectionStatus::Blocked,
                                         started_at: Utc::now(),
+                                        error_detail: None,
                                     },
                                     false,
                                 );

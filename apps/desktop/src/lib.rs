@@ -45,6 +45,8 @@ pub struct TrayStatusSnapshot {
     pub daemon_connected: bool,
     pub running: bool,
     pub locale: String,
+    pub active_profile_id: String,
+    pub profiles: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +57,7 @@ pub enum DesktopWindowCommand {
     DragWindow,
     ShowWindow,
     ToggleEngine,
+    SwitchProfile(usize),
     Quit,
 }
 

@@ -973,6 +973,7 @@ mod tests {
             auth: None,
             udp_enabled: true,
             tls: false,
+            tls_skip_verify: false,
             sni: None,
             enabled: true,
             last_latency_ms: Some(5),

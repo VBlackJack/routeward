@@ -19,8 +19,8 @@ use crate::TrayStatusSnapshot;
 use parking_lot::{Mutex, RwLock};
 use routeward_core::checker::ProxyHealthReport;
 use routeward_core::config::{
-    InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule, SystemConstants,
-    ThemeForgeCatalog,
+    InterceptionMode, ProfileConfig, ProfileSummary, ProxyChain, ProxyNode, RoutingRule,
+    SystemConstants, ThemeForgeCatalog,
 };
 use routeward_core::dns::FakeIpEntry;
 use routeward_core::error::ERR_KEY_DAEMON_DISCONNECTED;
@@ -33,6 +33,8 @@ use routeward_core::ipc::protocol::{
 use routeward_core::ipc::transport::connect_ipc_stream;
 use routeward_core::ipc::{generate_ephemeral_token, IpcClient};
 use routeward_core::logger::FileLogger;
+use routeward_core::pac::FoxyProxyImportResult;
+use routeward_core::process::{ProcessResolver, SystemApplicationEntry};
 use routeward_core::rules::{ConnectionRequest, RuleEvaluationResult};
 use routeward_core::system::{LaunchedProcessReport, SystemProxyManager};
 use routeward_core::telemetry::{
@@ -58,6 +60,7 @@ pub struct DesktopCommandBridge {
     ipc_client: IpcClient,
     file_logger: FileLogger,
     state: Arc<RwLock<DaemonFullState>>,
+    profiles: Arc<RwLock<Vec<ProfileSummary>>>,
     daemon_connected: Arc<AtomicBool>,
     event_tx: tokio::sync::broadcast::Sender<IpcStreamEvent>,
     daemon_start_guard: Arc<DaemonStartGuard>,
@@ -99,6 +102,14 @@ impl DesktopCommandBridge {
             active_locale: i18n.get_locale(),
         };
 
+        let initial_profiles = vec![ProfileSummary {
+            profile_id: default_profile.profile_id.clone(),
+            name: default_profile.name.clone(),
+            proxy_count: default_profile.proxies.len(),
+            rule_count: default_profile.rules.len(),
+            active: true,
+        }];
+
         let initial_state = DaemonFullState {
             diagnostics: initial_diagnostics,
             profile: default_profile.redacted_for_ipc(),
@@ -114,6 +125,7 @@ impl DesktopCommandBridge {
             ipc_client,
             file_logger,
             state: Arc::new(RwLock::new(initial_state)),
+            profiles: Arc::new(RwLock::new(initial_profiles)),
             daemon_connected: Arc::new(AtomicBool::new(false)),
             event_tx,
             daemon_start_guard: Arc::new(DaemonStartGuard::default()),
@@ -160,11 +172,22 @@ impl DesktopCommandBridge {
     }
 
     pub fn tray_snapshot(&self) -> TrayStatusSnapshot {
-        let running = self.state.read().diagnostics.running;
+        let st = self.state.read();
+        let running = st.diagnostics.running;
+        let active_profile_id = st.profile.profile_id.clone();
+        drop(st);
+        let profiles = self
+            .profiles
+            .read()
+            .iter()
+            .map(|p| (p.profile_id.clone(), p.name.clone()))
+            .collect();
         TrayStatusSnapshot {
             daemon_connected: self.is_daemon_connected(),
             running,
             locale: self.i18n.get_locale(),
+            active_profile_id,
+            profiles,
         }
     }
 
@@ -353,6 +376,10 @@ impl DesktopCommandBridge {
                 "Daemon connection established ({})",
                 self.ipc_endpoint_label()
             ));
+            let bridge_for_profiles = self.clone();
+            tokio::spawn(async move {
+                let _ = bridge_for_profiles.list_profiles().await;
+            });
             self.emit_resync();
         } else if prev_running != new_running {
             self.emit_resync();
@@ -490,6 +517,120 @@ impl DesktopCommandBridge {
         let diag = self.get_diagnostics();
         SystemProxyManager::set_system_proxy(enabled, &diag.relay_tcp_endpoint)
             .map_err(|e| e.to_string())
+    }
+
+    pub fn pac_url(&self) -> String {
+        format!(
+            "http://{}:{}/proxy.pac",
+            self.constants.network.local_bind_host, self.constants.network.default_pac_port
+        )
+    }
+
+    pub fn get_system_pac_status(&self) -> (bool, String) {
+        let expected = self.pac_url();
+        let active = SystemProxyManager::get_system_pac_url()
+            .map(|url| url.eq_ignore_ascii_case(&expected))
+            .unwrap_or(false);
+        (active, expected)
+    }
+
+    pub fn set_system_pac(&self, enabled: bool) -> Result<(bool, String), String> {
+        let expected = self.pac_url();
+        SystemProxyManager::set_system_pac(enabled, &expected)
+            .map(|res| (res, expected))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn get_autostart_status(&self) -> bool {
+        SystemProxyManager::is_autostart_enabled()
+    }
+
+    pub fn set_autostart(&self, enabled: bool) -> Result<bool, String> {
+        let exe_path = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned();
+        SystemProxyManager::set_autostart(enabled, &exe_path).map_err(|e| e.to_string())
+    }
+
+    pub async fn import_foxyproxy_json(
+        &self,
+        json: String,
+        process_patterns: Vec<String>,
+    ) -> Result<FoxyProxyImportResult, String> {
+        let report = self
+            .call_daemon::<FoxyProxyImportResult>(IpcCommand::ImportFoxyProxyJson {
+                json,
+                process_patterns,
+            })
+            .await?;
+        let _ = self.refresh_state().await;
+        Ok(report)
+    }
+
+    pub async fn list_profiles(&self) -> Vec<ProfileSummary> {
+        if let Ok(list) = self
+            .call_daemon::<Vec<ProfileSummary>>(IpcCommand::ListProfiles)
+            .await
+        {
+            *self.profiles.write() = list.clone();
+            self.notify_tray();
+            return list;
+        }
+        self.profiles.read().clone()
+    }
+
+    pub async fn save_named_profile(
+        &self,
+        profile_id: Option<String>,
+        name: Option<String>,
+    ) -> Result<Vec<ProfileSummary>, String> {
+        let list = self
+            .call_daemon::<Vec<ProfileSummary>>(IpcCommand::SaveNamedProfile { profile_id, name })
+            .await?;
+        *self.profiles.write() = list.clone();
+        let _ = self.refresh_state().await;
+        Ok(list)
+    }
+
+    pub async fn switch_profile(&self, profile_id: String) -> Result<ProfileConfig, String> {
+        let prof = self
+            .call_daemon::<ProfileConfig>(IpcCommand::SwitchProfile { profile_id })
+            .await?;
+        let _ = self.list_profiles().await;
+        let _ = self.refresh_state().await;
+        self.emit_resync();
+        Ok(prof)
+    }
+
+    pub async fn switch_profile_by_index(&self, index: usize) {
+        let target_id = self
+            .profiles
+            .read()
+            .get(index)
+            .map(|p| p.profile_id.clone());
+        if let Some(id) = target_id {
+            let _ = self.switch_profile(id).await;
+        }
+    }
+
+    pub async fn delete_profile(&self, profile_id: String) -> Result<Vec<ProfileSummary>, String> {
+        let list = self
+            .call_daemon::<Vec<ProfileSummary>>(IpcCommand::DeleteProfile { profile_id })
+            .await?;
+        *self.profiles.write() = list.clone();
+        self.notify_tray();
+        Ok(list)
+    }
+
+    pub async fn list_system_applications(&self) -> Vec<SystemApplicationEntry> {
+        let ttl = self.constants.telemetry.process_cache_ttl_ms;
+        tokio::task::spawn_blocking(move || {
+            let resolver = ProcessResolver::new(ttl);
+            resolver.list_system_applications()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     pub fn launch_process_with_proxy(
