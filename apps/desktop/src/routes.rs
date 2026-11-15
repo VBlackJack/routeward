@@ -261,11 +261,28 @@ pub async fn handle_api_route(
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
         }
-        let parsed: ToggleEngineRequest =
-            serde_json::from_str(body_str).unwrap_or(ToggleEngineRequest { start: false });
-        let diag = bridge.toggle_engine(parsed.start).await;
-        let json = serde_json::to_vec(&diag).unwrap_or_default();
-        return Some((200, json_ct, json));
+        match serde_json::from_str::<ToggleEngineRequest>(body_str) {
+            Ok(parsed) => match bridge.toggle_engine(parsed.start).await {
+                Ok(diag) => {
+                    let json = serde_json::to_vec(&diag).unwrap_or_default();
+                    return Some((200, json_ct, json));
+                }
+                Err(err) => {
+                    let status = if err.is_transport() { 503 } else { 409 };
+                    let json = serde_json::to_vec(&serde_json::json!({
+                        "error": err.message(),
+                        "errorKey": err.error_key(),
+                    }))
+                    .unwrap_or_default();
+                    return Some((status, json_ct, json));
+                }
+            },
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                    .unwrap_or_default();
+                return Some((400, json_ct, json));
+            }
+        }
     }
 
     if path.starts_with("/api/engine/mode") {

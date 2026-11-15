@@ -92,6 +92,8 @@ export const App: React.FC = () => {
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [namedProfiles, setNamedProfiles] = useState<ProfileSummary[]>([]);
   const [startingDaemon, setStartingDaemon] = useState(false);
+  const [togglingEngine, setTogglingEngine] = useState(false);
+  const togglingEngineRef = useRef(false);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const wizardAutoCheckedRef = useRef(false);
 
@@ -231,6 +233,35 @@ export const App: React.FC = () => {
       pushToast(t('app.toast.daemon.start_failed'), 'error');
     } finally {
       setStartingDaemon(false);
+    }
+  };
+
+  const handleToggleEngine = async (targetState: boolean) => {
+    if (togglingEngineRef.current) return;
+    togglingEngineRef.current = true;
+    setTogglingEngine(true);
+    try {
+      await routewardClient.toggleEngine(targetState);
+    } catch (err) {
+      if (err instanceof HttpResponseError) {
+        const engineErrorToastMap: Record<string, string> = {
+          'errors.interceptor.driver_missing':
+            'app.toast.engine.driver_missing',
+          'errors.interceptor.open_failed': 'app.toast.engine.open_failed',
+          'errors.interceptor.not_root': 'app.toast.engine.not_root',
+          'errors.interceptor.nft_missing': 'app.toast.engine.nft_missing',
+          'errors.interceptor.nft_failed': 'app.toast.engine.nft_failed'
+        };
+        const key = err.errorKey
+          ? engineErrorToastMap[err.errorKey]
+          : undefined;
+        pushToast(t(key ?? 'app.toast.engine.start_failed'), 'error');
+        return;
+      }
+      pushToast(t('app.toast.engine.start_failed'), 'error');
+    } finally {
+      togglingEngineRef.current = false;
+      setTogglingEngine(false);
     }
   };
 
@@ -560,9 +591,9 @@ export const App: React.FC = () => {
             {/* Primary Enable / Pause Protection CTA */}
             <button
               type="button"
-              disabled={!diagnostics.daemonConnected}
+              disabled={!diagnostics.daemonConnected || togglingEngine}
               onClick={() => {
-                void routewardClient.toggleEngine(!isEngineRunning);
+                void handleToggleEngine(!isEngineRunning);
               }}
               className={`flex items-center gap-2 rounded-tf-md px-3.5 py-1.5 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
                 isEngineRunning
@@ -708,7 +739,7 @@ export const App: React.FC = () => {
             proxies={profile.proxies}
             rules={profile.rules}
             onToggleEngine={() => {
-              void routewardClient.toggleEngine(!isEngineRunning);
+              void handleToggleEngine(!isEngineRunning);
             }}
             onApplyUseCase={handleApplyUseCase}
             onTestPrimaryProxy={(proxyId) => {
@@ -982,12 +1013,8 @@ export const App: React.FC = () => {
           proxies={profile.proxies}
           chains={profile.chains}
           currentMode={experienceMode}
-          onImportUris={(text) => {
-            void routewardClient.importProxyUris(text);
-          }}
-          onAddRule={(rule) => {
-            void routewardClient.upsertRule(rule);
-          }}
+          onImportUris={(text) => routewardClient.importProxyUris(text)}
+          onAddRule={(rule) => routewardClient.upsertRule(rule)}
           onSelectMode={(mode) => handleSetExperienceMode(mode)}
           onComplete={() => {
             window.localStorage.setItem(
@@ -1027,7 +1054,7 @@ export const App: React.FC = () => {
           onClose={() => setShowCommandPalette(false)}
           onNavigate={(tab) => setActiveTab(tab)}
           onToggleEngine={() => {
-            void routewardClient.toggleEngine(!isEngineRunning);
+            void handleToggleEngine(!isEngineRunning);
           }}
           onTestAllProxies={async () => {
             await routewardClient.testAllProxies();

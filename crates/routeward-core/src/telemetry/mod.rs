@@ -207,6 +207,7 @@ pub struct TelemetryHub {
     event_tx: broadcast::Sender<TelemetryEvent>,
     file_logger: FileLogger,
     max_logs: usize,
+    max_connections: usize,
     max_samples: usize,
     total_rx: Arc<AtomicU64>,
     total_tx: Arc<AtomicU64>,
@@ -253,6 +254,7 @@ impl TelemetryHub {
             event_tx,
             file_logger,
             max_logs: constants.max_log_ring_buffer_entries,
+            max_connections: constants.max_connection_history_entries.max(1),
             max_samples: constants.max_bandwidth_history_samples,
             total_rx: Arc::new(AtomicU64::new(0)),
             total_tx: Arc::new(AtomicU64::new(0)),
@@ -292,7 +294,29 @@ impl TelemetryHub {
         }
         self.add_traffic(conn.rx_bytes, conn.tx_bytes);
         self.connections.insert(conn.id.clone(), conn.clone());
+        self.evict_excess_connections();
         let _ = self.event_tx.send(TelemetryEvent::ConnectionUpdated(conn));
+    }
+
+    fn evict_excess_connections(&self) {
+        let len = self.connections.len();
+        if len <= self.max_connections {
+            return;
+        }
+        let excess = len - self.max_connections;
+        let mut candidates: Vec<(chrono::DateTime<Utc>, String)> = self
+            .connections
+            .iter()
+            .filter(|entry| entry.value().status != ConnectionStatus::Active)
+            .map(|entry| (entry.value().started_at, entry.key().clone()))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, id) in candidates.into_iter().take(excess) {
+            self.connections.remove(&id);
+        }
     }
 
     pub fn update_connection_traffic(&self, id: &str, delta_rx: u64, delta_tx: u64) {
@@ -653,5 +677,61 @@ mod tests {
             .expect("tracked connection after terminate");
         assert_eq!(after_conn.status, ConnectionStatus::Closed);
         assert_eq!(hub.snapshot().active_connections, 0);
+    }
+
+    #[test]
+    fn evicts_oldest_inactive_connections_while_preserving_active_ones() {
+        let constants = crate::config::TelemetryConstants {
+            max_log_ring_buffer_entries: 16,
+            max_connection_history_entries: 3,
+            max_bandwidth_history_samples: 4,
+            sampling_interval_ms: 1000,
+            process_cache_ttl_ms: 1000,
+            log_directory: "logs".to_string(),
+            windows_daemon_log_dir: "%ProgramData%\\RouteWard\\logs".to_string(),
+            linux_daemon_log_dir: "/var/log/routeward".to_string(),
+            windows_user_log_dir: "%LOCALAPPDATA%\\RouteWard\\logs".to_string(),
+            linux_user_log_dir: "$XDG_STATE_HOME/routeward/logs".to_string(),
+            linux_user_fallback_log_dir: ".local/state/routeward/logs".to_string(),
+            windows_user_webview_dir: "%LOCALAPPDATA%\\RouteWard\\WebView2".to_string(),
+            linux_user_webview_dir: "$XDG_DATA_HOME/routeward/webview".to_string(),
+            linux_user_fallback_webview_dir: ".local/share/routeward/webview".to_string(),
+            log_app_name: "RouteWard".to_string(),
+            log_flush_interval_ms: 500,
+            event_broadcast_capacity: 16,
+        };
+        let hub = TelemetryHub::new_with_logging(&constants, false);
+        let base_time = Utc::now();
+
+        let make_conn = |id: &str, offset_secs: i64, status: ConnectionStatus| TrackedConnection {
+            id: id.to_string(),
+            pid: 42,
+            process_name: "brave.exe".to_string(),
+            process_path: String::new(),
+            target_host: "example.com".to_string(),
+            resolved_domain: Some("example.com".to_string()),
+            target_port: 443,
+            protocol: crate::config::TransportProtocol::Tcp,
+            matched_rule: "rule-direct".to_string(),
+            route_label: "DIRECT".to_string(),
+            latency_ms: 0,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            status,
+            started_at: base_time + chrono::Duration::seconds(offset_secs),
+            error_detail: None,
+        };
+
+        hub.record_connection(make_conn("active-old", 1, ConnectionStatus::Active), false);
+        hub.record_connection(make_conn("closed-1", 2, ConnectionStatus::Closed), false);
+        hub.record_connection(make_conn("blocked-2", 3, ConnectionStatus::Blocked), false);
+        hub.record_connection(make_conn("closed-3", 4, ConnectionStatus::Closed), false);
+
+        let ids: Vec<String> = hub.list_connections().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&"active-old".to_string()));
+        assert!(!ids.contains(&"closed-1".to_string()));
+        assert!(ids.contains(&"blocked-2".to_string()));
+        assert!(ids.contains(&"closed-3".to_string()));
     }
 }

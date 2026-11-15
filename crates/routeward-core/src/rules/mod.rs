@@ -353,7 +353,14 @@ mod tests {
     #[test]
     fn matches_process_and_fake_ip_domain() {
         let constants = SystemConstants::load_embedded().unwrap();
-        let profile = ProfileConfig::load_embedded_default().unwrap();
+        let mut profile = ProfileConfig::load_embedded_default().unwrap();
+        if let Some(rule) = profile
+            .rules
+            .iter_mut()
+            .find(|r| r.id == "rule-browsers-socks5")
+        {
+            rule.enabled = true;
+        }
         let dns = FakeIpEngine::new(&profile.dns_config, &constants.dns);
 
         let fake_ip = dns.allocate_or_get("app.telemetry.example.com").unwrap();

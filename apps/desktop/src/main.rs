@@ -420,7 +420,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let b = Arc::clone(&bridge_for_loop);
                     rt_for_loop.spawn(async move {
                         let running = b.get_diagnostics().running;
-                        let _ = b.toggle_engine(!running).await;
+                        if let Err(err) = b.toggle_engine(!running).await {
+                            b.log_warn(format!("Tray engine toggle failed: {err}"));
+                        }
                     });
                 }
                 DesktopWindowCommand::SwitchProfile(idx) => {

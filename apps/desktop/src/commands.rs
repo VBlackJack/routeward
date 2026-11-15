@@ -31,7 +31,7 @@ use routeward_core::ipc::protocol::{
     ReadLineOutcome,
 };
 use routeward_core::ipc::transport::connect_ipc_stream;
-use routeward_core::ipc::{generate_ephemeral_token, IpcClient};
+use routeward_core::ipc::{generate_ephemeral_token, IpcCallError, IpcClient};
 use routeward_core::logger::FileLogger;
 use routeward_core::pac::FoxyProxyImportResult;
 use routeward_core::process::{ProcessResolver, SystemApplicationEntry};
@@ -407,6 +407,12 @@ impl DesktopCommandBridge {
                         *existing = conn.clone();
                     } else {
                         st.connections.insert(0, conn.clone());
+                        let max_conns = self
+                            .constants
+                            .telemetry
+                            .max_connection_history_entries
+                            .max(1);
+                        trim_cached_connections(&mut st.connections, max_conns);
                     }
                 }
                 TelemetryEvent::ConnectionsCleared => {
@@ -415,6 +421,8 @@ impl DesktopCommandBridge {
                 }
                 TelemetryEvent::Log(entry) => {
                     st.logs.insert(0, entry.clone());
+                    let max_logs = self.constants.telemetry.max_log_ring_buffer_entries.max(1);
+                    st.logs.truncate(max_logs);
                 }
                 TelemetryEvent::LogsCleared => {
                     st.logs.clear();
@@ -459,14 +467,17 @@ impl DesktopCommandBridge {
         self.notify_tray();
     }
 
-    async fn call_daemon<T: DeserializeOwned>(&self, command: IpcCommand) -> Result<T, String> {
+    async fn call_daemon_detailed<T: DeserializeOwned>(
+        &self,
+        command: IpcCommand,
+    ) -> Result<T, IpcCallError> {
         if !self.is_daemon_connected() {
             self.log_info(format!(
                 "Attempting IPC command to daemon ({})",
                 self.ipc_endpoint_label()
             ));
         }
-        match self.ipc_client.call_typed::<T>(command).await {
+        match self.ipc_client.call_typed_detailed::<T>(command).await {
             Ok(res) => {
                 let was_connected = self.daemon_connected.swap(true, Ordering::SeqCst);
                 self.state.write().diagnostics.daemon_connected = true;
@@ -482,15 +493,26 @@ impl DesktopCommandBridge {
                 Ok(res)
             }
             Err(err) => {
-                let err_msg = err.to_string();
                 self.log_warn(format!(
-                    "Daemon IPC command failed ({}): {err_msg}",
+                    "Daemon IPC command failed ({}): {err}",
                     self.ipc_endpoint_label()
                 ));
-                self.mark_disconnected();
-                Err(err_msg)
+                // Only treat actual pipe/socket loss as daemon disconnection; keep alive on remote errors.
+                if err.is_transport() {
+                    self.mark_disconnected();
+                } else {
+                    self.daemon_connected.store(true, Ordering::SeqCst);
+                    self.state.write().diagnostics.daemon_connected = true;
+                }
+                Err(err)
             }
         }
+    }
+
+    async fn call_daemon<T: DeserializeOwned>(&self, command: IpcCommand) -> Result<T, String> {
+        self.call_daemon_detailed(command)
+            .await
+            .map_err(|err| err.to_string())
     }
 
     pub fn is_daemon_connected(&self) -> bool {
@@ -795,20 +817,24 @@ impl DesktopCommandBridge {
         self.refresh_state().await.profile
     }
 
-    pub async fn toggle_engine(&self, start: bool) -> SystemDiagnostics {
-        if let Ok(mut diag) = self
-            .call_daemon::<SystemDiagnostics>(IpcCommand::ToggleEngine { start })
+    pub async fn toggle_engine(&self, start: bool) -> Result<SystemDiagnostics, IpcCallError> {
+        match self
+            .call_daemon_detailed::<SystemDiagnostics>(IpcCommand::ToggleEngine { start })
             .await
         {
-            diag.daemon_connected = true;
-            diag.active_locale = self.i18n.get_locale();
-            self.state.write().diagnostics = diag.clone();
-            self.emit_resync();
-            self.notify_tray();
-            return diag;
+            Ok(mut diag) => {
+                diag.daemon_connected = true;
+                diag.active_locale = self.i18n.get_locale();
+                self.state.write().diagnostics = diag.clone();
+                self.emit_resync();
+                self.notify_tray();
+                Ok(diag)
+            }
+            Err(err) => {
+                self.notify_tray();
+                Err(err)
+            }
         }
-        self.notify_tray();
-        self.get_diagnostics()
     }
 
     pub async fn set_interception_mode(&self, mode: InterceptionMode) -> SystemDiagnostics {
@@ -901,5 +927,18 @@ impl DesktopCommandBridge {
             .call_daemon::<serde_json::Value>(IpcCommand::ClearLogs)
             .await;
         self.state.write().logs.clear();
+    }
+}
+
+fn trim_cached_connections(connections: &mut Vec<TrackedConnection>, max_len: usize) {
+    while connections.len() > max_len {
+        if let Some(pos) = connections
+            .iter()
+            .rposition(|c| c.status != ConnectionStatus::Active)
+        {
+            connections.remove(pos);
+        } else {
+            break;
+        }
     }
 }

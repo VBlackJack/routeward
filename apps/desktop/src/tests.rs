@@ -872,3 +872,93 @@ async fn theme_route_parses_hex_colors_and_dispatches_window_theme_command() {
         })]
     );
 }
+
+#[tokio::test]
+async fn engine_toggle_route_validates_payload_and_surfaces_transport_errors() {
+    use crate::handle_api_route;
+    use routeward_core::error::{RouteWardError, ERR_KEY_INTERCEPTOR_DRIVER};
+    use routeward_core::ipc::protocol::{IpcCommand, IpcResponse};
+    use routeward_core::ipc::{DaemonIpcService, IpcClient};
+
+    let mut missing_consts = SystemConstants::load_embedded().expect("SystemConstants");
+    let unique_suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    #[cfg(windows)]
+    {
+        missing_consts.ipc.windows_pipe_name =
+            format!(r"\\.\pipe\routeward-missing-test-{unique_suffix}");
+    }
+    #[cfg(not(windows))]
+    {
+        missing_consts.ipc.unix_socket_path =
+            format!("/tmp/routeward-missing-test-{unique_suffix}.sock");
+    }
+
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let bridge = DesktopCommandBridge::new(missing_consts.clone(), profile.clone(), "en");
+
+    let bad_res = handle_api_route("POST", "/api/engine/toggle", "{invalid", &bridge, None).await;
+    assert_eq!(bad_res.map(|(code, _, _)| code), Some(400));
+
+    let missing_daemon = handle_api_route(
+        "POST",
+        "/api/engine/toggle",
+        r#"{"start":true}"#,
+        &bridge,
+        None,
+    )
+    .await
+    .expect("route response");
+    assert_eq!(missing_daemon.0, 503);
+    let err_json: serde_json::Value = serde_json::from_slice(&missing_daemon.2).expect("json");
+    assert!(err_json["error"].as_str().is_some_and(|s| !s.is_empty()));
+
+    // Verify IpcClient::call_typed_detailed distinguishes live daemon errors from transport loss
+    let mut custom_consts = missing_consts;
+    #[cfg(windows)]
+    {
+        custom_consts.ipc.windows_pipe_name =
+            format!(r"\\.\pipe\routeward-err-test-{unique_suffix}");
+    }
+    #[cfg(not(windows))]
+    {
+        custom_consts.ipc.unix_socket_path =
+            format!("/tmp/routeward-err-test-{unique_suffix}.sock");
+    }
+
+    let ctrl =
+        routeward_core::interceptor::RouteWardController::new(custom_consts.clone(), profile, "en");
+    let svc = DaemonIpcService::bind(ctrl).expect("bind test ipc");
+    let svc_task = tokio::spawn(async move {
+        let _ = svc.run_accept_loop().await;
+    });
+
+    let client = IpcClient::new(custom_consts.ipc);
+    let _diag: routeward_core::interceptor::SystemDiagnostics = client
+        .call_typed_detailed(IpcCommand::GetDiagnostics)
+        .await
+        .expect("live daemon responds cleanly");
+
+    let err_resp = IpcResponse::error_with_key(
+        Some("req-1".to_string()),
+        Some(ERR_KEY_INTERCEPTOR_DRIVER.to_string()),
+        RouteWardError::InterceptorError {
+            key: ERR_KEY_INTERCEPTOR_DRIVER,
+            detail: "missing".to_string(),
+        }
+        .to_string(),
+    );
+    assert!(!err_resp.ok);
+    assert_eq!(
+        err_resp.error_key.as_deref(),
+        Some(ERR_KEY_INTERCEPTOR_DRIVER)
+    );
+    svc_task.abort();
+}

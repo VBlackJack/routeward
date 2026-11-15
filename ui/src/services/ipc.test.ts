@@ -15,6 +15,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { SYSTEM_CONSTANTS } from '../config/constants';
 import {
   HttpResponseError,
   RouteWardClientService,
@@ -239,5 +240,94 @@ describe('RouteWardClientService', () => {
       payload: { event: 'logsCleared' }
     });
     expect(client.listLogs()).toHaveLength(0);
+  });
+
+  it('rethrows HttpResponseError with errorKey on toggleEngine 409 without marking daemon disconnected', async () => {
+    const client = new RouteWardClientService();
+    client.applyFullState({
+      diagnostics: {
+        ...client.getDiagnostics(),
+        daemonConnected: true,
+        running: false
+      },
+      profile: client.getProfile(),
+      telemetry: client.getTelemetry(),
+      connections: [],
+      logs: [],
+      fakeIps: []
+    });
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: 'WinDivert driver DLL not found',
+          errorKey: 'errors.interceptor.driver_missing'
+        }),
+        {
+          status: 409,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      )
+    );
+
+    let caught: unknown = null;
+    try {
+      await client.toggleEngine(true);
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(HttpResponseError);
+    expect((caught as HttpResponseError).status).toBe(409);
+    expect((caught as HttpResponseError).errorKey).toBe(
+      'errors.interceptor.driver_missing'
+    );
+    expect(client.getDiagnostics().daemonConnected).toBe(true);
+  });
+
+  it('bounds cached connections in applyStreamEvent while preserving active entries', () => {
+    const client = new RouteWardClientService();
+    const limit = SYSTEM_CONSTANTS.telemetry.maxConnectionHistoryEntries;
+    const baseEntry = {
+      pid: 4242,
+      processName: 'chrome.exe',
+      processPath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      targetHost: 'example.com',
+      resolvedDomain: 'example.com',
+      targetPort: 443,
+      protocol: 'tcp' as const,
+      matchedRule: 'Direct',
+      routeLabel: 'DIRECT',
+      latencyMs: 5,
+      rxBytes: 64,
+      txBytes: 32,
+      startedAt: '2026-11-15T08:00:00Z'
+    };
+
+    client.applyStreamEvent({
+      streamType: 'event',
+      payload: {
+        event: 'connectionUpdated',
+        data: { ...baseEntry, id: 'conn-active-oldest', status: 'active' }
+      }
+    });
+
+    for (let i = 0; i < limit + 15; i += 1) {
+      client.applyStreamEvent({
+        streamType: 'event',
+        payload: {
+          event: 'connectionUpdated',
+          data: {
+            ...baseEntry,
+            id: `conn-closed-${i}`,
+            status: 'closed'
+          }
+        }
+      });
+    }
+
+    const connections = client.listConnections();
+    expect(connections).toHaveLength(limit);
+    expect(connections.some((c) => c.id === 'conn-active-oldest')).toBe(true);
   });
 });
