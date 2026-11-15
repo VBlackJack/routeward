@@ -602,6 +602,12 @@
       "daemon": {
         "banner": "Démarrage du démon privilégié RouteWard",
         "listening_ipc": "Canal de contrôle IPC du démon en écoute"
+      },
+      "service": {
+        "installed": "Service Windows installé",
+        "uninstalled": "Service Windows désinstallé",
+        "started": "Service Windows démarré",
+        "stopped": "Service Windows arrêté"
       }
     }
   },

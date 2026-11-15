@@ -119,7 +119,64 @@ fn spawn_embedded_ui_server(
     });
 }
 
+fn is_smoke_ipc_arg_list<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|arg| arg.as_ref() == "--smoke-ipc")
+}
+
+fn run_smoke_ipc() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let maybe_state = rt.block_on(async {
+        let bridge = create_desktop_bridge()?;
+        Ok::<_, String>(
+            tokio::time::timeout(std::time::Duration::from_secs(3), bridge.refresh_state())
+                .await
+                .ok(),
+        )
+    })?;
+
+    match maybe_state {
+        Some(full_state) => {
+            let summary = serde_json::json!({
+                "daemonConnected": full_state.diagnostics.daemon_connected,
+                "running": full_state.diagnostics.running,
+                "elevatedPrivileges": full_state.diagnostics.elevated_privileges,
+                "osName": full_state.diagnostics.os_name,
+                "relayTcpEndpoint": full_state.diagnostics.relay_tcp_endpoint,
+                "dnsEndpoint": full_state.diagnostics.dns_endpoint,
+            });
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+
+            if full_state.diagnostics.daemon_connected {
+                Ok(())
+            } else {
+                Err("Daemon IPC is disconnected".into())
+            }
+        }
+        None => {
+            let summary = serde_json::json!({
+                "daemonConnected": false,
+                "error": "Timed out querying daemon IPC",
+            });
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            Err("Timed out querying daemon IPC".into())
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if is_smoke_ipc_arg_list(std::env::args().skip(1)) {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .try_init();
+        return run_smoke_ipc();
+    }
+
     tracing_subscriber::fmt::init();
 
     let std_listener = StdTcpListener::bind(LOOPBACK_EPHEMERAL_ADDR)?;
@@ -217,5 +274,13 @@ mod tests {
         assert!(std::str::from_utf8(EMBEDDED_ICON_SVG)
             .expect("UTF-8 icon SVG")
             .contains("<svg"));
+    }
+
+    #[test]
+    fn detects_smoke_ipc_cli_flag() {
+        assert!(is_smoke_ipc_arg_list(["--smoke-ipc"]));
+        assert!(is_smoke_ipc_arg_list(["--foo", "--smoke-ipc"]));
+        assert!(!is_smoke_ipc_arg_list::<[&str; 0], &str>([]));
+        assert!(!is_smoke_ipc_arg_list(["--help"]));
     }
 }

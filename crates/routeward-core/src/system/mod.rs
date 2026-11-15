@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+pub mod windows_service;
+
 use crate::error::RouteWardResult;
 use serde::{Deserialize, Serialize};
 use std::process::Command;

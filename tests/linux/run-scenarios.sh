@@ -681,9 +681,13 @@ fi
 
 # ---------------------------------------------------------------------------
 # Scenario (p): blockEncryptedDnsBypass=true - DoH canary returns NXDOMAIN,
-#               outbound port 853 (TCP & UDP) and IPv6 53/853 are blocked
+#               outbound port 853 (TCP & UDP) blocked, and IPv6 DNS (53 UDP/TCP)
+#               intercepted into RouteWard Fake-IP DNS engine
 # ---------------------------------------------------------------------------
 DNS_P_CANARY=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "use-application-dns.net" 1)
+DNS_P_V6_UDP_A=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IPV6}" "v6udp.routeward.test" 1)
+DNS_P_V6_UDP_AAAA=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IPV6}" "v6udp.routeward.test" 28)
+DNS_P_V6_TCP_A=$(python3 /workspace/tests/linux/mock_servers.py --dns-tcp-query "${TARGET_IPV6}" "v6tcp.routeward.test" 1)
 NFT_IP4_P=$(nft list table ip routeward)
 NFT_IP6_P=$(nft list table ip6 routeward)
 
@@ -697,16 +701,24 @@ sleep 0.2
 LOGS_P=$("${BIN}" ctl logs)
 
 if echo "${DNS_P_CANARY}" | grep -q "RCODE=3 ANCOUNT=0" \
+    && echo "${DNS_P_V6_UDP_A}" | grep -q "RCODE=0 ANCOUNT=1 IP=198.18." \
+    && echo "${DNS_P_V6_UDP_AAAA}" | grep -q "RCODE=0 ANCOUNT=0" \
+    && echo "${DNS_P_V6_TCP_A}" | grep -q "RCODE=0 ANCOUNT=1 IP=198.18." \
     && [[ "${DOT_TCP_EXIT}" -ne 0 ]] \
     && echo "${NFT_IP4_P}" | grep -q "udp dport 853 reject" \
-    && echo "${NFT_IP6_P}" | grep -q "udp dport 53 reject" \
+    && echo "${NFT_IP6_P}" | grep -q "udp dport 53 redirect to :10853" \
+    && echo "${NFT_IP6_P}" | grep -q "tcp dport 53 redirect to :10853" \
+    && ! echo "${NFT_IP6_P}" | grep -q "udp dport 53 reject" \
     && echo "${NFT_IP6_P}" | grep -q "tcp dport 853 reject with tcp reset" \
     && echo "${LOGS_P}" | grep -q "Blocked DoH canary DNS query" \
     && echo "${LOGS_P}" | grep -q "Blocked encrypted DNS bypass (DoT TCP port 853)"; then
-    echo "[PASS] Scenario (p): DoH canary returned NXDOMAIN, DoT 853 TCP/UDP and IPv6 53/853 blocked"
+    echo "[PASS] Scenario (p): DoH canary NXDOMAIN, IPv6 UDP/TCP 53 intercepted cleanly, DoT 853 blocked"
 else
     echo "[FAIL] Scenario (p)"
     echo "DNS_P_CANARY=${DNS_P_CANARY}"
+    echo "DNS_P_V6_UDP_A=${DNS_P_V6_UDP_A}"
+    echo "DNS_P_V6_UDP_AAAA=${DNS_P_V6_UDP_AAAA}"
+    echo "DNS_P_V6_TCP_A=${DNS_P_V6_TCP_A}"
     echo "DOT_TCP_EXIT=${DOT_TCP_EXIT}"
     echo "NFT_IP4_P=${NFT_IP4_P}"
     echo "NFT_IP6_P=${NFT_IP6_P}"
@@ -846,8 +858,8 @@ fi
 
 # ---------------------------------------------------------------------------
 # Scenario (t): Live change of securityPolicy via ctl replace-profile applied
-#               atomically without restarting the engine, while IPv6 53/853
-#               remains blocked unconditionally
+#               atomically without restarting the engine (IPv4 & IPv6 853
+#               unblocked while IPv6 53 interception remains active)
 # ---------------------------------------------------------------------------
 sed -e 's/"killSwitchEnabled": true/"killSwitchEnabled": false/' \
     -e 's/"blockEncryptedDnsBypass": true/"blockEncryptedDnsBypass": false/' \
@@ -862,10 +874,11 @@ LOGS_T=$("${BIN}" ctl logs)
 
 if kill -0 "${DAEMON_R_PID}" 2>/dev/null \
     && ! echo "${NFT_IP4_T}" | grep -q "udp dport 853 reject" \
-    && echo "${NFT_IP6_T}" | grep -q "udp dport 53 reject" \
-    && echo "${NFT_IP6_T}" | grep -q "tcp dport 853 reject with tcp reset" \
+    && echo "${NFT_IP6_T}" | grep -q "udp dport 53 redirect to :10853" \
+    && ! echo "${NFT_IP6_T}" | grep -q "tcp dport 853 reject" \
+    && ! echo "${NFT_IP6_T}" | grep -q "udp dport 853 reject" \
     && echo "${LOGS_T}" | grep -q "securityPolicyChanged=true"; then
-    echo "[PASS] Scenario (t): Live securityPolicy change applied atomically without restarting daemon (IPv6 53/853 still blocked)"
+    echo "[PASS] Scenario (t): Live securityPolicy change applied atomically without restarting daemon (IPv4/IPv6 853 unblocked, IPv6 53 intercepted)"
 else
     echo "[FAIL] Scenario (t)"
     echo "NFT_IP4_T=${NFT_IP4_T}"

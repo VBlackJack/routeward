@@ -602,6 +602,12 @@
       "daemon": {
         "banner": "Starting RouteWard Privileged Daemon",
         "listening_ipc": "Daemon IPC control channel listening"
+      },
+      "service": {
+        "installed": "Windows service installed",
+        "uninstalled": "Windows service uninstalled",
+        "started": "Windows service started",
+        "stopped": "Windows service stopped"
       }
     }
   },

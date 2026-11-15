@@ -896,10 +896,18 @@ impl RouteWardController {
         {
             const CONNTRACK_CACHE_TTL_MS: u64 = 100;
             let sport_tag = format!("sport={}", peer_addr.port());
+            let contains_exact_sport = |text: &str| {
+                text.lines().any(|line| {
+                    let mut tokens = line.split_whitespace();
+                    tokens.clone().any(|tok| tok == "udp") && tokens.any(|tok| tok == sport_tag)
+                })
+            };
             let cached_content = {
                 let guard = self.conntrack_cache.lock();
                 guard.as_ref().and_then(|(ts, text)| {
-                    if ts.elapsed() <= Duration::from_millis(CONNTRACK_CACHE_TTL_MS) {
+                    if ts.elapsed() <= Duration::from_millis(CONNTRACK_CACHE_TTL_MS)
+                        && contains_exact_sport(text)
+                    {
                         Some(text.clone())
                     } else {
                         None
@@ -918,13 +926,15 @@ impl RouteWardController {
             };
             if let Some(content) = content_opt {
                 for line in content.lines() {
-                    if !line.contains("udp") || !line.contains(&sport_tag) {
+                    let tokens: Vec<&str> = line.split_whitespace().collect();
+                    if !tokens.contains(&"udp") || !tokens.contains(&sport_tag.as_str()) {
                         continue;
                     }
                     for &dport in candidate_dports {
                         let dport_tag = format!("dport={dport}");
-                        if line.contains(&dport_tag) {
-                            for token in line.split_whitespace() {
+                        if tokens.contains(&dport_tag.as_str()) {
+                            // The first `dst=` token belongs to the original tuple in nf_conntrack.
+                            for token in &tokens {
                                 if let Some(ip_str) = token.strip_prefix("dst=") {
                                     if let Ok(ip) = ip_str.parse::<IpAddr>() {
                                         if !ip.is_loopback() && ip.is_ipv6() == peer_addr.is_ipv6()
@@ -932,6 +942,7 @@ impl RouteWardController {
                                             return Some(SocketAddr::new(ip, dport));
                                         }
                                     }
+                                    break;
                                 }
                             }
                         }

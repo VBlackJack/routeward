@@ -26,12 +26,17 @@ use routeward_core::error::{
 use routeward_core::i18n::I18nRegistry;
 use routeward_core::interceptor::RouteWardController;
 use routeward_core::ipc::protocol::IpcCommand;
-use routeward_core::ipc::{DaemonIpcService, IpcClient};
+use routeward_core::ipc::{wait_for_shutdown_signal, DaemonIpcService, IpcClient};
 use routeward_core::logger::FileLogger;
 use routeward_core::rules::ConnectionRequest;
+use routeward_core::system::windows_service::{
+    install_windows_service, query_windows_service_status, run_windows_service_dispatcher,
+    start_windows_service, stop_windows_service, uninstall_windows_service,
+};
 use routeward_core::telemetry::LogLevel;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::sync::watch;
 
 const DEFAULT_CLI_LOCALE: &str = "fr";
 const DEFAULT_EVAL_PORT: u16 = 443;
@@ -63,6 +68,14 @@ enum Commands {
         /// Optional safety timeout in seconds before automatic fail-open shutdown
         #[arg(long)]
         duration_secs: Option<u64>,
+        /// Additional allowed Windows user SID for restricted Named Pipe IPC access (repeatable)
+        #[arg(long = "allow-sid", value_name = "SID")]
+        allow_sid: Vec<String>,
+    },
+    /// Manage or host the Windows Service Control Manager (SCM) daemon
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommands,
     },
     /// Control and query the running RouteWard daemon over the local OS IPC channel
     Ctl {
@@ -93,6 +106,39 @@ enum Commands {
         /// Force removal even if a RouteWard daemon instance appears active
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommands {
+    /// Install or reconfigure the RouteWard Windows Service
+    Install {
+        /// Explicit path to routeward.exe (defaults to the current executable path)
+        #[arg(long = "bin-path", value_name = "PATH")]
+        bin_path: Option<PathBuf>,
+        /// Additional allowed Windows user SID for restricted Named Pipe IPC access (repeatable)
+        #[arg(long = "allow-sid", value_name = "SID")]
+        allow_sid: Vec<String>,
+        /// Include the current invoking account SID in the pipe ACL (for interactive admin desktop use)
+        #[arg(long)]
+        allow_current_user: bool,
+        /// Configure manual start instead of automatic start on boot
+        #[arg(long)]
+        demand_start: bool,
+    },
+    /// Stop and remove the RouteWard Windows Service
+    Uninstall,
+    /// Start the installed RouteWard Windows Service via SCM
+    Start,
+    /// Stop the running RouteWard Windows Service via SCM
+    Stop,
+    /// Query RouteWard Windows Service installation and runtime state as JSON
+    Status,
+    /// Run inside Windows Service Control Manager (invoked by services.exe)
+    Run {
+        /// Additional allowed Windows user SID for restricted Named Pipe IPC access (repeatable)
+        #[arg(long = "allow-sid", value_name = "SID")]
+        allow_sid: Vec<String>,
     },
 }
 
@@ -368,11 +414,185 @@ impl ShutdownSignals {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_daemon_host(
+    constants: SystemConstants,
+    locale: &str,
+    duration_secs: Option<u64>,
+    allowed_sids: &[String],
+    mut external_shutdown: Option<watch::Receiver<bool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let i18n = I18nRegistry::new(locale);
+    if !RouteWardController::detect_elevated_privileges() {
+        let msg = i18n.t(ERR_KEY_DAEMON_NOT_ELEVATED);
+        eprintln!("{msg}");
+        return Err(RouteWardError::DaemonError {
+            key: ERR_KEY_DAEMON_NOT_ELEVATED,
+            detail: msg,
+        }
+        .into());
+    }
+
+    let fixed_profile_path = constants.ipc.resolve_daemon_profile_path()?;
+    let profile = match load_or_init_secure_daemon_profile(&fixed_profile_path) {
+        Ok(prof) => prof,
+        Err(err) => {
+            let localized = i18n.t(err.i18n_key());
+            eprintln!("{localized}: {err}");
+            return Err(err.into());
+        }
+    };
+
+    let controller = RouteWardController::new(constants, profile, locale);
+
+    let service = match DaemonIpcService::bind_with_allowed_sids(controller.clone(), allowed_sids) {
+        Ok(svc) => svc,
+        Err(err) => {
+            let localized = controller.i18n.t(err.i18n_key());
+            eprintln!("{localized}: {err}");
+            return Err(err.into());
+        }
+    };
+
+    let _ = controller.cleanup_orphaned_rules(true);
+    println!("=== {} ===", controller.i18n.t("cli.engine.daemon.banner"));
+    println!("{}", controller.i18n.t("cli.engine.cleanup.completed"));
+    #[cfg(unix)]
+    let ipc_endpoint = controller.constants.ipc.unix_socket_path.clone();
+    #[cfg(windows)]
+    let ipc_endpoint = controller.constants.ipc.windows_pipe_name.clone();
+    println!(
+        "{}: {ipc_endpoint}",
+        controller.i18n.t("cli.engine.daemon.listening_ipc")
+    );
+
+    let (local_shutdown_tx, accept_shutdown) = watch::channel(false);
+    let mut accept_handle = tokio::spawn(async move {
+        let _ = service.run_accept_loop_until(accept_shutdown).await;
+    });
+
+    let wait_signals = ShutdownSignals::register();
+    let external_wait = async {
+        match external_shutdown.as_mut() {
+            Some(rx) => wait_for_shutdown_signal(rx).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    if let Some(secs) = duration_secs {
+        tokio::select! {
+            _ = wait_signals.wait() => {},
+            _ = external_wait => {},
+            _ = tokio::time::sleep(Duration::from_secs(secs)) => {},
+        }
+    } else {
+        tokio::select! {
+            _ = wait_signals.wait() => {},
+            _ = external_wait => {},
+        }
+    }
+
+    let _ = local_shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut accept_handle).await;
+    if controller.is_running() {
+        controller.stop_engine();
+    }
+    Ok(())
+}
+
+fn handle_service_command(
+    action: ServiceCommands,
+    locale: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let i18n = I18nRegistry::new(locale);
+    match action {
+        ServiceCommands::Run { allow_sid } => {
+            run_windows_service_dispatcher(
+                locale.to_string(),
+                allow_sid,
+                Box::new(|svc_locale, sids, shutdown_notify| {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|err| RouteWardError::DaemonError {
+                            key: routeward_core::error::ERR_KEY_DAEMON_IPC_ERROR,
+                            detail: format!(
+                                "Failed to construct Tokio runtime for SCM service: {err}"
+                            ),
+                        })?;
+                    let constants = SystemConstants::load_embedded()?;
+                    rt.block_on(async move {
+                        run_daemon_host(constants, &svc_locale, None, &sids, Some(shutdown_notify))
+                            .await
+                            .map_err(|err| RouteWardError::DaemonError {
+                                key: routeward_core::error::ERR_KEY_DAEMON_IPC_ERROR,
+                                detail: err.to_string(),
+                            })
+                    })
+                }),
+            )?;
+            Ok(())
+        }
+        ServiceCommands::Install {
+            bin_path,
+            #[cfg_attr(not(windows), allow(unused_mut))]
+            mut allow_sid,
+            allow_current_user,
+            demand_start,
+        } => {
+            if allow_current_user {
+                #[cfg(windows)]
+                {
+                    let current_sid = routeward_core::ipc::transport::current_user_sid_string()?;
+                    allow_sid.push(current_sid);
+                }
+            }
+            let exe_str = bin_path.as_ref().map(|p| p.to_string_lossy().into_owned());
+            let status = install_windows_service(exe_str.as_deref(), &allow_sid, !demand_start)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            eprintln!("{}", i18n.t("cli.engine.service.installed"));
+            Ok(())
+        }
+        ServiceCommands::Uninstall => {
+            uninstall_windows_service()?;
+            let status = query_windows_service_status()?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            eprintln!("{}", i18n.t("cli.engine.service.uninstalled"));
+            Ok(())
+        }
+        ServiceCommands::Start => {
+            let status = start_windows_service()?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            eprintln!("{}", i18n.t("cli.engine.service.started"));
+            Ok(())
+        }
+        ServiceCommands::Stop => {
+            let status = stop_windows_service()?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            eprintln!("{}", i18n.t("cli.engine.service.stopped"));
+            Ok(())
+        }
+        ServiceCommands::Status => {
+            let status = query_windows_service_status()?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            Ok(())
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = CliArgs::parse();
 
+    if let Commands::Service { action } = args.command {
+        return handle_service_command(action, &args.locale);
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async_main(args))
+}
+
+async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let constants = SystemConstants::load_embedded()?;
 
     if let Commands::Ctl { action } = args.command {
@@ -393,70 +613,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if let Commands::Daemon { duration_secs } = args.command {
-        let i18n = I18nRegistry::new(&args.locale);
-        if !RouteWardController::detect_elevated_privileges() {
-            let msg = i18n.t(ERR_KEY_DAEMON_NOT_ELEVATED);
-            eprintln!("{msg}");
-            return Err(RouteWardError::DaemonError {
-                key: ERR_KEY_DAEMON_NOT_ELEVATED,
-                detail: msg,
-            }
-            .into());
-        }
-
-        let fixed_profile_path = constants.ipc.resolve_daemon_profile_path()?;
-        let profile = match load_or_init_secure_daemon_profile(&fixed_profile_path) {
-            Ok(prof) => prof,
-            Err(err) => {
-                let localized = i18n.t(err.i18n_key());
-                eprintln!("{localized}: {err}");
-                return Err(err.into());
-            }
-        };
-
-        let shutdown_signals = ShutdownSignals::register();
-        let controller = RouteWardController::new(constants, profile, &args.locale);
-
-        let service = match DaemonIpcService::bind(controller.clone()) {
-            Ok(svc) => svc,
-            Err(err) => {
-                let localized = controller.i18n.t(err.i18n_key());
-                eprintln!("{localized}: {err}");
-                return Err(err.into());
-            }
-        };
-
-        let _ = controller.cleanup_orphaned_rules(true);
-        println!("=== {} ===", controller.i18n.t("cli.engine.daemon.banner"));
-        println!("{}", controller.i18n.t("cli.engine.cleanup.completed"));
-        #[cfg(unix)]
-        let ipc_endpoint = controller.constants.ipc.unix_socket_path.clone();
-        #[cfg(windows)]
-        let ipc_endpoint = controller.constants.ipc.windows_pipe_name.clone();
-        println!(
-            "{}: {ipc_endpoint}",
-            controller.i18n.t("cli.engine.daemon.listening_ipc")
-        );
-
-        let accept_handle = tokio::spawn(async move {
-            let _ = service.run_accept_loop().await;
-        });
-
-        if let Some(secs) = duration_secs {
-            tokio::select! {
-                _ = shutdown_signals.wait() => {},
-                _ = tokio::time::sleep(Duration::from_secs(secs)) => {},
-            }
-        } else {
-            shutdown_signals.wait().await;
-        }
-
-        accept_handle.abort();
-        if controller.is_running() {
-            controller.stop_engine();
-        }
-        return Ok(());
+    if let Commands::Daemon {
+        duration_secs,
+        allow_sid,
+    } = args.command
+    {
+        return run_daemon_host(constants, &args.locale, duration_secs, &allow_sid, None).await;
     }
 
     let profile = match &args.profile {
@@ -571,7 +733,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("{}", controller.i18n.t("cli.engine.cleanup.completed"));
         }
-        Commands::Daemon { .. } | Commands::Ctl { .. } => unreachable!(),
+        Commands::Daemon { .. } | Commands::Ctl { .. } | Commands::Service { .. } => unreachable!(),
     }
 
     Ok(())
@@ -875,5 +1037,75 @@ mod tests {
         let _ = std::fs::remove_file(&invalid_file_path);
         let _ = std::fs::remove_file(&temp_prof_path);
         let _ = std::fs::remove_dir_all(&temp_user_log_dir);
+    }
+
+    #[test]
+    fn parses_service_and_daemon_allow_sid_cli_arguments() {
+        let install = CliArgs::try_parse_from([
+            "routeward",
+            "service",
+            "install",
+            "--allow-sid",
+            "S-1-5-21-1-2-3-1000",
+            "--demand-start",
+        ])
+        .expect("parse service install");
+        match install.command {
+            Commands::Service {
+                action:
+                    ServiceCommands::Install {
+                        bin_path,
+                        allow_sid,
+                        allow_current_user,
+                        demand_start,
+                    },
+            } => {
+                assert!(bin_path.is_none());
+                assert_eq!(allow_sid, vec!["S-1-5-21-1-2-3-1000".to_string()]);
+                assert!(!allow_current_user);
+                assert!(demand_start);
+            }
+            _ => panic!("unexpected parsed command"),
+        }
+
+        let status = CliArgs::try_parse_from(["routeward", "service", "status"])
+            .expect("parse service status");
+        assert!(matches!(
+            status.command,
+            Commands::Service {
+                action: ServiceCommands::Status
+            }
+        ));
+
+        let run = CliArgs::try_parse_from([
+            "routeward",
+            "service",
+            "run",
+            "--allow-sid",
+            "S-1-5-21-1-2-3-1001",
+        ])
+        .expect("parse service run");
+        match run.command {
+            Commands::Service {
+                action: ServiceCommands::Run { allow_sid },
+            } => {
+                assert_eq!(allow_sid, vec!["S-1-5-21-1-2-3-1001".to_string()]);
+            }
+            _ => panic!("unexpected parsed command"),
+        }
+
+        let daemon =
+            CliArgs::try_parse_from(["routeward", "daemon", "--allow-sid", "S-1-5-21-1-2-3-1002"])
+                .expect("parse daemon --allow-sid");
+        match daemon.command {
+            Commands::Daemon {
+                duration_secs,
+                allow_sid,
+            } => {
+                assert!(duration_secs.is_none());
+                assert_eq!(allow_sid, vec!["S-1-5-21-1-2-3-1002".to_string()]);
+            }
+            _ => panic!("unexpected parsed command"),
+        }
     }
 }

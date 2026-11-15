@@ -114,13 +114,23 @@ pub struct IpcServer {
 
 impl IpcServer {
     pub fn bind(ipc_config: &IpcConstants) -> RouteWardResult<Self> {
+        Self::bind_with_allowed_sids(ipc_config, &[])
+    }
+
+    pub fn bind_with_allowed_sids(
+        ipc_config: &IpcConstants,
+        allowed_sids: &[String],
+    ) -> RouteWardResult<Self> {
         #[cfg(unix)]
         {
+            for raw_sid in allowed_sids {
+                validate_and_canonicalize_allowed_sid(raw_sid)?;
+            }
             Self::bind_unix(ipc_config)
         }
         #[cfg(windows)]
         {
-            Self::bind_windows(&ipc_config.windows_pipe_name)
+            Self::bind_windows_with_allowed_sids(&ipc_config.windows_pipe_name, allowed_sids)
         }
     }
 
@@ -161,12 +171,16 @@ impl IpcServer {
 
     #[cfg(windows)]
     pub fn bind_windows(pipe_name: &str) -> RouteWardResult<Self> {
+        Self::bind_windows_with_allowed_sids(pipe_name, &[])
+    }
+
+    #[cfg(windows)]
+    pub fn bind_windows_with_allowed_sids(
+        pipe_name: &str,
+        allowed_sids: &[String],
+    ) -> RouteWardResult<Self> {
         let user_sid = query_current_user_sid_string()?;
-        // D:P = Protected DACL
-        // (A;;GA;;;SY) = Allow Generic All to NT AUTHORITY\SYSTEM
-        // (A;;GA;;;BA) = Allow Generic All to BUILTIN\Administrators
-        // (A;;GRGW;;;{user_sid}) = Allow Generic Read + Generic Write to launching user SID
-        let sddl_string = format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{user_sid})");
+        let sddl_string = build_windows_pipe_sddl(&user_sid, allowed_sids)?;
         let first_pipe = create_windows_named_pipe_instance(pipe_name, &sddl_string, true)?;
         Ok(Self {
             current_pipe: first_pipe,
@@ -506,6 +520,173 @@ fn query_unix_peer_cred(stream: &tokio::net::UnixStream) -> RouteWardResult<Peer
 }
 
 #[cfg(windows)]
+pub fn current_user_sid_string() -> RouteWardResult<String> {
+    query_current_user_sid_string()
+}
+
+fn is_forbidden_broad_sid(sid_upper: &str) -> bool {
+    matches!(
+        sid_upper,
+        "WD" | "AU"
+            | "BU"
+            | "AN"
+            | "BG"
+            | "AC"
+            | "IU"
+            | "NU"
+            | "SU"
+            | "DU"
+            | "S-1-1-0"
+            | "S-1-5-11"
+            | "S-1-5-32-545"
+            | "S-1-5-7"
+            | "S-1-5-32-546"
+            | "S-1-15-2-1"
+            | "S-1-5-4"
+            | "S-1-5-2"
+            | "S-1-5-6"
+            | "S-1-5-32-555"
+    ) || sid_upper.starts_with("S-1-16-")
+}
+
+/// Validates and canonicalizes an explicit SID passed to `--allow-sid`, rejecting SDDL
+/// metacharacters, malformed strings, and broad/unprivileged principals.
+pub fn validate_and_canonicalize_allowed_sid(raw: &str) -> RouteWardResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains([';', '(', ')', ':'])
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return Err(RouteWardError::DaemonError {
+            key: ERR_KEY_DAEMON_IPC_ERROR,
+            detail: format!("Invalid SID syntax rejected for pipe ACL: '{raw}'"),
+        });
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    if is_forbidden_broad_sid(&upper) {
+        return Err(RouteWardError::DaemonError {
+            key: ERR_KEY_DAEMON_IPC_ERROR,
+            detail: format!("Refusing overly permissive principal SID '{trimmed}' in pipe ACL"),
+        });
+    }
+
+    let mut subauths = trimmed
+        .strip_prefix("S-1-")
+        .or_else(|| trimmed.strip_prefix("s-1-"));
+    let parts_ok = match subauths.take() {
+        Some(rest) if !rest.is_empty() => {
+            let segs: Vec<&str> = rest.split('-').collect();
+            segs.len() >= 2
+                && segs
+                    .iter()
+                    .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()))
+        }
+        _ => false,
+    };
+    if !parts_ok {
+        return Err(RouteWardError::DaemonError {
+            key: ERR_KEY_DAEMON_IPC_ERROR,
+            detail: format!("Allowed SID must be a canonical numeric S-1-... SID, got '{raw}'"),
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        let canonical = canonicalize_windows_sid(trimmed)?;
+        let canon_upper = canonical.to_ascii_uppercase();
+        if is_forbidden_broad_sid(&canon_upper) {
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_IPC_ERROR,
+                detail: format!(
+                    "Refusing overly permissive canonical SID '{canonical}' in pipe ACL"
+                ),
+            });
+        }
+        Ok(canonical)
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(upper)
+    }
+}
+
+#[cfg(windows)]
+fn canonicalize_windows_sid(sid_str: &str) -> RouteWardResult<String> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSidToSidW,
+    };
+    use windows_sys::Win32::Security::{IsValidSid, PSID};
+
+    let mut wide: Vec<u16> = sid_str.encode_utf16().collect();
+    wide.push(0);
+    unsafe {
+        let mut psid: PSID = null_mut();
+        if ConvertStringSidToSidW(wide.as_ptr(), &mut psid) == 0 || psid.is_null() {
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_IPC_ERROR,
+                detail: format!(
+                    "ConvertStringSidToSidW rejected '{sid_str}': {}",
+                    std::io::Error::last_os_error()
+                ),
+            });
+        }
+        let valid = IsValidSid(psid) != 0;
+        let mut out_ptr: *mut u16 = null_mut();
+        let conv_ok =
+            valid && ConvertSidToStringSidW(psid, &mut out_ptr) != 0 && !out_ptr.is_null();
+        let canonical = if conv_ok {
+            let mut len = 0usize;
+            while *out_ptr.add(len) != 0 {
+                len += 1;
+            }
+            Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+                out_ptr, len,
+            )))
+        } else {
+            None
+        };
+        if !out_ptr.is_null() {
+            let _ = LocalFree(out_ptr as *mut _);
+        }
+        let _ = LocalFree(psid as *mut _);
+        canonical.ok_or_else(|| RouteWardError::DaemonError {
+            key: ERR_KEY_DAEMON_IPC_ERROR,
+            detail: format!("SID failed Windows validation: '{sid_str}'"),
+        })
+    }
+}
+
+/// Builds a strict Protected DACL (`D:P`) SDDL string granting full control to `SYSTEM` (`SY`)
+/// and `Administrators` (`BA`), plus `GRGW` to the launching user SID and validated extra SIDs.
+pub fn build_windows_pipe_sddl(
+    current_user_sid: &str,
+    extra_sids: &[String],
+) -> RouteWardResult<String> {
+    let mut sddl = String::from("D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    let mut seen: Vec<String> = vec!["S-1-5-18".to_string(), "S-1-5-32-544".to_string()];
+
+    let launch_canon = validate_and_canonicalize_allowed_sid(current_user_sid)?;
+    if !seen.iter().any(|s| s.eq_ignore_ascii_case(&launch_canon)) {
+        sddl.push_str(&format!("(A;;GRGW;;;{launch_canon})"));
+        seen.push(launch_canon);
+    }
+
+    for raw in extra_sids {
+        let canon = validate_and_canonicalize_allowed_sid(raw)?;
+        if !seen.iter().any(|s| s.eq_ignore_ascii_case(&canon)) {
+            sddl.push_str(&format!("(A;;GRGW;;;{canon})"));
+            seen.push(canon);
+        }
+    }
+
+    Ok(sddl)
+}
+
+#[cfg(windows)]
 fn query_current_user_sid_string() -> RouteWardResult<String> {
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
@@ -653,5 +834,58 @@ fn create_windows_named_pipe_instance(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_broad_principals_and_sddl_injection_in_allow_sid() {
+        for bad in [
+            "",
+            "WD",
+            "AU",
+            "BU",
+            "S-1-1-0",
+            "S-1-5-11",
+            "S-1-5-32-545",
+            "S-1-5-7",
+            "S-1-15-2-1",
+            "S-1-16-8192",
+            "S-1-5-21-1-2-3-1001)(A;;GA;;;WD",
+            "S-1-5-21-1-2-3-1001;AU",
+            "not-a-sid",
+        ] {
+            assert!(
+                validate_and_canonicalize_allowed_sid(bad).is_err(),
+                "Expected SID '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn builds_deduplicated_protected_sddl_with_valid_user_sids() {
+        let extra = vec![
+            "S-1-5-21-1000-2000-3000-1005".to_string(),
+            "S-1-5-18".to_string(),
+            "S-1-5-21-1000-2000-3000-1005".to_string(),
+        ];
+        let sddl = build_windows_pipe_sddl("S-1-5-18", &extra).expect("valid SDDL");
+        assert_eq!(
+            sddl,
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-1000-2000-3000-1005)"
+        );
+
+        let interactive = build_windows_pipe_sddl(
+            "S-1-5-21-111-222-333-1001",
+            &["S-1-5-21-111-222-333-1002".to_string()],
+        )
+        .expect("interactive user SDDL");
+        assert_eq!(
+            interactive,
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-111-222-333-1001)(A;;GRGW;;;S-1-5-21-111-222-333-1002)"
+        );
     }
 }

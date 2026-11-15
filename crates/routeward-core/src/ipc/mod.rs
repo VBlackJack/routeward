@@ -28,10 +28,19 @@ use crate::ipc::transport::{connect_ipc_stream, IpcServer, IpcStream, PeerIdenti
 use crate::telemetry::LogLevel;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 const COMPONENT_DAEMON_IPC: &str = "DaemonIpc";
 const DEFAULT_OS_SCAN_LIMIT: usize = 48;
+
+pub async fn wait_for_shutdown_signal(rx: &mut watch::Receiver<bool>) {
+    while !*rx.borrow_and_update() {
+        if rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
 
 pub fn generate_ephemeral_token() -> String {
     Uuid::new_v4().to_string()
@@ -44,7 +53,14 @@ pub struct DaemonIpcService {
 
 impl DaemonIpcService {
     pub fn bind(controller: RouteWardController) -> RouteWardResult<Self> {
-        let server = IpcServer::bind(&controller.constants.ipc)?;
+        Self::bind_with_allowed_sids(controller, &[])
+    }
+
+    pub fn bind_with_allowed_sids(
+        controller: RouteWardController,
+        allowed_sids: &[String],
+    ) -> RouteWardResult<Self> {
+        let server = IpcServer::bind_with_allowed_sids(&controller.constants.ipc, allowed_sids)?;
         Ok(Self { controller, server })
     }
 
@@ -62,24 +78,41 @@ impl DaemonIpcService {
         Ok(Self { controller, server })
     }
 
-    pub async fn run_accept_loop(mut self) -> RouteWardResult<()> {
+    pub async fn run_accept_loop(self) -> RouteWardResult<()> {
+        let (_never_tx, never_rx) = watch::channel(false);
+        self.run_accept_loop_until(never_rx).await
+    }
+
+    pub async fn run_accept_loop_until(
+        mut self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> RouteWardResult<()> {
         let mut client_tasks = tokio::task::JoinSet::new();
         loop {
             while client_tasks.try_join_next().is_some() {}
-            match self.server.accept().await {
-                Ok((stream, peer)) => {
-                    log_peer_connection(&self.controller, &peer);
-                    let ctrl = self.controller.clone();
-                    client_tasks.spawn(async move {
-                        handle_client_stream(stream, ctrl).await;
-                    });
+            tokio::select! {
+                _ = wait_for_shutdown_signal(&mut shutdown) => {
+                    client_tasks.abort_all();
+                    while client_tasks.join_next().await.is_some() {}
+                    return Ok(());
                 }
-                Err(err) => {
-                    self.controller.telemetry.push_log(
-                        LogLevel::Error,
-                        COMPONENT_DAEMON_IPC,
-                        format!("IPC accept error: {err}"),
-                    );
+                accept_res = self.server.accept() => {
+                    match accept_res {
+                        Ok((stream, peer)) => {
+                            log_peer_connection(&self.controller, &peer);
+                            let ctrl = self.controller.clone();
+                            client_tasks.spawn(async move {
+                                handle_client_stream(stream, ctrl).await;
+                            });
+                        }
+                        Err(err) => {
+                            self.controller.telemetry.push_log(
+                                LogLevel::Error,
+                                COMPONENT_DAEMON_IPC,
+                                format!("IPC accept error: {err}"),
+                            );
+                        }
+                    }
                 }
             }
         }

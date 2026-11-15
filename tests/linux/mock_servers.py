@@ -146,7 +146,7 @@ def run_dns_tcp_server() -> None:
         ).start()
 
 
-def perform_dns_query_cli(server_ip: str, qname: str, qtype: int) -> int:
+def perform_dns_query_cli(server_ip: str, qname: str, qtype: int, use_tcp: bool = False) -> int:
     pkt = bytearray(struct.pack("!HHHHHH", 0x4242, 0x0100, 1, 0, 0, 0))
     for label in qname.strip(".").split("."):
         if label:
@@ -156,11 +156,32 @@ def perform_dns_query_cli(server_ip: str, qname: str, qtype: int) -> int:
     pkt.append(0)
     pkt.extend(struct.pack("!HH", qtype, 1))
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(3.0)
-    sock.sendto(bytes(pkt), (server_ip, 53))
-    resp, _ = sock.recvfrom(4096)
-    sock.close()
+    family = socket.AF_INET6 if ":" in server_ip else socket.AF_INET
+    if use_tcp:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(3.0)
+        sock.connect((server_ip, 53))
+        framed = struct.pack("!H", len(pkt)) + bytes(pkt)
+        sock.sendall(framed)
+        len_buf = sock.recv(2)
+        if len(len_buf) < 2:
+            sock.close()
+            print("INVALID")
+            return 1
+        resp_len = struct.unpack("!H", len_buf)[0]
+        resp = b""
+        while len(resp) < resp_len:
+            chunk = sock.recv(resp_len - len(resp))
+            if not chunk:
+                break
+            resp += chunk
+        sock.close()
+    else:
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        sock.settimeout(3.0)
+        sock.sendto(bytes(pkt), (server_ip, 53))
+        resp, _ = sock.recvfrom(4096)
+        sock.close()
 
     if len(resp) < 12:
         print("INVALID")
@@ -633,7 +654,13 @@ if __name__ == "__main__":
         srv_ip = sys.argv[2]
         qname_arg = sys.argv[3]
         qtype_arg = int(sys.argv[4]) if len(sys.argv) >= 5 else 1
-        sys.exit(perform_dns_query_cli(srv_ip, qname_arg, qtype_arg))
+        sys.exit(perform_dns_query_cli(srv_ip, qname_arg, qtype_arg, False))
+
+    if len(sys.argv) >= 4 and sys.argv[1] == "--dns-tcp-query":
+        srv_ip = sys.argv[2]
+        qname_arg = sys.argv[3]
+        qtype_arg = int(sys.argv[4]) if len(sys.argv) >= 5 else 1
+        sys.exit(perform_dns_query_cli(srv_ip, qname_arg, qtype_arg, True))
 
     if len(sys.argv) >= 4 and sys.argv[1] == "--tls-sni-probe":
         sys.exit(perform_tls_sni_probe_cli(sys.argv[2], sys.argv[3]))

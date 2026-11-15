@@ -193,7 +193,11 @@ $script:ScenarioExecutionPlan = @(
     [PSCustomObject]@{ ExecutionOrder = 18; Id = "s"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Transparent Direct UDP with process attribution" },
     [PSCustomObject]@{ ExecutionOrder = 19; Id = "t"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "IPv6 TCP interception & SOCKS5 ATYP=0x04 routing via WinDivert" },
     [PSCustomObject]@{ ExecutionOrder = 20; Id = "u"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "IPv6 UDP interception & SOCKS5 UDP ASSOCIATE ATYP=0x04 via WinDivert" },
-    [PSCustomObject]@{ ExecutionOrder = 21; Id = "j"; RequiresSocks5 = $true;  StopsSocks5 = $true;  Title = "Kill-Switch blocks curl when SOCKS5 proxy is stopped" }
+    [PSCustomObject]@{ ExecutionOrder = 21; Id = "v"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "IPv6 DNS (port 53 UDP/TCP Fake-IP) & gated IPv6 DoT (port 853)" },
+    [PSCustomObject]@{ ExecutionOrder = 22; Id = "w"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "IPv6 QUIC (UDP 443) rejected with ICMPv6 Port Unreachable" },
+    [PSCustomObject]@{ ExecutionOrder = 23; Id = "x"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Direct IPv6 UDP flow attributed to process in ctl connections" },
+    [PSCustomObject]@{ ExecutionOrder = 24; Id = "y"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Windows SCM service status & routeward-desktop --smoke-ipc" },
+    [PSCustomObject]@{ ExecutionOrder = 25; Id = "j"; RequiresSocks5 = $true;  StopsSocks5 = $true;  Title = "Kill-Switch blocks curl when SOCKS5 proxy is stopped" }
 )
 
 $script:CurrentPowerShellHostExe = ([System.Diagnostics.Process]::GetCurrentProcess().ProcessName + ".exe")
@@ -249,7 +253,10 @@ function New-DnsWireQueryPacket {
         [string]$QueryName,
 
         [Parameter(Mandatory = $false)]
-        [uint16]$TransactionId = 0x5355
+        [uint16]$TransactionId = 0x5355,
+
+        [Parameter(Mandatory = $false)]
+        [uint16]$QType = 1
     )
     $bytes = New-Object System.Collections.Generic.List[byte]
     # Header: ID, Flags=0x0000, QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
@@ -266,8 +273,8 @@ function New-DnsWireQueryPacket {
         }
     }
     $bytes.Add([byte]0x00)
-    # QTYPE=1 (A), QCLASS=1 (IN)
-    $bytes.AddRange([byte[]]@(0x00, 0x01, 0x00, 0x01))
+    # QTYPE (1=A, 28=AAAA), QCLASS=1 (IN)
+    $bytes.AddRange([byte[]]@([byte](($QType -shr 8) -band 0xFF), [byte]($QType -band 0xFF), 0x00, 0x01))
     return ,$bytes.ToArray()
 }
 
@@ -378,9 +385,21 @@ function Invoke-QuicUdp443Probe {
         [int]$Port = 443,
 
         [Parameter(Mandatory = $false)]
-        [int]$ReceiveTimeoutMs = 1500
+        [int]$ReceiveTimeoutMs = 1500,
+
+        [Parameter(Mandatory = $false)]
+        [string]$LocalIp = ""
     )
-    $udp = New-Object System.Net.Sockets.UdpClient
+    $parsedIp = [System.Net.IPAddress]::Loopback
+    $isV6 = [System.Net.IPAddress]::TryParse($TargetIp, [ref]$parsedIp) -and ($parsedIp.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6)
+    $udp = if (-not [string]::IsNullOrWhiteSpace($LocalIp)) {
+        $localEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($LocalIp), 0)
+        New-Object System.Net.Sockets.UdpClient($localEp)
+    } elseif ($isV6) {
+        New-Object System.Net.Sockets.UdpClient([System.Net.Sockets.AddressFamily]::InterNetworkV6)
+    } else {
+        New-Object System.Net.Sockets.UdpClient
+    }
     try {
         $udp.Client.ReceiveTimeout = $ReceiveTimeoutMs
         try {
@@ -393,7 +412,8 @@ function Invoke-QuicUdp443Probe {
         $payload = [System.Text.Encoding]::ASCII.GetBytes("QUIC_INITIAL_PROBE_42A")
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $null = $udp.Send($payload, $payload.Length)
-        $remoteEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+        $anyAddr = if ($isV6) { [System.Net.IPAddress]::IPv6Any } else { [System.Net.IPAddress]::Any }
+        $remoteEp = New-Object System.Net.IPEndPoint($anyAddr, 0)
         try {
             $null = $udp.Receive([ref]$remoteEp)
             $sw.Stop()
@@ -1108,12 +1128,12 @@ if ($DryRun.IsPresent) {
     if ($frExtractedMethod -ne "dnsapi.dll!DnsFlushResolverCache") {
         throw "DryRun failed: expected invariant English method from localized log, got '$frExtractedMethod'."
     }
-    if ($script:ScenarioExecutionPlan.Count -ne 21) {
-        throw "DryRun failed: expected 21 scenarios in ScenarioExecutionPlan, got $($script:ScenarioExecutionPlan.Count)."
+    if ($script:ScenarioExecutionPlan.Count -ne 25) {
+        throw "DryRun failed: expected 25 scenarios in ScenarioExecutionPlan, got $($script:ScenarioExecutionPlan.Count)."
     }
     $lastScenario = $script:ScenarioExecutionPlan[$script:ScenarioExecutionPlan.Count - 1]
-    if ($lastScenario.Id -ne "j" -or $lastScenario.ExecutionOrder -ne 21 -or (-not $lastScenario.StopsSocks5)) {
-        throw "DryRun failed: Scenario (j) must execute last (ExecutionOrder=21, StopsSocks5=true)."
+    if ($lastScenario.Id -ne "j" -or $lastScenario.ExecutionOrder -ne 25 -or (-not $lastScenario.StopsSocks5)) {
+        throw "DryRun failed: Scenario (j) must execute last (ExecutionOrder=25, StopsSocks5=true)."
     }
     foreach ($planItem in $script:ScenarioExecutionPlan) {
         if ($planItem.RequiresSocks5 -and $planItem.Id -ne "j" -and $planItem.ExecutionOrder -ge $lastScenario.ExecutionOrder) {
@@ -1123,6 +1143,10 @@ if ($DryRun.IsPresent) {
     $llmnrTestPkt = New-DnsWireQueryPacket -QueryName "public-leak.routeward.test" -TransactionId 0x5355
     if ($llmnrTestPkt.Length -le 20 -or $llmnrTestPkt[0] -ne 0x53 -or $llmnrTestPkt[1] -ne 0x55) {
         throw "DryRun failed: New-DnsWireQueryPacket produced unexpected wire bytes."
+    }
+    $aaaaTestPkt = New-DnsWireQueryPacket -QueryName "example.com" -TransactionId 0x5356 -QType 28
+    if ($aaaaTestPkt.Length -le 20 -or $aaaaTestPkt[$aaaaTestPkt.Length - 4] -ne 0x00 -or $aaaaTestPkt[$aaaaTestPkt.Length - 3] -ne 0x1C) {
+        throw "DryRun failed: New-DnsWireQueryPacket QType=28 did not encode AAAA QTYPE."
     }
     $ntpTestPkt = New-NtpClientRequestPacket
     if ($ntpTestPkt.Length -ne 48 -or $ntpTestPkt[0] -ne 0x23) {
@@ -1606,6 +1630,177 @@ function Invoke-Ipv6UdpNtpExchange {
         }
     } finally {
         $udp.Close()
+    }
+}
+
+function Invoke-Ipv6DnsWireQuery {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetIp,
+
+        [Parameter(Mandatory = $true)]
+        [string]$QueryName,
+
+        [Parameter(Mandatory = $false)]
+        [int]$Port = 53,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("udp", "tcp")]
+        [string]$Protocol = "udp",
+
+        [Parameter(Mandatory = $false)]
+        [uint16]$QType = 1,
+
+        [Parameter(Mandatory = $false)]
+        [int]$TimeoutMs = 4000,
+
+        [Parameter(Mandatory = $false)]
+        [string]$LocalIp = ""
+    )
+    $txId = [uint16](Get-Random -Minimum 1000 -Maximum 65000)
+    $queryPkt = New-DnsWireQueryPacket -QueryName $QueryName -TransactionId $txId -QType $QType
+    $respBytes = $null
+    $errMsg = ""
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        if ($Protocol -eq "udp") {
+            $udp = if (-not [string]::IsNullOrWhiteSpace($LocalIp)) {
+                $localEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($LocalIp), 0)
+                New-Object System.Net.Sockets.UdpClient($localEp)
+            } else {
+                New-Object System.Net.Sockets.UdpClient([System.Net.Sockets.AddressFamily]::InterNetworkV6)
+            }
+            try {
+                $udp.Client.ReceiveTimeout = $TimeoutMs
+                $udp.Connect([System.Net.IPAddress]::Parse($TargetIp), $Port)
+                $null = $udp.Send($queryPkt, $queryPkt.Length)
+                $remoteEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::IPv6Any, 0)
+                $respBytes = $udp.Receive([ref]$remoteEp)
+            } finally {
+                $udp.Close()
+            }
+        } else {
+            $tcp = if (-not [string]::IsNullOrWhiteSpace($LocalIp)) {
+                $localEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($LocalIp), 0)
+                New-Object System.Net.Sockets.TcpClient($localEp)
+            } else {
+                New-Object System.Net.Sockets.TcpClient([System.Net.Sockets.AddressFamily]::InterNetworkV6)
+            }
+            try {
+                $tcp.ReceiveTimeout = $TimeoutMs
+                $tcp.SendTimeout = $TimeoutMs
+                $connectTask = $tcp.ConnectAsync([System.Net.IPAddress]::Parse($TargetIp), $Port)
+                if (-not $connectTask.Wait($TimeoutMs)) {
+                    throw "TCP connect timed out after $TimeoutMs ms"
+                }
+                if ($connectTask.IsFaulted) {
+                    throw $connectTask.Exception.InnerException
+                }
+                $stream = $tcp.GetStream()
+                $stream.ReadTimeout = $TimeoutMs
+                $stream.WriteTimeout = $TimeoutMs
+                $lenPrefix = [byte[]]@([byte](($queryPkt.Length -shr 8) -band 0xFF), [byte]($queryPkt.Length -band 0xFF))
+                $stream.Write($lenPrefix, 0, 2)
+                $stream.Write($queryPkt, 0, $queryPkt.Length)
+                $stream.Flush()
+
+                $lenBuf = New-Object byte[] 2
+                $got = 0
+                while ($got -lt 2) {
+                    $n = $stream.Read($lenBuf, $got, 2 - $got)
+                    if ($n -le 0) {
+                        throw "Unexpected EOF reading TCP DNS length prefix"
+                    }
+                    $got += $n
+                }
+                $msgLen = (([int]$lenBuf[0]) -shl 8) -bor [int]$lenBuf[1]
+                $respBytes = New-Object byte[] $msgLen
+                $got = 0
+                while ($got -lt $msgLen) {
+                    $n = $stream.Read($respBytes, $got, $msgLen - $got)
+                    if ($n -le 0) {
+                        throw "Unexpected EOF reading TCP DNS payload"
+                    }
+                    $got += $n
+                }
+            } finally {
+                $tcp.Close()
+            }
+        }
+    } catch {
+        $errMsg = $_.Exception.Message
+    } finally {
+        $sw.Stop()
+    }
+
+    if ($null -eq $respBytes -or $respBytes.Length -lt 12) {
+        return [PSCustomObject]@{
+            ReplyReceived = $false
+            RCode         = -1
+            AnswerCount   = 0
+            AnswerIps     = @()
+            DelayMs       = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+            ErrorMessage  = $errMsg
+        }
+    }
+
+    $rcode = [int]($respBytes[3] -band 0x0F)
+    $qdCount = (([int]$respBytes[4]) -shl 8) -bor [int]$respBytes[5]
+    $anCount = (([int]$respBytes[6]) -shl 8) -bor [int]$respBytes[7]
+    $answerIps = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $pos = 12
+        for ($q = 0; $q -lt $qdCount -and $pos -lt $respBytes.Length; $q++) {
+            while ($pos -lt $respBytes.Length) {
+                $labelLen = [int]$respBytes[$pos]
+                if ($labelLen -eq 0) {
+                    $pos += 1
+                    break
+                }
+                if (($labelLen -band 0xC0) -eq 0xC0) {
+                    $pos += 2
+                    break
+                }
+                $pos += (1 + $labelLen)
+            }
+            $pos += 4
+        }
+        for ($a = 0; $a -lt $anCount -and ($pos + 10) -le $respBytes.Length; $a++) {
+            while ($pos -lt $respBytes.Length) {
+                $labelLen = [int]$respBytes[$pos]
+                if ($labelLen -eq 0) {
+                    $pos += 1
+                    break
+                }
+                if (($labelLen -band 0xC0) -eq 0xC0) {
+                    $pos += 2
+                    break
+                }
+                $pos += (1 + $labelLen)
+            }
+            if (($pos + 10) -gt $respBytes.Length) { break }
+            $rrType = (([int]$respBytes[$pos]) -shl 8) -bor [int]$respBytes[$pos + 1]
+            $rdLen = (([int]$respBytes[$pos + 8]) -shl 8) -bor [int]$respBytes[$pos + 9]
+            $pos += 10
+            if (($pos + $rdLen) -gt $respBytes.Length) { break }
+            if ($rrType -eq 1 -and $rdLen -eq 4) {
+                $answerIps.Add("$($respBytes[$pos]).$($respBytes[$pos + 1]).$($respBytes[$pos + 2]).$($respBytes[$pos + 3])")
+            }
+            $pos += $rdLen
+        }
+    } catch {
+        # Best-effort RR walk
+    }
+
+    return [PSCustomObject]@{
+        ReplyReceived = $true
+        RCode         = $rcode
+        AnswerCount   = $anCount
+        AnswerIps     = @($answerIps)
+        DelayMs       = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+        ErrorMessage  = $errMsg
     }
 }
 
@@ -2761,7 +2956,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (t) [Order 19/21]: Real Windows WinDivert IPv6 TCP interception
+    # Scenario (t) [Order 19/25]: Real Windows WinDivert IPv6 TCP interception
     #               -> [::]:10810 transparent reflect -> SOCKS5 ATYP=0x04
     #               -> curl.exe -6 HTTP 200 (temporary ULA + route cleaned up)
     # -----------------------------------------------------------------------
@@ -2896,7 +3091,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (u) [Order 20/21]: Real Windows WinDivert IPv6 UDP interception
+    # Scenario (u) [Order 20/25]: Real Windows WinDivert IPv6 UDP interception
     #               -> SOCKS5 UDP ASSOCIATE (ATYP=0x04) -> forged IPv6 UDP reply
     # -----------------------------------------------------------------------
     try {
@@ -3032,7 +3227,252 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (j) [Order 21/21 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) -
+    # Scenario (v) [Order 21/25]: IPv6 DNS (port 53 UDP/TCP Fake-IP A & AAAA NODATA)
+    #               and gated IPv6 DoT (port 853) SecurityPolicy check
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+        $ipv6LocalUlaV = "fd00:7277:2026::10"
+        $ipv6TargetIpV = "2001:db8:7277::10"
+        $ipv6RouteCtxV = $null
+        try {
+            $ipv6RouteCtxV = Initialize-TransientWinDivertIpv6Route -LocalUlaIp $ipv6LocalUlaV -TargetRemoteIp $ipv6TargetIpV
+            if ($null -eq $ipv6RouteCtxV) {
+                throw "No connected non-loopback network adapter found to attach transient IPv6 route for Scenario (v)."
+            }
+
+            Start-Sleep -Milliseconds 200
+            $dnsV6UdpA = Invoke-Ipv6DnsWireQuery -TargetIp $ipv6TargetIpV -QueryName "example.com" -Port 53 -Protocol "udp" -QType 1 -TimeoutMs 3500 -LocalIp $ipv6LocalUlaV
+            $dnsV6UdpAaaa = Invoke-Ipv6DnsWireQuery -TargetIp $ipv6TargetIpV -QueryName "example.com" -Port 53 -Protocol "udp" -QType 28 -TimeoutMs 3500 -LocalIp $ipv6LocalUlaV
+            $dnsV6TcpA = Invoke-Ipv6DnsWireQuery -TargetIp $ipv6TargetIpV -QueryName "example.com" -Port 53 -Protocol "tcp" -QType 1 -TimeoutMs 4000 -LocalIp $ipv6LocalUlaV
+
+            # Probe IPv6 DoT port 853 while blockEncryptedDnsBypass is active (default profile policy)
+            $dotProbeUdp = New-Object System.Net.Sockets.UdpClient((New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($ipv6LocalUlaV), 0)))
+            try {
+                $dotBytes = [System.Text.Encoding]::ASCII.GetBytes("DOT_BYPASS_PROBE")
+                $null = $dotProbeUdp.Send($dotBytes, $dotBytes.Length, $ipv6TargetIpV, 853)
+            } finally {
+                $dotProbeUdp.Close()
+            }
+            Start-Sleep -Milliseconds $PollIntervalMs
+
+            $connsResV = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-v-connections"
+            $connsListV = ConvertFrom-CtlResponseJson `
+                -RawJson $connsResV.RawText `
+                -Context "Scenario-v-connections" `
+                -ExpectResultArray `
+                -RequiredArrayElementProperties @("targetHost", "targetPort", "protocol", "matchedRule", "status")
+
+            $sawDotV6Blocked = $false
+            foreach ($c in $connsListV) {
+                if ([int]$c.targetPort -eq 853 -and $c.targetHost -ieq $ipv6TargetIpV -and $c.matchedRule -eq "SecurityPolicy:blockEncryptedDnsBypass" -and $c.status -eq "blocked") {
+                    $sawDotV6Blocked = $true
+                    break
+                }
+            }
+
+            $udpAFakeIp = if ($dnsV6UdpA.AnswerIps.Count -ge 1) { [string]$dnsV6UdpA.AnswerIps[0] } else { "" }
+            $tcpAFakeIp = if ($dnsV6TcpA.AnswerIps.Count -ge 1) { [string]$dnsV6TcpA.AnswerIps[0] } else { "" }
+            $udpAValid = $dnsV6UdpA.ReplyReceived -and $dnsV6UdpA.RCode -eq 0 -and (Test-IpInFakePool -IpAddressString $udpAFakeIp -PoolCidr $FakeIpCidr)
+            $udpAaaaValid = $dnsV6UdpAaaa.ReplyReceived -and $dnsV6UdpAaaa.RCode -eq 0 -and $dnsV6UdpAaaa.AnswerCount -eq 0
+            $tcpAValid = $dnsV6TcpA.ReplyReceived -and $dnsV6TcpA.RCode -eq 0 -and (Test-IpInFakePool -IpAddressString $tcpAFakeIp -PoolCidr $FakeIpCidr)
+
+            if ($udpAValid -and $udpAaaaValid -and $tcpAValid -and $sawDotV6Blocked) {
+                Record-ScenarioResult -Id "v" -Status "PASS" -Title "IPv6 DNS (port 53 UDP/TCP Fake-IP) & gated IPv6 DoT (port 853)" -Detail "IPv6 UDP 53 A->$udpAFakeIp, UDP 53 AAAA->NODATA (rcode=0, ancount=0), TCP 53 A->$tcpAFakeIp, IPv6 DoT 853 blocked=true (SecurityPolicy:blockEncryptedDnsBypass)"
+            } else {
+                Record-ScenarioResult -Id "v" -Status "FAIL" -Title "IPv6 DNS (port 53 UDP/TCP Fake-IP) & gated IPv6 DoT (port 853)" -Detail "udpA=$udpAValid ('$udpAFakeIp', err=$($dnsV6UdpA.ErrorMessage)), udpAAAA=$udpAaaaValid (rcode=$($dnsV6UdpAaaa.RCode), an=$($dnsV6UdpAaaa.AnswerCount), err=$($dnsV6UdpAaaa.ErrorMessage)), tcpA=$tcpAValid ('$tcpAFakeIp', err=$($dnsV6TcpA.ErrorMessage)), dot853Blocked=$sawDotV6Blocked"
+            }
+        } finally {
+            Remove-TransientWinDivertIpv6Route -Context $ipv6RouteCtxV
+        }
+    } catch {
+        Record-ScenarioResult -Id "v" -Status "FAIL" -Title "IPv6 DNS (port 53 UDP/TCP Fake-IP) & gated IPv6 DoT (port 853)" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (w) [Order 22/25]: IPv6 QUIC (UDP 443) rejected with inbound
+    #               ICMPv6 Port Unreachable (Type 1, Code 4) via WinDivert
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+        $ipv6LocalUlaW = "fd00:7277:2026::10"
+        $ipv6TargetIpW = "2001:db8:7277::10"
+        $ipv6RouteCtxW = $null
+        try {
+            $ipv6RouteCtxW = Initialize-TransientWinDivertIpv6Route -LocalUlaIp $ipv6LocalUlaW -TargetRemoteIp $ipv6TargetIpW
+            if ($null -eq $ipv6RouteCtxW) {
+                throw "No connected non-loopback network adapter found to attach transient IPv6 route for Scenario (w)."
+            }
+
+            Start-Sleep -Milliseconds 150
+            $quicProbeV6 = Invoke-QuicUdp443Probe -TargetIp $ipv6TargetIpW -Port 443 -ReceiveTimeoutMs 1500 -LocalIp $ipv6LocalUlaW
+            Start-Sleep -Milliseconds $PollIntervalMs
+
+            $connsResW = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-w-connections"
+            $connsListW = ConvertFrom-CtlResponseJson `
+                -RawJson $connsResW.RawText `
+                -Context "Scenario-w-connections" `
+                -ExpectResultArray `
+                -RequiredArrayElementProperties @("targetHost", "targetPort", "protocol", "matchedRule", "status")
+
+            $logsResW = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-w-logs"
+            $logsListW = ConvertFrom-CtlResponseJson `
+                -RawJson $logsResW.RawText `
+                -Context "Scenario-w-logs" `
+                -ExpectResultArray `
+                -RequiredArrayElementProperties @("level", "component", "message")
+
+            $sawQuicV6BlockedConn = $false
+            foreach ($c in $connsListW) {
+                if ([int]$c.targetPort -eq 443 -and $c.protocol -eq "udp" -and $c.targetHost -ieq $ipv6TargetIpW -and $c.matchedRule -eq "SecurityPolicy:blockQuicUdp443" -and $c.status -eq "blocked") {
+                    $sawQuicV6BlockedConn = $true
+                    break
+                }
+            }
+
+            $sawQuicV6WarnLog = $false
+            foreach ($l in $logsListW) {
+                $msgW = [string]$l.message
+                if ($l.level -eq "WARN" -and $msgW.Contains("Rejected QUIC (UDP port 443) with ICMPv6 Port Unreachable") -and $msgW.Contains($ipv6TargetIpW)) {
+                    $sawQuicV6WarnLog = $true
+                    break
+                }
+            }
+
+            if ($sawQuicV6BlockedConn -and $sawQuicV6WarnLog -and (-not $quicProbeV6.UnexpectedReplyReceived)) {
+                Record-ScenarioResult -Id "w" -Status "PASS" -Title "IPv6 QUIC (UDP 443) rejected with ICMPv6 Port Unreachable" -Detail "IPv6 UDP 443 toward [${ipv6TargetIpW}]:443 blocked=true, fastRejection=$($quicProbeV6.FastRejection) (clientError=$($quicProbeV6.SocketErrorCode), measuredDelay=$($quicProbeV6.DelayMs) ms, matchedRule=SecurityPolicy:blockQuicUdp443, status=blocked)"
+            } else {
+                Record-ScenarioResult -Id "w" -Status "FAIL" -Title "IPv6 QUIC (UDP 443) rejected with ICMPv6 Port Unreachable" -Detail "blocked=$sawQuicV6BlockedConn, sawWarnLog=$sawQuicV6WarnLog, unexpectedReply=$($quicProbeV6.UnexpectedReplyReceived), fastRejection=$($quicProbeV6.FastRejection), clientError=$($quicProbeV6.SocketErrorCode), delayMs=$($quicProbeV6.DelayMs)"
+            }
+        } finally {
+            Remove-TransientWinDivertIpv6Route -Context $ipv6RouteCtxW
+        }
+    } catch {
+        Record-ScenarioResult -Id "w" -Status "FAIL" -Title "IPv6 QUIC (UDP 443) rejected with ICMPv6 Port Unreachable" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (x) [Order 23/25]: Direct IPv6 UDP flow attributed to process in
+    #               ctl connections / ctl logs
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+        $ipv6LocalUlaX = "fd00:7277:2026::10"
+        $ipv6TargetIpX = "2001:db8:7277::10"
+        $ipv6DirectPortX = $NtpPort
+        $ipv6RouteCtxX = $null
+        try {
+            $ipv6RouteCtxX = Initialize-TransientWinDivertIpv6Route -LocalUlaIp $ipv6LocalUlaX -TargetRemoteIp $ipv6TargetIpX
+            if ($null -eq $ipv6RouteCtxX) {
+                throw "No connected non-loopback network adapter found to attach transient IPv6 route for Scenario (x)."
+            }
+
+            Start-Sleep -Milliseconds 150
+            $null = Invoke-Ipv6UdpNtpExchange -TargetIp $ipv6TargetIpX -Port $ipv6DirectPortX -ReceiveTimeoutMs 400 -LocalIp $ipv6LocalUlaX
+
+            $matchedDirectV6Conn = $null
+            $sawDirectV6Log = $false
+            $pollSwX = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($pollSwX.ElapsedMilliseconds -lt 3000) {
+                Start-Sleep -Milliseconds 300
+                $connsResX = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-x-connections"
+                $connsListX = ConvertFrom-CtlResponseJson `
+                    -RawJson $connsResX.RawText `
+                    -Context "Scenario-x-connections" `
+                    -ExpectResultArray `
+                    -RequiredArrayElementProperties @("processName", "targetHost", "targetPort", "protocol", "matchedRule", "routeLabel", "status")
+
+                foreach ($c in $connsListX) {
+                    if ([int]$c.targetPort -eq $ipv6DirectPortX -and $c.protocol -eq "udp" -and $c.targetHost -ieq $ipv6TargetIpX -and $c.routeLabel -eq "DIRECT" -and ($script:ExpectedUdpHostProcesses -contains $c.processName)) {
+                        $matchedDirectV6Conn = $c
+                        break
+                    }
+                }
+
+                $logsResX = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-x-logs"
+                $logsListX = ConvertFrom-CtlResponseJson `
+                    -RawJson $logsResX.RawText `
+                    -Context "Scenario-x-logs" `
+                    -ExpectResultArray `
+                    -RequiredArrayElementProperties @("level", "component", "message")
+
+                foreach ($l in $logsListX) {
+                    $msgX = [string]$l.message
+                    if (($l.component -eq "TransparentRelay" -or $l.component -eq "WinDivert" -or $l.component -eq "Interceptor") -and ($msgX.Contains("Routed UDP") -or $msgX.Contains("Routed IPv6 UDP")) -and $msgX.Contains($ipv6TargetIpX) -and $msgX.Contains("DIRECT")) {
+                        $sawDirectV6Log = $true
+                        break
+                    }
+                }
+                if ($null -ne $matchedDirectV6Conn -and $sawDirectV6Log) {
+                    break
+                }
+            }
+
+            if ($null -ne $matchedDirectV6Conn -and $sawDirectV6Log) {
+                Record-ScenarioResult -Id "x" -Status "PASS" -Title "Direct IPv6 UDP flow attributed to process in ctl connections" -Detail "Attributed IPv6 DIRECT UDP flow toward [${ipv6TargetIpX}]:$ipv6DirectPortX to processName=$($matchedDirectV6Conn.processName), routeLabel=DIRECT, matchedRule=$($matchedDirectV6Conn.matchedRule)"
+            } else {
+                Record-ScenarioResult -Id "x" -Status "FAIL" -Title "Direct IPv6 UDP flow attributed to process in ctl connections" -Detail "hasAttributedConn=$($null -ne $matchedDirectV6Conn), sawDirectV6Log=$sawDirectV6Log for [${ipv6TargetIpX}]:$ipv6DirectPortX"
+            }
+        } finally {
+            Remove-TransientWinDivertIpv6Route -Context $ipv6RouteCtxX
+        }
+    } catch {
+        Record-ScenarioResult -Id "x" -Status "FAIL" -Title "Direct IPv6 UDP flow attributed to process in ctl connections" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (y) [Order 24/25]: Windows SCM service status command &
+    #               routeward-desktop.exe --smoke-ipc against live daemon
+    # -----------------------------------------------------------------------
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+
+        $svcStatusOutput = & $routeWardExePath "service" "status" 2>&1
+        $svcExitCode = $LASTEXITCODE
+        $svcRaw = ($svcStatusOutput | Out-String).Trim()
+        if ($svcExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($svcRaw)) {
+            throw "routeward service status failed (exit=$svcExitCode): $svcRaw"
+        }
+        $svcObj = $svcRaw | ConvertFrom-Json
+        if ($svcObj.serviceName -ne "RouteWard" -or [string]::IsNullOrWhiteSpace([string]$svcObj.state)) {
+            throw "Unexpected routeward service status payload: $svcRaw"
+        }
+
+        $desktopExePath = Join-Path $resolvedBinDir "routeward-desktop.exe"
+        if (-not (Test-Path -LiteralPath $desktopExePath)) {
+            throw "Missing routeward-desktop.exe in '$resolvedBinDir' for --smoke-ipc check."
+        }
+        $smokeId = [Guid]::NewGuid().ToString("N")
+        $smokeOutFile = Join-Path ([System.IO.Path]::GetTempPath()) "routeward_smoke_${smokeId}_out.txt"
+        $smokeErrFile = Join-Path ([System.IO.Path]::GetTempPath()) "routeward_smoke_${smokeId}_err.txt"
+        try {
+            $smokeProc = Start-Process -FilePath $desktopExePath -ArgumentList "--smoke-ipc" -Wait -PassThru -RedirectStandardOutput $smokeOutFile -RedirectStandardError $smokeErrFile
+            $smokeExitCode = $smokeProc.ExitCode
+            $smokeRawStdout = if (Test-Path -LiteralPath $smokeOutFile) { Get-Content -LiteralPath $smokeOutFile -Raw -Encoding UTF8 } else { $null }
+            $smokeRawStderr = if (Test-Path -LiteralPath $smokeErrFile) { Get-Content -LiteralPath $smokeErrFile -Raw -Encoding UTF8 } else { $null }
+            $smokeStdout = if ($null -ne $smokeRawStdout) { $smokeRawStdout.Trim() } else { "" }
+            $smokeStderr = if ($null -ne $smokeRawStderr) { $smokeRawStderr.Trim() } else { "" }
+            if ($smokeExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($smokeStdout)) {
+                throw "routeward-desktop.exe --smoke-ipc failed (exit=$smokeExitCode): stdout='$smokeStdout' stderr='$smokeStderr'"
+            }
+            $smokeObj = $smokeStdout | ConvertFrom-Json
+            if ($smokeObj.daemonConnected -ne $true -or $smokeObj.elevatedPrivileges -ne $true) {
+                throw "Unexpected --smoke-ipc JSON payload: $smokeStdout"
+            }
+        } finally {
+            Remove-Item -LiteralPath $smokeOutFile, $smokeErrFile -Force -ErrorAction SilentlyContinue
+        }
+
+        Record-ScenarioResult -Id "y" -Status "PASS" -Title "Windows SCM service status & routeward-desktop --smoke-ipc" -Detail "serviceName=$($svcObj.serviceName) state=$($svcObj.state); routeward-desktop --smoke-ipc daemonConnected=true, running=$($smokeObj.running), elevated=$($smokeObj.elevatedPrivileges)"
+    } catch {
+        Record-ScenarioResult -Id "y" -Status "FAIL" -Title "Windows SCM service status & routeward-desktop --smoke-ipc" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (j) [Order 25/25 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) -
     #               SOCKS5 proxy stopped during test, curl.exe matched by Proxy rule
     #               fails without falling back to Direct, and ctl connections reports Blocked
     # -----------------------------------------------------------------------

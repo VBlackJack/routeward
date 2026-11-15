@@ -1,0 +1,12 @@
+Package: routeward
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Depends: nftables, iproute2
+Recommends: libwebkit2gtk-4.1-0, libgtk-3-0
+Maintainer: Julien Bombled <222413562+VBlackJack@users.noreply.github.com>
+Homepage: https://github.com/VBlackJack/routeward
+Description: RouteWard transparent proxy routing daemon and desktop UI
+ Process-aware SOCKS5 and HTTP transparent proxy router using Linux nftables
+ TPROXY, Fake-IP DNS interception (IPv4 and IPv6), and per-application rules.

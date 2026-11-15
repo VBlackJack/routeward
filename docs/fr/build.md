@@ -100,9 +100,38 @@ Sous Windows, lancez `routeward.exe daemon` dans une console PowerShell en Admin
 .\target\release\routeward-desktop.exe
 ```
 
-Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lancé le daemon. Si le daemon est arrêté ou non démarré, `routeward-desktop` affiche une bannière persistante de déconnexion et se reconnecte automatiquement dès que le daemon démarre.
+Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lancé le daemon (ainsi que les SID accordés via `--allow-sid`). Si le daemon est arrêté ou non démarré, `routeward-desktop` affiche une bannière persistante de déconnexion et se reconnecte automatiquement dès que le daemon démarre.
 
-> **Important (Élévation du compte Windows UAC) :** Le daemon doit être lancé par l'utilisateur de l'interface (par élévation UAC de son propre compte). Si l'élévation se fait avec un autre compte administrateur (par exemple via "Exécuter en tant qu'autre utilisateur" ou un compte admin distinct), la DACL du Named Pipe autorisera le SID de cet autre compte, et l'interface ou la CLI de l'utilisateur courant ne pourra pas se connecter au pipe `\\.\pipe\routeward-daemon`.
+> **Important (Élévation du compte Windows UAC) :** En lancement interactif via `routeward.exe daemon`, le daemon doit tourner sous le même compte utilisateur que l'interface ou `routeward ctl`, sauf si `--allow-sid <SID>` est fourni explicitement.
+
+### Mode Service Windows (SCM) & Empaquetage
+Pour une exécution persistante sous `LocalSystem`, enregistrez RouteWard comme service Windows en autorisant le SID de votre compte utilisateur sur le Named Pipe :
+
+```powershell
+# Installer et démarrer le service Windows (PowerShell Administrateur) :
+.\packaging\windows\install-service.ps1
+
+# Ou directement via la CLI :
+.\target\release\routeward.exe service install --allow-current-user
+.\target\release\routeward.exe service start
+.\target\release\routeward.exe service status
+
+# Supprimer le service Windows :
+.\target\release\routeward.exe service stop
+.\target\release\routeward.exe service uninstall
+
+# Empaqueter les binaires release en ZIP + SHA-256 (sans inclure les pilotes WinDivert) :
+.\packaging\windows\package-windows.ps1
+```
+
+### Unité `systemd` & Paquet `.deb` sous Linux
+Pour un déploiement système sous Linux, utilisez `packaging/linux/build-deb.sh` (ou installez `packaging/linux/routeward.service` avec le groupe système `routeward`) :
+
+```bash
+bash packaging/linux/build-deb.sh --target-dir target/release --out-dir dist
+sudo apt install ./dist/routeward_*.deb
+sudo systemctl enable --now routeward
+```
 
 ### Emplacement des Journaux (Daemon vs Bureau / CLI)
 Les fichiers journaux (`RouteWard_yyyyMMdd.log`) sont écrits dans des dossiers système ou utilisateur fixes, indépendamment du répertoire courant (`CWD`) :

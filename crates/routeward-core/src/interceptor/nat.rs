@@ -742,6 +742,11 @@ impl TransparentNatTable {
         None
     }
 
+    /// Returns `true` when `pid` matches RouteWard's own process ID.
+    pub fn is_self_pid(&self, pid: Option<u32>) -> bool {
+        pid == Some(self.self_pid)
+    }
+
     /// Checks whether a connection must bypass interception to prevent routing loops.
     pub fn is_loop_or_excluded(
         &self,

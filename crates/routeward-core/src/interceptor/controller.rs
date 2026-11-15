@@ -310,6 +310,7 @@ impl RouteWardController {
                             &socket,
                             dns_udp_v6_ctrl.constants.network.linux_fwmark,
                         );
+                        NftablesInterceptor::enable_ipv6_udp_pktinfo(&socket);
                         let socket = Arc::new(socket);
                         dns_udp_v6_ctrl.telemetry.push_log(
                             LogLevel::Info,
@@ -318,7 +319,10 @@ impl RouteWardController {
                         );
                         let mut buf = vec![0u8; 4096];
                         while dns_udp_v6_ctrl.is_running() {
-                            if let Ok((len, peer_addr)) = socket.recv_from(&mut buf).await {
+                            if let Ok((len, peer_addr, local_dst_ip)) =
+                                NftablesInterceptor::recv_udp_v6_with_local_ip(&socket, &mut buf)
+                                    .await
+                            {
                                 let query_bytes = buf[..len].to_vec();
                                 let sock_reply = Arc::clone(&socket);
                                 let ctrl_query = dns_udp_v6_ctrl.clone();
@@ -329,7 +333,13 @@ impl RouteWardController {
                                         .resolve_dns_query_async(&query_bytes, orig_resolver, true)
                                         .await;
                                     if !resp.is_empty() {
-                                        let _ = sock_reply.send_to(&resp, peer_addr).await;
+                                        let _ = NftablesInterceptor::send_udp_v6_from_local_ip(
+                                            &sock_reply,
+                                            &resp,
+                                            peer_addr,
+                                            local_dst_ip,
+                                        )
+                                        .await;
                                     }
                                 });
                             }

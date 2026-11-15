@@ -419,8 +419,13 @@ impl RouteWardController {
                         Some(SocketAddr::new(session.orig_dst_ip, target_port)),
                     )
                     .await;
-                self.nat_table
-                    .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
+                let nat_cleanup = self.nat_table.clone();
+                let cleanup_ip = peer_addr.ip();
+                let cleanup_port = peer_addr.port();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    nat_cleanup.remove_session_by_relay_peer(cleanup_ip, cleanup_port);
+                });
                 return res;
             }
             let is_fake_ip = self.is_in_fake_subnet_any(&session.orig_dst_ip);
