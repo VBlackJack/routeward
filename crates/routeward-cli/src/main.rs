@@ -48,7 +48,7 @@ struct CliArgs {
     #[arg(short, long, env = "ROUTEWARD_CONFIG_PATH")]
     profile: Option<PathBuf>,
 
-    #[arg(short, long, env = "ROUTEWARD_LOCALE", default_value = DEFAULT_CLI_LOCALE)]
+    #[arg(short, long, global = true, env = "ROUTEWARD_LOCALE", default_value = DEFAULT_CLI_LOCALE)]
     locale: String,
 
     #[command(subcommand)]
@@ -1094,9 +1094,16 @@ mod tests {
             _ => panic!("unexpected parsed command"),
         }
 
-        let daemon =
-            CliArgs::try_parse_from(["routeward", "daemon", "--allow-sid", "S-1-5-21-1-2-3-1002"])
-                .expect("parse daemon --allow-sid");
+        let daemon = CliArgs::try_parse_from([
+            "routeward",
+            "daemon",
+            "--locale",
+            "en",
+            "--allow-sid",
+            "S-1-5-21-1-2-3-1002",
+        ])
+        .expect("parse daemon --locale --allow-sid");
+        assert_eq!(daemon.locale, "en");
         match daemon.command {
             Commands::Daemon {
                 duration_secs,
