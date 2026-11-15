@@ -441,13 +441,9 @@ impl DesktopCommandBridge {
         args: &[String],
     ) -> Result<LaunchedProcessReport, String> {
         let diag = self.get_diagnostics();
-        let command_line = if args.is_empty() {
-            executable_path.to_string()
-        } else {
-            format!("{executable_path} {}", args.join(" "))
-        };
         SystemProxyManager::spawn_process_with_proxy(
-            &command_line,
+            executable_path,
+            args,
             &diag.relay_tcp_endpoint,
             &diag.relay_http_endpoint,
         )

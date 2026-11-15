@@ -106,6 +106,11 @@ export const App: React.FC = () => {
   const [logs, setLogs] = useState(() => routewardClient.listLogs());
 
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const tabRefs = useRef<Partial<Record<NavTabId, HTMLButtonElement | null>>>({});
+
+  useEffect(() => {
+    document.documentElement.lang = i18n.language.slice(0, 2) || 'en';
+  }, [i18n.language]);
 
   const pushToast = useCallback(
     (message: string, severity: ToastNotification['severity'] = 'success') => {
@@ -148,8 +153,9 @@ export const App: React.FC = () => {
           '2': 'connections',
           '3': 'proxies',
           '4': 'rules',
-          '5': 'dns',
-          '6': 'logs'
+          ...(experienceMode === 'expert'
+            ? { '5': 'dns' as const, '6': 'logs' as const }
+            : {})
         };
         if (map[e.key]) {
           e.preventDefault();
@@ -159,7 +165,7 @@ export const App: React.FC = () => {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [experienceMode]);
 
   const handleToggleLanguage = () => {
     const nextLang = i18n.language.startsWith('fr') ? 'en' : 'fr';
@@ -181,14 +187,23 @@ export const App: React.FC = () => {
 
   const handleImportProfile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') {
-        void routewardClient.importProfileJson(reader.result).then(() => {
-          pushToast(t('app.toast.profile.imported'));
-        });
+        void routewardClient
+          .importProfileJson(reader.result)
+          .then(() => {
+            pushToast(t('app.toast.profile.imported'));
+          })
+          .catch(() => {
+            pushToast(t('app.toast.profile.import_error'), 'error');
+          });
       }
+    };
+    reader.onerror = () => {
+      pushToast(t('app.toast.profile.import_error'), 'error');
     };
     reader.readAsText(file);
   };
@@ -248,6 +263,7 @@ export const App: React.FC = () => {
             >
               <button
                 type="button"
+                aria-pressed={experienceMode === 'simple'}
                 onClick={() => handleSetExperienceMode('simple')}
                 className={`flex items-center gap-1 rounded-tf-sm px-2.5 py-1 text-xs font-bold transition ${
                   experienceMode === 'simple'
@@ -260,6 +276,7 @@ export const App: React.FC = () => {
               </button>
               <button
                 type="button"
+                aria-pressed={experienceMode === 'expert'}
                 onClick={() => handleSetExperienceMode('expert')}
                 className={`flex items-center gap-1 rounded-tf-sm px-2.5 py-1 text-xs font-bold transition ${
                   experienceMode === 'expert'
@@ -309,16 +326,22 @@ export const App: React.FC = () => {
 
             {/* 1-Click Windows System Proxy Toggle */}
             <button
+              type="button"
+              aria-pressed={systemProxyEnabled}
               onClick={async () => {
                 const next = !systemProxyEnabled;
-                const applied = await routewardClient.setSystemProxy(next);
-                setSystemProxyEnabled(applied);
-                pushToast(
-                  applied
-                    ? t('app.toast.system.proxy_enabled')
-                    : t('app.toast.system.proxy_disabled'),
-                  applied ? 'success' : 'info'
-                );
+                try {
+                  const applied = await routewardClient.setSystemProxy(next);
+                  setSystemProxyEnabled(applied);
+                  pushToast(
+                    applied
+                      ? t('app.toast.system.proxy_enabled')
+                      : t('app.toast.system.proxy_disabled'),
+                    applied ? 'success' : 'info'
+                  );
+                } catch {
+                  pushToast(t('app.toast.system.proxy_error'), 'error');
+                }
               }}
               title={t('app.system_proxy.tooltip')}
               className={`flex items-center gap-1.5 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
@@ -352,6 +375,7 @@ export const App: React.FC = () => {
             {/* Interception Mode Selector (Expert Mode) */}
             {experienceMode === 'expert' && (
               <select
+                aria-label={t('app.experience_mode.expert')}
                 value={diagnostics.interceptionMode}
                 onChange={(e) => {
                   void routewardClient.setInterceptionMode(
@@ -381,9 +405,11 @@ export const App: React.FC = () => {
 
             {/* Import / Export Profile */}
             <button
+              type="button"
               onClick={() => importInputRef.current?.click()}
               className="tf-surface-alt flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-tf-secondary hover:text-tf-primary"
               title={t('app.header.profile.import')}
+              aria-label={t('app.header.profile.import')}
             >
               <Upload className="h-3.5 w-3.5" />
             </button>
@@ -396,9 +422,11 @@ export const App: React.FC = () => {
             />
 
             <button
+              type="button"
               onClick={handleExportProfile}
               className="tf-surface-alt flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-tf-secondary hover:text-tf-primary"
               title={t('app.header.profile.export')}
+              aria-label={t('app.header.profile.export')}
             >
               <Download className="h-3.5 w-3.5" />
             </button>
@@ -445,7 +473,7 @@ export const App: React.FC = () => {
                   {t('app.daemon_banner.disconnected_title')}
                 </span>{' '}
                 <span className="text-tf-primary">
-                  — {t('app.daemon_banner.disconnected_desc')}
+                  - {t('app.daemon_banner.disconnected_desc')}
                 </span>
               </div>
             </div>
@@ -477,7 +505,7 @@ export const App: React.FC = () => {
                 {t('app.daemon_banner.not_elevated_title')}
               </span>{' '}
               <span className="text-tf-primary">
-                — {t('app.daemon_banner.not_elevated_desc')}
+                - {t('app.daemon_banner.not_elevated_desc')}
               </span>
             </div>
           </div>
@@ -486,13 +514,42 @@ export const App: React.FC = () => {
 
       {/* Navigation Tabs */}
       <nav className="border-b border-tf-border bg-tf-surface/60 px-6">
-        <div className="mx-auto flex max-w-7xl gap-1 overflow-x-auto">
-          {navItems.map(({ id, icon: Icon }) => {
+        <div
+          role="tablist"
+          aria-label={t('app.nav.tablist_label')}
+          className="mx-auto flex max-w-7xl gap-1 overflow-x-auto"
+        >
+          {navItems.map(({ id, icon: Icon }, idx) => {
             const active = activeTab === id;
             return (
               <button
                 key={id}
+                ref={(el) => {
+                  tabRefs.current[id] = el;
+                }}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                tabIndex={active ? 0 : -1}
                 onClick={() => setActiveTab(id)}
+                onKeyDown={(e) => {
+                  let targetIdx: number | null = null;
+                  if (e.key === 'ArrowRight') {
+                    targetIdx = (idx + 1) % navItems.length;
+                  } else if (e.key === 'ArrowLeft') {
+                    targetIdx = (idx - 1 + navItems.length) % navItems.length;
+                  } else if (e.key === 'Home') {
+                    targetIdx = 0;
+                  } else if (e.key === 'End') {
+                    targetIdx = navItems.length - 1;
+                  }
+                  if (targetIdx !== null) {
+                    e.preventDefault();
+                    const nextId = navItems[targetIdx].id;
+                    setActiveTab(nextId);
+                    tabRefs.current[nextId]?.focus();
+                  }
+                }}
                 className={`flex items-center gap-2 border-b-2 px-4 py-3 text-xs font-semibold transition ${
                   active
                     ? 'border-tf-accent text-tf-accent'
@@ -690,9 +747,18 @@ export const App: React.FC = () => {
           {toasts.map((toast) => (
             <div
               key={toast.id}
-              className="tf-card flex items-center gap-2.5 border-l-4 border-l-tf-accent px-4 py-2.5 text-xs font-medium text-tf-primary shadow-xl"
+              role={toast.severity === 'error' ? 'alert' : 'status'}
+              className={`tf-card flex items-center gap-2.5 border-l-4 px-4 py-2.5 text-xs font-medium text-tf-primary shadow-xl ${
+                toast.severity === 'error'
+                  ? 'border-l-tf-red'
+                  : 'border-l-tf-accent'
+              }`}
             >
-              <CheckCircle2 className="h-4 w-4 text-tf-accent" />
+              {toast.severity === 'error' ? (
+                <AlertTriangle className="h-4 w-4 text-tf-red" />
+              ) : (
+                <CheckCircle2 className="h-4 w-4 text-tf-accent" />
+              )}
               <span>{toast.message}</span>
             </div>
           ))}
@@ -730,8 +796,13 @@ export const App: React.FC = () => {
         <ProcessLauncherModal
           relayEndpoint={diagnostics.relayTcpEndpoint}
           onLaunch={async (exe, args) => {
-            await routewardClient.launchProcessWithProxy(exe, args);
-            pushToast(`${t('app.toast.system.process_launched')}: ${exe}`);
+            try {
+              await routewardClient.launchProcessWithProxy(exe, args);
+              pushToast(`${t('app.toast.system.process_launched')}: ${exe}`);
+            } catch (err) {
+              pushToast(t('app.toast.system.process_launch_error'), 'error');
+              throw err;
+            }
           }}
           onClose={() => setShowLauncherModal(false)}
         />
@@ -739,6 +810,7 @@ export const App: React.FC = () => {
 
       {showCommandPalette && (
         <CommandPaletteModal
+          experienceMode={experienceMode}
           onClose={() => setShowCommandPalette(false)}
           onNavigate={(tab) => setActiveTab(tab)}
           onToggleEngine={() => {

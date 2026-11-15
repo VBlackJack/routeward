@@ -1,39 +1,44 @@
+[English](README.md) | Français
+
 # RouteWard
 
-Outil de routage reseau par processus et de chainage de proxies ecrit en Rust, avec une interface bureau native basee sur `tao` + `wry` (WebView2) et **ThemeForge**.
+Outil de routage réseau par processus et de chaînage de proxies écrit en Rust, avec une interface bureau native basée sur `tao` + `wry` (WebView2) et **ThemeForge**.
 
 ## Licence et Auteur
 
 - **Auteur :** Julien Bombled
 - **Licence :** Apache License, Version 2.0 (voir [LICENSE](LICENSE) et [NOTICE](NOTICE))
 
-## Fonctionnalites et Etat Actuel
+## Fonctionnalités et État Actuel
 
-- **Attribution de processus (`routeward-core::process`)** : Associe les sockets TCP actifs aux PID et chemins d'executables via l'API Windows IP Helper (`GetExtendedTcpTable`) et Linux `/proc/net/tcp` + `/proc/<pid>/exe`.
-- **Moteur DNS Fake-IP (`routeward-core::dns`)** : Alloue en memoire des adresses virtuelles RFC 2544 (`198.18.0.0/15`) aux noms de domaines pour permettre la resolution inverse lors de l'evaluation des regles.
-- **Chainage de proxies SOCKS5 et HTTP CONNECT (`routeward-core::proxy`)** : Prend en charge SOCKS5 (`CONNECT` et `UDP ASSOCIATE`, RFC 1928/1929) et HTTP/HTTPS `CONNECT`, avec strategies multi-sauts, bascule (failover), latence minimale et repartition de charge.
-- **Moteur de regles par priorite (`routeward-core::rules`)** : Evalue les regles selon le nom ou chemin d'executable, masque ou regex de domaine, sous-reseau CIDR IPv4/IPv6, plage de ports et protocole (`TCP`/`UDP`/`ANY`).
-- **Journalisation sur fichier (`routeward-core::logger`)** : Ecrit des journaux quotidiens thread-safe dans `logs/RouteWard_<yyyyMMdd>.log`, activables ou desactivables a chaud via `enableLogging`.
-- **Interface Bureau ThemeForge (`apps/desktop` et `ui/`)** : Fenetre native `tao` + `wry` integrant les 16 palettes Oklab canoniques de ThemeForge + `HighContrast` et 9 teintes d'accent.
-- **Limitation actuelle** : L'interception transparente des paquets au niveau de l'OS (capture du trafic d'applications non modifiees sans configuration proxy) n'est pas encore implementee. Actuellement, les applications doivent passer par les ecouteurs locaux SOCKS5 (`127.0.0.1:10808`) ou HTTP CONNECT (`127.0.0.1:10809`).
+- **Interception Transparente OS (`routeward-core::interceptor`)** : Capture le trafic sortant double pile **IPv4 et IPv6** TCP et UDP ainsi que les requêtes DNS IPv4/locales (port `53`) d'applications non modifiées via **WinDivert 2.2** sous Windows et **`nftables` (`table ip` + `table ip6`) + `TPROXY`** sous Linux, en plus des écouteurs locaux SOCKS5 (`127.0.0.1:10808` / `[::1]:10808`) et HTTP CONNECT (`127.0.0.1:10809` / `[::1]:10809`).
+- **Attribution de Processus (`routeward-core::process`)** : Associe les sockets TCP et UDP IPv4/IPv6 actifs aux PID et chemins d'exécutables via la couche `SOCKET` WinDivert + l'API Windows IP Helper (`GetExtendedTcpTable` / `GetExtendedUdpTable` pour `AF_INET` et `AF_INET6`) et Linux **`NETLINK_SOCK_DIAG`** (`AF_INET` / `AF_INET6`) avec repli `/proc/net/{tcp,udp,tcp6,udp6}` + `/proc/<pid>/exe`.
+- **Moteur DNS Anti-Fuite (`routeward-core::dns`)** : Alloue des adresses virtuelles RFC 2544 (`198.18.0.0/15`) Fake-IP ou transporte les requêtes DNS-over-TCP via le proxy, bloque les canaux de contournement DNS (canari DoH, DoT/DoQ, DNS IPv6) et résout directement les zones locales et Active Directory.
+- **Kill-Switch et Gardes Anti-Fuite (`routeward-core::interceptor`)** : Applique le blocage strict sur échec de proxy amont lorsque `killSwitchEnabled = true`, rejette QUIC (`UDP 443`) par défaut et bloque les fuites publiques LLMNR (`5355`), mDNS (`5353`) et NetBIOS-NS (`137`).
+- **Chaînage de Proxies SOCKS5 et HTTP CONNECT (`routeward-core::proxy`)** : Prend en charge SOCKS5 (`CONNECT` et `UDP ASSOCIATE`, RFC 1928/1929) et HTTP/HTTPS `CONNECT`, avec stratégies multi-sauts, bascule (failover), latence minimale et répartition de charge.
+- **Moteur de Règles par Priorité (`routeward-core::rules`)** : Évalue les règles selon le nom ou chemin d'exécutable, masque ou regex de domaine (avec inspection TLS `ClientHello` SNI), sous-réseau CIDR IPv4/IPv6, plage de ports et protocole (`TCP`/`UDP`/`ANY`).
+- **Journalisation sur Fichier (`routeward-core::logger`)** : Écrit des journaux quotidiens thread-safe dans des dossiers système dédiés au daemon et à l'utilisateur, activables à chaud via `enableLogging`.
+- **Interface Bureau ThemeForge (`apps/desktop` et `ui/`)** : Fenêtre native `tao` + `wry` intégrant les 16 palettes Oklab canoniques de ThemeForge + `HighContrast` et 9 teintes d'accent.
+- **Périmètre Actuel** : RouteWard assure l'interception transparente double pile IPv4 et IPv6 en TCP et UDP (`TPROXY` / `WinDivert`), l'interception DNS IPv4/locale avec Fake-IP, l'inspection TLS SNI, le rejet QUIC (`UDP 443`), le blocage des fuites DNS chiffrées et IPv6 (DoT/DoQ `853` + IPv6 `53`/`853` + canari DoH Mozilla) et une architecture modulaire Rust bureau + interface React/Vitest.
 
 ## Documentation
 
 - [Architecture](docs/fr/architecture.md) ([English](docs/architecture.md))
 - [Compilation et Installation](docs/fr/build.md) ([English](docs/build.md))
 - [Maintenance](docs/fr/maintenance.md) ([English](docs/maintenance.md))
-- [Depannage](docs/fr/troubleshooting.md) ([English](docs/troubleshooting.md))
+- [Dépannage](docs/fr/troubleshooting.md) ([English](docs/troubleshooting.md))
+- [Tests Windows](docs/fr/windows-testing.md) ([English](docs/windows-testing.md))
 - [Contribution et Versionnement](CONTRIBUTING.fr.md) ([English](CONTRIBUTING.md))
 
-## Identite Visuelle et Icones
+## Identité Visuelle et Icônes
 
-Les fichiers de marque et icones de l'application se trouvent dans [`assets/branding/`](assets/branding/) :
+Les fichiers de marque et icônes de l'application se trouvent dans [`assets/branding/`](assets/branding/) :
 - `routeward-icon.svg` et `routeward-glyph.svg` (sources vectorielles Drakul)
-- `routeward-16.png` a `routeward-512.png`, `routeward.ico` (embarque dans les executables Windows via `embed-resource`), ainsi que `routeward-32.rgba` et `routeward-256.rgba` (utilises par `tao` pour l'icone de fenetre et de barre des taches)
-- `preview.html` (planche de controle visuel des PNG generes sur fonds sombre et clair)
-- Regenerer tous les fichiers matriciels depuis `routeward-icon.svg` via Microsoft Edge headless et PowerShell : `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\branding\build-icons.ps1`
+- `routeward-16.png` à `routeward-512.png`, `routeward.ico` (embarqué dans les exécutables Windows via `embed-resource`), ainsi que `routeward-32.rgba` et `routeward-256.rgba` (utilisés par `tao` pour l'icône de fenêtre et de barre des tâches)
+- `preview.html` (planche de contrôle visuel des PNG générés sur fonds sombre et clair)
+- Régénérer tous les fichiers matriciels depuis `routeward-icon.svg` via Microsoft Edge headless et PowerShell : `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\branding\build-icons.ps1`
 
-## Compilation et Execution
+## Compilation et Exécution
 
 ```powershell
 # Compiler d'abord le bundle frontend
@@ -44,7 +49,7 @@ Set-Location ..
 # Lancer les tests unitaires Rust
 cargo test --workspace
 
-# Evaluer une regle de routage en ligne de commande
+# Évaluer une règle de routage en ligne de commande
 cargo run -p routeward-cli -- eval --process firefox.exe --host api.github.com --port 443
 
 # Compiler l'application bureau native

@@ -31,8 +31,7 @@
     },
     "help": {
       "wizard_button": "Assistant de Démarrage",
-      "glossary_button": "Lexique & Aide",
-      "what_is_this": "À quoi ça sert ?"
+      "glossary_button": "Lexique & Aide"
     },
     "daemon_banner": {
       "disconnected_title": "Démon Privilégié RouteWard Déconnecté",
@@ -49,9 +48,7 @@
       },
       "engine": {
         "running": "Intercepteur Actif",
-        "stopped": "Intercepteur en Pause",
-        "toggle_start": "Démarrer le Moteur",
-        "toggle_stop": "Arrêter le Moteur"
+        "stopped": "Intercepteur en Pause"
       },
       "mode": {
         "hybrid": "Hybride (Fake-IP + Pilote/Relais)",
@@ -77,6 +74,7 @@
       }
     },
     "nav": {
+      "tablist_label": "Onglets de navigation principaux",
       "dashboard": {
         "tab": "Tableau de Bord"
       },
@@ -130,7 +128,9 @@
       "system": {
         "proxy_enabled": "Proxy Système Windows activé sur le relais local",
         "proxy_disabled": "Proxy Système Windows désactivé",
-        "process_launched": "Processus démarré avec injection proxy"
+        "proxy_error": "Échec de la mise à jour du Proxy Système Windows",
+        "process_launched": "Processus démarré avec injection proxy",
+        "process_launch_error": "Échec du lancement du processus via le proxy"
       },
       "wizard": {
         "completed": "Configuration appliquée avec succès via l'Assistant"
@@ -140,6 +140,7 @@
       },
       "profile": {
         "imported": "Profil de configuration importé",
+        "import_error": "Fichier JSON de profil invalide",
         "exported": "Profil exporté au format JSON"
       }
     }
@@ -155,7 +156,6 @@
     "actions": {
       "toggle_engine": "Démarrer / Mettre en pause le moteur d'interception",
       "test_all_proxies": "Tester la latence et l'IP de sortie de tous les proxies",
-      "simulate_traffic": "Simuler une connexion réseau de processus",
       "flush_dns": "Vider le cache DNS anti-fuite Fake-IP",
       "toggle_killswitch": "Activer / Désactiver le Kill-Switch strict",
       "open_themeforge": "Ouvrir ThemeForge Studio",
@@ -232,14 +232,16 @@
         "udp_guard_title": "Protection Anti-Fuite UDP",
         "udp_guard_desc": "Bloque les paquets UDP non supportés sur les proxies TCP uniquement",
         "dns_guard_title": "Résolution DNS Distante via Fake-IP",
-        "dns_guard_desc": "Intercepte les requêtes DNS vers 198.18.0.0/15 et résout côté proxy"
+        "dns_guard_desc": "Intercepte les requêtes DNS vers 198.18.0.0/15 et résout côté proxy",
+        "killswitch_aria": "Activer ou désactiver le Kill-Switch strict",
+        "udp_guard_aria": "Activer ou désactiver la protection anti-fuite UDP",
+        "dns_guard_aria": "Activer ou désactiver la résolution DNS distante via Fake-IP"
       }
     },
     "system": {
       "status": {
         "title": "Diagnostics des Sous-Systèmes",
         "os_label": "Système d'Exploitation",
-        "driver_label": "Moteur d'Interception",
         "relay_tcp_label": "Relais Local SOCKS5/TCP",
         "relay_http_label": "Relais Local HTTP",
         "dns_server_label": "Écouteur DNS Fake-IP",
@@ -338,7 +340,8 @@
         "title": "Chaînes Multi-Sauts & Groupes Intelligents",
         "subtitle": "Encapsulation séquentielle (Multi-Hop) ou bascule automatique (Failover / Latence Minimale)",
         "add": "Créer une Chaîne / Groupe",
-        "hops": "Noeuds"
+        "hops": "Noeuds",
+        "delete": "Supprimer la Chaîne"
       }
     },
     "strategy": {
@@ -382,7 +385,6 @@
         "password_unchanged_placeholder": "Inchangé (conservé par le démon)",
         "replace_password_action": "Remplacer le mot de passe",
         "cancel_replace_password": "Conserver le mot de passe actuel",
-        "sni_label": "Nom d'hôte SNI TLS",
         "udp_label": "Activer UDP Associate",
         "tls_label": "Activer le transport TLS",
         "submit": "Enregistrer le Proxy",
@@ -401,6 +403,9 @@
         "strategy_label": "Stratégie de Routage",
         "select_hop": "Ajouter un noeud proxy",
         "sequence_label": "Noeuds sélectionnés",
+        "move_hop_up": "Monter le saut",
+        "move_hop_down": "Descendre le saut",
+        "remove_hop": "Retirer le saut",
         "submit": "Enregistrer la Chaîne",
         "cancel": "Annuler"
       }
@@ -474,7 +479,8 @@
     },
     "table": {
       "enabled": {
-        "header": "Actif"
+        "header": "Actif",
+        "toggle_aria": "Activer ou désactiver la règle"
       },
       "priority": {
         "header": "Priorité"
@@ -529,8 +535,7 @@
     "header": {
       "title": "Moteur DNS Anti-Fuite Fake-IP",
       "subtitle": "Associe les requêtes DNS à des IP virtuelles RFC 2544 (198.18.0.0/15) pour éviter toute fuite DNS locale et conserver le nom de domaine exact.",
-      "flush_button": "Vider le Cache Fake-IP",
-      "allocate_button": "Tester une Allocation"
+      "flush_button": "Vider le Cache Fake-IP"
     },
     "allocate": {
       "placeholder": "Saisir un nom de domaine (ex. stealth.torproject.org)",
@@ -576,7 +581,6 @@
         "banner": "Démarrage du moteur RouteWard",
         "loaded_profile": "Profil de configuration chargé",
         "listening_socks": "Relais transparent SOCKS5 en écoute",
-        "listening_http": "Relais HTTP CONNECT en écoute",
         "listening_transparent": "Relais TCP transparent (WinDivert reflect) en écoute",
         "interception_active": "Interception de paquets active via le moteur",
         "duration_limit": "Arrêt automatique programmé après (secondes)",
@@ -645,6 +649,7 @@
       "accent_label": "Teinte d'Accent",
       "preview_label": "Aperçu des Jetons Sémantiques",
       "import_palette": "Charger une Palette JSON ThemeForge v1",
+      "import_error": "Fichier JSON de palette ThemeForge v1 invalide",
       "close": "Fermer"
     },
     "families": {

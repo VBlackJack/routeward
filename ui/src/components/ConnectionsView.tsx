@@ -324,7 +324,9 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                   </p>
                 </div>
                 <button
+                  type="button"
                   onClick={() => setSelectedConnId(null)}
+                  aria-label={t('connections.inspector.drawer.close')}
                   className="rounded p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary"
                 >
                   <X className="h-4 w-4" />

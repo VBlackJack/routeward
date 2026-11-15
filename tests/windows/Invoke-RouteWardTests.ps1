@@ -2493,7 +2493,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (j) [Order 19/19 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) —
+    # Scenario (j) [Order 19/19 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) -
     #               SOCKS5 proxy stopped during test, curl.exe matched by Proxy rule
     #               fails without falling back to Direct, and ctl connections reports Blocked
     # -----------------------------------------------------------------------

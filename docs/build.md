@@ -1,3 +1,5 @@
+[Français](fr/build.md) | English
+
 # Build and Installation
 
 ## Prerequisites

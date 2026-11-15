@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import React, { useState } from 'react';
+import React, { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   ArrowDown,
@@ -45,6 +45,7 @@ import {
   TransportProtocol
 } from '../types/routeward';
 import { ExperienceMode } from './QuickSetupWizardModal';
+import { ModalContainer } from './ModalContainer';
 
 interface RulesViewProps {
   rules: RoutingRule[];
@@ -92,6 +93,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
   onRemoveRule
 }) => {
   const { t } = useTranslation();
+  const addRuleModalTitleId = useId();
 
   // Simulator state
   const [simProc, setSimProc] = useState('firefox.exe');
@@ -376,6 +378,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
             value={simProc}
             onChange={(e) => setSimProc(e.target.value)}
             placeholder={t('rules.simulator.process_placeholder')}
+            aria-label={t('rules.simulator.process_placeholder')}
             className="tf-input px-3 py-1.5 text-xs"
           />
           <input
@@ -383,6 +386,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
             value={simHost}
             onChange={(e) => setSimHost(e.target.value)}
             placeholder={t('rules.simulator.host_placeholder')}
+            aria-label={t('rules.simulator.host_placeholder')}
             className="tf-input px-3 py-1.5 text-xs"
           />
           <input
@@ -390,6 +394,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
             value={simPort}
             onChange={(e) => setSimPort(Number(e.target.value))}
             placeholder={t('rules.simulator.port_placeholder')}
+            aria-label={t('rules.simulator.port_placeholder')}
             className="tf-input px-3 py-1.5 text-xs"
           />
           <button type="submit" className="tf-btn-accent py-1.5 text-xs">
@@ -460,6 +465,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                       type="checkbox"
                       checked={rule.enabled}
                       onChange={() => onToggleRule(rule.id)}
+                      aria-label={`${t('rules.table.enabled.toggle_aria')}: ${rule.name}`}
                       className="h-4 w-4 cursor-pointer accent-tf-accent"
                     />
                   </td>
@@ -511,6 +517,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         onClick={() => onReorderRule(rule.id, 'up')}
                         className="rounded p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary disabled:opacity-30"
                         title={t('rules.table.controls.move_up')}
+                        aria-label={`${t('rules.table.controls.move_up')}: ${rule.name}`}
                       >
                         <ArrowUp className="h-3.5 w-3.5" />
                       </button>
@@ -519,6 +526,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         onClick={() => onReorderRule(rule.id, 'down')}
                         className="rounded p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary disabled:opacity-30"
                         title={t('rules.table.controls.move_down')}
+                        aria-label={`${t('rules.table.controls.move_down')}: ${rule.name}`}
                       >
                         <ArrowDown className="h-3.5 w-3.5" />
                       </button>
@@ -526,6 +534,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         onClick={() => onRemoveRule(rule.id)}
                         className="rounded p-1 text-tf-secondary hover:text-tf-red"
                         title={t('rules.table.controls.delete')}
+                        aria-label={`${t('rules.table.controls.delete')}: ${rule.name}`}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -540,12 +549,18 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
       {/* Add Rule Modal */}
       {showModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <ModalContainer
+          labelledBy={addRuleModalTitleId}
+          onClose={() => setShowModal(false)}
+        >
           <form
             onSubmit={handleCreateRule}
             className="tf-card w-full max-w-lg space-y-3.5 p-6"
           >
-            <h3 className="text-base font-bold text-tf-primary">
+            <h3
+              id={addRuleModalTitleId}
+              className="text-base font-bold text-tf-primary"
+            >
               {t('rules.modal.add.title')}
             </h3>
             <div className="grid grid-cols-3 gap-3">
@@ -706,7 +721,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
               </button>
             </div>
           </form>
-        </div>
+        </ModalContainer>
       )}
     </div>
   );

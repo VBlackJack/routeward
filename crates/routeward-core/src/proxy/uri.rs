@@ -136,7 +136,11 @@ impl ProxyUriCodec {
 
         let auth_prefix = match &node.auth {
             Some(creds) if !creds.username.is_empty() || !creds.password_str().is_empty() => {
-                format!("{}:{}@", creds.username, creds.password_str())
+                format!(
+                    "{}:{}@",
+                    Self::percent_encode(&creds.username),
+                    Self::percent_encode(creds.password_str())
+                )
             }
             _ => String::new(),
         };
@@ -145,10 +149,10 @@ impl ProxyUriCodec {
             .sni
             .as_ref()
             .filter(|s| !s.is_empty())
-            .map(|s| format!("?sni={s}"))
+            .map(|s| format!("?sni={}", Self::percent_encode(s)))
             .unwrap_or_default();
 
-        let frag = node.name.replace(' ', "%20");
+        let frag = Self::percent_encode(&node.name);
         format!(
             "{scheme}://{auth_prefix}{}:{}{query}#{frag}",
             node.host, node.port
@@ -193,8 +197,40 @@ impl ProxyUriCodec {
             .and_then(|bytes| String::from_utf8(bytes).ok())
     }
 
+    fn percent_encode(input: &str) -> String {
+        let mut encoded = String::with_capacity(input.len());
+        for &byte in input.as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                encoded.push(byte as char);
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        encoded
+    }
+
     fn percent_decode(input: &str) -> String {
-        input.replace("%20", " ").replace('+', " ")
+        let bytes = input.as_bytes();
+        let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut idx = 0;
+        while idx < bytes.len() {
+            if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+                if let Ok(hex_str) = std::str::from_utf8(&bytes[idx + 1..idx + 3]) {
+                    if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                        decoded.push(val);
+                        idx += 3;
+                        continue;
+                    }
+                }
+            }
+            if bytes[idx] == b'+' {
+                decoded.push(b' ');
+            } else {
+                decoded.push(bytes[idx]);
+            }
+            idx += 1;
+        }
+        String::from_utf8_lossy(&decoded).into_owned()
     }
 
     fn redact_uri_userinfo(uri: &str) -> String {
@@ -235,5 +271,27 @@ mod tests {
 
         let exported = ProxyUriCodec::to_uri(&https_node);
         assert!(exported.starts_with("https://bob:pass@edge.example.net:443"));
+    }
+
+    #[test]
+    fn round_trips_special_characters_in_userinfo_sni_and_fragment() {
+        let mut node = ProxyUriCodec::parse_uri(
+            "socks5://alice%3Adev:p%40ss%3Aw%25ord@10.20.30.40:1080?sni=edge%20node#Corp%20%25Node",
+        )
+        .expect("Valid URI with percent-encoded special chars");
+        assert_eq!(node.name, "Corp %Node");
+        assert_eq!(node.sni.as_deref(), Some("edge node"));
+        let creds = node.auth.as_ref().expect("auth preserved");
+        assert_eq!(creds.username, "alice:dev");
+        assert_eq!(creds.password_str(), "p@ss:w%ord");
+
+        let re_encoded = ProxyUriCodec::to_uri(&node);
+        node.id = String::new();
+        let reparsed = ProxyUriCodec::parse_uri(&re_encoded).expect("Re-parsed URI");
+        assert_eq!(reparsed.name, "Corp %Node");
+        assert_eq!(reparsed.sni.as_deref(), Some("edge node"));
+        let recreds = reparsed.auth.expect("re-parsed auth");
+        assert_eq!(recreds.username, "alice:dev");
+        assert_eq!(recreds.password_str(), "p@ss:w%ord");
     }
 }

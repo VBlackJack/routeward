@@ -26,7 +26,7 @@ use crate::interceptor::backend::Interceptor;
 use crate::interceptor::RouteWardController;
 use crate::telemetry::{LogLevel, TelemetryHub};
 use parking_lot::Mutex;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,6 +34,7 @@ use std::sync::Arc;
 const BACKEND_NAME: &str = "nftables";
 const COMPONENT_NFTABLES: &str = "NftablesInterceptor";
 const AF_INET_U16: u16 = 2;
+const AF_INET6_U16: u16 = 10;
 const DEFAULT_TPROXY_FWMARK: u32 = 21080;
 
 /// Policy routing and `TPROXY` parameters loaded from `SystemConstants.network`.
@@ -50,6 +51,8 @@ struct NftActiveState {
     ip_binary: String,
     table_name: String,
     tproxy_spec: TproxyRoutingSpec,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    ipv6_tproxy_active: bool,
     watchdog_stdin: Option<ChildStdin>,
     watchdog_child: Option<Child>,
     telemetry: TelemetryHub,
@@ -273,22 +276,74 @@ impl NftablesInterceptor {
         script
     }
 
-    /// Generates the dedicated IPv6 `nftables` ruleset (`table ip6 <table_name>`) to block
-    /// outbound IPv6 DNS (port 53) and DoT (port 853) unconditionally while the engine runs
-    /// (independently of `killSwitchEnabled`), forcing the OS to fall back to IPv4 DNS resolvers
-    /// until full IPv6 interception in Batch 4.3.
-    pub fn build_nft_ip6_table_ruleset(
+    /// Generates the dedicated IPv6 `nftables` ruleset (`table ip6 <table_name>`) covering:
+    /// - outbound IPv6 TCP transparent NAT redirect (`tcp dport 1-65535 redirect to :relay_port`)
+    /// - outbound IPv6 UDP `TPROXY` marking and local prerouting redirection to `[::1]:local_name_inspect_port`
+    /// - unconditional blocking of outbound IPv6 DNS (port 53) and DoT (port 853) in `filter_output`
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_nft_ip6_table_ruleset_with_tproxy(
         table_name: &str,
         chain_name: &str,
         fwmark: u32,
+        tproxy_fwmark: u32,
+        relay_port: u16,
+        local_name_inspect_port: u16,
         dns_standard_port: u16,
         dot_port: u16,
-        _kill_switch_enabled: bool,
-        _block_encrypted_dns: bool,
-    ) -> Option<String> {
-        let mut script = String::with_capacity(512);
+        quic_port: u16,
+        mdns_port: u16,
+        llmnr_port: u16,
+        block_quic_udp_443: bool,
+        upstream_v6_endpoints: &[(Ipv6Addr, u16)],
+    ) -> String {
+        let mut script = String::with_capacity(1536);
         script.push_str(&format!("table ip6 {table_name} {{\n"));
         script.push_str(&format!("    chain {chain_name} {{\n"));
+        script.push_str("        type nat hook output priority -100; policy accept;\n");
+        script.push_str(&format!("        meta mark {fwmark} return\n"));
+        script.push_str("        ip6 daddr ::1 return\n");
+        script.push_str(&format!("        tcp dport {dns_standard_port} return\n"));
+        script.push_str(&format!("        tcp dport {dot_port} return\n"));
+        for (ip, port) in upstream_v6_endpoints {
+            if !ip.is_loopback() {
+                script.push_str(&format!("        ip6 daddr {ip} tcp dport {port} return\n"));
+            }
+        }
+        script.push_str(&format!(
+            "        tcp dport 1-65535 redirect to :{relay_port}\n"
+        ));
+        script.push_str("    }\n");
+
+        script.push_str("    chain route_output {\n");
+        script.push_str("        type route hook output priority -150; policy accept;\n");
+        script.push_str(&format!("        meta mark {fwmark} return\n"));
+        script.push_str("        ip6 daddr ::1 return\n");
+        script.push_str(&format!("        udp dport {dns_standard_port} return\n"));
+        script.push_str(&format!("        udp dport {dot_port} return\n"));
+        if block_quic_udp_443 {
+            script.push_str(&format!("        udp dport {quic_port} return\n"));
+        }
+        for (ip, port) in upstream_v6_endpoints {
+            if !ip.is_loopback() {
+                script.push_str(&format!("        ip6 daddr {ip} udp dport {port} return\n"));
+            }
+        }
+        script.push_str(&format!(
+            "        ip6 daddr ff00::/8 udp dport != {{ {mdns_port}, {llmnr_port} }} return\n"
+        ));
+        script.push_str(&format!(
+            "        meta l4proto udp meta mark set {tproxy_fwmark}\n"
+        ));
+        script.push_str("    }\n");
+
+        script.push_str("    chain prerouting {\n");
+        script.push_str("        type filter hook prerouting priority -150; policy accept;\n");
+        script.push_str(&format!(
+            "        meta mark {tproxy_fwmark} meta l4proto udp tproxy ip6 to [::1]:{local_name_inspect_port} accept\n"
+        ));
+        script.push_str("    }\n");
+
+        script.push_str("    chain filter_output {\n");
         script.push_str("        type filter hook output priority 0; policy accept;\n");
         script.push_str(&format!("        meta mark {fwmark} return\n"));
         script.push_str("        ip6 daddr ::1 return\n");
@@ -300,9 +355,40 @@ impl NftablesInterceptor {
         script.push_str(&format!(
             "        tcp dport {dot_port} reject with tcp reset\n"
         ));
+        if block_quic_udp_443 {
+            script.push_str(&format!("        udp dport {quic_port} reject\n"));
+        }
         script.push_str("    }\n");
         script.push_str("}\n");
-        Some(script)
+        script
+    }
+
+    /// Generates the dedicated IPv6 `nftables` ruleset (`table ip6 <table_name>`) using
+    /// default transparent TCP/UDP relay ports alongside the unconditional IPv6 DNS/DoT guard.
+    pub fn build_nft_ip6_table_ruleset(
+        table_name: &str,
+        chain_name: &str,
+        fwmark: u32,
+        dns_standard_port: u16,
+        dot_port: u16,
+        _kill_switch_enabled: bool,
+        _block_encrypted_dns: bool,
+    ) -> Option<String> {
+        Some(Self::build_nft_ip6_table_ruleset_with_tproxy(
+            table_name,
+            chain_name,
+            fwmark,
+            DEFAULT_TPROXY_FWMARK,
+            10810,
+            10854,
+            dns_standard_port,
+            dot_port,
+            443,
+            5353,
+            5355,
+            true,
+            &[],
+        ))
     }
 
     /// Builds a single atomic `nft -f -` transaction script that replaces both `table ip <table_name>`
@@ -402,6 +488,7 @@ impl NftablesInterceptor {
         block_quic_udp_443: bool,
         upstream_endpoints: &[(Ipv4Addr, u16)],
     ) -> String {
+        let _ = kill_switch_enabled;
         let mut batch = String::with_capacity(2048);
         batch.push_str(&format!("table ip {table_name}\n"));
         batch.push_str(&format!("delete table ip {table_name}\n"));
@@ -423,19 +510,102 @@ impl NftablesInterceptor {
             block_quic_udp_443,
             upstream_endpoints,
         ));
-        if let Some(ip6_script) = Self::build_nft_ip6_table_ruleset(
+        let ip6_script = Self::build_nft_ip6_table_ruleset_with_tproxy(
             table_name,
             chain_name,
             fwmark,
+            tproxy_fwmark,
+            relay_port,
+            local_name_inspect_port,
             dns_standard_port,
             dot_port,
-            kill_switch_enabled,
+            quic_port,
+            mdns_port,
+            llmnr_port,
+            block_quic_udp_443,
+            &[],
+        );
+        batch.push_str(&format!("table ip6 {table_name}\n"));
+        batch.push_str(&format!("delete table ip6 {table_name}\n"));
+        batch.push_str(&ip6_script);
+        batch
+    }
+
+    /// Builds an atomic `nft -f -` batch transaction carrying both IPv4 and IPv6 upstream endpoints.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_atomic_replace_ruleset_dual_stack(
+        table_name: &str,
+        chain_name: &str,
+        fwmark: u32,
+        tproxy_fwmark: u32,
+        relay_port: u16,
+        dns_listen_port: u16,
+        local_name_inspect_port: u16,
+        dns_standard_port: u16,
+        dot_port: u16,
+        quic_port: u16,
+        mdns_port: u16,
+        llmnr_port: u16,
+        netbios_ns_port: u16,
+        kill_switch_enabled: bool,
+        block_encrypted_dns: bool,
+        block_quic_udp_443: bool,
+        upstream_endpoints: &[(IpAddr, u16)],
+    ) -> String {
+        let up4: Vec<(Ipv4Addr, u16)> = upstream_endpoints
+            .iter()
+            .filter_map(|(ip, port)| match ip {
+                IpAddr::V4(v4) => Some((*v4, *port)),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+        let up6: Vec<(Ipv6Addr, u16)> = upstream_endpoints
+            .iter()
+            .filter_map(|(ip, port)| match ip {
+                IpAddr::V6(v6) => Some((*v6, *port)),
+                IpAddr::V4(_) => None,
+            })
+            .collect();
+
+        let mut batch = String::with_capacity(3072);
+        batch.push_str(&format!("table ip {table_name}\n"));
+        batch.push_str(&format!("delete table ip {table_name}\n"));
+        batch.push_str(&Self::build_nft_table_ruleset_with_tproxy(
+            table_name,
+            chain_name,
+            fwmark,
+            tproxy_fwmark,
+            relay_port,
+            dns_listen_port,
+            local_name_inspect_port,
+            dns_standard_port,
+            dot_port,
+            quic_port,
+            mdns_port,
+            llmnr_port,
+            netbios_ns_port,
             block_encrypted_dns,
-        ) {
-            batch.push_str(&format!("table ip6 {table_name}\n"));
-            batch.push_str(&format!("delete table ip6 {table_name}\n"));
-            batch.push_str(&ip6_script);
-        }
+            block_quic_udp_443,
+            &up4,
+        ));
+        batch.push_str(&format!("table ip6 {table_name}\n"));
+        batch.push_str(&format!("delete table ip6 {table_name}\n"));
+        batch.push_str(&Self::build_nft_ip6_table_ruleset_with_tproxy(
+            table_name,
+            chain_name,
+            fwmark,
+            tproxy_fwmark,
+            relay_port,
+            local_name_inspect_port,
+            dns_standard_port,
+            dot_port,
+            quic_port,
+            mdns_port,
+            llmnr_port,
+            block_quic_udp_443,
+            &up6,
+        ));
+        let _ = kill_switch_enabled;
         batch
     }
 
@@ -584,6 +754,66 @@ impl NftablesInterceptor {
         ]
     }
 
+    /// Builds the exact `ip -6` CLI arguments to install the IPv6 `TPROXY` `ip rule`.
+    pub fn build_ip6_rule_add_args(spec: TproxyRoutingSpec) -> [String; 9] {
+        [
+            "-6".to_string(),
+            "rule".to_string(),
+            "add".to_string(),
+            "fwmark".to_string(),
+            spec.fwmark.to_string(),
+            "lookup".to_string(),
+            spec.route_table.to_string(),
+            "priority".to_string(),
+            spec.rule_priority.to_string(),
+        ]
+    }
+
+    /// Builds the exact `ip -6` CLI arguments to remove the IPv6 `TPROXY` `ip rule`.
+    pub fn build_ip6_rule_del_args(spec: TproxyRoutingSpec) -> [String; 9] {
+        [
+            "-6".to_string(),
+            "rule".to_string(),
+            "del".to_string(),
+            "fwmark".to_string(),
+            spec.fwmark.to_string(),
+            "lookup".to_string(),
+            spec.route_table.to_string(),
+            "priority".to_string(),
+            spec.rule_priority.to_string(),
+        ]
+    }
+
+    /// Builds the exact `ip -6` CLI arguments to install the local `::/0 dev lo` route in `spec.route_table`.
+    pub fn build_ip6_route_add_args(spec: TproxyRoutingSpec) -> [String; 9] {
+        [
+            "-6".to_string(),
+            "route".to_string(),
+            "add".to_string(),
+            "local".to_string(),
+            "::/0".to_string(),
+            "dev".to_string(),
+            "lo".to_string(),
+            "table".to_string(),
+            spec.route_table.to_string(),
+        ]
+    }
+
+    /// Builds the exact `ip -6` CLI arguments to remove the local `::/0 dev lo` route from `spec.route_table`.
+    pub fn build_ip6_route_del_args(spec: TproxyRoutingSpec) -> [String; 9] {
+        [
+            "-6".to_string(),
+            "route".to_string(),
+            "del".to_string(),
+            "local".to_string(),
+            "::/0".to_string(),
+            "dev".to_string(),
+            "lo".to_string(),
+            "table".to_string(),
+            spec.route_table.to_string(),
+        ]
+    }
+
     /// Builds the pipe-linked fail-open watchdog shell command that deletes `table ip/ip6 <table_name>`,
     /// the exact `TPROXY` `ip rule`, and the exact local route on `lo` when the daemon process exits or crashes (`kill -9`).
     pub fn build_watchdog_cleanup_script(
@@ -593,7 +823,8 @@ impl NftablesInterceptor {
         spec: TproxyRoutingSpec,
     ) -> String {
         format!(
-            "cat >/dev/null; {nft_bin} delete table ip {table_name} >/dev/null 2>&1; {nft_bin} delete table ip6 {table_name} >/dev/null 2>&1; {ip_bin} -4 rule del fwmark {} lookup {} priority {} >/dev/null 2>&1; {ip_bin} -4 route del local 0.0.0.0/0 dev lo table {} >/dev/null 2>&1",
+            "cat >/dev/null; {nft_bin} delete table ip {table_name} >/dev/null 2>&1; {nft_bin} delete table ip6 {table_name} >/dev/null 2>&1; {ip_bin} -4 rule del fwmark {} lookup {} priority {} >/dev/null 2>&1; {ip_bin} -4 route del local 0.0.0.0/0 dev lo table {} >/dev/null 2>&1; {ip_bin} -6 rule del fwmark {} lookup {} priority {} >/dev/null 2>&1; {ip_bin} -6 route del local ::/0 dev lo table {} >/dev/null 2>&1",
+            spec.fwmark, spec.route_table, spec.rule_priority, spec.route_table,
             spec.fwmark, spec.route_table, spec.rule_priority, spec.route_table
         )
     }
@@ -641,6 +872,17 @@ impl NftablesInterceptor {
                 );
             }
         }
+
+        let _ = Command::new(ip_binary)
+            .args(Self::build_ip6_rule_del_args(spec))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        let _ = Command::new(ip_binary)
+            .args(Self::build_ip6_route_del_args(spec))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
     }
 
     #[cfg(target_os = "linux")]
@@ -752,6 +994,38 @@ impl NftablesInterceptor {
                         spec.fwmark, spec.route_table, spec.rule_priority, spec.tproxy_port
                     ),
                 );
+                // Best-effort IPv6 TPROXY routing: install ip -6 rule & local ::/0 route if IPv6 is enabled on kernel
+                let ip6_rule_ok = Command::new(ip_binary)
+                    .args(Self::build_ip6_rule_add_args(spec))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if ip6_rule_ok {
+                    let ip6_route_ok = Command::new(ip_binary)
+                        .args(Self::build_ip6_route_add_args(spec))
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if !ip6_route_ok {
+                        let _ = Command::new(ip_binary)
+                            .args(Self::build_ip6_rule_del_args(spec))
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .output();
+                        telemetry.push_log(
+                            LogLevel::Warn,
+                            COMPONENT_NFTABLES,
+                            format!(
+                                "IPv6 TPROXY route (local ::/0 table {}) unavailable on this kernel; continuing with IPv4 TPROXY",
+                                spec.route_table
+                            ),
+                        );
+                    }
+                }
                 Ok(())
             }
             Ok(out) => {
@@ -902,6 +1176,74 @@ impl NftablesInterceptor {
         _stream: &tokio::net::TcpStream,
         _relay_port: u16,
     ) -> Option<SocketAddrV4> {
+        None
+    }
+
+    /// Parses raw `sockaddr_in6` fields returned by `IP6T_SO_ORIGINAL_DST` and rejects
+    /// loopback connections targeting `relay_port` directly without NAT redirection.
+    pub fn parse_sockaddr_in6_fields(
+        sin6_family: u16,
+        sin6_port_be: u16,
+        sin6_addr: [u8; 16],
+        relay_port: u16,
+    ) -> Option<SocketAddrV6> {
+        if sin6_family != AF_INET6_U16 {
+            return None;
+        }
+        let port = u16::from_be(sin6_port_be);
+        if port == 0 {
+            return None;
+        }
+        let ip = Ipv6Addr::from(sin6_addr);
+        if ip.is_loopback() && port == relay_port {
+            return None;
+        }
+        Some(SocketAddrV6::new(ip, port, 0, 0))
+    }
+
+    /// Queries `SO_ORIGINAL_DST` (IPv4) or `IP6T_SO_ORIGINAL_DST` (IPv6) on an accepted Linux TCP stream.
+    #[cfg(target_os = "linux")]
+    pub fn query_original_dst_any(
+        stream: &tokio::net::TcpStream,
+        relay_port: u16,
+    ) -> Option<SocketAddr> {
+        if let Some(v4) = Self::query_original_dst(stream, relay_port) {
+            return Some(SocketAddr::V4(v4));
+        }
+        use std::os::fd::AsRawFd;
+
+        let fd = stream.as_raw_fd();
+        let mut raw_addr6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut addr_len: libc::socklen_t =
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_IPV6,
+                libc::IP6T_SO_ORIGINAL_DST,
+                &mut raw_addr6 as *mut libc::sockaddr_in6 as *mut libc::c_void,
+                &mut addr_len,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+
+        Self::parse_sockaddr_in6_fields(
+            raw_addr6.sin6_family,
+            raw_addr6.sin6_port,
+            raw_addr6.sin6_addr.s6_addr,
+            relay_port,
+        )
+        .map(SocketAddr::V6)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn query_original_dst_any(
+        _stream: &tokio::net::TcpStream,
+        _relay_port: u16,
+    ) -> Option<SocketAddr> {
         None
     }
 
@@ -1200,6 +1542,119 @@ impl NftablesInterceptor {
         Ok((len, client_v4, None))
     }
 
+    /// Enables `IPV6_TRANSPARENT` and `IPV6_RECVORIGDSTADDR` on a bound Linux IPv6 UDP TPROXY socket
+    /// (`IPV6_V6ONLY` must already be configured prior to `bind()`).
+    #[cfg(target_os = "linux")]
+    pub fn enable_udp_tproxy_v6_options(sock: &tokio::net::UdpSocket) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let on: libc::c_int = 1;
+        unsafe {
+            if libc::setsockopt(
+                fd,
+                libc::SOL_IPV6,
+                libc::IPV6_TRANSPARENT,
+                &on as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setsockopt(
+                fd,
+                libc::SOL_IPV6,
+                libc::IPV6_RECVORIGDSTADDR,
+                &on as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn enable_udp_tproxy_v6_options(_sock: &tokio::net::UdpSocket) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Receives an IPv6 UDP datagram on a `TPROXY` listener socket and extracts
+    /// `(len, client_addr, orig_dst)` from the ancillary `IPV6_ORIGDSTADDR` control message.
+    #[cfg(target_os = "linux")]
+    pub async fn recv_udp_tproxy_v6_orig_dst(
+        sock: &tokio::net::UdpSocket,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, SocketAddrV6, Option<SocketAddrV6>)> {
+        use std::os::fd::AsRawFd;
+        sock.async_io(tokio::io::Interest::READABLE, || {
+            let fd = sock.as_raw_fd();
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let mut src_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            let mut cmsg_space = [0u8; 256];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = &mut src_addr as *mut libc::sockaddr_in6 as *mut libc::c_void;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_space.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = cmsg_space.len();
+
+            let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let peer_ip = Ipv6Addr::from(src_addr.sin6_addr.s6_addr);
+            let peer_port = u16::from_be(src_addr.sin6_port);
+            let client_addr = SocketAddrV6::new(
+                peer_ip,
+                peer_port,
+                src_addr.sin6_flowinfo,
+                src_addr.sin6_scope_id,
+            );
+
+            let mut orig_dst: Option<SocketAddrV6> = None;
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                while !cmsg.is_null() {
+                    if (*cmsg).cmsg_level == libc::SOL_IPV6
+                        && (*cmsg).cmsg_type == libc::IPV6_ORIGDSTADDR
+                    {
+                        let data_ptr = libc::CMSG_DATA(cmsg);
+                        let data_slice = std::slice::from_raw_parts(
+                            data_ptr,
+                            std::mem::size_of::<libc::sockaddr_in6>(),
+                        );
+                        orig_dst =
+                            crate::interceptor::nat::parse_ipv6_origdstaddr_bytes(data_slice);
+                        break;
+                    }
+                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                }
+            }
+
+            Ok((n as usize, client_addr, orig_dst))
+        })
+        .await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn recv_udp_tproxy_v6_orig_dst(
+        sock: &tokio::net::UdpSocket,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, SocketAddrV6, Option<SocketAddrV6>)> {
+        let (len, peer) = sock.recv_from(buf).await?;
+        let client_v6 = match peer {
+            SocketAddr::V6(v6) => v6,
+            SocketAddr::V4(_) => SocketAddrV6::new(Ipv6Addr::LOCALHOST, peer.port(), 0, 0),
+        };
+        Ok((len, client_v6, None))
+    }
+
     /// Returns `true` if `ip` belongs to the RFC 2544 Fake-IP pool (`198.18.0.0/15`).
     pub fn is_rfc2544_fake_ip(ip: Ipv4Addr) -> bool {
         let octets = ip.octets();
@@ -1341,6 +1796,109 @@ impl NftablesInterceptor {
             "send_raw_ipv4_udp_packet is only supported on Linux",
         ))
     }
+
+    /// Sends an arbitrary forged IPv6 + UDP packet from `src` to `dst` via a marked raw socket.
+    #[cfg(target_os = "linux")]
+    pub fn send_raw_ipv6_udp_packet(
+        src: SocketAddrV6,
+        dst: SocketAddrV6,
+        payload: &[u8],
+        fwmark: u32,
+    ) -> std::io::Result<usize> {
+        const LINUX_IPV6_HDRINCL: libc::c_int = 36;
+        let raw_pkt = crate::interceptor::nat::build_forged_ipv6_udp_reply(
+            *src.ip(),
+            src.port(),
+            *dst.ip(),
+            dst.port(),
+            payload,
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UDP payload too large for IPv6 packet",
+            )
+        })?;
+
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET6,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_RAW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        struct RawFdGuard(libc::c_int);
+        impl Drop for RawFdGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = libc::close(self.0);
+                }
+            }
+        }
+        let _guard = RawFdGuard(fd);
+
+        let one: libc::c_int = 1;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_IPV6,
+                LINUX_IPV6_HDRINCL,
+                &one as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if fwmark != 0 {
+                let mark: libc::c_uint = fwmark;
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_MARK,
+                    &mark as *const libc::c_uint as *const libc::c_void,
+                    std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                );
+            }
+        }
+
+        let mut dst_sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        dst_sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        dst_sin6.sin6_port = 0;
+        dst_sin6.sin6_scope_id = dst.scope_id();
+        dst_sin6.sin6_addr = libc::in6_addr {
+            s6_addr: dst.ip().octets(),
+        };
+
+        let sent = unsafe {
+            libc::sendto(
+                fd,
+                raw_pkt.as_ptr() as *const libc::c_void,
+                raw_pkt.len(),
+                0,
+                &dst_sin6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn send_raw_ipv6_udp_packet(
+        _src: SocketAddrV6,
+        _dst: SocketAddrV6,
+        _payload: &[u8],
+        _fwmark: u32,
+    ) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "send_raw_ipv6_udp_packet is only supported on Linux",
+        ))
+    }
 }
 
 impl Interceptor for NftablesInterceptor {
@@ -1377,7 +1935,6 @@ impl Interceptor for NftablesInterceptor {
         let table_name = net.linux_nft_table_name.clone();
         let chain_name = net.linux_nft_chain_name.clone();
         let fwmark = net.linux_fwmark;
-        let relay_port = net.default_transparent_tcp_port;
         let tproxy_spec = TproxyRoutingSpec {
             fwmark: net.linux_tproxy_fwmark,
             route_table: net.linux_tproxy_route_table,
@@ -1443,6 +2000,21 @@ impl Interceptor for NftablesInterceptor {
 
         // 5. Build and load the dedicated nftables tables via `nft -f -`
         let upstream_endpoints = controller.nat_table.upstream_endpoints();
+        let upstream_v4: Vec<(Ipv4Addr, u16)> = upstream_endpoints
+            .iter()
+            .filter_map(|(ip, port)| match ip {
+                IpAddr::V4(v4) => Some((*v4, *port)),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+        let upstream_v6: Vec<(Ipv6Addr, u16)> = upstream_endpoints
+            .iter()
+            .filter_map(|(ip, port)| match ip {
+                IpAddr::V6(v6) => Some((*v6, *port)),
+                IpAddr::V4(_) => None,
+            })
+            .collect();
+        let relay_port = net.default_transparent_tcp_port;
         let dns_listen_port = net.default_dns_listen_port;
         let local_name_inspect_port = net.default_local_name_inspect_port;
         let quic_port = net.quic_default_port;
@@ -1459,44 +2031,65 @@ impl Interceptor for NftablesInterceptor {
                 prof.security_policy.block_quic_udp_443,
             )
         };
+        let _ = kill_switch_enabled;
 
-        if let Some(ip6_ruleset) = Self::build_nft_ip6_table_ruleset(
+        let mut ipv6_tproxy_active = false;
+        let ip6_ruleset = Self::build_nft_ip6_table_ruleset_with_tproxy(
             &table_name,
             &chain_name,
             fwmark,
+            tproxy_spec.fwmark,
+            relay_port,
+            local_name_inspect_port,
             dns_standard_port,
             dot_port,
-            kill_switch_enabled,
-            block_encrypted_dns,
-        ) {
-            if let Ok(mut ip6_child) = Command::new(&nft_bin)
-                .args(["-f", "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                if let Some(mut stdin) = ip6_child.stdin.take() {
-                    let _ = stdin.write_all(ip6_ruleset.as_bytes());
-                }
-                if let Ok(out) = ip6_child.wait_with_output() {
-                    if out.status.success() {
-                        controller.telemetry.push_log(
-                            LogLevel::Info,
-                            COMPONENT_NFTABLES,
-                            format!(
-                                "Installed nftables IPv6 DNS/DoT guard table \"ip6 {table_name}\""
-                            ),
-                        );
-                    } else {
-                        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                        controller.telemetry.push_log(
-                            LogLevel::Warn,
-                            COMPONENT_NFTABLES,
-                            format!(
-                                "Could not install nftables table \"ip6 {table_name}\": {stderr}"
-                            ),
-                        );
+            quic_port,
+            mdns_port,
+            llmnr_port,
+            block_quic_udp_443,
+            &upstream_v6,
+        );
+        if let Ok(mut ip6_child) = Command::new(&nft_bin)
+            .args(["-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = ip6_child.stdin.take() {
+                let _ = stdin.write_all(ip6_ruleset.as_bytes());
+            }
+            if let Ok(out) = ip6_child.wait_with_output() {
+                if out.status.success() {
+                    ipv6_tproxy_active = true;
+                    controller.telemetry.push_log(
+                        LogLevel::Info,
+                        COMPONENT_NFTABLES,
+                        format!("Installed nftables IPv6 dual-stack table \"ip6 {table_name}\""),
+                    );
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    controller.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_NFTABLES,
+                        format!(
+                            "Could not install full IPv6 NAT/TPROXY table \"ip6 {table_name}\" ({stderr}); falling back to IPv6 DNS/DoT guard"
+                        ),
+                    );
+                    let fallback_ip6 = format!(
+                        "table ip6 {table_name} {{\n    chain {chain_name} {{\n        type filter hook output priority 0; policy accept;\n        meta mark {fwmark} return\n        ip6 daddr ::1 return\n        udp dport {dns_standard_port} reject\n        tcp dport {dns_standard_port} reject with tcp reset\n        udp dport {dot_port} reject\n        tcp dport {dot_port} reject with tcp reset\n    }}\n}}\n"
+                    );
+                    if let Ok(mut fb_child) = Command::new(&nft_bin)
+                        .args(["-f", "-"])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        if let Some(mut stdin) = fb_child.stdin.take() {
+                            let _ = stdin.write_all(fallback_ip6.as_bytes());
+                        }
+                        let _ = fb_child.wait();
                     }
                 }
             }
@@ -1544,6 +2137,7 @@ impl Interceptor for NftablesInterceptor {
             ip_binary: ip_bin,
             table_name: table_name.clone(),
             tproxy_spec,
+            ipv6_tproxy_active,
             watchdog_stdin,
             watchdog_child,
             telemetry: controller.telemetry.clone(),
@@ -1565,7 +2159,7 @@ impl Interceptor for NftablesInterceptor {
             netbios_ns_port,
             block_encrypted_dns,
             block_quic_udp_443,
-            &upstream_endpoints,
+            &upstream_v4,
         );
 
         let mut apply_child = match Command::new(&nft_bin)
@@ -1669,7 +2263,16 @@ impl Interceptor for NftablesInterceptor {
             )
         };
 
-        let prev_spec = self.state.lock().as_ref().map(|s| s.tproxy_spec);
+        let (prev_spec, ipv6_tproxy_active) = {
+            let guard = self.state.lock();
+            (
+                guard.as_ref().map(|s| s.tproxy_spec),
+                guard
+                    .as_ref()
+                    .map(|s| s.ipv6_tproxy_active)
+                    .unwrap_or(false),
+            )
+        };
         if let Some(old_spec) = prev_spec {
             if old_spec != tproxy_spec {
                 Self::delete_tproxy_routing(&ip_bin, old_spec, &controller.telemetry);
@@ -1685,25 +2288,62 @@ impl Interceptor for NftablesInterceptor {
             }
         }
 
-        let atomic_batch = Self::build_atomic_replace_ruleset_with_tproxy(
-            &table_name,
-            &chain_name,
-            fwmark,
-            tproxy_spec.fwmark,
-            relay_port,
-            dns_listen_port,
-            local_name_inspect_port,
-            dns_standard_port,
-            dot_port,
-            quic_port,
-            mdns_port,
-            llmnr_port,
-            netbios_ns_port,
-            kill_switch_enabled,
-            block_encrypted_dns,
-            block_quic_udp_443,
-            &upstream_endpoints,
-        );
+        let atomic_batch = if ipv6_tproxy_active {
+            Self::build_atomic_replace_ruleset_dual_stack(
+                &table_name,
+                &chain_name,
+                fwmark,
+                tproxy_spec.fwmark,
+                relay_port,
+                dns_listen_port,
+                local_name_inspect_port,
+                dns_standard_port,
+                dot_port,
+                quic_port,
+                mdns_port,
+                llmnr_port,
+                netbios_ns_port,
+                kill_switch_enabled,
+                block_encrypted_dns,
+                block_quic_udp_443,
+                &upstream_endpoints,
+            )
+        } else {
+            let up4: Vec<(Ipv4Addr, u16)> = upstream_endpoints
+                .iter()
+                .filter_map(|(ip, port)| match ip {
+                    IpAddr::V4(v4) => Some((*v4, *port)),
+                    IpAddr::V6(_) => None,
+                })
+                .collect();
+            let mut batch = String::with_capacity(2048);
+            batch.push_str(&format!("table ip {table_name}\n"));
+            batch.push_str(&format!("delete table ip {table_name}\n"));
+            batch.push_str(&Self::build_nft_table_ruleset_with_tproxy(
+                &table_name,
+                &chain_name,
+                fwmark,
+                tproxy_spec.fwmark,
+                relay_port,
+                dns_listen_port,
+                local_name_inspect_port,
+                dns_standard_port,
+                dot_port,
+                quic_port,
+                mdns_port,
+                llmnr_port,
+                netbios_ns_port,
+                block_encrypted_dns,
+                block_quic_udp_443,
+                &up4,
+            ));
+            batch.push_str(&format!("table ip6 {table_name}\n"));
+            batch.push_str(&format!("delete table ip6 {table_name}\n"));
+            batch.push_str(&format!(
+                "table ip6 {table_name} {{\n    chain {chain_name} {{\n        type filter hook output priority 0; policy accept;\n        meta mark {fwmark} return\n        ip6 daddr ::1 return\n        udp dport {dns_standard_port} reject\n        tcp dport {dns_standard_port} reject with tcp reset\n        udp dport {dot_port} reject\n        tcp dport {dot_port} reject with tcp reset\n    }}\n}}\n"
+            ));
+            batch
+        };
 
         let mut apply_child = Command::new(&nft_bin)
             .args(["-f", "-"])
@@ -1946,5 +2586,60 @@ mod tests {
         assert!(wd.contains("nft delete table ip6 routeward"));
         assert!(wd.contains("ip -4 rule del fwmark 21080 lookup 100 priority 10810"));
         assert!(wd.contains("ip -4 route del local 0.0.0.0/0 dev lo table 100"));
+        assert!(wd.contains("ip -6 rule del fwmark 21080 lookup 100 priority 10810"));
+        assert!(wd.contains("ip -6 route del local ::/0 dev lo table 100"));
+    }
+
+    #[test]
+    fn builds_dual_stack_ip6_nat_tproxy_ruleset_and_parses_sockaddr_in6() {
+        let upstreams = vec![
+            (IpAddr::V4(Ipv4Addr::new(192, 168, 31, 10)), 1080),
+            (IpAddr::V6("2001:db8::10".parse().unwrap()), 1080),
+        ];
+        let batch = NftablesInterceptor::build_atomic_replace_ruleset_dual_stack(
+            "routeward",
+            "output",
+            21079,
+            21080,
+            10810,
+            10853,
+            10854,
+            53,
+            853,
+            443,
+            5353,
+            5355,
+            137,
+            true,
+            true,
+            true,
+            &upstreams,
+        );
+        assert!(batch.contains("ip6 daddr 2001:db8::10 tcp dport 1080 return"));
+        assert!(batch.contains("ip6 daddr 2001:db8::10 udp dport 1080 return"));
+        assert!(batch.contains("tcp dport 1-65535 redirect to :10810"));
+        assert!(batch.contains("tproxy ip6 to [::1]:10854 accept"));
+        assert!(batch.contains("udp dport 53 reject"));
+        assert!(batch.contains("tcp dport 853 reject with tcp reset"));
+
+        let dst_v6: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        let parsed = NftablesInterceptor::parse_sockaddr_in6_fields(
+            AF_INET6_U16,
+            443u16.to_be(),
+            dst_v6.octets(),
+            10810,
+        )
+        .expect("parse valid original IPv6 dst");
+        assert_eq!(*parsed.ip(), dst_v6);
+        assert_eq!(parsed.port(), 443);
+
+        // Reject unredirected ::1:10810
+        assert!(NftablesInterceptor::parse_sockaddr_in6_fields(
+            AF_INET6_U16,
+            10810u16.to_be(),
+            Ipv6Addr::LOCALHOST.octets(),
+            10810,
+        )
+        .is_none());
     }
 }

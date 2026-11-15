@@ -1,3 +1,5 @@
+[Français](CONTRIBUTING.fr.md) | English
+
 # Contributing to RouteWard
 
 ## License and Copyright

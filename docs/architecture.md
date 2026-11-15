@@ -1,3 +1,5 @@
+[Français](fr/architecture.md) | English
+
 # RouteWard Architecture
 
 ## Overview and Current Status
@@ -60,13 +62,13 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
   - Cleanly terminates the client connection: sends a SOCKS5 general failure reply (`0x05, 0x01, ...`) followed by socket shutdown on the local SOCKS5 relay (`127.0.0.1:10808`), shuts down the client stream and removes the NAT session on the Windows transparent relay, and sends a `TCP RST` (`SO_LINGER(1, 0)`) on the Linux `nftables` transparent relay.
 - **Explicit Direct Fallback When Disabled (`securityPolicy.killSwitchEnabled = false`)**: When `killSwitchEnabled` is explicitly set to `false` and an upstream `Proxy` or `Chain` fails, RouteWard logs a `WARN` entry (`Upstream proxy failed ...; falling back to DIRECT because killSwitchEnabled=false`), opens a `Direct` outbound connection, and records the connection with `routeLabel = "DIRECT"`.
 - **Smart Group Failover (`Failover`, `LowestLatency`, `LoadBalance`)**: Groups iterate only across enabled proxy nodes configured in the group (`ProxyConnector::connect_group`). If an individual node fails, the group attempts the next candidate proxy in the group; if all nodes in the group fail and `killSwitchEnabled` is `true`, the flow is blocked and never falls back to `Direct`.
-- **Daemon Stop / Crash Fail-Open Preserved**: Stopping interception (`ctl stop`) or terminating the daemon (`SIGKILL` / `Stop-Process -Force`) removes the OS interception rules and fails open at the OS level, unchanged from Milestones 1–3.
+- **Daemon Stop / Crash Fail-Open Preserved**: Stopping interception (`ctl stop`) or terminating the daemon (`SIGKILL` / `Stop-Process -Force`) removes the OS interception rules and fails open at the OS level, unchanged from Milestones 1-3.
 - **Active Directory & Split-Horizon DNS Bypass (`dnsConfig.bypassDomains`)**: In Active Directory and enterprise split-horizon environments, internal domain suffixes, private zones, and reverse zones (for example `*.ad.company.tld`, `*.internal`, `*.local`, `10.in-addr.arpa`, `168.192.in-addr.arpa`, `*.ip6.arpa`) are configured in `dnsConfig.bypassDomains` so they resolve directly against the local/domain DNS without Fake-IP allocation or remote proxy tunneling.
 - **Not Implemented Yet**: Transparent DNS capture (Batch 4.1), UDP relay (Batch 4.2), and IPv6 interception (Batch 4.3).
 
 ### Milestone 4 - Batch 4.0.1 Status (Indirect Leak Closure)
 - **Windows `PendingSynQueue` Expiration Policy (`routeward-core::interceptor::nat` & `windivert`)**:
-  - When `securityPolicy.killSwitchEnabled = true` (default) and PID resolution for a queued `SYN` exceeds `pendingSynTimeoutMs` (`50` ms), RouteWard **drops** the `SYN` without reinjecting it (`WinDivertSend` is not called) and sends no reply. The client TCP stack naturally retransmits the `SYN` (~1 s later), by which time PID attribution has completed. Each dropped `SYN` increments `dropped_unattributed_syn_count` and logs an `INFO` entry (`Dropped unattributed Pending SYN #<count> after <ms>ms ...`).
+  - When `securityPolicy.killSwitchEnabled = true` (default) and PID resolution for a queued `SYN` exceeds `pendingSynTimeoutMs` (`40` ms), RouteWard **drops** the `SYN` without reinjecting it (`WinDivertSend` is not called) and sends no reply. The client TCP stack naturally retransmits the `SYN` (~1 s later), by which time PID attribution has completed. Each dropped `SYN` increments `dropped_unattributed_syn_count` and logs an `INFO` entry (`Dropped unattributed Pending SYN #<count> after <ms>ms ...`).
   - When `securityPolicy.killSwitchEnabled = false`, RouteWard preserves the fail-open reinjection behavior, increments `reinjected_unattributed_syn_count`, and logs a `WARN` entry (`Released unattributed Pending SYN #<count> after <ms>ms ...`).
 - **Unattributed Process Policy (`securityPolicy.unknownProcessAction`)**:
   - The default value of `securityPolicy.unknownProcessAction` in `configs/default_profile.json` and `SecurityPolicyConfig::default()` is now `Block` (`{ "type": "block" }`).
@@ -122,7 +124,7 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
   - When the Fake-IP pool reaches capacity (`dns.maxCacheEntries`), RouteWard first evicts expired entries (`evict_expired`) and then evicts the oldest entry (`evict_oldest`). If allocation still fails, RouteWard returns **`SERVFAIL` (`RCODE = 2`)** and never falls back to cleartext DNS.
 
 ### Milestone 4 - Batch 4.2 Status (UDP Relay, QUIC Rejection, Local Name Guards, and Transparent IPv4 UDP Interception)
-- **Batch 4.2.a — SOCKS5 `UDP ASSOCIATE`, Local SOCKS5 UDP Relay, QUIC (`UDP 443`) Rejection, and LLMNR/mDNS/NetBIOS Guards**:
+- **Batch 4.2.a - SOCKS5 `UDP ASSOCIATE`, Local SOCKS5 UDP Relay, QUIC (`UDP 443`) Rejection, and LLMNR/mDNS/NetBIOS Guards**:
   - **`UdpAssociationManager` (`routeward-core::proxy::udp`)**: Implements RFC 1928 `UDP ASSOCIATE` (`CMD = 0x03`) and RFC 1928 §7 UDP datagram framing (`RSV=0x0000`, `FRAG`, `ATYP` `0x01`/`0x03`/`0x04`). Associations are indexed by `(client_socket_addr, proxy_id)` with configurable idle timeout (`udp.associationIdleTimeoutSeconds = 60` s) and capacity (`udp.maxConcurrentAssociations = 256`).
   - **Per-Datagram Rule Evaluation & Multi-Node Group Failover**: Every outbound UDP datagram evaluates `RuleEngine::evaluate` against its own destination (`ATYP = 0x03` domain name or Fake-IP reverse lookup + target port). Two datagrams sent from the same client socket toward different destinations can follow different rules (`Proxy`, `Direct`, `Block`). If a proxy node returns `REP = 0x07` (`Command not supported`) or fails during `UDP ASSOCIATE`, groups (`Failover`, `LowestLatency`, `LoadBalance`) fail over to the next enabled node; if no node succeeds and `killSwitchEnabled = true`, the datagram is blocked (`status = Blocked`, `routeLabel = "BLOCKED"`).
   - **Fragmented UDP Policy**: Fragmented SOCKS5 UDP frames (`FRAG != 0`) and fragmented IPv4 UDP packets (`MF != 0 || frag_offset != 0`) are never reassembled in v1; when matched by a `Proxy`/`Chain` rule with `killSwitchEnabled = true`, they are blocked with a counter and rate-limited `WARN` log (`Direct` fragments pass).
@@ -132,7 +134,7 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
   - **LLMNR (`UDP 5355`), mDNS (`UDP 5353`), and NetBIOS-NS (`UDP 137`) Guards**:
     - LLMNR and mDNS queries for local names (single-label names, `.local`, Active Directory / machine DNS suffixes, `dnsConfig.bypassDomains`, private reverse zones) are allowed directly; queries for public FQDNs are blocked (`LocalNameGuard:LLMNR` / `LocalNameGuard:mDNS`) with a rate-limited `WARN` log.
     - NetBIOS-NS (`UDP 137`) toward private/link-local/broadcast IPv4 addresses is allowed directly; toward public unicast IPv4 addresses it is blocked (`LocalNameGuard:NetBIOS-NS`) with a rate-limited `WARN` log.
-- **Batch 4.2.b — General Transparent IPv4 UDP Interception (`Linux TPROXY` & `Windows WinDivert`)**:
+- **Batch 4.2.b - General Transparent IPv4 UDP Interception (`Linux TPROXY` & `Windows WinDivert`)**:
   - **Linux (`TPROXY` in `routeward-core::interceptor::nftables` & `mod.rs`)**:
     - Outbound IPv4 UDP packets (excluding `SO_MARK = linuxFwmark`, loopback `127.0.0.0/8`, configured/bootstrapped upstream proxies, and non-LLMNR/mDNS multicast/broadcast) are marked in `chain route_output` (`type route hook output priority -150`, `meta mark set <linuxTproxyFwmark>`) and routed to `lo` via `ip rule add fwmark <linuxTproxyFwmark> lookup <linuxTproxyRouteTable> priority <linuxTproxyRulePriority>` and `ip route add local 0.0.0.0/0 dev lo table <linuxTproxyRouteTable>`.
     - `chain prerouting` (`type filter hook prerouting priority -150`) intercepts marked packets via `meta l4proto udp meta mark <linuxTproxyFwmark> tproxy to 127.0.0.1:10854 accept`.
@@ -145,24 +147,38 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
     - Resolves process attribution via `SOCKET`-layer cache with fallback to `GetExtendedUdpTable` (`resolve_by_local_udp_port`). If a first outbound UDP datagram arrives before `SOCKET` attribution completes, it is queued in the bounded `PendingUdpQueue` (`pendingUdpTimeoutMs = 40` ms, `maxPendingUdpPackets = 256`); on expiration, it is dropped (`INFO` log + counter) when `killSwitchEnabled = true` or reinjected (`WARN` log + counter) when `false`.
     - Evaluated per datagram: `Block` drops the packet; `Direct` reinjects outbound (or translates a Fake-IP to its real IPv4 via `send_and_optional_recv_udp_direct_protected` and reinjects the reply with the Fake-IP as source); `Proxy`/`Chain` relays via `UdpAssociationManager::send_datagram` and reinjects upstream UDP replies inbound via `build_forged_ipv4_udp_reply` + `WinDivertSend` with the remote server's source IP/port (or Fake-IP).
 
+### Milestone 4 - Batch 4.3 Status (Dual-Stack IPv6 Interception, Linux `NETLINK_SOCK_DIAG`, and Modular Refactoring)
+- **Full Dual-Stack IPv4 + IPv6 Transparent TCP, UDP, and DNS Interception**:
+  - **`TransparentNatTable` (`routeward-core::interceptor::nat`)**: Generalizes NAT reverse mappings (`IpAddr`), pending SYN/UDP queues (`PendingSynQueue<T, M>`, `PendingUdpQueue<T, M>`), checksums, and synthetic ICMPv6 Port Unreachable / IPv6 UDP reply forging alongside IPv4.
+  - **Linux (`NftablesInterceptor` in `routeward-core::interceptor::nftables`)**: Installs symmetric `table ip routeward` and `table ip6 routeward` NAT/TPROXY rules (including `ip -6 rule` / `ip -6 route` local routing to `::1:10854`), queries dual-stack `SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST` (`query_original_dst_any`) and `IPV6_ORIGDSTADDR`, and removes both IPv4 and IPv6 routing state atomically on `reload`, `stop`, watchdog trip, or `routeward cleanup`.
+  - **Windows (`WinDivertInterceptor` in `routeward-core::interceptor::windivert`)**: Captures and reflects outbound IPv6 TCP SYNs, UDP datagrams, QUIC (`UDP 443`), and DNS traffic via dual-stack `WinDivert` filters and dedicated IPv6 pending queues.
+  - **Dual-Stack Controller Listeners (`routeward-core::interceptor::controller`)**: Binds explicit `0.0.0.0` and `[::]` (`IPV6_V6ONLY = 1`) sockets for DNS UDP/TCP, transparent TCP, TPROXY UDP, and explicit SOCKS5/HTTP listeners, plus separate IPv4 and IPv6 protected direct UDP pools (`acquire_direct_udp_socket`) and dual-stack `Fake-IP` / upstream proxy bootstrap formatting (`[ipv6]:port`).
+- **Linux `NETLINK_SOCK_DIAG` & Dual-Stack PID Attribution (`routeward-core::process`)**:
+  - Uses `AF_NETLINK` (`NETLINK_SOCK_DIAG`) directly for exact single-socket inode lookups across both `AF_INET` and `AF_INET6` (`build_inet_diag_request` / `parse_inet_diag_response_inode`), falling back to `/proc/net/{tcp,udp,tcp6,udp6}` when `NETLINK_SOCK_DIAG` is restricted.
+  - Windows IP Helper fallback queries both IPv4 and `AF_INET6` (`MIB_TCP6TABLE_OWNER_PID` / `MIB_UDP6TABLE_OWNER_PID`).
+- **Modular Codebase Split & Extended Test Coverage**:
+  - Split `crates/routeward-core/src/interceptor` into focused submodules (`controller.rs`, `tcp_relay.rs`, `udp_relay.rs`, `dns_handler.rs`, `nat.rs`, `nftables.rs`, `windivert.rs`, `tests.rs`).
+  - Split `apps/desktop/src` loopback API/bridge into `security.rs`, `sse.rs`, `routes.rs`, `lib.rs`, and `tests.rs`.
+  - Split `ui/src/services` into `uri.ts` (with `[ipv6]:port` URI formatting/parsing), `sse.ts`, and `ipc.ts` alongside Vitest UI view tests (`ui/src/components/Views.test.tsx`).
+
 ## Component Diagram
 
 ```mermaid
 flowchart TD
     subgraph ClientApp["Unmodified Application (curl.exe / curl)"]
-        Curl["Outbound IPv4 TCP (client_ip:C -> dst_ip:D)"]
+        Curl["Outbound IPv4 / IPv6 TCP & UDP (client_ip:C -> dst_ip:D)"]
     end
 
     subgraph OSBackend["OS Interceptor Backend (Interceptor Trait)"]
-        WinBackend["Windows: WinDivert 2.2 (SOCKET + NETWORK Reflection)"]
-        LinBackend["Linux: nftables table ip routeward + SO_ORIGINAL_DST + SO_MARK"]
+        WinBackend["Windows: WinDivert 2.2 Dual-Stack (SOCKET + NETWORK Reflection)"]
+        LinBackend["Linux: nftables table ip + ip6 + TPROXY + SO_MARK"]
     end
 
     subgraph Core["Core Engine (crates/routeward-core)"]
-        ProcRes["ProcessResolver (GetExtendedTcpTable / procfs Inode Scan)"]
-        TransRelay["Transparent TCP Listener (0.0.0.0:10810)"]
+        ProcRes["ProcessResolver (GetExtendedTcp/UdpTable v4+v6 / NETLINK_SOCK_DIAG + procfs)"]
+        TransRelay["Dual-Stack Relays (TCP 0.0.0.0/[::]:10810 & UDP TPROXY :10854)"]
         RuleEngine["RuleEngine (Priority, Process, Domain, CIDR, Port)"]
-        ProxyConnector["ProxyConnector (SOCKS5 / HTTP CONNECT + SO_MARK)"]
+        ProxyConnector["ProxyConnector (SOCKS5 / HTTP CONNECT + [IPv6]:port + SO_MARK)"]
         Telemetry["TelemetryHub + FileLogger (logs/RouteWard_yyyyMMdd.log)"]
     end
 

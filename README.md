@@ -1,3 +1,5 @@
+[Français](README.fr.md) | English
+
 # RouteWard
 
 Process-aware network routing and proxy chaining toolkit written in Rust, with a native desktop interface built on `tao` + `wry` (WebView2) and **ThemeForge**.
@@ -9,21 +11,24 @@ Process-aware network routing and proxy chaining toolkit written in Rust, with a
 
 ## Current Capabilities and Status
 
-- **Process Attribution (`routeward-core::process`)**: Maps active TCP sockets to owning PIDs and executable paths using the Windows IP Helper API (`GetExtendedTcpTable`) and Linux `/proc/net/tcp` + `/proc/<pid>/exe`.
-- **Fake-IP DNS Engine (`routeward-core::dns`)**: Allocates virtual RFC 2544 (`198.18.0.0/15`) addresses to domain queries in memory for reverse domain lookup during rule evaluation.
+- **Transparent OS Interception (`routeward-core::interceptor`)**: Captures outbound dual-stack **IPv4 and IPv6** TCP and UDP traffic plus IPv4/local port `53` DNS queries from unmodified applications via **WinDivert 2.2** on Windows and **`nftables` (`table ip` + `table ip6`) + `TPROXY`** on Linux, alongside explicit local SOCKS5 (`127.0.0.1:10808` / `[::1]:10808`) and HTTP CONNECT (`127.0.0.1:10809` / `[::1]:10809`) relay listeners.
+- **Process Attribution (`routeward-core::process`)**: Maps active IPv4 and IPv6 TCP and UDP sockets to owning PIDs and executable paths using WinDivert `SOCKET` + Windows IP Helper (`GetExtendedTcpTable` / `GetExtendedUdpTable` for `AF_INET` and `AF_INET6`) and Linux **`NETLINK_SOCK_DIAG`** (`AF_INET` / `AF_INET6`) with `/proc/net/{tcp,udp,tcp6,udp6}` + `/proc/<pid>/exe` fallback.
+- **Anti-Leak DNS Engine (`routeward-core::dns`)**: Allocates virtual RFC 2544 (`198.18.0.0/15`) Fake-IP addresses or tunnels DNS-over-TCP through proxies, blocks encrypted DNS canary/DoT/IPv6 DNS bypasses, and selectively bypasses Active Directory and local/private zones.
+- **Kill-Switch & Leak Guards (`routeward-core::interceptor`)**: Enforces fail-closed `Proxy`/`Chain` routing when `killSwitchEnabled = true`, rejects QUIC (`UDP 443`) by default, and guards against public-domain LLMNR (`5355`), mDNS (`5353`), and NetBIOS-NS (`137`) leaks.
 - **SOCKS5 and HTTP CONNECT Proxy Chaining (`routeward-core::proxy`)**: Supports SOCKS5 (`CONNECT` and `UDP ASSOCIATE`, RFC 1928/1929) and HTTP/HTTPS `CONNECT`, with multi-hop sequence, failover, lowest-latency, and round-robin group strategies.
-- **Priority Rule Engine (`routeward-core::rules`)**: Evaluates routing rules by executable wildcard, binary path, domain wildcard/regex, IPv4/IPv6 CIDR subnet, port range, and protocol (`TCP`/`UDP`/`ANY`).
-- **Daily Rolling File Logger (`routeward-core::logger`)**: Writes thread-safe logs to `logs/RouteWard_<yyyyMMdd>.log`, toggleable at runtime via `enableLogging`.
+- **Priority Rule Engine (`routeward-core::rules`)**: Evaluates routing rules by executable wildcard, binary path, domain wildcard/regex (plus TLS `ClientHello` SNI inspection), IPv4/IPv6 CIDR subnet, port range, and protocol (`TCP`/`UDP`/`ANY`).
+- **Daily Rolling File Logger (`routeward-core::logger`)**: Writes thread-safe logs to dedicated daemon/user OS log directories, toggleable at runtime via `enableLogging`.
 - **ThemeForge Desktop UI (`apps/desktop` & `ui/`)**: Standalone `tao` + `wry` desktop window styled with the 16 canonical ThemeForge Oklab palettes + `HighContrast` and 9 accent tints.
-- **Current Limitation**: Transparent OS-level packet interception (capturing traffic from unmodified applications without proxy settings) is not implemented yet. Currently, applications must connect through the local SOCKS5 (`127.0.0.1:10808`) or HTTP CONNECT (`127.0.0.1:10809`) relay listeners.
+- **Current Scope**: RouteWard provides dual-stack IPv4 and IPv6 transparent TCP and UDP (`TPROXY` / `WinDivert`) interception, IPv4/local DNS interception with Fake-IP, TLS SNI inspection, QUIC (`UDP 443`) rejection, encrypted/IPv6 DNS leak blocking (port `853` DoT/DoQ + IPv6 `53`/`853` + Mozilla DoH canary), and modular Rust desktop + React/Vitest UI components.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) ([Francais](docs/fr/architecture.md))
-- [Build and Installation](docs/build.md) ([Francais](docs/fr/build.md))
-- [Maintenance](docs/maintenance.md) ([Francais](docs/fr/maintenance.md))
-- [Troubleshooting](docs/troubleshooting.md) ([Francais](docs/fr/troubleshooting.md))
-- [Contributing & Versioning](CONTRIBUTING.md) ([Francais](CONTRIBUTING.fr.md))
+- [Architecture](docs/architecture.md) ([Français](docs/fr/architecture.md))
+- [Build and Installation](docs/build.md) ([Français](docs/fr/build.md))
+- [Maintenance](docs/maintenance.md) ([Français](docs/fr/maintenance.md))
+- [Troubleshooting](docs/troubleshooting.md) ([Français](docs/fr/troubleshooting.md))
+- [Windows Testing](docs/windows-testing.md) ([Français](docs/fr/windows-testing.md))
+- [Contributing & Versioning](CONTRIBUTING.md) ([Français](CONTRIBUTING.fr.md))
 
 ## Branding Assets
 

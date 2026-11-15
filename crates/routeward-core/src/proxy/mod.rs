@@ -121,7 +121,7 @@ impl ProxyConnector {
         let handshake_timeout = Duration::from_millis(constants.network.proxy_handshake_timeout_ms);
         let fwmark = constants.network.linux_fwmark;
 
-        let proxy_addr = format!("{}:{}", node.host, node.port);
+        let proxy_addr = Self::format_host_port(&node.host, node.port);
         let mut stream = timeout(
             connect_timeout,
             Self::connect_tcp_marked(&proxy_addr, fwmark),
@@ -167,7 +167,7 @@ impl ProxyConnector {
         let fwmark = constants.network.linux_fwmark;
 
         let first_hop = &hops[0];
-        let entry_addr = format!("{}:{}", first_hop.host, first_hop.port);
+        let entry_addr = Self::format_host_port(&first_hop.host, first_hop.port);
         let mut stream = timeout(
             connect_timeout,
             Self::connect_tcp_marked(&entry_addr, fwmark),
@@ -344,6 +344,15 @@ impl ProxyConnector {
                 })?;
             let user_bytes = creds.username.as_bytes();
             let pass_bytes = creds.password_str().as_bytes();
+            if user_bytes.is_empty()
+                || user_bytes.len() > u8::MAX as usize
+                || pass_bytes.len() > u8::MAX as usize
+            {
+                return Err(RouteWardError::ProtocolHandshake {
+                    key: ERR_KEY_HANDSHAKE_FAILED,
+                    detail: "SOCKS5 RFC 1929 credentials must fit within 1..=255 bytes".to_string(),
+                });
+            }
 
             let mut auth_pkt = Vec::with_capacity(3 + user_bytes.len() + pass_bytes.len());
             auth_pkt.push(proto.socks5_password_auth_version);
@@ -441,19 +450,28 @@ impl ProxyConnector {
             String::new()
         };
 
+        let host_port = Self::format_host_port(target_host, target_port);
         let request = format!(
-            "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n{auth_header}Proxy-Connection: Keep-Alive\r\n\r\n"
+            "CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n{auth_header}Proxy-Connection: Keep-Alive\r\n\r\n"
         );
         stream.write_all(request.as_bytes()).await?;
 
         let mut response_buf = Vec::with_capacity(256);
         let mut byte = [0u8; 1];
+        let mut header_complete = false;
         while response_buf.len() < MAX_HTTP_RESPONSE_HEADER_BYTES {
             stream.read_exact(&mut byte).await?;
             response_buf.push(byte[0]);
             if response_buf.ends_with(HTTP_HEADER_TERMINATOR) {
+                header_complete = true;
                 break;
             }
+        }
+        if !header_complete {
+            return Err(RouteWardError::ProtocolHandshake {
+                key: ERR_KEY_HANDSHAKE_FAILED,
+                detail: "HTTP CONNECT response header exceeded maximum allowed size".to_string(),
+            });
         }
 
         let response_str = String::from_utf8_lossy(&response_buf);
@@ -467,6 +485,14 @@ impl ProxyConnector {
                 key: ERR_KEY_HANDSHAKE_FAILED,
                 detail: status_line.to_string(),
             })
+        }
+    }
+
+    pub fn format_host_port(host: &str, port: u16) -> String {
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
         }
     }
 
@@ -495,5 +521,132 @@ impl ProxyConnector {
             buf.extend_from_slice(&domain_bytes[..len]);
         }
         buf.extend_from_slice(&target_port.to_be_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ProxyCredentials, ProxyNode, ProxyProtocol, SystemConstants};
+    use tokio::io::{duplex, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn socks5_rejects_credentials_longer_than_255_bytes() {
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let node = ProxyNode {
+            id: "test-socks5".to_string(),
+            name: "Test".to_string(),
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 1080,
+            auth: Some(ProxyCredentials::new("u".repeat(256), "secret")),
+            tls: false,
+            sni: None,
+            udp_enabled: false,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        };
+        let (mut client, mut server) = duplex(64);
+        tokio::spawn(async move {
+            let mut req = [0u8; 4];
+            let _ = tokio::io::AsyncReadExt::read_exact(&mut server, &mut req).await;
+            let _ = server
+                .write_all(&[proto.socks5_version, proto.socks5_auth_password])
+                .await;
+        });
+
+        let err = ProxyConnector::negotiate_socks5(
+            &mut client,
+            &node,
+            "example.com",
+            443,
+            proto.socks5_cmd_connect,
+            &proto,
+        )
+        .await
+        .expect_err("username >255 bytes must fail RFC 1929 validation");
+        assert!(err.to_string().contains("1..=255"));
+    }
+
+    #[tokio::test]
+    async fn http_connect_rejects_oversized_unterminated_header() {
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let node = ProxyNode {
+            id: "test-http".to_string(),
+            name: "HTTP".to_string(),
+            protocol: ProxyProtocol::Http,
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            auth: None,
+            tls: false,
+            sni: None,
+            udp_enabled: false,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        };
+        let (mut client, mut server) = duplex(16384);
+        tokio::spawn(async move {
+            let mut drain = [0u8; 256];
+            let _ = tokio::io::AsyncReadExt::read(&mut server, &mut drain).await;
+            let payload = vec![b'X'; MAX_HTTP_RESPONSE_HEADER_BYTES + 16];
+            let _ = server.write_all(&payload).await;
+        });
+
+        let err =
+            ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
+                .await
+                .expect_err("unterminated header exceeding limit must error");
+        assert!(err.to_string().contains("exceeded maximum allowed size"));
+    }
+
+    #[tokio::test]
+    async fn brackets_ipv6_literals_in_proxy_addrs_and_http_connect() {
+        assert_eq!(ProxyConnector::format_host_port("::1", 1080), "[::1]:1080");
+        assert_eq!(
+            ProxyConnector::format_host_port("[::1]", 1080),
+            "[::1]:1080"
+        );
+        assert_eq!(
+            ProxyConnector::format_host_port("127.0.0.1", 1080),
+            "127.0.0.1:1080"
+        );
+
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let node = ProxyNode {
+            id: "test-http-v6".to_string(),
+            name: "HTTPv6".to_string(),
+            protocol: ProxyProtocol::Http,
+            host: "::1".to_string(),
+            port: 8080,
+            auth: None,
+            tls: false,
+            sni: None,
+            udp_enabled: false,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        };
+        let (mut client, mut server) = duplex(1024);
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let n = tokio::io::AsyncReadExt::read(&mut server, &mut buf)
+                .await
+                .unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            server
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            req
+        });
+
+        ProxyConnector::negotiate_http_connect(&mut client, &node, "2001:db8::1", 443, &proto)
+            .await
+            .expect("HTTP CONNECT over IPv6 target literal should succeed");
+        let sent_req = server_task.await.unwrap();
+        assert!(sent_req
+            .starts_with("CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n"));
     }
 }

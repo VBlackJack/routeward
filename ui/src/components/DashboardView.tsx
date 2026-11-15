@@ -439,6 +439,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </div>
               <input
                 type="checkbox"
+                aria-label={t('dashboard.security_shield.panel.killswitch_aria')}
                 checked={securityPolicy.killSwitchEnabled}
                 onChange={(e) =>
                   onUpdateSecurityPolicy({
@@ -464,6 +465,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </div>
               <input
                 type="checkbox"
+                aria-label={t('dashboard.security_shield.panel.udp_guard_aria')}
                 checked={securityPolicy.blockUdpOnTcpOnlyProxy}
                 onChange={(e) =>
                   onUpdateSecurityPolicy({
@@ -489,6 +491,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </div>
               <input
                 type="checkbox"
+                aria-label={t('dashboard.security_shield.panel.dns_guard_aria')}
                 checked={securityPolicy.strictDnsNoLocalFallback}
                 onChange={(e) =>
                   onUpdateSecurityPolicy({

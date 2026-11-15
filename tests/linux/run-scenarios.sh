@@ -17,13 +17,15 @@ set -euo pipefail
 
 BIN="/workspace/target/release/routeward"
 TARGET_IP="10.200.1.1"
+TARGET_IPV6="fd00:200:1::1"
 TARGET_PORT="18080"
 SOCKS_LOG="/tmp/socks5_hits.log"
 
 echo "=== RouteWard Milestone 2 - Linux Container Integration Suite ==="
 
-# Attach non-127.0.0.0/8 IPv4 address to loopback so outbound packets traverse nftables output chain
+# Attach non-127.0.0.0/8 IPv4 and non-::1 IPv6 addresses to loopback so outbound packets traverse nftables output chain
 ip addr add "${TARGET_IP}/32" dev lo 2>/dev/null || true
+ip -6 addr add "${TARGET_IPV6}/128" dev lo nodad 2>/dev/null || true
 
 # Start local HTTP target server (0.0.0.0:18080) and SOCKS5 gateway (127.0.0.1:1080)
 python3 /workspace/tests/linux/mock_servers.py &
@@ -433,7 +435,7 @@ kill -TERM "${DAEMON_K_PID}" 2>/dev/null || true
 wait "${DAEMON_K_PID}" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Scenario (l): Kill-Switch (killSwitchEnabled=true) — SOCKS5 server stopped,
+# Scenario (l): Kill-Switch (killSwitchEnabled=true) - SOCKS5 server stopped,
 #               curl matched by Proxy rule fails, target HTTP server receives
 #               zero direct connections, and ctl connections reports Blocked
 # ---------------------------------------------------------------------------
@@ -609,7 +611,7 @@ cat > /tmp/profile_dns_real.json <<EOF
 EOF
 
 # ---------------------------------------------------------------------------
-# Scenario (m): Fake-IP end-to-end — DNS query returns IP in 198.18.0.0/15
+# Scenario (m): Fake-IP end-to-end - DNS query returns IP in 198.18.0.0/15
 #               with 5s TTL (AAAA -> NODATA), curl to domain matches domain
 #               rule and sends domain name to SOCKS5, 0 INFO DNS logs
 # ---------------------------------------------------------------------------
@@ -678,7 +680,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Scenario (p): blockEncryptedDnsBypass=true — DoH canary returns NXDOMAIN,
+# Scenario (p): blockEncryptedDnsBypass=true - DoH canary returns NXDOMAIN,
 #               outbound port 853 (TCP & UDP) and IPv6 53/853 are blocked
 # ---------------------------------------------------------------------------
 DNS_P_CANARY=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "use-application-dns.net" 1)
@@ -717,7 +719,7 @@ kill -TERM "${DAEMON_M_PID}" 2>/dev/null || true
 wait "${DAEMON_M_PID}" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Scenario (n): enableFakeIp=false — DNS query resolved via DNS-over-TCP
+# Scenario (n): enableFakeIp=false - DNS query resolved via DNS-over-TCP
 #               through SOCKS5 proxy, 0 direct UDP DNS packets
 # ---------------------------------------------------------------------------
 rm -f "${SOCKS_LOG}" /tmp/dns_hits.log /run/routeward/routeward.sock
@@ -1059,7 +1061,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Scenario (x): kill -9 of daemon — watchdog removes nftables rules so
+# Scenario (x): kill -9 of daemon - watchdog removes nftables rules so
 #               UDP 443 and UDP 5355 (LLMNR) are no longer blocked
 # ---------------------------------------------------------------------------
 kill -9 "${DAEMON_U_PID}"
@@ -1311,7 +1313,7 @@ kill -TERM "${UDP_SRV_AC_PID}" 2>/dev/null || true
 wait "${UDP_SRV_AC_PID}" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Scenario (ad): kill -9 of daemon — watchdog removes nftables tables,
+# Scenario (ad): kill -9 of daemon - watchdog removes nftables tables,
 #                ip rule (priority 10810), and local route (table 100),
 #                restoring direct UDP immediately
 # ---------------------------------------------------------------------------
@@ -1364,7 +1366,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # Scenario (af): Pre-existing routing table or ip rule conflict detected at
-#                startup — refuses to start without overwriting third-party route
+#                startup - refuses to start without overwriting third-party route
 # ---------------------------------------------------------------------------
 ip route add 198.51.100.0/24 dev lo table 100
 
@@ -1443,7 +1445,115 @@ else
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Scenario (ah): Transparent IPv6 TCP connection intercepted via table ip6
+#                routeward and routed through SOCKS5 (ATYP=0x04 IPv6)
+# ---------------------------------------------------------------------------
+rm -f "${SOCKS_LOG}" /tmp/http_target_hits.log /run/routeward/routeward.sock
+cp /tmp/profile_proxy.json /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
+
+"${BIN}" daemon >/tmp/rw_daemon_ah.out 2>&1 &
+DAEMON_AH_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+CURL_AH_OUT=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+    curl -6 --noproxy "" -sS --max-time 5 "http://[${TARGET_IPV6}]:${TARGET_PORT}/v6-proxy-test")
+sleep 0.2
+LOGS_AH=$("${BIN}" ctl logs)
+
+kill -TERM "${DAEMON_AH_PID}" 2>/dev/null || true
+wait "${DAEMON_AH_PID}" 2>/dev/null || true
+
+if [[ "${CURL_AH_OUT}" == "ROUTEWARD_OK" ]] \
+    && grep -q "CONNECT ${TARGET_IPV6}:${TARGET_PORT}" "${SOCKS_LOG}" \
+    && grep -q "GET /v6-proxy-test" /tmp/http_target_hits.log \
+    && echo "${LOGS_AH}" | grep -q "via Local SOCKS5 Gateway"; then
+    echo "[PASS] Scenario (ah): Transparent IPv6 TCP connection intercepted via table ip6 and routed via SOCKS5 (${TARGET_IPV6}:${TARGET_PORT})"
+else
+    echo "[FAIL] Scenario (ah)"
+    echo "CURL_AH_OUT=${CURL_AH_OUT}"
+    cat "${SOCKS_LOG}" 2>/dev/null || true
+    cat /tmp/http_target_hits.log 2>/dev/null || true
+    echo "LOGS_AH=${LOGS_AH}"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Scenarios (ai) & (aj): Transparent IPv6 Direct UDP (TPROXY ip6 -> port 19990)
+#                        and Transparent IPv6 Proxy UDP (TPROXY ip6 -> SOCKS5 ATYP=0x04 -> port 19999)
+# ---------------------------------------------------------------------------
+rm -f /tmp/udp_srv_aj.json /tmp/udp_direct_hits.log /run/routeward/routeward.sock
+
+"${UDP_TEST_SRV}" \
+    --bind 127.0.0.1:1084 \
+    --udp-echo-bind "[${TARGET_IPV6}]:19999" \
+    --echo-prefix "UDP6_ECHO_OK:" \
+    --stats-file /tmp/udp_srv_aj.json >/tmp/udp_srv_aj.out 2>&1 &
+UDP_SRV_AJ_PID=$!
+sleep 0.3
+
+cp /tmp/profile_udp_tproxy.json /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
+
+"${BIN}" daemon >/tmp/rw_daemon_aiaj.out 2>&1 &
+DAEMON_AIAJ_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+UDP_AI_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp6-send "${TARGET_IPV6}" 19990 "transparent-v6-direct")
+UDP_AJ_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp6-send "${TARGET_IPV6}" 19999 "transparent-v6-proxy")
+sleep 0.2
+STATS_AJ=$(cat /tmp/udp_srv_aj.json 2>/dev/null || echo "{}")
+LOGS_AIAJ=$("${BIN}" ctl logs)
+
+kill -TERM "${DAEMON_AIAJ_PID}" "${UDP_SRV_AJ_PID}" 2>/dev/null || true
+wait "${DAEMON_AIAJ_PID}" 2>/dev/null || true
+wait "${UDP_SRV_AJ_PID}" 2>/dev/null || true
+
+if [[ "${UDP_AI_OUT}" == "TRANSPARENT_UDP6_OK FROM=[${TARGET_IPV6}]:19990 BODY=DIRECT_ECHO_OK:transparent-v6-direct" ]] \
+    && grep -q "UDP_DIRECT_V6" /tmp/udp_direct_hits.log \
+    && grep -q "transparent-v6-direct" /tmp/udp_direct_hits.log \
+    && echo "${LOGS_AIAJ}" | grep -Eq "${TARGET_IPV6}.*:19990.*via DIRECT"; then
+    echo "[PASS] Scenario (ai): Transparent IPv6 Direct UDP routed via TPROXY ip6 and replied from [${TARGET_IPV6}]:19990"
+else
+    echo "[FAIL] Scenario (ai)"
+    echo "UDP_AI_OUT=${UDP_AI_OUT}"
+    cat /tmp/udp_direct_hits.log 2>/dev/null || true
+    echo "LOGS_AIAJ=${LOGS_AIAJ}"
+    exit 1
+fi
+
+if [[ "${UDP_AJ_OUT}" == "TRANSPARENT_UDP6_OK FROM=[${TARGET_IPV6}]:19999 BODY=UDP6_ECHO_OK:transparent-v6-proxy" ]] \
+    && echo "${STATS_AJ}" | grep -q '"udp_associate_requests":1' \
+    && echo "${STATS_AJ}" | grep -q '"udp_datagrams_relayed":1' \
+    && echo "${STATS_AJ}" | grep -q '"udp_echo_received":1' \
+    && echo "${STATS_AJ}" | grep -q "\"last_udp_target\":\"Ipv6(${TARGET_IPV6}:19999)\""; then
+    echo "[PASS] Scenario (aj): Transparent IPv6 UDP routed via TPROXY ip6 through SOCKS5 UDP ASSOCIATE (ATYP=0x04)"
+else
+    echo "[FAIL] Scenario (aj)"
+    echo "UDP_AJ_OUT=${UDP_AJ_OUT}"
+    echo "STATS_AJ=${STATS_AJ}"
+    echo "LOGS_AIAJ=${LOGS_AIAJ}"
+    exit 1
+fi
+
 cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
 kill "${MOCK_PID}" 2>/dev/null || true
 
-echo "=== ALL 33 LINUX CONTAINER SCENARIOS PASSED ==="
+echo "=== ALL 36 LINUX CONTAINER SCENARIOS PASSED ==="

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM rust:bookworm
+FROM rust:1.97.1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nftables \
@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN rustup toolchain install stable --component rustfmt,clippy
+RUN rustup component add rustfmt clippy
 
 WORKDIR /workspace
 COPY . /workspace

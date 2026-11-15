@@ -1,20 +1,22 @@
+[English](../build.md) | Français
+
 # Compilation et Installation
 
-## Prerequis
+## Prérequis
 
-- **Toolchain Rust** : Rust stable (`1.80+`, edition 2021) avec `cargo`, `rustfmt` et `clippy`.
-  - `rust-toolchain.toml` utilise `channel = "stable"` afin d'assurer la compatibilite multi-plateforme (Windows et Linux).
-  - **Cible Windows MSVC** : Sous Windows, utiliser la cible MSVC (`x86_64-pc-windows-msvc`). Si la toolchain par defaut du poste est `gnu`, definir MSVC par defaut (`rustup default stable-x86_64-pc-windows-msvc`) ou appeler Cargo avec `cargo +stable-x86_64-pc-windows-msvc`.
-- **Node.js** : Node.js `20+` et `npm` (requis pour compiler le bundle `ui/dist` embarque par `routeward-desktop`).
-- **Dependances systeme** :
+- **Toolchain Rust** : Rust stable (`1.80+`, édition 2021) avec `cargo`, `rustfmt` et `clippy`.
+  - `rust-toolchain.toml` spécifie `channel = "stable"` afin d'assurer la compatibilité multi-plateforme (Windows et Linux).
+  - **Cible Windows MSVC** : Sous Windows, utiliser la cible MSVC (`x86_64-pc-windows-msvc`). Si la toolchain par défaut du poste est `gnu`, définir MSVC par défaut (`rustup default stable-x86_64-pc-windows-msvc`) ou appeler Cargo avec `cargo +stable-x86_64-pc-windows-msvc`.
+- **Node.js** : Node.js `20+` et `npm` (requis pour compiler le bundle `ui/dist` embarqué par `routeward-desktop`).
+- **Dépendances système** :
   - **Windows** : Microsoft Edge WebView2 Runtime (inclus dans Windows 10/11) et outils de compilation C++ MSVC / Windows SDK.
   - **Linux** : `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev` et `pkg-config`.
 
-## Etape 1 : Compiler le Bundle Frontend
+## Étape 1 : Compiler le Bundle Frontend
 
-`routeward-desktop` embarque `ui/dist/index.html`, `ui/dist/assets/app.js`, `ui/dist/assets/app.css` ainsi que les ressources de marque de `assets/branding/` (`routeward-glyph.svg`, `routeward-icon.svg`, `routeward-32.rgba`, `routeward-256.rgba`) a la compilation via `include_bytes!`. Sous Windows, `build.rs` incorpore egalement `assets/branding/routeward.ico` dans `routeward.exe` et `routeward-desktop.exe` via `embed-resource`.
+`routeward-desktop` embarque `ui/dist/index.html`, `ui/dist/assets/app.js`, `ui/dist/assets/app.css` ainsi que les ressources de marque de `assets/branding/` (`routeward-glyph.svg`, `routeward-icon.svg`, `routeward-32.rgba`, `routeward-256.rgba`) à la compilation via `include_bytes!`. Sous Windows, `build.rs` incorpore également `assets/branding/routeward.ico` dans `routeward.exe` et `routeward-desktop.exe` via `embed-resource`.
 
-Tous les fichiers generes dans `assets/branding/` (`routeward-16.png` a `routeward-512.png`, `routeward.ico`, `routeward-32.rgba`, `routeward-256.rgba`) sont versionnes dans le depot afin que la compilation standard n'ait pas besoin d'executer le script. Pour les regenerer a partir de `assets/branding/routeward-icon.svg`, executer :
+Tous les fichiers générés dans `assets/branding/` (`routeward-16.png` à `routeward-512.png`, `routeward.ico`, `routeward-32.rgba`, `routeward-256.rgba`) sont versionnés dans le dépôt afin que la compilation standard n'ait pas besoin d'exécuter le script. Pour les régénérer à partir de `assets/branding/routeward-icon.svg`, exécuter :
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\branding\build-icons.ps1
@@ -29,84 +31,84 @@ npm run build
 Set-Location ..
 ```
 
-## Etape 2 : Compiler le Workspace Rust
+## Étape 2 : Compiler le Workspace Rust
 
-Compiler les binaires CLI et bureau depuis la racine du depot :
+Compiler les binaires CLI et bureau depuis la racine du dépôt :
 
 ```powershell
 cargo build --workspace --release
 ```
 
-Binaires generes :
+Binaires générés :
 - Binaire CLI : `target/release/routeward` (ou `routeward.exe` sous Windows)
 - Binaire Bureau : `target/release/routeward-desktop` (ou `routeward-desktop.exe` sous Windows)
 
-## Etape 3 : Telecharger les Binaires WinDivert (Test en VM Windows uniquement)
+## Étape 3 : Télécharger les Binaires WinDivert (Test en VM Windows uniquement)
 
-Les binaires WinDivert ne sont pas versionnes dans Git. Dans la VM Windows de test, executer :
+Les binaires WinDivert ne sont pas versionnés dans Git. Dans la VM Windows de test, exécuter :
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
 ```
 
-Ce script telecharge `WinDivert-2.2.2-A.zip`, verifie son empreinte SHA-256 (`63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15`) et extrait `WinDivert.dll` et `WinDivert64.sys` dans `third_party/windivert/bin/`.
+Ce script télécharge `WinDivert-2.2.2-A.zip`, vérifie son empreinte SHA-256 (`63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15`) et extrait `WinDivert.dll` et `WinDivert64.sys` dans `third_party/windivert/bin/`.
 
-## Etape 4 : Lancement en Deux Etapes (Daemon Privilegie + Interface Bureau / CLI Standard)
+## Étape 4 : Lancement en Deux Étapes (Daemon Privilégié + Interface Bureau / CLI Standard)
 
-RouteWard separe le moteur d'interception privilegie (`routeward daemon`) de l'interface bureau non privilegiee (`routeward-desktop`) et du client CLI (`routeward ctl`). Au demarrage de `routeward daemon`, toute regle de pare-feu Windows (`RouteWard_TransparentRelay_*`) ou table `nftables` Linux (`table ip routeward`) orpheline laissee par un arret brutal precedent est nettoyee automatiquement et journalisee au niveau `INFO`.
+RouteWard sépare le moteur d'interception privilégié (`routeward daemon`) de l'interface bureau non privilégiée (`routeward-desktop`) et du client CLI (`routeward ctl`). Au démarrage de `routeward daemon`, toute règle de pare-feu Windows (`RouteWard_TransparentRelay_*`) ou table `nftables` Linux (`table ip routeward`) orpheline laissée par un arrêt brutal précédent est nettoyée automatiquement et journalisée au niveau `INFO`.
 
-### Lancement en deux etapes sous Linux (groupe `routeward`)
-Sous Linux, le daemon cree `/run/routeward/routeward.sock` avec pour proprietaire `root:routeward` (socket en `0660` dans un dossier en `0750`). Creez le groupe systeme `routeward` et ajoutez-y votre utilisateur courant avant de lancer le daemon :
+### Lancement en deux étapes sous Linux (groupe `routeward`)
+Sous Linux, le daemon crée `/run/routeward/routeward.sock` avec pour propriétaire `root:routeward` (socket en `0660` dans un dossier en `0750`). Créez le groupe système `routeward` et ajoutez-y votre utilisateur courant avant de lancer le daemon :
 
 ```bash
 sudo groupadd -r routeward
 sudo usermod -aG routeward "$USER"
-# Reconnectez votre session (ou executez `newgrp routeward`) pour activer le groupe
+# Reconnectez votre session (ou exécutez `newgrp routeward`) pour activer le groupe
 ```
 
-Lancez le daemon en `root` (etape 1), puis demarrez l'interface bureau ou pilotez le daemon depuis votre compte utilisateur non privilegie (etape 2) :
+Lancez le daemon en `root` (étape 1), puis démarrez l'interface bureau ou pilotez le daemon depuis votre compte utilisateur non privilégié (étape 2) :
 
 ```bash
-# Etape 1 - Terminal 1 (root) :
+# Étape 1 - Terminal 1 (root) :
 sudo ./target/release/routeward daemon
 
-# Etape 2 - Terminal 2 (utilisateur standard membre du groupe 'routeward') :
+# Étape 2 - Terminal 2 (utilisateur standard membre du groupe 'routeward') :
 ./target/release/routeward-desktop
 # Ou via la CLI :
 ./target/release/routeward ctl status
 ./target/release/routeward ctl start
 ./target/release/routeward ctl connections
 ./target/release/routeward ctl upsert-rule --json '{"id":"rule-1","name":"Custom","enabled":true,"priority":5,"processPatterns":["curl"],"domainPatterns":[],"ipCidrs":[],"portRanges":[],"protocol":"tcp","action":{"type":"block"}}'
-# Ou depuis un fichier JSON UTF-8 (recommande sous Windows PowerShell 5.1, qui retire les guillemets doubles internes des arguments passes aux executables natifs) :
+# Ou depuis un fichier JSON UTF-8 (recommandé sous Windows PowerShell 5.1, qui retire les guillemets doubles internes des arguments passés aux exécutables natifs) :
 ./target/release/routeward ctl upsert-rule --json-file ./rule.json
 ./target/release/routeward ctl remove-rule --id rule-1
 ./target/release/routeward ctl stop
 
-# Nettoyage des regles OS orphelines apres un crash (refuse si un daemon est actif, sauf avec --force) :
+# Nettoyage des règles OS orphelines après un crash (refusé si un daemon est actif, sauf avec --force) :
 sudo ./target/release/routeward cleanup
 sudo ./target/release/routeward cleanup --force
 ```
 
-### Lancement en deux etapes sous Windows (Named Pipe)
-Sous Windows, lancez `routeward.exe daemon` dans une console PowerShell en Administrateur (etape 1), puis lancez `routeward-desktop.exe` ou `routeward.exe ctl` dans une session standard non elevee du meme compte utilisateur (etape 2) :
+### Lancement en deux étapes sous Windows (Named Pipe)
+Sous Windows, lancez `routeward.exe daemon` dans une console PowerShell en Administrateur (étape 1), puis lancez `routeward-desktop.exe` ou `routeward.exe ctl` dans une session standard non élevée du même compte utilisateur (étape 2) :
 
 ```powershell
-# Etape 1 - PowerShell en Administrateur :
+# Étape 1 - PowerShell en Administrateur :
 .\target\release\routeward.exe daemon
 
-# Etape 2 - PowerShell standard (meme compte utilisateur, non eleve) :
+# Étape 2 - PowerShell standard (même compte utilisateur, non élevé) :
 .\target\release\routeward-desktop.exe
 ```
 
-Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lance le daemon. Si le daemon est arrete ou non demarre, `routeward-desktop` affiche une banniere persistante de deconnexion et se reconnecte automatiquement des que le daemon demarre.
+Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant uniquement `SYSTEM`, `Administrators` et le SID de l'utilisateur ayant lancé le daemon. Si le daemon est arrêté ou non démarré, `routeward-desktop` affiche une bannière persistante de déconnexion et se reconnecte automatiquement dès que le daemon démarre.
 
-> **Important (Elevation du compte Windows UAC) :** Le daemon doit etre lance par l'utilisateur de l'interface (par elevation UAC de son propre compte). Si l'elevation se fait avec un autre compte administrateur (par exemple via « Executer en tant qu'autre utilisateur » ou un compte admin distinct), la DACL du Named Pipe autorisera le SID de cet autre compte, et l'interface ou la CLI de l'utilisateur courant ne pourra pas se connecter au pipe `\\.\pipe\routeward-daemon`.
+> **Important (Élévation du compte Windows UAC) :** Le daemon doit être lancé par l'utilisateur de l'interface (par élévation UAC de son propre compte). Si l'élévation se fait avec un autre compte administrateur (par exemple via "Exécuter en tant qu'autre utilisateur" ou un compte admin distinct), la DACL du Named Pipe autorisera le SID de cet autre compte, et l'interface ou la CLI de l'utilisateur courant ne pourra pas se connecter au pipe `\\.\pipe\routeward-daemon`.
 
 ### Emplacement des Journaux (Daemon vs Bureau / CLI)
-Les fichiers journaux (`RouteWard_yyyyMMdd.log`) sont ecrits dans des dossiers systeme ou utilisateur fixes, independamment du repertoire courant (`CWD`) :
-- **Daemon privilegie (`routeward daemon`, `routeward run`, `routeward cleanup`)** :
-  - **Windows** : `%ProgramData%\RouteWard\logs` (resolu via `SHGetKnownFolderPath(FOLDERID_ProgramData)`)
+Les fichiers journaux (`RouteWard_yyyyMMdd.log`) sont écrits dans des dossiers système ou utilisateur fixes, indépendamment du répertoire courant (`CWD`) :
+- **Daemon privilégié (`routeward daemon`, `routeward run`, `routeward cleanup`)** :
+  - **Windows** : `%ProgramData%\RouteWard\logs` (résolu via `SHGetKnownFolderPath(FOLDERID_ProgramData)`)
   - **Linux** : `/var/log/routeward`
-- **Pont Bureau et CLI non privilegies (`routeward-desktop`, `routeward ctl`)** :
-  - **Windows** : `%LOCALAPPDATA%\RouteWard\logs` (resolu via `SHGetKnownFolderPath(FOLDERID_LocalAppData)`)
-  - **Linux** : `$XDG_STATE_HOME/routeward/logs` (ou `~/.local/state/routeward/logs` par defaut)
+- **Pont Bureau et CLI non privilégiés (`routeward-desktop`, `routeward ctl`)** :
+  - **Windows** : `%LOCALAPPDATA%\RouteWard\logs` (résolu via `SHGetKnownFolderPath(FOLDERID_LocalAppData)`)
+  - **Linux** : `$XDG_STATE_HOME/routeward/logs` (ou `~/.local/state/routeward/logs` par défaut)

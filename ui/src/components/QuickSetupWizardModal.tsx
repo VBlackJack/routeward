@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import React, { useState } from 'react';
+import React, { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Briefcase,
@@ -26,6 +26,7 @@ import {
   Wand2,
   X
 } from 'lucide-react';
+import { ModalContainer } from './ModalContainer';
 import { SYSTEM_CONSTANTS } from '../config/constants';
 import { generateClientId } from '../services/ipc';
 import {
@@ -62,6 +63,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   onClose
 }) => {
   const { t } = useTranslation();
+  const titleId = useId();
   const [step, setStep] = useState(1);
   const [goal, setGoal] = useState<GoalProfile>('privacy');
   const [customUri, setCustomUri] = useState('');
@@ -127,7 +129,11 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+    <ModalContainer
+      onClose={onClose}
+      labelledBy={titleId}
+      backdropClassName="bg-black/75 p-4 backdrop-blur-sm"
+    >
       <div className="tf-card w-full max-w-xl p-6 shadow-2xl">
         {/* Header */}
         <div className="flex items-start justify-between border-b border-tf-border pb-4">
@@ -137,7 +143,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h2 className="text-base font-bold text-tf-primary">
+                <h2 id={titleId} className="text-base font-bold text-tf-primary">
                   {t('wizard.modal.title')}
                 </h2>
                 <span className="rounded bg-tf-surface-alt px-2 py-0.5 font-mono text-[10px] font-bold text-tf-accent">
@@ -150,7 +156,9 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
+            aria-label={t('app.titlebar.close')}
             className="rounded-tf-sm p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary"
           >
             <X className="h-4 w-4" />
@@ -341,6 +349,6 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
           )}
         </div>
       </div>
-    </div>
+    </ModalContainer>
   );
 };

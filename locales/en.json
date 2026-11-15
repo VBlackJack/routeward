@@ -31,8 +31,7 @@
     },
     "help": {
       "wizard_button": "Quick Setup Wizard",
-      "glossary_button": "Glossary & Help",
-      "what_is_this": "What is this?"
+      "glossary_button": "Glossary & Help"
     },
     "daemon_banner": {
       "disconnected_title": "Privileged RouteWard Daemon Disconnected",
@@ -49,9 +48,7 @@
       },
       "engine": {
         "running": "Interceptor Active",
-        "stopped": "Interceptor Paused",
-        "toggle_start": "Start Engine",
-        "toggle_stop": "Stop Engine"
+        "stopped": "Interceptor Paused"
       },
       "mode": {
         "hybrid": "Hybrid (Fake-IP + Driver/Relay)",
@@ -77,6 +74,7 @@
       }
     },
     "nav": {
+      "tablist_label": "Primary navigation tabs",
       "dashboard": {
         "tab": "Dashboard"
       },
@@ -130,7 +128,9 @@
       "system": {
         "proxy_enabled": "Windows System Proxy enabled on local relay",
         "proxy_disabled": "Windows System Proxy disabled",
-        "process_launched": "Process launched with injected proxy tunnel"
+        "proxy_error": "Failed to update Windows System Proxy",
+        "process_launched": "Process launched with injected proxy tunnel",
+        "process_launch_error": "Failed to launch process via proxy"
       },
       "wizard": {
         "completed": "Configuration applied via Quick Setup Wizard"
@@ -140,6 +140,7 @@
       },
       "profile": {
         "imported": "Profile configuration imported",
+        "import_error": "Invalid profile JSON file",
         "exported": "Profile exported to JSON"
       }
     }
@@ -155,7 +156,6 @@
     "actions": {
       "toggle_engine": "Toggle Interceptor Engine Start / Stop",
       "test_all_proxies": "Probe All Upstream Proxies (Latency & Exit IP)",
-      "simulate_traffic": "Simulate Process Network Connection",
       "flush_dns": "Flush Fake-IP Anti-Leak DNS Cache",
       "toggle_killswitch": "Toggle Strict Proxy Kill-Switch",
       "open_themeforge": "Open ThemeForge Studio",
@@ -232,14 +232,16 @@
         "udp_guard_title": "UDP Leak Guard",
         "udp_guard_desc": "Block unproxied UDP packets when routed to TCP-only proxies",
         "dns_guard_title": "Fake-IP Remote DNS Enforcement",
-        "dns_guard_desc": "Intercept all DNS queries into 198.18.0.0/15 and resolve remotely"
+        "dns_guard_desc": "Intercept all DNS queries into 198.18.0.0/15 and resolve remotely",
+        "killswitch_aria": "Toggle strict proxy kill-switch",
+        "udp_guard_aria": "Toggle UDP leak guard",
+        "dns_guard_aria": "Toggle Fake-IP remote DNS enforcement"
       }
     },
     "system": {
       "status": {
         "title": "Subsystem Diagnostics",
         "os_label": "Operating System",
-        "driver_label": "Interception Backend",
         "relay_tcp_label": "Local SOCKS5/TCP Relay",
         "relay_http_label": "Local HTTP Relay",
         "dns_server_label": "Fake-IP DNS Listener",
@@ -338,7 +340,8 @@
         "title": "Smart Proxy Chains & Failover Groups",
         "subtitle": "Tunnel sequentially (Multi-Hop) or balance/failover across multiple upstream nodes",
         "add": "Create Chain / Group",
-        "hops": "Nodes"
+        "hops": "Nodes",
+        "delete": "Remove Chain"
       }
     },
     "strategy": {
@@ -382,7 +385,6 @@
         "password_unchanged_placeholder": "Unchanged (stored in daemon)",
         "replace_password_action": "Replace Password",
         "cancel_replace_password": "Keep Existing Password",
-        "sni_label": "TLS SNI Hostname",
         "udp_label": "Enable UDP Associate",
         "tls_label": "Enable TLS Transport",
         "submit": "Save Proxy",
@@ -401,6 +403,9 @@
         "strategy_label": "Routing Strategy",
         "select_hop": "Add Proxy Node",
         "sequence_label": "Ordered Proxy Nodes",
+        "move_hop_up": "Move hop earlier",
+        "move_hop_down": "Move hop later",
+        "remove_hop": "Remove hop",
         "submit": "Save Chain",
         "cancel": "Cancel"
       }
@@ -474,7 +479,8 @@
     },
     "table": {
       "enabled": {
-        "header": "On"
+        "header": "On",
+        "toggle_aria": "Toggle rule enabled state"
       },
       "priority": {
         "header": "Priority"
@@ -529,8 +535,7 @@
     "header": {
       "title": "Fake-IP Anti-Leak DNS Engine",
       "subtitle": "Maps domain queries to virtual RFC 2544 IPs (198.18.0.0/15) so applications never leak DNS locally and rules match exact domain names.",
-      "flush_button": "Flush Fake-IP Cache",
-      "allocate_button": "Test Domain Allocation"
+      "flush_button": "Flush Fake-IP Cache"
     },
     "allocate": {
       "placeholder": "Enter domain name (e.g. stealth.torproject.org)",
@@ -576,7 +581,6 @@
         "banner": "Starting RouteWard Engine",
         "loaded_profile": "Loaded profile configuration",
         "listening_socks": "Local SOCKS5 transparent relay listening",
-        "listening_http": "Local HTTP CONNECT relay listening",
         "listening_transparent": "Transparent TCP relay (WinDivert reflect) listening",
         "interception_active": "Packet interception active via backend",
         "duration_limit": "Automatic shutdown scheduled after (seconds)",
@@ -645,6 +649,7 @@
       "accent_label": "Accent Tint",
       "preview_label": "Semantic Token Preview",
       "import_palette": "Load External ThemeForge v1 JSON",
+      "import_error": "Invalid ThemeForge v1 palette JSON",
       "close": "Done"
     },
     "families": {

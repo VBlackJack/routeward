@@ -297,7 +297,7 @@ pub struct UdpAssociationSession {
     pub proxy_name: String,
     pub relay_udp_addr: SocketAddr,
     pub udp_socket: Arc<UdpSocket>,
-    io_lock: tokio::sync::Mutex<()>,
+    recv_lock: tokio::sync::Mutex<()>,
     control_alive: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     last_activity_ms: AtomicU64,
@@ -632,7 +632,7 @@ impl UdpAssociationManager {
             proxy_name: node.name.clone(),
             relay_udp_addr,
             udp_socket: Arc::new(udp_socket),
-            io_lock: tokio::sync::Mutex::new(()),
+            recv_lock: tokio::sync::Mutex::new(()),
             control_alive,
             shutdown_notify,
             last_activity_ms: AtomicU64::new(self.now_ms()),
@@ -653,7 +653,6 @@ impl UdpAssociationManager {
         read_timeout: Duration,
         proto: &ProtocolConstants,
     ) -> RouteWardResult<UdpProxiedDatagramReply> {
-        let _io_guard = session.io_lock.lock().await;
         if !session.is_control_alive() {
             self.sessions.remove(&session.key);
             return Err(RouteWardError::ProtocolHandshake {
@@ -675,6 +674,16 @@ impl UdpAssociationManager {
             .send_to(&wire_pkt, session.relay_udp_addr)
             .await
             .map_err(RouteWardError::Io)?;
+
+        // Serialize only the recv_from wait so concurrent outbound sends never stall on a prior read timeout.
+        let _recv_guard = session.recv_lock.lock().await;
+        if !session.is_control_alive() {
+            self.sessions.remove(&session.key);
+            return Err(RouteWardError::ProtocolHandshake {
+                key: ERR_KEY_HANDSHAKE_FAILED,
+                detail: "SOCKS5 UDP control connection closed".to_string(),
+            });
+        }
 
         let mut recv_buf = vec![0u8; MAX_UDP_DATAGRAM_BYTES];
         let (n, _from_addr) = timeout(read_timeout, session.udp_socket.recv_from(&mut recv_buf))
@@ -1040,7 +1049,7 @@ mod tests {
                 last_activity_ms: AtomicU64::new(now_ms),
                 _udp_port_guard: None,
                 _tcp_port_guard: None,
-                io_lock: tokio::sync::Mutex::new(()),
+                recv_lock: tokio::sync::Mutex::new(()),
             })
         };
 

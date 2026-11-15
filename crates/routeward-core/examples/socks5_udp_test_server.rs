@@ -361,10 +361,14 @@ async fn handle_client(
             let domain_map_worker = domain_map.clone();
 
             let relay_task = tokio::spawn(async move {
-                let Ok(outbound_udp) = UdpSocket::bind("0.0.0.0:0").await else {
+                let Ok(outbound_udp_v4) = UdpSocket::bind("0.0.0.0:0").await else {
                     return;
                 };
-                ProxyConnector::apply_platform_mark_udp(&outbound_udp, 21079);
+                ProxyConnector::apply_platform_mark_udp(&outbound_udp_v4, 21079);
+                let outbound_udp_v6 = UdpSocket::bind("[::]:0").await.ok();
+                if let Some(ref v6) = outbound_udp_v6 {
+                    ProxyConnector::apply_platform_mark_udp(v6, 21079);
+                }
                 let mut buf = vec![0u8; UDP_BUFFER_SIZE];
                 let mut reply_buf = vec![0u8; UDP_BUFFER_SIZE];
                 while let Ok((n, client_peer)) = udp_relay_worker.recv_from(&mut buf).await {
@@ -397,12 +401,19 @@ async fn handle_client(
                     let Some(dst_addr) = resolved_dst else {
                         continue;
                     };
-                    if outbound_udp.send_to(payload, dst_addr).await.is_err() {
+                    let active_outbound = match dst_addr {
+                        SocketAddr::V4(_) => &outbound_udp_v4,
+                        SocketAddr::V6(_) => match outbound_udp_v6.as_ref() {
+                            Some(v6) => v6,
+                            None => continue,
+                        },
+                    };
+                    if active_outbound.send_to(payload, dst_addr).await.is_err() {
                         continue;
                     }
                     if let Ok(Ok((resp_len, resp_from))) = tokio::time::timeout(
                         Duration::from_millis(UDP_RELAY_RECV_TIMEOUT_MS),
-                        outbound_udp.recv_from(&mut reply_buf),
+                        active_outbound.recv_from(&mut reply_buf),
                     )
                     .await
                     {

@@ -1,11 +1,13 @@
+[Français](fr/maintenance.md) | English
+
 # Maintenance Guide
 
 ## Configuration Files (`configs/`)
 
 All operational constants, default profiles, and color palettes live in `configs/`:
 
-- `configs/system_constants.json`: Defines default local ports (`10808`, `10809`, `10810`, `10853`), Linux `nftables` settings (`linuxFwmark`: `21079` / `0x5257`, `linuxNftBinary`: `"nft"`, `linuxNftTableName`: `"routeward"`, `linuxNftChainName`: `"output"`), connection timeouts, Fake-IP subnet (`198.18.0.0/15`), log directory (`logs`), log application prefix (`RouteWard`), telemetry broadcast capacity (`eventBroadcastCapacity`: `256`), default active profile path (`defaultProfilePath`: `"configs/active_profile.json"`), and built-in rule presets.
-- `configs/default_profile.json`: Defines the initial routing profile, proxy nodes, chains, rules, and security policy (`enableLogging`, `blockUdpQuic`, `forceRemoteDns`, `unknownProcessAction`).
+- `configs/system_constants.json`: Defines default local ports (`10808`, `10809`, `10810`, `10853`, `10854`), Linux `nftables` / `TPROXY` settings (`linuxFwmark`: `21079` / `0x5257`, `linuxTproxyFwmark`: `21080`, `linuxTproxyRouteTable`: `100`, `linuxTproxyRulePriority`: `10810`, `linuxNftBinary`: `"nft"`, `linuxNftTableName`: `"routeward"`, `linuxNftChainName`: `"output"`), connection timeouts (`pendingSynTimeoutMs`: `40`, `pendingUdpTimeoutMs`: `40`), Fake-IP subnet (`198.18.0.0/15`), log paths (`telemetry.windowsDaemonLogDir`, `telemetry.linuxDaemonLogDir`, `telemetry.windowsUserLogDir`, `telemetry.linuxUserLogDir`), log application prefix (`RouteWard`), telemetry broadcast capacity (`eventBroadcastCapacity`: `256`), protected active profile paths (`ipc.windowsProfilePath`: `"%ProgramData%\\RouteWard\\active_profile.json"`, `ipc.linuxProfilePath`: `"/etc/routeward/active_profile.json"`), and built-in rule presets.
+- `configs/default_profile.json`: Defines the initial routing profile, proxy nodes, chains, rules, `dnsConfig` (`enableFakeIp`, `remoteDnsResolution`, `fakeIpCidr`, `upstreamDns`, `bypassDomains`), and `securityPolicy` (`killSwitchEnabled`, `blockUdpOnTcpOnlyProxy`, `blockQuicUdp443`, `strictDnsNoLocalFallback`, `blockEncryptedDnsBypass`, `unknownProcessAction`).
 - `configs/themeforge_palettes.json`: Contains the 16 canonical ThemeForge Oklab palettes (`Dracula`, `Drakul`, `Striga`, `Cinder`, `Bracken`, `Tarn`, `Mortis`, `Slate`, `Voivode`, `Carmilla`, `Whitby`, `Vesper`, `Parchment`, `Folio`, `Wormwood`, `Sconce`), `HighContrast`, and 9 accent tints.
 
 Because `routeward-core` embeds these JSON files via `include_str!` for zero-dependency startup, recompile the Rust workspace after modifying any file under `configs/`.
@@ -18,10 +20,10 @@ Because `routeward-core` embeds these JSON files via `include_str!` for zero-dep
 
 ## Logging (`logs/`)
 
-- `FileLogger` (`crates/routeward-core/src/logger/mod.rs`) writes daily rolling log files to `logs/RouteWard_<yyyyMMdd>.log`.
+- `FileLogger` (`crates/routeward-core/src/logger/mod.rs`) writes daily rolling log files (`RouteWard_<yyyyMMdd>.log`) to OS-specific daemon/user log directories (`%ProgramData%\RouteWard\logs` and `%LOCALAPPDATA%\RouteWard\logs` on Windows; `/var/log/routeward` and `$XDG_STATE_HOME/routeward/logs` on Linux).
 - Format: `[yyyy-MM-dd HH:mm:ss] [LEVEL] [Component] message` (local timezone).
 - Logging is enabled by default (`enableLogging: true` in `ProfileConfig`) and can be toggled at runtime without restarting the application.
-- The `logs/` directory is ignored by Git.
+- Local `logs/` directories in the repository are ignored by Git.
 
 ## Quality Checks
 
@@ -31,4 +33,8 @@ Run the full test and lint suite regularly:
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+Set-Location ui
+npm test
+npm run build
+Set-Location ..
 ```

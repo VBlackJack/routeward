@@ -18,14 +18,20 @@ use crate::config::{RoutingRule, RuleAction, TransportProtocol};
 use crate::dns::FakeIpEngine;
 use crate::process::ProcessResolver;
 use ipnet::IpNet;
+use parking_lot::RwLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 const DEFAULT_FALLBACK_RULE_ID: &str = "default-policy";
 const DEFAULT_FALLBACK_RULE_NAME: &str = "Default Profile Policy";
 const REGEX_PREFIX: &str = "regex:";
+const MAX_CACHED_REGEX_PATTERNS: usize = 2048;
+
+static REGEX_CACHE: OnceLock<RwLock<HashMap<String, Option<Regex>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -185,12 +191,27 @@ impl RuleEngine {
         true
     }
 
+    fn get_or_compile_regex(raw_regex: &str) -> Option<Regex> {
+        let cache = REGEX_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+        if let Some(cached) = cache.read().get(raw_regex) {
+            return cached.clone();
+        }
+        let compiled = Regex::new(raw_regex).ok();
+        let mut guard = cache.write();
+        if guard.len() >= MAX_CACHED_REGEX_PATTERNS {
+            guard.clear();
+        }
+        guard.insert(raw_regex.to_string(), compiled.clone());
+        compiled
+    }
+
     pub fn domain_match(pattern: &str, domain: &str) -> bool {
         let pat = pattern.trim().to_lowercase();
         if let Some(raw_regex) = pat.strip_prefix(REGEX_PREFIX) {
-            if let Ok(re) = Regex::new(raw_regex) {
+            if let Some(re) = Self::get_or_compile_regex(raw_regex) {
                 return re.is_match(domain);
             }
+            return false;
         }
         if let Some(suffix) = pat.strip_prefix("*.") {
             if domain == suffix || domain.ends_with(&format!(".{suffix}")) {
@@ -267,5 +288,19 @@ mod tests {
                 target_id: "proxy-socks5-primary".to_string()
             }
         );
+    }
+
+    #[test]
+    fn caches_regex_patterns_and_handles_invalid_regex_safely() {
+        assert!(RuleEngine::domain_match(
+            "regex:^api-[0-9]+\\.example\\.com$",
+            "api-42.example.com"
+        ));
+        assert!(!RuleEngine::domain_match(
+            "regex:^api-[0-9]+\\.example\\.com$",
+            "web.example.com"
+        ));
+        // Invalid regex must safely return false instead of panicking
+        assert!(!RuleEngine::domain_match("regex:[unclosed", "example.com"));
     }
 }

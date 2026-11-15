@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-import React from 'react';
+import React, { useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { BookOpen, Sparkles, Terminal, X } from 'lucide-react';
+import { ModalContainer } from './ModalContainer';
 
 interface GlossaryModalProps {
   onClose: () => void;
@@ -33,9 +34,14 @@ const GLOSSARY_KEYS = [
 
 export const GlossaryModal: React.FC<GlossaryModalProps> = ({ onClose }) => {
   const { t } = useTranslation();
+  const titleId = useId();
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+    <ModalContainer
+      onClose={onClose}
+      labelledBy={titleId}
+      backdropClassName="bg-black/75 p-4 backdrop-blur-sm"
+    >
       <div className="tf-card flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden p-6 shadow-2xl">
         <div className="flex items-start justify-between border-b border-tf-border pb-4">
           <div className="flex items-center gap-3">
@@ -43,7 +49,7 @@ export const GlossaryModal: React.FC<GlossaryModalProps> = ({ onClose }) => {
               <BookOpen className="h-5 w-5" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-tf-primary">
+              <h2 id={titleId} className="text-base font-bold text-tf-primary">
                 {t('glossary.modal.title')}
               </h2>
               <p className="text-xs text-tf-secondary">
@@ -52,7 +58,9 @@ export const GlossaryModal: React.FC<GlossaryModalProps> = ({ onClose }) => {
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
+            aria-label={t('glossary.modal.close')}
             className="rounded-tf-sm p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary"
           >
             <X className="h-4 w-4" />
@@ -91,6 +99,7 @@ export const GlossaryModal: React.FC<GlossaryModalProps> = ({ onClose }) => {
 
         <div className="mt-4 flex justify-end border-t border-tf-border pt-3">
           <button
+            type="button"
             onClick={onClose}
             className="tf-btn-accent px-5 py-2 text-xs font-bold"
           >
@@ -98,6 +107,6 @@ export const GlossaryModal: React.FC<GlossaryModalProps> = ({ onClose }) => {
           </button>
         </div>
       </div>
-    </div>
+    </ModalContainer>
   );
 };

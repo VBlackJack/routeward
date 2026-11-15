@@ -266,7 +266,7 @@ export interface ProxyHealthReport {
 export interface ToastNotification {
   id: string;
   message: string;
-  severity: 'success' | 'info' | 'warning';
+  severity: 'success' | 'info' | 'warning' | 'error';
 }
 
 export interface DaemonFullState {

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 
@@ -22,9 +22,13 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      '@configs': path.resolve(__dirname, '../configs'),
-      '@locales': path.resolve(__dirname, '../locales')
+      '@configs': path.resolve(import.meta.dirname, '../configs'),
+      '@locales': path.resolve(import.meta.dirname, '../locales')
     }
+  },
+  test: {
+    environment: 'jsdom',
+    globals: true
   },
   build: {
     rollupOptions: {

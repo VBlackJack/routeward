@@ -577,16 +577,27 @@ pub fn parse_resolv_conf_suffixes(content: &str) -> Vec<String> {
     suffixes
 }
 
-/// Extracts non-loopback IPv4 nameservers from a `resolv.conf` file content.
-pub fn parse_resolv_conf_nameservers(content: &str) -> Vec<Ipv4Addr> {
+/// Extracts non-loopback IPv4 and IPv6 nameservers from a `resolv.conf` file content.
+pub fn parse_resolv_conf_nameservers(content: &str) -> Vec<IpAddr> {
     let mut servers = Vec::new();
     for line in content.lines() {
         let line_no_comment = line.split(['#', ';']).next().unwrap_or("").trim();
         let mut tokens = line_no_comment.split_whitespace();
         if let (Some(dir), Some(addr_str)) = (tokens.next(), tokens.next()) {
             if dir.eq_ignore_ascii_case("nameserver") {
-                if let Ok(ip) = addr_str.parse::<Ipv4Addr>() {
-                    if !ip.is_loopback() && !ip.is_unspecified() && !servers.contains(&ip) {
+                if let Ok(ip) = addr_str.parse::<IpAddr>() {
+                    let usable = match ip {
+                        IpAddr::V4(v4) => {
+                            !v4.is_loopback() && !v4.is_unspecified() && !v4.is_multicast()
+                        }
+                        IpAddr::V6(v6) => {
+                            !v6.is_loopback()
+                                && !v6.is_unspecified()
+                                && !v6.is_multicast()
+                                && !v6.is_unicast_link_local()
+                        }
+                    };
+                    if usable && !servers.contains(&ip) {
                         servers.push(ip);
                     }
                 }
@@ -596,12 +607,12 @@ pub fn parse_resolv_conf_nameservers(content: &str) -> Vec<Ipv4Addr> {
     servers
 }
 
-/// Resolves Linux non-loopback IPv4 nameservers from `/etc/resolv.conf`, falling back to
+/// Resolves Linux non-loopback nameservers from `/etc/resolv.conf`, falling back to
 /// `/run/systemd/resolve/resolv.conf` when `/etc/resolv.conf` only contains the `127.0.0.53` stub.
 pub fn resolve_linux_resolv_conf_nameservers(
     etc_resolv: Option<&str>,
     systemd_resolv: Option<&str>,
-) -> Vec<Ipv4Addr> {
+) -> Vec<IpAddr> {
     if let Some(etc_content) = etc_resolv {
         let primary = parse_resolv_conf_nameservers(etc_content);
         if !primary.is_empty() {
@@ -614,7 +625,7 @@ pub fn resolve_linux_resolv_conf_nameservers(
     Vec::new()
 }
 
-/// Detects the active system IPv4 DNS resolvers:
+/// Detects the active system IPv4/IPv6 DNS resolvers:
 /// - On Windows: queries active network adapters via `GetAdaptersAddresses` (`Win32_NetworkManagement_IpHelper`).
 /// - On Linux: reads `/etc/resolv.conf` and falls back to `/run/systemd/resolve/resolv.conf` if `/etc/resolv.conf` only contains `127.0.0.53`.
 pub fn detect_system_dns_resolvers(constants: &DnsConstants) -> Vec<SocketAddr> {
@@ -635,9 +646,9 @@ pub fn detect_system_dns_resolvers(constants: &DnsConstants) -> Vec<SocketAddr> 
                 if !sa.ip().is_loopback() && !sa.ip().is_unspecified() && !out.contains(&sa) {
                     out.push(sa);
                 }
-            } else if let Ok(ip) = tok.parse::<Ipv4Addr>() {
+            } else if let Ok(ip) = tok.parse::<IpAddr>() {
                 if !ip.is_loopback() && !ip.is_unspecified() {
-                    let sa = SocketAddr::new(IpAddr::V4(ip), dns_port);
+                    let sa = SocketAddr::new(ip, dns_port);
                     if !out.contains(&sa) {
                         out.push(sa);
                     }
@@ -652,7 +663,7 @@ pub fn detect_system_dns_resolvers(constants: &DnsConstants) -> Vec<SocketAddr> 
     #[cfg(windows)]
     {
         for ip in query_windows_adapter_dns_servers() {
-            let sa = SocketAddr::new(IpAddr::V4(ip), dns_port);
+            let sa = SocketAddr::new(ip, dns_port);
             if !out.contains(&sa) {
                 out.push(sa);
             }
@@ -668,7 +679,7 @@ pub fn detect_system_dns_resolvers(constants: &DnsConstants) -> Vec<SocketAddr> 
             etc_content.as_deref(),
             systemd_content.as_deref(),
         ) {
-            let sa = SocketAddr::new(IpAddr::V4(ip), dns_port);
+            let sa = SocketAddr::new(ip, dns_port);
             if !out.contains(&sa) {
                 out.push(sa);
             }
@@ -679,13 +690,16 @@ pub fn detect_system_dns_resolvers(constants: &DnsConstants) -> Vec<SocketAddr> 
 }
 
 #[cfg(windows)]
-fn query_windows_adapter_dns_servers() -> Vec<Ipv4Addr> {
+fn query_windows_adapter_dns_servers() -> Vec<IpAddr> {
+    use std::net::Ipv6Addr;
     use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_FRIENDLY_NAME,
         GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
     };
-    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+    };
 
     const IF_OPER_STATUS_UP: i32 = 1;
     const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
@@ -740,8 +754,29 @@ fn query_windows_adapter_dns_servers() -> Vec<Ipv4Addr> {
                         let sin = &*(sa_ptr as *const SOCKADDR_IN);
                         let raw_ip = u32::from_be(sin.sin_addr.S_un.S_addr);
                         let ip = Ipv4Addr::from(raw_ip);
-                        if !ip.is_loopback() && !ip.is_unspecified() && !servers.contains(&ip) {
-                            servers.push(ip);
+                        if !ip.is_loopback() && !ip.is_unspecified() {
+                            let addr = IpAddr::V4(ip);
+                            if !servers.contains(&addr) {
+                                servers.push(addr);
+                            }
+                        }
+                    } else if !sa_ptr.is_null()
+                        && sa_len >= std::mem::size_of::<SOCKADDR_IN6>()
+                        && (*sa_ptr).sa_family == AF_INET6
+                    {
+                        let sin6 = &*(sa_ptr as *const SOCKADDR_IN6);
+                        let ip = Ipv6Addr::from(sin6.sin6_addr.u.Byte);
+                        let is_deprecated_site_local = (ip.segments()[0] & 0xffc0) == 0xfec0;
+                        if !ip.is_loopback()
+                            && !ip.is_unspecified()
+                            && !ip.is_multicast()
+                            && !ip.is_unicast_link_local()
+                            && !is_deprecated_site_local
+                        {
+                            let addr = IpAddr::V6(ip);
+                            if !servers.contains(&addr) {
+                                servers.push(addr);
+                            }
                         }
                     }
                     dns_ptr = dns_entry.Next;
@@ -935,25 +970,32 @@ nameserver 10.200.1.1
             ]
         );
         let nameservers = parse_resolv_conf_nameservers(resolv_sample);
-        assert_eq!(nameservers, vec![Ipv4Addr::new(10, 200, 1, 1)]);
+        assert_eq!(nameservers, vec![IpAddr::V4(Ipv4Addr::new(10, 200, 1, 1))]);
     }
 
     #[test]
     fn linux_resolv_conf_falls_back_to_systemd_resolved_when_only_stub_present() {
-        let stub_only_etc = "nameserver 127.0.0.53\noptions edns0 trust-ad\n";
-        let systemd_real = "nameserver 10.42.0.10\nnameserver 10.42.0.11\n";
+        let stub_only_etc = "nameserver 127.0.0.53\nnameserver ::1\noptions edns0 trust-ad\n";
+        let systemd_real =
+            "nameserver 10.42.0.10\nnameserver 2001:4860:4860::8888\nnameserver fe80::1\n";
 
         let resolved =
             resolve_linux_resolv_conf_nameservers(Some(stub_only_etc), Some(systemd_real));
         assert_eq!(
             resolved,
-            vec![Ipv4Addr::new(10, 42, 0, 10), Ipv4Addr::new(10, 42, 0, 11)]
+            vec![
+                IpAddr::V4(Ipv4Addr::new(10, 42, 0, 10)),
+                IpAddr::V6("2001:4860:4860::8888".parse().unwrap()),
+            ]
         );
 
         let direct_etc = "nameserver 192.168.50.1\n";
         let resolved_direct =
             resolve_linux_resolv_conf_nameservers(Some(direct_etc), Some(systemd_real));
-        assert_eq!(resolved_direct, vec![Ipv4Addr::new(192, 168, 50, 1)]);
+        assert_eq!(
+            resolved_direct,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 50, 1))]
+        );
     }
 
     #[test]

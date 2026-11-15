@@ -18,8 +18,7 @@
 
 use routeward_core::ipc::generate_ephemeral_token;
 use routeward_desktop_lib::{
-    create_desktop_bridge, extract_json_body, handle_api_route, http_status_line,
-    stream_sse_events, validate_loopback_http_request, DesktopWindowCommand, HTTP_REQ_BUFFER_BYTES,
+    create_desktop_bridge, serve_loopback_http_connection, DesktopWindowCommand,
 };
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
@@ -27,7 +26,6 @@ use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::{Icon, Theme, WindowBuilder};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use wry::WebViewBuilder;
 
@@ -85,83 +83,36 @@ fn spawn_embedded_ui_server(
             let listener = TcpListener::from_std(std_listener).expect("Async listener");
             let token_arc = Arc::new(ephemeral_token);
 
-            while let Ok((mut stream, _)) = listener.accept().await {
+            while let Ok((stream, _)) = listener.accept().await {
                 let bridge_ref = Arc::clone(&bridge);
                 let proxy_ref = event_proxy.clone();
                 let token_ref = Arc::clone(&token_arc);
 
                 tokio::spawn(async move {
-                    let _ = stream.set_nodelay(true);
-                    let mut buf = vec![0u8; HTTP_REQ_BUFFER_BYTES];
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    if n == 0 {
-                        return;
-                    }
-                    let req = String::from_utf8_lossy(&buf[..n]);
-
-                    let path = match validate_loopback_http_request(&req, bound_port, &token_ref) {
-                        Ok(valid_path) => valid_path,
-                        Err(rejection) => {
-                            let status = rejection.status_line();
-                            let body = b"{\"error\":\"forbidden\"}";
-                            let resp = format!(
-                                "{status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-                                body.len()
-                            );
-                            let _ = stream.write_all(resp.as_bytes()).await;
-                            let _ = stream.write_all(body).await;
-                            let _ = stream.flush().await;
-                            let _ = stream.shutdown().await;
-                            return;
-                        }
-                    };
-
-                    if path.starts_with("/api/events") {
-                        stream_sse_events(stream, bound_port, &bridge_ref).await;
-                        return;
-                    }
-
-                    let body_str = extract_json_body(&req);
-                    let allowed_origin = format!("http://127.0.0.1:{bound_port}");
                     let win_cb = |cmd: DesktopWindowCommand| {
                         let _ = proxy_ref.send_event(cmd);
                     };
-
-                    if let Some((status_code, content_type, payload)) =
-                        handle_api_route(&path, body_str, &bridge_ref, Some(&win_cb)).await
-                    {
-                        let status = http_status_line(status_code);
-                        let header = format!(
-                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: {allowed_origin}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-                            payload.len()
-                        );
-                        let _ = stream.write_all(header.as_bytes()).await;
-                        let _ = stream.write_all(&payload).await;
-                        let _ = stream.flush().await;
-                        let _ = stream.shutdown().await;
-                        return;
-                    }
-
-                    let (content_type, body) = if path.starts_with("/assets/app.js") {
-                        ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
-                    } else if path.starts_with("/assets/app.css") {
-                        ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
-                    } else if path.starts_with("/routeward-glyph.svg") {
-                        ("image/svg+xml", EMBEDDED_GLYPH_SVG)
-                    } else if path.starts_with("/routeward-icon.svg") {
-                        ("image/svg+xml", EMBEDDED_ICON_SVG)
-                    } else {
-                        ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
-                    };
-
-                    let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(header.as_bytes()).await;
-                    let _ = stream.write_all(body).await;
-                    let _ = stream.flush().await;
-                    let _ = stream.shutdown().await;
+                    serve_loopback_http_connection(
+                        stream,
+                        bound_port,
+                        &token_ref,
+                        &bridge_ref,
+                        Some(&win_cb),
+                        Some(|path: &str| {
+                            if path.starts_with("/assets/app.js") {
+                                ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
+                            } else if path.starts_with("/assets/app.css") {
+                                ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
+                            } else if path.starts_with("/routeward-glyph.svg") {
+                                ("image/svg+xml", EMBEDDED_GLYPH_SVG)
+                            } else if path.starts_with("/routeward-icon.svg") {
+                                ("image/svg+xml", EMBEDDED_ICON_SVG)
+                            } else {
+                                ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
+                            }
+                        }),
+                    )
+                    .await;
                 });
             }
         });

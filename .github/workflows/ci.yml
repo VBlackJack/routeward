@@ -1,0 +1,124 @@
+# Copyright 2026 Julien Bombled
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  frontend:
+    name: UI Build, Tests, and Audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --audit-level=high
+      - name: Upload built UI dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          retention-days: 1
+
+  rust-linux:
+    name: Rust Check, Clippy, and Tests (Linux)
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download built UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  rust-windows:
+    name: Rust Check, Clippy, and Tests (Windows)
+    needs: frontend
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download built UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  rust-audit:
+    name: Rust Security Audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  linux-integration:
+    name: Linux Netfilter & Dual-Stack Integration (Docker)
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download built UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+      - name: Load kernel modules for nftables and TPROXY
+        run: |
+          sudo modprobe nf_tables nf_nat nf_conntrack xt_TPROXY ip6_tables || true
+      - name: Build Linux integration test image
+        run: docker build -f tests/linux/Dockerfile -t routeward-linux-test .
+      - name: Run Linux container integration suite with IPv6 enabled
+        run: |
+          docker run --rm --privileged \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv6.conf.default.disable_ipv6=0 \
+            routeward-linux-test

@@ -231,6 +231,20 @@ def run_http_server() -> None:
         threading.Thread(target=handle_http_client, args=(conn,), daemon=True).start()
 
 
+def run_http_v6_server() -> None:
+    try:
+        srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        srv.bind(("::", HTTP_PORT))
+        srv.listen(64)
+    except OSError:
+        return
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle_http_client, args=(conn,), daemon=True).start()
+
+
 def handle_https_443_client(conn: socket.socket) -> None:
     try:
         raw = conn.recv(4096)
@@ -327,6 +341,9 @@ def handle_socks5_client(client: socket.socket) -> None:
         elif atyp == 3:
             dlen = client.recv(1)[0]
             dst_host = client.recv(dlen).decode("utf-8")
+        elif atyp == 4:
+            raw_ip = client.recv(16)
+            dst_host = socket.inet_ntop(socket.AF_INET6, raw_ip)
         else:
             client.close()
             return
@@ -337,14 +354,24 @@ def handle_socks5_client(client: socket.socket) -> None:
             f.write(f"CONNECT {dst_host}:{dst_port}\n")
 
         connect_host = dst_host
+        is_ipv6_target = False
         try:
             socket.inet_aton(dst_host)
         except OSError:
-            connect_host = DNS_ANSWER_IP
+            try:
+                socket.inet_pton(socket.AF_INET6, dst_host)
+                is_ipv6_target = True
+            except OSError:
+                connect_host = DNS_ANSWER_IP
 
-        upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        upstream.setsockopt(socket.SOL_SOCKET, SO_MARK_OPTION, ROUTEWARD_FWMARK)
-        upstream.connect((connect_host, dst_port))
+        if is_ipv6_target:
+            upstream = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            upstream.setsockopt(socket.SOL_SOCKET, SO_MARK_OPTION, ROUTEWARD_FWMARK)
+            upstream.connect((connect_host, dst_port))
+        else:
+            upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            upstream.setsockopt(socket.SOL_SOCKET, SO_MARK_OPTION, ROUTEWARD_FWMARK)
+            upstream.connect((connect_host, dst_port))
 
         reply = b"\x05\x00\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", SOCKS_PORT)
         client.sendall(reply)
@@ -510,6 +537,48 @@ def run_udp_direct_echo_server() -> None:
             pass
 
 
+def run_udp_direct_echo_v6_server() -> None:
+    try:
+        srv = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        srv.setsockopt(socket.SOL_SOCKET, SO_MARK_OPTION, ROUTEWARD_FWMARK)
+        srv.bind(("::", UDP_DIRECT_PORT))
+    except OSError:
+        return
+    while True:
+        try:
+            data, addr = srv.recvfrom(4096)
+            body = data.decode("utf-8", errors="replace")
+            with open(UDP_DIRECT_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"UDP_DIRECT_V6 [{addr[0]}]:{addr[1]} {body}\n")
+            srv.sendto(("DIRECT_ECHO_OK:" + body).encode("utf-8"), addr)
+        except Exception:
+            pass
+
+
+def perform_transparent_udp6_send_cli(
+    target_ip: str, target_port: int, payload_str: str
+) -> int:
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    sock.settimeout(2.5)
+    sock.sendto(payload_str.encode("utf-8"), (target_ip, target_port))
+    try:
+        resp, from_addr = sock.recvfrom(4096)
+    except socket.timeout:
+        print("TRANSPARENT_UDP6_TIMEOUT")
+        sock.close()
+        return 2
+    except OSError as exc:
+        print(f"TRANSPARENT_UDP6_ERR {type(exc).__name__}:{exc.errno}")
+        sock.close()
+        return 3
+    sock.close()
+    body = resp.decode("utf-8", errors="replace")
+    print(f"TRANSPARENT_UDP6_OK FROM=[{from_addr[0]}]:{from_addr[1]} BODY={body}")
+    return 0
+
+
 def perform_transparent_udp_send_cli(
     target_ip: str, target_port: int, payload_str: str
 ) -> int:
@@ -589,6 +658,13 @@ if __name__ == "__main__":
             )
         )
 
+    if len(sys.argv) >= 5 and sys.argv[1] == "--transparent-udp6-send":
+        sys.exit(
+            perform_transparent_udp6_send_cli(
+                sys.argv[2], int(sys.argv[3]), sys.argv[4]
+            )
+        )
+
     if len(sys.argv) >= 7 and sys.argv[1] == "--transparent-udp-dual-send":
         sys.exit(
             perform_transparent_udp_dual_send_cli(
@@ -603,6 +679,8 @@ if __name__ == "__main__":
     http_only = "--http-only" in sys.argv
     t_http = threading.Thread(target=run_http_server, daemon=True)
     t_http.start()
+    t_http_v6 = threading.Thread(target=run_http_v6_server, daemon=True)
+    t_http_v6.start()
     t_https = threading.Thread(target=run_https_443_server, daemon=True)
     t_https.start()
     t_udp_443 = threading.Thread(target=run_udp_443_server, daemon=True)
@@ -611,6 +689,8 @@ if __name__ == "__main__":
     t_llmnr.start()
     t_udp_direct = threading.Thread(target=run_udp_direct_echo_server, daemon=True)
     t_udp_direct.start()
+    t_udp_direct_v6 = threading.Thread(target=run_udp_direct_echo_v6_server, daemon=True)
+    t_udp_direct_v6.start()
     t_dns_udp = threading.Thread(target=run_dns_udp_server, daemon=True)
     t_dns_udp.start()
     t_dns_tcp = threading.Thread(target=run_dns_tcp_server, daemon=True)

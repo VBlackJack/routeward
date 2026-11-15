@@ -76,9 +76,9 @@ impl ProxyChecker {
         let udp_supported = if node.udp_enabled && node.protocol == ProxyProtocol::Socks5 {
             Self::probe_socks5_udp(node, constants)
                 .await
-                .unwrap_or(node.udp_enabled)
+                .unwrap_or(false)
         } else {
-            node.udp_enabled
+            false
         };
 
         ProxyHealthReport {
@@ -161,5 +161,52 @@ impl ProxyChecker {
         .ok()?;
 
         Some(assoc.is_ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ProxyNode, ProxyProtocol, SystemConstants};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn reports_udp_unsupported_when_probe_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral listener");
+        let port = listener.local_addr().unwrap().port();
+        let server_task = tokio::spawn(async move {
+            // Accept TCP health connection and close immediately, then reject/close UDP probe
+            for _ in 0..2 {
+                if let Ok((stream, _)) = listener.accept().await {
+                    drop(stream);
+                }
+            }
+        });
+
+        let constants = SystemConstants::load_embedded().unwrap();
+        let node = ProxyNode {
+            id: "udp-probe-fail".to_string(),
+            name: "UDP Probe Fail".to_string(),
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".to_string(),
+            port,
+            auth: None,
+            tls: false,
+            sni: None,
+            udp_enabled: true,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        };
+
+        let report = ProxyChecker::test_proxy(&node, &constants).await;
+        assert!(report.reachable);
+        assert!(
+            !report.udp_supported,
+            "udp_supported must be false when probe_socks5_udp fails"
+        );
+        server_task.abort();
     }
 }

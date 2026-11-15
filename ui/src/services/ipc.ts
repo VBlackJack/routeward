@@ -31,7 +31,6 @@ import {
   ProxyChain,
   ProxyHealthReport,
   ProxyNode,
-  ProxyProtocol,
   RoutingRule,
   RuleEvaluationResult,
   SecurityPolicyConfig,
@@ -40,16 +39,33 @@ import {
   TelemetrySnapshot,
   TrackedConnection
 } from '../types/routeward';
+import { ParsedSseFrame, parseSseChunk, runRealtimeSseLoop } from './sse';
+import {
+  formatProxyUri as formatProxyUriHelper,
+  generateClientId,
+  parseSingleProxyUri as parseSingleProxyUriHelper,
+  sanitizeProxyNodeForWrite
+} from './uri';
+
+export {
+  formatProxyUriHelper as formatProxyUri,
+  generateClientId,
+  parseSingleProxyUriHelper as parseSingleProxyUri,
+  parseSseChunk,
+  sanitizeProxyNodeForWrite,
+  type ParsedSseFrame
+};
 
 const PRIORITY_STEP = 5;
-let idSequenceCounter = 0;
 
-export function generateClientId(prefix: string): string {
-  idSequenceCounter += 1;
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return `${prefix}-${crypto.randomUUID()}`;
+export class HttpResponseError extends Error {
+  public readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'HttpResponseError';
+    this.status = status;
   }
-  return `${prefix}-${Date.now()}-${idSequenceCounter}`;
 }
 
 export function getEphemeralToken(): string {
@@ -67,73 +83,6 @@ export function buildAuthHeaders(
   return {
     [UI_CONFIG.TOKEN_HEADER]: token,
     ...(extraHeaders || {})
-  };
-}
-
-export interface ParsedSseFrame {
-  event: string;
-  data: string;
-}
-
-export function parseSseChunk(buffer: string): {
-  events: ParsedSseFrame[];
-  remainder: string;
-} {
-  const normalized = buffer.replace(/\r\n/g, '\n');
-  const frames = normalized.split('\n\n');
-  const remainder = frames.pop() ?? '';
-  const events: ParsedSseFrame[] = [];
-
-  for (const rawFrame of frames) {
-    const lines = rawFrame.split('\n');
-    let eventName = 'message';
-    const dataLines: string[] = [];
-
-    for (const line of lines) {
-      if (!line || line.startsWith(':')) {
-        continue;
-      }
-      if (line.startsWith('event:')) {
-        eventName = line.slice('event:'.length).trim();
-      } else if (line.startsWith('data:')) {
-        dataLines.push(line.slice('data:'.length).trim());
-      }
-    }
-
-    if (dataLines.length > 0) {
-      events.push({
-        event: eventName,
-        data: dataLines.join('\n')
-      });
-    }
-  }
-
-  return { events, remainder };
-}
-
-export function sanitizeProxyNodeForWrite(node: ProxyNode): ProxyNode {
-  if (!node.auth) {
-    return { ...node, auth: null };
-  }
-  const cleanUser = node.auth.username.trim();
-  const rawPass = node.auth.password;
-  const hasNewPassword = typeof rawPass === 'string' && rawPass.length > 0;
-
-  if (!cleanUser && !hasNewPassword && !node.auth.hasPassword) {
-    return { ...node, auth: null };
-  }
-
-  const sanitizedAuth: NonNullable<ProxyNode['auth']> = {
-    username: cleanUser,
-    hasPassword: hasNewPassword ? true : Boolean(node.auth.hasPassword)
-  };
-  if (hasNewPassword) {
-    sanitizedAuth.password = rawPass;
-  }
-
-  return {
-    ...node,
-    auth: sanitizedAuth
   };
 }
 
@@ -365,6 +314,12 @@ export class RouteWardClientService {
     );
   }
 
+  private handleRequestFailure(err: unknown): void {
+    if (!(err instanceof HttpResponseError)) {
+      this.markDisconnectedState();
+    }
+  }
+
   private async requestJson<T>(
     url: string,
     method: 'GET' | 'POST' = 'GET',
@@ -380,7 +335,16 @@ export class RouteWardClientService {
       body: body !== undefined ? JSON.stringify(body) : undefined
     });
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      let detail = `HTTP ${response.status}`;
+      try {
+        const errBody = (await response.json()) as { error?: unknown };
+        if (errBody && typeof errBody.error === 'string' && errBody.error.trim()) {
+          detail = errBody.error;
+        }
+      } catch {
+        // Response did not contain a structured JSON error payload
+      }
+      throw new HttpResponseError(response.status, detail);
     }
     return (await response.json()) as T;
   }
@@ -412,84 +376,21 @@ export class RouteWardClientService {
     }
     this.streamRunning = true;
 
-    const reconnectPollTimer = window.setInterval(() => {
-      if (abortSignal?.aborted) {
-        window.clearInterval(reconnectPollTimer);
-        return;
-      }
-      if (!this.diagnostics.daemonConnected) {
-        void this.fetchState();
-      }
-    }, UI_CONFIG.SSE_RECONNECT_DELAY_MS);
-
-    const runLoop = async () => {
-      try {
-        while (!abortSignal?.aborted) {
+    void runRealtimeSseLoop(
+      {
+        endpoint: UI_CONFIG.API_ENDPOINTS.EVENTS,
+        headers: () => buildAuthHeaders({ Accept: 'text/event-stream' }),
+        reconnectDelayMs: UI_CONFIG.SSE_RECONNECT_DELAY_MS,
+        fetchState: async () => {
           await this.fetchState();
-          if (abortSignal?.aborted) {
-            break;
-          }
-
-          try {
-            const response = await fetch(UI_CONFIG.API_ENDPOINTS.EVENTS, {
-              method: 'GET',
-              headers: buildAuthHeaders({ Accept: 'text/event-stream' }),
-              cache: 'no-store',
-              signal: abortSignal
-            });
-
-            if (!response.ok || !response.body) {
-              this.markDisconnectedState();
-            } else {
-              const reader = response.body.getReader();
-              const decoder = new TextDecoder();
-              let buffer = '';
-
-              while (!abortSignal?.aborted) {
-                const { value, done } = await reader.read();
-                if (done) {
-                  break;
-                }
-                buffer += decoder.decode(value, { stream: true });
-                const parsed = parseSseChunk(buffer);
-                buffer = parsed.remainder;
-
-                for (const frame of parsed.events) {
-                  if (frame.event === 'resync') {
-                    await this.fetchState();
-                    continue;
-                  }
-                  try {
-                    const streamEv = JSON.parse(frame.data) as IpcStreamEvent;
-                    if (this.applyStreamEvent(streamEv)) {
-                      await this.fetchState();
-                    }
-                  } catch {
-                    // Ignore malformed frame
-                  }
-                }
-              }
-            }
-          } catch {
-            if (!abortSignal?.aborted) {
-              this.markDisconnectedState();
-            }
-          }
-
-          if (abortSignal?.aborted) {
-            break;
-          }
-          await new Promise((resolve) =>
-            window.setTimeout(resolve, UI_CONFIG.SSE_RECONNECT_DELAY_MS)
-          );
-        }
-      } finally {
-        window.clearInterval(reconnectPollTimer);
-        this.streamRunning = false;
-      }
-    };
-
-    void runLoop();
+        },
+        onDisconnected: () => this.markDisconnectedState(),
+        onStreamEvent: (ev) => this.applyStreamEvent(ev)
+      },
+      abortSignal
+    ).finally(() => {
+      this.streamRunning = false;
+    });
   }
 
   public getProfile(): ProfileConfig {
@@ -525,8 +426,8 @@ export class RouteWardClientService {
       );
       this.diagnostics = diag;
       await this.fetchState();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.diagnostics;
   }
@@ -543,8 +444,8 @@ export class RouteWardClientService {
       this.diagnostics = diag;
       this.profile = { ...this.profile, interceptionMode: mode };
       this.notifyListeners();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.diagnostics;
   }
@@ -580,15 +481,39 @@ export class RouteWardClientService {
       );
       this.profile = saved;
       this.notifyListeners();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.profile;
   }
 
   public async importProfileJson(jsonText: string): Promise<ProfileConfig> {
     const parsed = JSON.parse(jsonText) as ProfileConfig;
-    return this.replaceProfile(parsed);
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      !Array.isArray(parsed.proxies) ||
+      !Array.isArray(parsed.rules)
+    ) {
+      throw new Error('Invalid profile structure');
+    }
+    const sanitized: ProfileConfig = {
+      ...parsed,
+      proxies: parsed.proxies.map(sanitizeProxyNodeForWrite)
+    };
+    try {
+      const saved = await this.requestJson<ProfileConfig>(
+        UI_CONFIG.API_ENDPOINTS.PROFILE_REPLACE,
+        'POST',
+        sanitized
+      );
+      this.profile = saved;
+      this.notifyListeners();
+      return this.profile;
+    } catch (err) {
+      this.handleRequestFailure(err);
+      throw err;
+    }
   }
 
   public exportProfileJson(): string {
@@ -617,8 +542,8 @@ export class RouteWardClientService {
         { connectionId }
       );
       await this.fetchState();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.connections;
   }
@@ -631,8 +556,8 @@ export class RouteWardClientService {
         {}
       );
       await this.fetchState();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.connections;
   }
@@ -646,8 +571,8 @@ export class RouteWardClientService {
         'POST',
         req
       );
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
       return null;
     }
   }
@@ -661,8 +586,8 @@ export class RouteWardClientService {
       );
       await this.fetchState();
       return report;
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
       return null;
     }
   }
@@ -676,8 +601,8 @@ export class RouteWardClientService {
       );
       await this.fetchState();
       return reports;
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
       return [];
     }
   }
@@ -692,8 +617,8 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.profile;
   }
@@ -707,8 +632,8 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.profile;
   }
@@ -757,30 +682,31 @@ export class RouteWardClientService {
       );
       await this.fetchState();
       return osConns;
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
       return this.connections;
     }
   }
 
   public async setSystemProxy(enabled: boolean): Promise<boolean> {
     try {
-      await this.requestJson<unknown>(
+      const confirmed = await this.requestJson<boolean>(
         UI_CONFIG.API_ENDPOINTS.SYSTEM_PROXY,
         'POST',
         { enabled }
       );
       await this.fetchState();
-      return enabled;
-    } catch {
-      return false;
+      return Boolean(confirmed);
+    } catch (err) {
+      this.handleRequestFailure(err);
+      throw err;
     }
   }
 
   public async launchProcessWithProxy(
     executable: string,
     args: string[]
-  ): Promise<boolean> {
+  ): Promise<void> {
     try {
       await this.requestJson<unknown>(
         UI_CONFIG.API_ENDPOINTS.LAUNCH_PROCESS,
@@ -788,81 +714,18 @@ export class RouteWardClientService {
         { executable, args }
       );
       await this.fetchState();
-      return true;
-    } catch {
-      return false;
+    } catch (err) {
+      this.handleRequestFailure(err);
+      throw err;
     }
   }
 
   public formatProxyUri(node: ProxyNode): string {
-    const scheme = node.protocol;
-    const authPart =
-      node.auth && node.auth.username
-        ? `${encodeURIComponent(node.auth.username)}@`
-        : '';
-    const queryPart = node.sni ? `?sni=${encodeURIComponent(node.sni)}` : '';
-    const hashPart = `#${encodeURIComponent(node.name)}`;
-    return `${scheme}://${authPart}${node.host}:${node.port}${queryPart}${hashPart}`;
+    return formatProxyUriHelper(node);
   }
 
-  private parseSingleProxyUri(uri: string): ProxyNode | null {
-    const match = uri.match(/^([a-zA-Z0-9]+):\/\/([^?#]+)(\?[^#]*)?(#.*)?$/);
-    if (!match) return null;
-    const rawScheme = match[1].toLowerCase();
-    const authority = match[2];
-    const query = match[3] || '';
-    const fragment = match[4] ? decodeURIComponent(match[4].slice(1)) : '';
-
-    const protocolMap: Record<string, ProxyProtocol> = {
-      socks5: 'socks5',
-      http: 'http',
-      https: 'https'
-    };
-    const protocol = protocolMap[rawScheme];
-    if (!protocol) return null;
-
-    let userInfo = '';
-    let hostPort = authority;
-    if (authority.includes('@')) {
-      const atIdx = authority.lastIndexOf('@');
-      userInfo = authority.slice(0, atIdx);
-      hostPort = authority.slice(atIdx + 1);
-    }
-
-    const colonIdx = hostPort.lastIndexOf(':');
-    if (colonIdx <= 0) return null;
-    const host = hostPort.slice(0, colonIdx);
-    const port = Number(hostPort.slice(colonIdx + 1).replace(/\/$/, ''));
-    if (!host || Number.isNaN(port) || port <= 0) return null;
-
-    let auth: ProxyNode['auth'] = null;
-    if (userInfo) {
-      const [u, p] = userInfo.split(':');
-      const decodedPass = decodeURIComponent(p || '');
-      auth = {
-        username: decodeURIComponent(u || ''),
-        ...(decodedPass ? { password: decodedPass, hasPassword: true } : { hasPassword: false })
-      };
-    }
-
-    const params = new URLSearchParams(query.replace(/^\?/, ''));
-    const sni = params.get('sni');
-    const tls = protocol === 'https' || Boolean(sni);
-
-    return {
-      id: generateClientId('proxy'),
-      name: fragment || `${protocol.toUpperCase()} ${host}:${port}`,
-      protocol,
-      host,
-      port,
-      auth,
-      udpEnabled: protocol === 'socks5',
-      tls,
-      sni,
-      enabled: true,
-      lastLatencyMs: null,
-      exitIp: null
-    };
+  public parseSingleProxyUri(uri: string): ProxyNode | null {
+    return parseSingleProxyUriHelper(uri);
   }
 
   public async upsertChain(chain: ProxyChain): Promise<ProfileConfig> {
@@ -874,8 +737,8 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.profile;
   }
@@ -889,8 +752,8 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.profile;
   }
@@ -904,8 +767,8 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.profile;
   }
@@ -961,8 +824,8 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
     return this.profile;
   }
@@ -978,8 +841,8 @@ export class RouteWardClientService {
       );
       await this.fetchState();
       return res.fakeIp;
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
       return null;
     }
   }
@@ -992,8 +855,8 @@ export class RouteWardClientService {
         {}
       );
       await this.fetchState();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
   }
 
@@ -1005,8 +868,8 @@ export class RouteWardClientService {
         {}
       );
       await this.fetchState();
-    } catch {
-      this.markDisconnectedState();
+    } catch (err) {
+      this.handleRequestFailure(err);
     }
   }
 }

@@ -38,39 +38,50 @@ pub struct LaunchedProcessReport {
 pub struct SystemProxyManager;
 
 impl SystemProxyManager {
+    #[cfg(windows)]
+    fn run_reg_add(args: &[&str]) -> RouteWardResult<()> {
+        let output = Command::new("reg").args(args).output()?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(std::io::Error::other(if detail.is_empty() {
+                format!("reg add exited with status {}", output.status)
+            } else {
+                format!("reg add failed: {detail}")
+            })
+            .into());
+        }
+        Ok(())
+    }
+
     pub fn set_system_proxy(enable: bool, socks_endpoint: &str) -> RouteWardResult<bool> {
         #[cfg(windows)]
         {
             let enable_val = if enable { "1" } else { "0" };
-            let _ = Command::new("reg")
-                .args([
-                    "add",
-                    WIN_INET_REG_PATH,
-                    "/v",
-                    "ProxyEnable",
-                    "/t",
-                    "REG_DWORD",
-                    "/d",
-                    enable_val,
-                    "/f",
-                ])
-                .output()?;
+            Self::run_reg_add(&[
+                "add",
+                WIN_INET_REG_PATH,
+                "/v",
+                "ProxyEnable",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                enable_val,
+                "/f",
+            ])?;
 
             if enable {
                 let server_val = format!("socks={socks_endpoint}");
-                let _ = Command::new("reg")
-                    .args([
-                        "add",
-                        WIN_INET_REG_PATH,
-                        "/v",
-                        "ProxyServer",
-                        "/t",
-                        "REG_SZ",
-                        "/d",
-                        &server_val,
-                        "/f",
-                    ])
-                    .output()?;
+                Self::run_reg_add(&[
+                    "add",
+                    WIN_INET_REG_PATH,
+                    "/v",
+                    "ProxyServer",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    &server_val,
+                    "/f",
+                ])?;
             }
             Ok(enable)
         }
@@ -82,18 +93,24 @@ impl SystemProxyManager {
     }
 
     pub fn spawn_process_with_proxy(
-        command_line: &str,
+        executable_path: &str,
+        args: &[String],
         socks_endpoint: &str,
         http_endpoint: &str,
     ) -> RouteWardResult<LaunchedProcessReport> {
-        let parts: Vec<&str> = command_line.split_whitespace().collect();
-        let program = parts.first().copied().unwrap_or(command_line);
-        let args = if parts.len() > 1 { &parts[1..] } else { &[] };
+        let trimmed_exe = executable_path.trim();
+        if trimmed_exe.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Executable path cannot be empty",
+            )
+            .into());
+        }
 
         let socks_url = format!("socks5h://{socks_endpoint}");
         let http_url = format!("http://{http_endpoint}");
 
-        let child = Command::new(program)
+        let child = Command::new(trimmed_exe)
             .args(args)
             .env(ENV_ALL_PROXY, &socks_url)
             .env(ENV_HTTP_PROXY, &http_url)
@@ -101,10 +118,33 @@ impl SystemProxyManager {
             .env(ENV_NO_PROXY, DEFAULT_NO_PROXY_VALUE)
             .spawn()?;
 
+        let display_command = if args.is_empty() {
+            trimmed_exe.to_string()
+        } else {
+            format!("{trimmed_exe} {}", args.join(" "))
+        };
+
         Ok(LaunchedProcessReport {
             pid: child.id(),
-            command: command_line.to_string(),
+            command: display_command,
             proxy_endpoint: socks_endpoint.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_executable_path_without_split_whitespace() {
+        let err = SystemProxyManager::spawn_process_with_proxy(
+            "   ",
+            &["--flag".to_string()],
+            "127.0.0.1:1080",
+            "127.0.0.1:8080",
+        )
+        .expect_err("empty executable path must return error");
+        assert!(err.to_string().contains("empty"));
     }
 }

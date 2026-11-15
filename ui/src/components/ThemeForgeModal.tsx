@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-import React, { useRef } from 'react';
+import React, { useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, Palette, Upload, X } from 'lucide-react';
+import { AlertTriangle, Check, Palette, Upload, X } from 'lucide-react';
 import { useThemeForge } from '../theme/ThemeForgeContext';
 import { AccentTint, ThemeFamily } from '../types/routeward';
+import { ModalContainer } from './ModalContainer';
 
 interface ThemeForgeModalProps {
   onClose: () => void;
@@ -28,6 +29,8 @@ const FAMILIES: ThemeFamily[] = ['Root', 'Dark', 'Light', 'Alt'];
 
 export const ThemeForgeModal: React.FC<ThemeForgeModalProps> = ({ onClose }) => {
   const { t } = useTranslation();
+  const titleId = useId();
+  const [importError, setImportError] = useState(false);
   const {
     palettes,
     accents,
@@ -44,12 +47,18 @@ export const ThemeForgeModal: React.FC<ThemeForgeModalProps> = ({ onClose }) => 
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
+    setImportError(false);
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') {
-        importExternalPalette(reader.result);
+        const imported = importExternalPalette(reader.result);
+        setImportError(!imported);
       }
+    };
+    reader.onerror = () => {
+      setImportError(true);
     };
     reader.readAsText(file);
   };
@@ -62,13 +71,13 @@ export const ThemeForgeModal: React.FC<ThemeForgeModalProps> = ({ onClose }) => 
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
+    <ModalContainer onClose={onClose} labelledBy={titleId}>
       <div className="tf-card flex max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden shadow-2xl">
         <div className="flex items-center justify-between border-b border-tf-border px-6 py-4">
           <div className="flex items-center gap-3">
             <Palette className="h-5 w-5 text-tf-accent" />
             <div>
-              <h2 className="text-lg font-bold text-tf-primary">
+              <h2 id={titleId} className="text-lg font-bold text-tf-primary">
                 {t('themeforge.modal.title')}
               </h2>
               <p className="text-xs text-tf-secondary">
@@ -77,7 +86,9 @@ export const ThemeForgeModal: React.FC<ThemeForgeModalProps> = ({ onClose }) => 
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
+            aria-label={t('themeforge.modal.close')}
             className="rounded p-1.5 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary"
           >
             <X className="h-5 w-5" />
@@ -85,6 +96,15 @@ export const ThemeForgeModal: React.FC<ThemeForgeModalProps> = ({ onClose }) => 
         </div>
 
         <div className="flex-1 space-y-6 overflow-y-auto p-6">
+          {importError && (
+            <div
+              role="alert"
+              className="flex items-center gap-2 rounded-tf-md border border-tf-red/40 bg-tf-red/10 px-3 py-2 text-xs text-tf-red"
+            >
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span>{t('themeforge.modal.import_error')}</span>
+            </div>
+          )}
           {/* Accent Tint Selector */}
           <div>
             <div className="mb-2 flex items-center justify-between">
@@ -242,11 +262,15 @@ export const ThemeForgeModal: React.FC<ThemeForgeModalProps> = ({ onClose }) => 
         </div>
 
         <div className="flex justify-end border-t border-tf-border px-6 py-3">
-          <button onClick={onClose} className="tf-btn-accent px-5 py-1.5 text-sm">
+          <button
+            type="button"
+            onClick={onClose}
+            className="tf-btn-accent px-5 py-1.5 text-sm"
+          >
             {t('themeforge.modal.close')}
           </button>
         </div>
       </div>
-    </div>
+    </ModalContainer>
   );
 };

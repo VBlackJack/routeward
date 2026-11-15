@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-import React, { useState } from 'react';
+import React, { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Play, Terminal, X } from 'lucide-react';
+import { ModalContainer } from './ModalContainer';
 
 interface ProcessLauncherModalProps {
   relayEndpoint: string;
@@ -36,6 +37,9 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
   onClose
 }) => {
   const { t } = useTranslation();
+  const titleId = useId();
+  const exeInputId = useId();
+  const argsInputId = useId();
   const [executable, setExecutable] = useState('curl.exe');
   const [rawArgs, setRawArgs] = useState('https://api.ipify.org?format=json');
   const [launching, setLaunching] = useState(false);
@@ -48,13 +52,18 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
       .trim()
       .split(/\s+/)
       .filter(Boolean);
-    await onLaunch(executable.trim(), parsedArgs);
-    setLaunching(false);
-    onClose();
+    try {
+      await onLaunch(executable.trim(), parsedArgs);
+      onClose();
+    } catch {
+      // Toast error is raised by caller; keep modal open so user can adjust path/args
+    } finally {
+      setLaunching(false);
+    }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
+    <ModalContainer onClose={onClose} labelledBy={titleId}>
       <div className="tf-card w-full max-w-lg p-6 shadow-2xl">
         <div className="flex items-start justify-between border-b border-tf-border pb-4">
           <div className="flex items-center gap-3">
@@ -62,7 +71,7 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
               <Terminal className="h-5 w-5" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-tf-primary">
+              <h2 id={titleId} className="text-base font-bold text-tf-primary">
                 {t('app.launcher.modal.title')}
               </h2>
               <p className="text-xs text-tf-secondary">
@@ -71,7 +80,9 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
+            aria-label={t('app.launcher.modal.cancel')}
             className="rounded-tf-sm p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary"
           >
             <X className="h-4 w-4" />
@@ -96,10 +107,14 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-semibold text-tf-secondary">
+            <label
+              htmlFor={exeInputId}
+              className="mb-1 block text-xs font-semibold text-tf-secondary"
+            >
               {t('app.launcher.modal.executable_label')}
             </label>
             <input
+              id={exeInputId}
               type="text"
               value={executable}
               onChange={(e) => setExecutable(e.target.value)}
@@ -110,10 +125,14 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-semibold text-tf-secondary">
+            <label
+              htmlFor={argsInputId}
+              className="mb-1 block text-xs font-semibold text-tf-secondary"
+            >
               {t('app.launcher.modal.args_label')}
             </label>
             <input
+              id={argsInputId}
               type="text"
               value={rawArgs}
               onChange={(e) => setRawArgs(e.target.value)}
@@ -152,6 +171,6 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
           </div>
         </form>
       </div>
-    </div>
+    </ModalContainer>
   );
 };

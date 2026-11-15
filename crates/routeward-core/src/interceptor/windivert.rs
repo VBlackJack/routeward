@@ -34,10 +34,13 @@ use crate::dns::LocalNameQueryDecision;
 #[cfg(windows)]
 use crate::interceptor::nat::{
     build_forged_ipv4_icmp_port_unreachable, build_forged_ipv4_udp_reply,
+    build_forged_ipv6_icmpv6_port_unreachable, build_forged_ipv6_udp_reply,
     is_ipv4_packet_fragmented, is_private_or_local_ipv4, parse_ipv4_tcp_meta, parse_ipv4_udp_meta,
-    parse_ipv6_transport_meta, reflect_outbound_to_local_relay, reflect_relay_reply_to_client,
-    Ipv4TcpPacketMeta, Ipv4UdpPacketMeta, NatSessionEntry, PendingSynOutcome, PendingSynQueue,
-    PendingUdpOutcome, PendingUdpQueue, PidResolutionSource,
+    parse_ipv6_tcp_meta, parse_ipv6_transport_meta, reflect_outbound_ipv6_to_local_relay,
+    reflect_outbound_to_local_relay, reflect_relay_reply_ipv6_to_client,
+    reflect_relay_reply_to_client, Ipv4TcpPacketMeta, Ipv4UdpPacketMeta, Ipv6TransportPacketMeta,
+    NatSessionEntry, PendingSynOutcome, PendingSynQueue, PendingUdpOutcome, PendingUdpQueue,
+    PidResolutionSource,
 };
 #[cfg(windows)]
 use crate::process::ProcessResolver;
@@ -94,18 +97,16 @@ pub fn build_network_filter_string(dns_port: u16, dot_port: u16) -> String {
 }
 
 /// Builds the full `WINDIVERT_LAYER_NETWORK` filter string capturing all outbound non-loopback
-/// IPv4 TCP and UDP packets plus IPv6 DNS, DoT, QUIC, and local name ports.
+/// IPv4 and IPv6 TCP and UDP packets.
 pub fn build_network_filter_string_full(
-    dns_port: u16,
-    dot_port: u16,
-    quic_port: u16,
-    mdns_port: u16,
-    llmnr_port: u16,
+    _dns_port: u16,
+    _dot_port: u16,
+    _quic_port: u16,
+    _mdns_port: u16,
+    _llmnr_port: u16,
     _netbios_ns_port: u16,
 ) -> String {
-    format!(
-        "outbound and !loopback and ((ip and (tcp or udp)) or (ipv6 and (tcp.DstPort == {dns_port} or udp.DstPort == {dns_port} or tcp.DstPort == {dot_port} or udp.DstPort == {dot_port} or udp.DstPort == {quic_port} or udp.DstPort == {mdns_port} or udp.DstPort == {llmnr_port})))"
-    )
+    "outbound and !loopback and ((ip and (tcp or udp)) or (ipv6 and (tcp or udp)))".to_string()
 }
 
 /// Returns `true` if an outbound IPv6 packet targeting `dst_port` must be blocked while the engine runs
@@ -228,7 +229,11 @@ struct ActiveHandles {
     socket_handle: usize,
     network_handle: Arc<AtomicUsize>,
     pending_syn_queue: PendingSynQueue<(Vec<u8>, WinDivertAddress)>,
+    pending_syn_v6_queue: PendingSynQueue<(Vec<u8>, WinDivertAddress), Ipv6TransportPacketMeta>,
     pending_udp_queue: PendingUdpQueue<(Vec<u8>, WinDivertAddress)>,
+    pending_udp_v6_queue: PendingUdpQueue<(Vec<u8>, WinDivertAddress), Ipv6TransportPacketMeta>,
+    rt_handle: tokio::runtime::Handle,
+    _fallback_runtime: Option<tokio::runtime::Runtime>,
     firewall_rule_name: String,
     telemetry: TelemetryHub,
 }
@@ -442,9 +447,9 @@ impl WinDivertInterceptor {
             // 1. Outbound TCP port 53 (DNS-over-TCP from OS DNS client/server): always reflect to local relay
             if meta.dst_port == dns_port {
                 ctrl.nat_table.insert_session(NatSessionEntry {
-                    client_ip: meta.src_ip,
+                    client_ip: IpAddr::V4(meta.src_ip),
                     client_port: meta.src_port,
-                    orig_dst_ip: meta.dst_ip,
+                    orig_dst_ip: IpAddr::V4(meta.dst_ip),
                     orig_dst_port: meta.dst_port,
                     pid: proc_id.pid,
                     process_name: proc_id.name,
@@ -528,9 +533,9 @@ impl WinDivertInterceptor {
                     );
 
                     ctrl.nat_table.insert_session(NatSessionEntry {
-                        client_ip: meta.src_ip,
+                        client_ip: IpAddr::V4(meta.src_ip),
                         client_port: meta.src_port,
-                        orig_dst_ip: meta.dst_ip,
+                        orig_dst_ip: IpAddr::V4(meta.dst_ip),
                         orig_dst_port: meta.dst_port,
                         pid: proc_id.pid,
                         process_name: proc_id.name,
@@ -617,9 +622,9 @@ impl WinDivertInterceptor {
                             ),
                         );
                         ctrl.nat_table.insert_session(NatSessionEntry {
-                            client_ip: meta.src_ip,
+                            client_ip: IpAddr::V4(meta.src_ip),
                             client_port: meta.src_port,
-                            orig_dst_ip: meta.dst_ip,
+                            orig_dst_ip: IpAddr::V4(meta.dst_ip),
                             orig_dst_port: meta.dst_port,
                             pid: proc_id.pid,
                             process_name: proc_id.name,
@@ -669,14 +674,15 @@ impl WinDivertInterceptor {
         ctrl: &RouteWardController,
         active: &Arc<AtomicBool>,
         api: &WinDivertApi,
-        net_handle_usize: usize,
+        shared_net_handle: &Arc<AtomicUsize>,
+        rt_handle: &tokio::runtime::Handle,
         packet: &[u8],
         addr: &WinDivertAddress,
         meta: Ipv4UdpPacketMeta,
         is_fragmented: bool,
         resolved: Option<(u32, PidResolutionSource)>,
     ) {
-        let net_handle = net_handle_usize as *mut c_void;
+        let net_handle = shared_net_handle.load(Ordering::Acquire) as *mut c_void;
         let pid_opt = resolved.map(|(p, _)| p);
 
         if ctrl.nat_table.is_loop_or_excluded(
@@ -771,30 +777,28 @@ impl WinDivertInterceptor {
             packet[meta.payload_offset..meta.payload_offset + meta.payload_len].to_vec();
         let ctrl_async = ctrl.clone();
         let active_async = Arc::clone(active);
+        let net_handle_async = Arc::clone(shared_net_handle);
         let mut reply_addr = *addr;
         let api_copy = *api;
         let proc_name = proc_id.name;
         let proc_path = proc_id.executable_path;
         let proc_pid = proc_id.pid;
 
-        std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
+        rt_handle.spawn(async move {
             let client_addr = SocketAddr::new(IpAddr::V4(meta.src_ip), meta.src_port);
             let target = Socks5UdpTarget::Ipv4(meta.dst_ip, meta.dst_port);
-            let Ok(reply_bytes) = rt.block_on(ctrl_async.forward_udp_datagram(
-                client_addr,
-                &proc_name,
-                Some(&proc_path),
-                proc_pid,
-                &target,
-                &udp_payload,
-                is_fragmented,
-            )) else {
+            let Ok(reply_bytes) = ctrl_async
+                .forward_udp_datagram(
+                    client_addr,
+                    &proc_name,
+                    Some(&proc_path),
+                    proc_pid,
+                    &target,
+                    &udp_payload,
+                    is_fragmented,
+                )
+                .await
+            else {
                 return;
             };
             if !active_async.load(Ordering::Relaxed) || reply_bytes.is_empty() {
@@ -810,7 +814,347 @@ impl WinDivertInterceptor {
                 reply_addr.set_outbound(false);
                 reply_addr.clear_impostor();
                 let mut send_len: u32 = 0;
-                let h_ptr = net_handle_usize as *mut c_void;
+                let h_ptr = net_handle_async.load(Ordering::Acquire) as *mut c_void;
+                unsafe {
+                    let _ = (api_copy.calc_checksums)(
+                        forged.as_mut_ptr() as *mut c_void,
+                        forged.len() as u32,
+                        &mut reply_addr as *mut WinDivertAddress,
+                        0,
+                    );
+                    let _ = (api_copy.send)(
+                        h_ptr,
+                        forged.as_ptr() as *const c_void,
+                        forged.len() as u32,
+                        &mut send_len,
+                        &reply_addr as *const WinDivertAddress,
+                    );
+                }
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_resolved_ipv6_syn(
+        ctrl: &RouteWardController,
+        api: &WinDivertApi,
+        net_handle: *mut c_void,
+        packet: &mut [u8],
+        addr: &mut WinDivertAddress,
+        meta: Ipv6TransportPacketMeta,
+        resolved: Option<(u32, PidResolutionSource)>,
+    ) {
+        let relay_port = ctrl.nat_table.transparent_relay_port();
+        let dns_port = ctrl.constants.dns.dns_standard_port;
+        let dot_port = ctrl.constants.dns.dns_over_tls_port;
+        let pid_opt = resolved.map(|(p, _)| p);
+
+        if !ctrl.nat_table.is_loop_or_excluded(
+            pid_opt,
+            meta.src_ip,
+            meta.src_port,
+            meta.dst_ip,
+            meta.dst_port,
+        ) {
+            if meta.dst_port == dns_port
+                || (meta.dst_port == dot_port
+                    && ctrl
+                        .profile
+                        .read()
+                        .security_policy
+                        .block_encrypted_dns_bypass)
+            {
+                return;
+            }
+
+            let (pid, res_source) = resolved.unwrap_or((0, PidResolutionSource::TcpTableFallback));
+            let proc_id = ctrl.process_resolver.resolve_by_pid(pid);
+            let dst_ip_str = meta.dst_ip.to_string();
+
+            let eval = if proc_id.is_unattributed() {
+                let (unknown_action, rule_name) = ctrl.resolve_unknown_process_action(
+                    COMPONENT_WINDIVERT,
+                    meta.src_port,
+                    &dst_ip_str,
+                    meta.dst_port,
+                    "process image unavailable",
+                );
+                crate::rules::RuleEvaluationResult {
+                    matched_rule_id: "security-policy-unknown-process".to_string(),
+                    matched_rule_name: rule_name,
+                    action: unknown_action,
+                    effective_domain: None,
+                    resolved_from_fake_ip: false,
+                }
+            } else {
+                ctrl.evaluate_rule(&ConnectionRequest {
+                    process_name: proc_id.name.clone(),
+                    process_path: Some(proc_id.executable_path.clone()),
+                    target_host: dst_ip_str.clone(),
+                    target_ip: Some(dst_ip_str.clone()),
+                    target_port: meta.dst_port,
+                    protocol: TransportProtocol::Tcp,
+                })
+            };
+
+            match &eval.action {
+                RuleAction::Proxy { .. } | RuleAction::Chain { .. } => {
+                    ctrl.telemetry.push_log(
+                        LogLevel::Info,
+                        COMPONENT_WINDIVERT,
+                        format!(
+                            "Intercepted IPv6 SYN PID={} process=\"{}\" exe=\"{}\" resolvedVia={} [{}]:{} -> [{}]:{} [rule=\"{}\"]",
+                            proc_id.pid,
+                            proc_id.name,
+                            proc_id.executable_path,
+                            res_source.as_str(),
+                            meta.src_ip,
+                            meta.src_port,
+                            meta.dst_ip,
+                            meta.dst_port,
+                            eval.matched_rule_name
+                        ),
+                    );
+                    ctrl.nat_table.insert_session(NatSessionEntry {
+                        client_ip: IpAddr::V6(meta.src_ip),
+                        client_port: meta.src_port,
+                        orig_dst_ip: IpAddr::V6(meta.dst_ip),
+                        orig_dst_port: meta.dst_port,
+                        pid: proc_id.pid,
+                        process_name: proc_id.name,
+                        process_path: proc_id.executable_path,
+                        resolution_source: res_source,
+                        action: eval.action,
+                        matched_rule_name: eval.matched_rule_name,
+                        created_at: Instant::now(),
+                    });
+                    if reflect_outbound_ipv6_to_local_relay(packet, relay_port) {
+                        addr.set_outbound(false);
+                        addr.clear_impostor();
+                        unsafe {
+                            let _ = (api.calc_checksums)(
+                                packet.as_mut_ptr() as *mut c_void,
+                                packet.len() as u32,
+                                addr as *mut WinDivertAddress,
+                                0,
+                            );
+                        }
+                    }
+                }
+                RuleAction::Block => {
+                    ctrl.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_WINDIVERT,
+                        format!(
+                            "Blocked IPv6 SYN PID={} process=\"{}\" exe=\"{}\" -> [{}]:{} [rule=\"{}\"]",
+                            proc_id.pid,
+                            proc_id.name,
+                            proc_id.executable_path,
+                            meta.dst_ip,
+                            meta.dst_port,
+                            eval.matched_rule_name
+                        ),
+                    );
+                    ctrl.telemetry.record_connection(
+                        TrackedConnection {
+                            id: Uuid::new_v4().to_string(),
+                            pid: proc_id.pid,
+                            process_name: proc_id.name,
+                            process_path: proc_id.executable_path,
+                            target_host: dst_ip_str,
+                            resolved_domain: eval.effective_domain,
+                            target_port: meta.dst_port,
+                            protocol: TransportProtocol::Tcp,
+                            matched_rule: eval.matched_rule_name,
+                            route_label: "BLOCKED".to_string(),
+                            latency_ms: 0,
+                            rx_bytes: 0,
+                            tx_bytes: 0,
+                            status: ConnectionStatus::Blocked,
+                            started_at: Utc::now(),
+                        },
+                        false,
+                    );
+                    return;
+                }
+                RuleAction::Direct => {
+                    let needs_sni = meta.dst_port == ctrl.constants.network.tls_sni_default_port
+                        && ctrl.has_enabled_domain_rules();
+                    if needs_sni {
+                        ctrl.nat_table.insert_session(NatSessionEntry {
+                            client_ip: IpAddr::V6(meta.src_ip),
+                            client_port: meta.src_port,
+                            orig_dst_ip: IpAddr::V6(meta.dst_ip),
+                            orig_dst_port: meta.dst_port,
+                            pid: proc_id.pid,
+                            process_name: proc_id.name,
+                            process_path: proc_id.executable_path,
+                            resolution_source: res_source,
+                            action: RuleAction::Direct,
+                            matched_rule_name: eval.matched_rule_name,
+                            created_at: Instant::now(),
+                        });
+                        if reflect_outbound_ipv6_to_local_relay(packet, relay_port) {
+                            addr.set_outbound(false);
+                            addr.clear_impostor();
+                            unsafe {
+                                let _ = (api.calc_checksums)(
+                                    packet.as_mut_ptr() as *mut c_void,
+                                    packet.len() as u32,
+                                    addr as *mut WinDivertAddress,
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_resolved_ipv6_udp(
+        ctrl: &RouteWardController,
+        active: &Arc<AtomicBool>,
+        api: &WinDivertApi,
+        shared_net_handle: &Arc<AtomicUsize>,
+        rt_handle: &tokio::runtime::Handle,
+        packet: &[u8],
+        addr: &WinDivertAddress,
+        meta: Ipv6TransportPacketMeta,
+        resolved: Option<(u32, PidResolutionSource)>,
+    ) {
+        let net_handle = shared_net_handle.load(Ordering::Acquire) as *mut c_void;
+        let pid_opt = resolved.map(|(p, _)| p);
+
+        if ctrl.nat_table.is_loop_or_excluded(
+            pid_opt,
+            meta.src_ip,
+            meta.src_port,
+            meta.dst_ip,
+            meta.dst_port,
+        ) {
+            Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
+            return;
+        }
+
+        let (pid, res_source) = resolved.unwrap_or((0, PidResolutionSource::TcpTableFallback));
+        let proc_id = ctrl.process_resolver.resolve_by_pid(pid);
+        let dst_ip_str = meta.dst_ip.to_string();
+
+        let eval = if proc_id.is_unattributed() {
+            let (unknown_action, rule_name) = ctrl.resolve_unknown_process_action(
+                COMPONENT_WINDIVERT,
+                meta.src_port,
+                &dst_ip_str,
+                meta.dst_port,
+                "process image unavailable",
+            );
+            crate::rules::RuleEvaluationResult {
+                matched_rule_id: "security-policy-unknown-process".to_string(),
+                matched_rule_name: rule_name,
+                action: unknown_action,
+                effective_domain: None,
+                resolved_from_fake_ip: false,
+            }
+        } else {
+            ctrl.evaluate_rule(&ConnectionRequest {
+                process_name: proc_id.name.clone(),
+                process_path: Some(proc_id.executable_path.clone()),
+                target_host: dst_ip_str.clone(),
+                target_ip: Some(dst_ip_str.clone()),
+                target_port: meta.dst_port,
+                protocol: TransportProtocol::Udp,
+            })
+        };
+
+        if matches!(eval.action, RuleAction::Direct) {
+            ctrl.telemetry.push_log(
+                LogLevel::Info,
+                COMPONENT_WINDIVERT,
+                format!(
+                    "Routed IPv6 UDP PID={} process=\"{}\" exe=\"{}\" resolvedVia={} [{}]:{} -> [{}]:{} via DIRECT [rule=\"{}\"]",
+                    proc_id.pid,
+                    proc_id.name,
+                    proc_id.executable_path,
+                    res_source.as_str(),
+                    meta.src_ip,
+                    meta.src_port,
+                    meta.dst_ip,
+                    meta.dst_port,
+                    eval.matched_rule_name
+                ),
+            );
+            ctrl.telemetry.record_connection(
+                TrackedConnection {
+                    id: Uuid::new_v4().to_string(),
+                    pid: proc_id.pid,
+                    process_name: proc_id.name,
+                    process_path: proc_id.executable_path,
+                    target_host: dst_ip_str,
+                    resolved_domain: eval.effective_domain,
+                    target_port: meta.dst_port,
+                    protocol: TransportProtocol::Udp,
+                    matched_rule: eval.matched_rule_name,
+                    route_label: "DIRECT".to_string(),
+                    latency_ms: 0,
+                    rx_bytes: 0,
+                    tx_bytes: meta.payload_len as u64,
+                    status: ConnectionStatus::Active,
+                    started_at: Utc::now(),
+                },
+                true,
+            );
+            Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
+            return;
+        }
+
+        let udp_payload =
+            packet[meta.payload_offset..meta.payload_offset + meta.payload_len].to_vec();
+        let ctrl_async = ctrl.clone();
+        let active_async = Arc::clone(active);
+        let net_handle_async = Arc::clone(shared_net_handle);
+        let mut reply_addr = *addr;
+        let api_copy = *api;
+        let proc_name = proc_id.name;
+        let proc_path = proc_id.executable_path;
+        let proc_pid = proc_id.pid;
+
+        rt_handle.spawn(async move {
+            let client_addr = SocketAddr::new(IpAddr::V6(meta.src_ip), meta.src_port);
+            let target = Socks5UdpTarget::Ipv6(meta.dst_ip, meta.dst_port);
+            let Ok(reply_bytes) = ctrl_async
+                .forward_udp_datagram(
+                    client_addr,
+                    &proc_name,
+                    Some(&proc_path),
+                    proc_pid,
+                    &target,
+                    &udp_payload,
+                    false,
+                )
+                .await
+            else {
+                return;
+            };
+            if !active_async.load(Ordering::Relaxed) || reply_bytes.is_empty() {
+                return;
+            }
+            if let Some(mut forged) = build_forged_ipv6_udp_reply(
+                meta.dst_ip,
+                meta.dst_port,
+                meta.src_ip,
+                meta.src_port,
+                &reply_bytes,
+            ) {
+                reply_addr.set_outbound(false);
+                reply_addr.clear_impostor();
+                let mut send_len: u32 = 0;
+                let h_ptr = net_handle_async.load(Ordering::Acquire) as *mut c_void;
                 unsafe {
                     let _ = (api_copy.calc_checksums)(
                         forged.as_mut_ptr() as *mut c_void,
@@ -1006,21 +1350,51 @@ impl Interceptor for WinDivertInterceptor {
         let firewall_rule_name =
             Self::create_scoped_firewall_rule(relay_port, &controller.telemetry);
 
+        let (rt_handle, fallback_runtime) = match tokio::runtime::Handle::try_current() {
+            Ok(h) => (h, None),
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .map_err(|err| RouteWardError::InterceptorError {
+                        key: ERR_KEY_INTERCEPTOR_OPEN,
+                        detail: format!(
+                            "Failed to create Tokio runtime for WinDivert workers: {err}"
+                        ),
+                    })?;
+                let h = rt.handle().clone();
+                (h, Some(rt))
+            }
+        };
+
         self.active.store(true, Ordering::SeqCst);
         let sock_handle_usize = socket_handle as usize;
         let net_handle_usize = network_handle as usize;
         let shared_net_handle = Arc::new(AtomicUsize::new(net_handle_usize));
         let pending_syn_queue: PendingSynQueue<(Vec<u8>, WinDivertAddress)> =
             PendingSynQueue::new();
+        let pending_syn_v6_queue: PendingSynQueue<
+            (Vec<u8>, WinDivertAddress),
+            Ipv6TransportPacketMeta,
+        > = PendingSynQueue::new();
         let pending_udp_queue: PendingUdpQueue<(Vec<u8>, WinDivertAddress)> =
             PendingUdpQueue::new(net_consts.max_pending_udp_packets);
+        let pending_udp_v6_queue: PendingUdpQueue<
+            (Vec<u8>, WinDivertAddress),
+            Ipv6TransportPacketMeta,
+        > = PendingUdpQueue::new(net_consts.max_pending_udp_packets);
 
         *self.handles.lock() = Some(ActiveHandles {
             api,
             socket_handle: sock_handle_usize,
             network_handle: Arc::clone(&shared_net_handle),
             pending_syn_queue: pending_syn_queue.clone(),
+            pending_syn_v6_queue: pending_syn_v6_queue.clone(),
             pending_udp_queue: pending_udp_queue.clone(),
+            pending_udp_v6_queue: pending_udp_v6_queue.clone(),
+            rt_handle: rt_handle.clone(),
+            _fallback_runtime: fallback_runtime,
             firewall_rule_name,
             telemetry: controller.telemetry.clone(),
         });
@@ -1054,8 +1428,11 @@ impl Interceptor for WinDivertInterceptor {
         let active_syn = Arc::clone(&self.active);
         let ctrl_syn = controller.clone();
         let syn_queue_worker = pending_syn_queue.clone();
+        let syn_v6_queue_worker = pending_syn_v6_queue.clone();
         let udp_queue_worker = pending_udp_queue.clone();
+        let udp_v6_queue_worker = pending_udp_v6_queue.clone();
         let net_handle_for_syn = Arc::clone(&shared_net_handle);
+        let rt_for_syn = rt_handle.clone();
         std::thread::spawn(move || {
             let poll_interval =
                 Duration::from_millis(ctrl_syn.constants.network.pid_fallback_delay_ms.max(1));
@@ -1122,7 +1499,8 @@ impl Interceptor for WinDivertInterceptor {
                                 &ctrl_syn,
                                 &active_syn,
                                 &api,
-                                handle_usize,
+                                &net_handle_for_syn,
+                                &rt_for_syn,
                                 &pkt,
                                 &addr,
                                 meta,
@@ -1142,6 +1520,75 @@ impl Interceptor for WinDivertInterceptor {
                     }
                 }
 
+                let udp_v6_outcomes = ctrl_syn.poll_pending_udps(
+                    &udp_v6_queue_worker,
+                    udp_timeout,
+                    ProcessResolver::find_pid_for_udp_port,
+                );
+                for outcome in udp_v6_outcomes {
+                    match outcome {
+                        PendingUdpOutcome::Resolved {
+                            payload: (pkt, addr),
+                            meta,
+                            pid,
+                            source,
+                            ..
+                        } => {
+                            Self::dispatch_resolved_ipv6_udp(
+                                &ctrl_syn,
+                                &active_syn,
+                                &api,
+                                &net_handle_for_syn,
+                                &rt_for_syn,
+                                &pkt,
+                                &addr,
+                                meta,
+                                Some((pid, source)),
+                            );
+                        }
+                        PendingUdpOutcome::TimedOutDropped { .. } => {}
+                        PendingUdpOutcome::TimedOutReinject {
+                            payload: (pkt, addr),
+                            ..
+                        } => {
+                            Self::send_packet_guarded(&ctrl_syn, &api, handle, &pkt, &addr);
+                        }
+                    }
+                }
+
+                let syn_v6_outcomes = ctrl_syn.poll_pending_syns(
+                    &syn_v6_queue_worker,
+                    syn_timeout,
+                    ProcessResolver::find_pid_for_tcp_port,
+                );
+                for outcome in syn_v6_outcomes {
+                    match outcome {
+                        PendingSynOutcome::Resolved {
+                            payload: (mut pkt, mut addr),
+                            meta,
+                            pid,
+                            source,
+                        } => {
+                            Self::dispatch_resolved_ipv6_syn(
+                                &ctrl_syn,
+                                &api,
+                                handle,
+                                &mut pkt,
+                                &mut addr,
+                                meta,
+                                Some((pid, source)),
+                            );
+                        }
+                        PendingSynOutcome::TimedOutDropped { .. } => {}
+                        PendingSynOutcome::TimedOutReinject {
+                            payload: (pkt, addr),
+                            ..
+                        } => {
+                            Self::send_packet_guarded(&ctrl_syn, &api, handle, &pkt, &addr);
+                        }
+                    }
+                }
+
                 std::thread::sleep(poll_interval);
             }
         });
@@ -1152,8 +1599,12 @@ impl Interceptor for WinDivertInterceptor {
             controller,
             api,
             net_handle_usize,
+            Arc::clone(&shared_net_handle),
+            rt_handle,
             pending_syn_queue,
+            pending_syn_v6_queue,
             pending_udp_queue,
+            pending_udp_v6_queue,
         );
 
         Ok(())
@@ -1175,7 +1626,15 @@ impl Interceptor for WinDivertInterceptor {
             return Ok(());
         }
 
-        let (api, shared_net_handle, pending_syn_queue, pending_udp_queue) = {
+        let (
+            api,
+            shared_net_handle,
+            pending_syn_queue,
+            pending_syn_v6_queue,
+            pending_udp_queue,
+            pending_udp_v6_queue,
+            rt_handle,
+        ) = {
             let guard = self.handles.lock();
             let Some(ref handles) = *guard else {
                 return Ok(());
@@ -1184,7 +1643,10 @@ impl Interceptor for WinDivertInterceptor {
                 handles.api,
                 Arc::clone(&handles.network_handle),
                 handles.pending_syn_queue.clone(),
+                handles.pending_syn_v6_queue.clone(),
                 handles.pending_udp_queue.clone(),
+                handles.pending_udp_v6_queue.clone(),
+                handles.rt_handle.clone(),
             )
         };
 
@@ -1227,8 +1689,12 @@ impl Interceptor for WinDivertInterceptor {
             controller.clone(),
             api,
             new_net_usize,
+            Arc::clone(&shared_net_handle),
+            rt_handle,
             pending_syn_queue,
+            pending_syn_v6_queue,
             pending_udp_queue,
+            pending_udp_v6_queue,
         );
 
         let old_net_usize = shared_net_handle.swap(new_net_usize, Ordering::SeqCst);
@@ -1273,13 +1739,24 @@ impl Interceptor for WinDivertInterceptor {
 
 #[cfg(windows)]
 impl WinDivertInterceptor {
+    #[allow(clippy::too_many_arguments)]
     fn spawn_network_reflection_thread(
         active_net: Arc<AtomicBool>,
         ctrl_net: RouteWardController,
         api: WinDivertApi,
-        net_handle_usize: usize,
+        recv_handle_usize: usize,
+        shared_net_handle: Arc<AtomicUsize>,
+        rt_handle: tokio::runtime::Handle,
         syn_queue_producer: PendingSynQueue<(Vec<u8>, WinDivertAddress)>,
+        syn_v6_queue_producer: PendingSynQueue<
+            (Vec<u8>, WinDivertAddress),
+            Ipv6TransportPacketMeta,
+        >,
         udp_queue_producer: PendingUdpQueue<(Vec<u8>, WinDivertAddress)>,
+        udp_v6_queue_producer: PendingUdpQueue<
+            (Vec<u8>, WinDivertAddress),
+            Ipv6TransportPacketMeta,
+        >,
     ) {
         let dns_port = ctrl_net.constants.dns.dns_standard_port;
         let dot_port = ctrl_net.constants.dns.dns_over_tls_port;
@@ -1288,7 +1765,7 @@ impl WinDivertInterceptor {
         let llmnr_port = ctrl_net.constants.network.llmnr_standard_port;
         let netbios_ns_port = ctrl_net.constants.network.netbios_ns_standard_port;
         std::thread::spawn(move || {
-            let handle = net_handle_usize as *mut c_void;
+            let handle = recv_handle_usize as *mut c_void;
             let mut packet_buf = vec![0u8; PACKET_BUFFER_SIZE];
             let relay_port = ctrl_net.nat_table.transparent_relay_port();
 
@@ -1369,23 +1846,165 @@ impl WinDivertInterceptor {
                         // Drop outbound IPv6 DNS (port 53) and DoT (port 853) so Windows falls back to IPv4 DNS immediately
                         continue;
                     }
-                    if v6_meta.next_header == crate::interceptor::nat::IPPROTO_UDP {
+                    if v6_meta.next_header == crate::interceptor::nat::IPPROTO_UDP
+                        && !ctrl_net.nat_table.is_self_udp_port(v6_meta.src_port)
+                    {
                         if v6_meta.dst_port == quic_port && block_quic {
+                            if let Some(mut icmp6_reply) =
+                                build_forged_ipv6_icmpv6_port_unreachable(packet)
+                            {
+                                let mut reply_addr = addr;
+                                reply_addr.set_outbound(false);
+                                reply_addr.clear_impostor();
+                                let mut send_len: u32 = 0;
+                                unsafe {
+                                    let _ = (api.calc_checksums)(
+                                        icmp6_reply.as_mut_ptr() as *mut c_void,
+                                        icmp6_reply.len() as u32,
+                                        &mut reply_addr as *mut WinDivertAddress,
+                                        0,
+                                    );
+                                    let _ = (api.send)(
+                                        handle,
+                                        icmp6_reply.as_ptr() as *const c_void,
+                                        icmp6_reply.len() as u32,
+                                        &mut send_len,
+                                        &reply_addr as *const WinDivertAddress,
+                                    );
+                                }
+                            }
                             continue;
                         }
                         if v6_meta.dst_port == mdns_port || v6_meta.dst_port == llmnr_port {
-                            if pkt_len >= 48 {
-                                let udp_payload = &packet[48..pkt_len];
-                                if !matches!(
-                                    ctrl_net.dns.classify_local_name_query(udp_payload),
-                                    LocalNameQueryDecision::AllowLocal { .. }
-                                ) {
-                                    continue;
-                                }
-                            } else {
+                            let udp_payload = &packet[v6_meta.payload_offset
+                                ..v6_meta.payload_offset + v6_meta.payload_len];
+                            if !matches!(
+                                ctrl_net.dns.classify_local_name_query(udp_payload),
+                                LocalNameQueryDecision::AllowLocal { .. }
+                            ) {
                                 continue;
                             }
+                            Self::send_packet_guarded(
+                                &ctrl_net,
+                                &api,
+                                handle,
+                                &packet[..pkt_len],
+                                &addr,
+                            );
+                            continue;
                         }
+                        if !v6_meta.dst_ip.is_multicast()
+                            && !v6_meta.dst_ip.is_loopback()
+                            && !v6_meta.dst_ip.is_unicast_link_local()
+                            && !ctrl_net.nat_table.is_loop_or_excluded(
+                                None,
+                                v6_meta.src_ip,
+                                v6_meta.src_port,
+                                v6_meta.dst_ip,
+                                v6_meta.dst_port,
+                            )
+                        {
+                            let resolved = ctrl_net.nat_table.try_resolve_pid_nonblocking(
+                                v6_meta.src_port,
+                                ProcessResolver::find_pid_for_udp_port,
+                            );
+                            if resolved.is_some() {
+                                Self::dispatch_resolved_ipv6_udp(
+                                    &ctrl_net,
+                                    &active_net,
+                                    &api,
+                                    &shared_net_handle,
+                                    &rt_handle,
+                                    packet,
+                                    &addr,
+                                    v6_meta,
+                                    resolved,
+                                );
+                            } else if let Some(evicted) = udp_v6_queue_producer.enqueue(
+                                &ctrl_net.nat_table,
+                                (packet.to_vec(), addr),
+                                v6_meta,
+                                false,
+                                kill_switch_enabled,
+                            ) {
+                                ctrl_net.log_pending_udp_outcome(&evicted);
+                                if let PendingUdpOutcome::TimedOutReinject {
+                                    payload: (ev_pkt, ev_addr),
+                                    ..
+                                } = evicted
+                                {
+                                    Self::send_packet_guarded(
+                                        &ctrl_net, &api, handle, &ev_pkt, &ev_addr,
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                    } else if parse_ipv6_tcp_meta(packet).is_some() {
+                        if v6_meta.src_port == relay_port {
+                            let Some(session) = ctrl_net
+                                .nat_table
+                                .get_session_by_relay_peer(v6_meta.dst_ip, v6_meta.dst_port)
+                            else {
+                                continue;
+                            };
+                            if !reflect_relay_reply_ipv6_to_client(packet, &session) {
+                                continue;
+                            }
+                            addr.set_outbound(false);
+                            addr.clear_impostor();
+                            unsafe {
+                                let _ = (api.calc_checksums)(
+                                    packet.as_mut_ptr() as *mut c_void,
+                                    pkt_len as u32,
+                                    &mut addr as *mut WinDivertAddress,
+                                    0,
+                                );
+                            }
+                        } else if let Some(existing_session) = ctrl_net
+                            .nat_table
+                            .get_session_by_flow(&v6_meta.outbound_flow_key())
+                        {
+                            if matches!(
+                                existing_session.action,
+                                RuleAction::Proxy { .. }
+                                    | RuleAction::Chain { .. }
+                                    | RuleAction::Direct
+                            ) && reflect_outbound_ipv6_to_local_relay(packet, relay_port)
+                            {
+                                addr.set_outbound(false);
+                                addr.clear_impostor();
+                                unsafe {
+                                    let _ = (api.calc_checksums)(
+                                        packet.as_mut_ptr() as *mut c_void,
+                                        pkt_len as u32,
+                                        &mut addr as *mut WinDivertAddress,
+                                        0,
+                                    );
+                                }
+                            }
+                        } else if v6_meta.is_syn_only() {
+                            let resolved = ctrl_net.nat_table.try_resolve_pid_nonblocking(
+                                v6_meta.src_port,
+                                ProcessResolver::find_pid_for_tcp_port,
+                            );
+                            if resolved.is_some() {
+                                Self::dispatch_resolved_ipv6_syn(
+                                    &ctrl_net, &api, handle, packet, &mut addr, v6_meta, resolved,
+                                );
+                            } else {
+                                syn_v6_queue_producer.enqueue((packet.to_vec(), addr), v6_meta);
+                            }
+                            continue;
+                        }
+                        Self::send_packet_guarded(
+                            &ctrl_net,
+                            &api,
+                            handle,
+                            &packet[..pkt_len],
+                            &addr,
+                        );
+                        continue;
                     }
                 }
 
@@ -1661,27 +2280,19 @@ impl WinDivertInterceptor {
                             let query_vec = dns_payload.to_vec();
                             let ctrl_async = ctrl_net.clone();
                             let active_async = Arc::clone(&active_net);
+                            let net_handle_async = Arc::clone(&shared_net_handle);
                             let mut reply_addr = addr;
                             let src_ip = udp_meta.src_ip;
                             let src_port = udp_meta.src_port;
                             let dst_ip = udp_meta.dst_ip;
                             let dst_port = udp_meta.dst_port;
                             let api_copy = api;
-                            let handle_usize = net_handle_usize;
-                            std::thread::spawn(move || {
-                                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                else {
-                                    return;
-                                };
+                            rt_handle.spawn(async move {
                                 let orig_resolver =
                                     Some(SocketAddr::new(IpAddr::V4(dst_ip), dst_port));
-                                let resp_bytes = rt.block_on(ctrl_async.resolve_dns_query_async(
-                                    &query_vec,
-                                    orig_resolver,
-                                    true,
-                                ));
+                                let resp_bytes = ctrl_async
+                                    .resolve_dns_query_async(&query_vec, orig_resolver, true)
+                                    .await;
                                 if !active_async.load(Ordering::Relaxed) || resp_bytes.is_empty() {
                                     return;
                                 }
@@ -1695,7 +2306,8 @@ impl WinDivertInterceptor {
                                     reply_addr.set_outbound(false);
                                     reply_addr.clear_impostor();
                                     let mut send_len: u32 = 0;
-                                    let h_ptr = handle_usize as *mut c_void;
+                                    let h_ptr =
+                                        net_handle_async.load(Ordering::Acquire) as *mut c_void;
                                     unsafe {
                                         let _ = (api_copy.calc_checksums)(
                                             forged.as_mut_ptr() as *mut c_void,
@@ -1738,7 +2350,8 @@ impl WinDivertInterceptor {
                                     &ctrl_net,
                                     &active_net,
                                     &api,
-                                    net_handle_usize,
+                                    &shared_net_handle,
+                                    &rt_handle,
                                     packet,
                                     &addr,
                                     udp_meta,
@@ -1870,7 +2483,7 @@ mod tests {
 
         let filter = build_network_filter_string(53, 853);
         assert!(filter.contains("ip and (tcp or udp)"));
-        assert!(filter.contains("ipv6 and (tcp.DstPort == 53 or udp.DstPort == 53"));
+        assert!(filter.contains("ipv6 and (tcp or udp)"));
 
         // IPv6 ports 53 and 853 are blocked even when killSwitchEnabled=false
         assert!(should_block_outbound_ipv6_dns_or_dot(53, 53, 853, false));

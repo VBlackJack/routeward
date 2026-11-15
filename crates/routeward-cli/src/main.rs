@@ -185,30 +185,33 @@ enum CtlCommands {
     },
 }
 
-fn parse_profile_payload(
+fn parse_json_payload<T: serde::de::DeserializeOwned>(
+    entity_label: &str,
     json: Option<String>,
     json_file: Option<PathBuf>,
-) -> RouteWardResult<ProfileConfig> {
+) -> RouteWardResult<T> {
     if let Some(path) = json_file {
         let raw_content =
             std::fs::read_to_string(&path).map_err(|err| RouteWardError::ConfigError {
                 key: ERR_KEY_CONFIG_LOAD,
-                detail: format!("Cannot read profile JSON file '{}': {err}", path.display()),
+                detail: format!(
+                    "Cannot read {entity_label} JSON file '{}': {err}",
+                    path.display()
+                ),
             })?;
         let without_bom = raw_content.strip_prefix('\u{feff}').unwrap_or(&raw_content);
-        serde_json::from_str::<ProfileConfig>(without_bom).map_err(|err| {
-            RouteWardError::ConfigError {
-                key: ERR_KEY_CONFIG_JSON,
-                detail: format!("Invalid profile JSON in file '{}': {err}", path.display()),
-            }
+        serde_json::from_str::<T>(without_bom).map_err(|err| RouteWardError::ConfigError {
+            key: ERR_KEY_CONFIG_JSON,
+            detail: format!(
+                "Invalid {entity_label} JSON in file '{}': {err}",
+                path.display()
+            ),
         })
     } else if let Some(raw_inline) = json {
         let without_bom = raw_inline.strip_prefix('\u{feff}').unwrap_or(&raw_inline);
-        serde_json::from_str::<ProfileConfig>(without_bom).map_err(|err| {
-            RouteWardError::ConfigError {
-                key: ERR_KEY_CONFIG_JSON,
-                detail: format!("Invalid inline profile JSON: {err}"),
-            }
+        serde_json::from_str::<T>(without_bom).map_err(|err| RouteWardError::ConfigError {
+            key: ERR_KEY_CONFIG_JSON,
+            detail: format!("Invalid inline {entity_label} JSON: {err}"),
         })
     } else {
         Err(RouteWardError::ConfigError {
@@ -218,101 +221,55 @@ fn parse_profile_payload(
     }
 }
 
-fn parse_routing_rule_payload(
-    json: Option<String>,
-    json_file: Option<PathBuf>,
-) -> RouteWardResult<RoutingRule> {
-    if let Some(path) = json_file {
-        let raw_content =
-            std::fs::read_to_string(&path).map_err(|err| RouteWardError::ConfigError {
-                key: ERR_KEY_CONFIG_LOAD,
-                detail: format!("Cannot read rule JSON file '{}': {err}", path.display()),
-            })?;
-        let without_bom = raw_content.strip_prefix('\u{feff}').unwrap_or(&raw_content);
-        serde_json::from_str::<RoutingRule>(without_bom).map_err(|err| {
-            RouteWardError::ConfigError {
-                key: ERR_KEY_CONFIG_JSON,
-                detail: format!("Invalid rule JSON in file '{}': {err}", path.display()),
-            }
-        })
-    } else if let Some(raw_inline) = json {
-        let without_bom = raw_inline.strip_prefix('\u{feff}').unwrap_or(&raw_inline);
-        serde_json::from_str::<RoutingRule>(without_bom).map_err(|err| {
-            RouteWardError::ConfigError {
-                key: ERR_KEY_CONFIG_JSON,
-                detail: format!("Invalid inline rule JSON: {err}"),
-            }
-        })
-    } else {
-        Err(RouteWardError::ConfigError {
-            key: ERR_KEY_CONFIG_JSON,
-            detail: "Either --json or --json-file must be provided".to_string(),
-        })
-    }
-}
-
-fn parse_proxy_node_payload(
-    json: Option<String>,
-    json_file: Option<PathBuf>,
-) -> RouteWardResult<ProxyNode> {
-    if let Some(path) = json_file {
-        let raw_content =
-            std::fs::read_to_string(&path).map_err(|err| RouteWardError::ConfigError {
-                key: ERR_KEY_CONFIG_LOAD,
-                detail: format!("Cannot read proxy JSON file '{}': {err}", path.display()),
-            })?;
-        let without_bom = raw_content.strip_prefix('\u{feff}').unwrap_or(&raw_content);
-        serde_json::from_str::<ProxyNode>(without_bom).map_err(|err| RouteWardError::ConfigError {
-            key: ERR_KEY_CONFIG_JSON,
-            detail: format!("Invalid proxy JSON in file '{}': {err}", path.display()),
-        })
-    } else if let Some(raw_inline) = json {
-        let without_bom = raw_inline.strip_prefix('\u{feff}').unwrap_or(&raw_inline);
-        serde_json::from_str::<ProxyNode>(without_bom).map_err(|err| RouteWardError::ConfigError {
-            key: ERR_KEY_CONFIG_JSON,
-            detail: format!("Invalid inline proxy JSON: {err}"),
-        })
-    } else {
-        Err(RouteWardError::ConfigError {
-            key: ERR_KEY_CONFIG_JSON,
-            detail: "Either --json or --json-file must be provided".to_string(),
-        })
+fn ctl_action_label(action: &CtlCommands) -> &'static str {
+    match action {
+        CtlCommands::Status => "status",
+        CtlCommands::State => "state",
+        CtlCommands::Start => "start",
+        CtlCommands::Stop => "stop",
+        CtlCommands::Connections => "connections",
+        CtlCommands::Logs => "logs",
+        CtlCommands::FakeIps => "fake-ips",
+        CtlCommands::FlushFakeIps => "flush-fake-ips",
+        CtlCommands::UpsertRule { .. } => "upsert-rule",
+        CtlCommands::RemoveRule { .. } => "remove-rule",
+        CtlCommands::UpsertProxy { .. } => "upsert-proxy",
+        CtlCommands::RemoveProxy { .. } => "remove-proxy",
+        CtlCommands::TerminateConnection { .. } => "terminate-connection",
+        CtlCommands::ReplaceProfile { .. } => "replace-profile",
     }
 }
 
 fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, IpcCommand)> {
-    match action {
-        CtlCommands::Status => Ok(("status", IpcCommand::GetDiagnostics)),
-        CtlCommands::State => Ok(("state", IpcCommand::GetState)),
-        CtlCommands::Start => Ok(("start", IpcCommand::ToggleEngine { start: true })),
-        CtlCommands::Stop => Ok(("stop", IpcCommand::ToggleEngine { start: false })),
-        CtlCommands::Connections => Ok(("connections", IpcCommand::ListConnections)),
-        CtlCommands::Logs => Ok(("logs", IpcCommand::ListLogs)),
-        CtlCommands::FakeIps => Ok(("fake-ips", IpcCommand::ListFakeIps)),
-        CtlCommands::FlushFakeIps => Ok(("flush-fake-ips", IpcCommand::FlushFakeIps)),
+    let label = ctl_action_label(&action);
+    let ipc_cmd = match action {
+        CtlCommands::Status => IpcCommand::GetDiagnostics,
+        CtlCommands::State => IpcCommand::GetState,
+        CtlCommands::Start => IpcCommand::ToggleEngine { start: true },
+        CtlCommands::Stop => IpcCommand::ToggleEngine { start: false },
+        CtlCommands::Connections => IpcCommand::ListConnections,
+        CtlCommands::Logs => IpcCommand::ListLogs,
+        CtlCommands::FakeIps => IpcCommand::ListFakeIps,
+        CtlCommands::FlushFakeIps => IpcCommand::FlushFakeIps,
         CtlCommands::UpsertRule { json, json_file } => {
-            let rule = parse_routing_rule_payload(json, json_file)?;
-            Ok(("upsert-rule", IpcCommand::UpsertRule { rule }))
+            let rule = parse_json_payload::<RoutingRule>("rule", json, json_file)?;
+            IpcCommand::UpsertRule { rule }
         }
-        CtlCommands::RemoveRule { id } => {
-            Ok(("remove-rule", IpcCommand::RemoveRule { rule_id: id }))
-        }
+        CtlCommands::RemoveRule { id } => IpcCommand::RemoveRule { rule_id: id },
         CtlCommands::UpsertProxy { json, json_file } => {
-            let node = parse_proxy_node_payload(json, json_file)?;
-            Ok(("upsert-proxy", IpcCommand::UpsertProxy { node }))
+            let node = parse_json_payload::<ProxyNode>("proxy", json, json_file)?;
+            IpcCommand::UpsertProxy { node }
         }
-        CtlCommands::RemoveProxy { id } => {
-            Ok(("remove-proxy", IpcCommand::RemoveProxy { proxy_id: id }))
+        CtlCommands::RemoveProxy { id } => IpcCommand::RemoveProxy { proxy_id: id },
+        CtlCommands::TerminateConnection { id } => {
+            IpcCommand::TerminateConnection { connection_id: id }
         }
-        CtlCommands::TerminateConnection { id } => Ok((
-            "terminate-connection",
-            IpcCommand::TerminateConnection { connection_id: id },
-        )),
         CtlCommands::ReplaceProfile { json, json_file } => {
-            let profile = parse_profile_payload(json, json_file)?;
-            Ok(("replace-profile", IpcCommand::ReplaceProfile { profile }))
+            let profile = parse_json_payload::<ProfileConfig>("profile", json, json_file)?;
+            IpcCommand::ReplaceProfile { profile }
         }
-    }
+    };
+    Ok((label, ipc_cmd))
 }
 
 async fn execute_ctl_action(
@@ -320,13 +277,14 @@ async fn execute_ctl_action(
     user_logger: &FileLogger,
     action: CtlCommands,
 ) -> Result<routeward_core::ipc::protocol::IpcResponse, Box<dyn std::error::Error>> {
+    let expected_label = ctl_action_label(&action);
     let (cmd_label, ipc_cmd) = match ctl_action_into_ipc(action) {
         Ok(pair) => pair,
         Err(err) => {
             user_logger.log(
                 LogLevel::Info,
                 COMPONENT_CLI_CTL,
-                &format!("Executed ctl command 'upsert-rule': outcome=invalid_input ({err})"),
+                &format!("Executed ctl command '{expected_label}': outcome=invalid_input ({err})"),
             );
             return Err(err.into());
         }
@@ -879,8 +837,9 @@ mod tests {
         // 3. Missing file -> clear error with ERR_KEY_CONFIG_LOAD
         let missing_path =
             std::env::temp_dir().join(format!("routeward_nonexistent_{unique_id}.json"));
-        let missing_err = parse_routing_rule_payload(None, Some(missing_path.clone()))
-            .expect_err("missing --json-file must fail");
+        let missing_err =
+            parse_json_payload::<RoutingRule>("rule", None, Some(missing_path.clone()))
+                .expect_err("missing --json-file must fail");
         match missing_err {
             RouteWardError::ConfigError { key, detail } => {
                 assert_eq!(key, ERR_KEY_CONFIG_LOAD);
@@ -893,8 +852,9 @@ mod tests {
         let invalid_file_path =
             std::env::temp_dir().join(format!("routeward_invalid_rule_{unique_id}.json"));
         std::fs::write(&invalid_file_path, b"{protocol:tcp}").expect("write invalid json");
-        let invalid_err = parse_routing_rule_payload(None, Some(invalid_file_path.clone()))
-            .expect_err("invalid --json-file must fail");
+        let invalid_err =
+            parse_json_payload::<RoutingRule>("rule", None, Some(invalid_file_path.clone()))
+                .expect_err("invalid --json-file must fail");
         match invalid_err {
             RouteWardError::ConfigError { key, detail } => {
                 assert_eq!(key, ERR_KEY_CONFIG_JSON);
@@ -902,6 +862,12 @@ mod tests {
             }
             other => panic!("Expected ConfigError(ERR_KEY_CONFIG_JSON), got {other:?}"),
         }
+
+        assert_eq!(
+            ctl_action_label(&CtlCommands::FlushFakeIps),
+            "flush-fake-ips"
+        );
+        assert_eq!(ctl_action_label(&CtlCommands::Start), "start");
 
         daemon_task.abort();
         let _ = std::fs::remove_file(&valid_file_path);

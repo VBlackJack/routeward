@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import React, { useState } from 'react';
+import React, { useId, useState } from 'react';
 import { HelpCircle } from 'lucide-react';
 
 interface HelpTooltipProps {
@@ -23,6 +23,7 @@ interface HelpTooltipProps {
 
 export const HelpTooltip: React.FC<HelpTooltipProps> = ({ text }) => {
   const [open, setOpen] = useState(false);
+  const tooltipId = useId();
 
   return (
     <span
@@ -36,13 +37,26 @@ export const HelpTooltip: React.FC<HelpTooltipProps> = ({ text }) => {
           e.stopPropagation();
           setOpen((prev) => !prev);
         }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') {
+            setOpen(false);
+          }
+        }}
         className="inline-flex h-4 w-4 items-center justify-center rounded-full text-tf-secondary transition hover:bg-tf-surface-alt hover:text-tf-accent"
         aria-label={text}
+        aria-expanded={open}
+        aria-describedby={open ? tooltipId : undefined}
       >
         <HelpCircle className="h-3.5 w-3.5" />
       </button>
       {open && (
-        <span className=" absolute bottom-full left-1/2 z-50 mb-2 w-64 -translate-x-1/2 rounded-tf-md border border-tf-accent/50 bg-tf-surface p-2.5 text-[11px] font-normal leading-relaxed text-tf-primary shadow-xl">
+        <span
+          id={tooltipId}
+          role="tooltip"
+          className="absolute bottom-full left-1/2 z-50 mb-2 w-64 -translate-x-1/2 rounded-tf-md border border-tf-accent/50 bg-tf-surface p-2.5 text-[11px] font-normal leading-relaxed text-tf-primary shadow-xl"
+        >
           {text}
         </span>
       )}

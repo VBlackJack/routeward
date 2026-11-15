@@ -1,3 +1,5 @@
+[Français](fr/windows-testing.md) | English
+
 # Windows Non-Regression Test Suite
 
 `tests/windows/Invoke-RouteWardTests.ps1` (and its batch wrapper `tests/windows/Run-RouteWardTests.bat`) runs an automated 19-scenario non-regression test suite for RouteWard on a dedicated Windows test VM.
@@ -36,7 +38,7 @@ All paths, endpoints, rule names, and timeouts are configurable via parameters (
 
 Each scenario retains a **stable letter identifier** (`(a)` through `(s)`) across reports, paired with an **explicit execution order** (`[Order 01/19]` through `[Order 19/19]`).
 
-Because Scenario `(j)` stops the local SOCKS5 listener process on `-Socks5Port` to validate the Kill-Switch—and an interactive `ssh -D` tunnel that prompts for a password cannot be restarted unattended—Scenario `(j)` always executes **last (`Order 19/19`)**, after every other scenario:
+Because Scenario `(j)` stops the local SOCKS5 listener process on `-Socks5Port` to validate the Kill-Switch (and an interactive `ssh -D` tunnel that prompts for a password cannot be restarted unattended), Scenario `(j)` always executes **last (`Order 19/19`)**, after every other scenario:
 
 `01:(a) -> 02:(b) -> 03:(c) -> 04:(d) -> 05:(e) -> 06:(f) -> 07:(g) -> 08:(h) -> 09:(i) -> 10:(k) -> 11:(l) -> 12:(m) -> 13:(n) -> 14:(o) -> 15:(p) -> 16:(q) -> 17:(r) -> 18:(s) -> 19:(j)`
 

@@ -30,6 +30,8 @@ import {
   Zap
 } from 'lucide-react';
 import { useThemeForge } from '../theme/ThemeForgeContext';
+import { ModalContainer } from './ModalContainer';
+import { ExperienceMode } from './QuickSetupWizardModal';
 
 export type NavTabId =
   | 'dashboard'
@@ -40,6 +42,7 @@ export type NavTabId =
   | 'logs';
 
 interface CommandPaletteModalProps {
+  experienceMode: ExperienceMode;
   onClose: () => void;
   onNavigate: (tab: NavTabId) => void;
   onToggleEngine: () => void;
@@ -61,6 +64,7 @@ interface PaletteItem {
 }
 
 export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
+  experienceMode,
   onClose,
   onNavigate,
   onToggleEngine,
@@ -118,22 +122,26 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
         icon: Shield,
         onSelect: () => onNavigate('rules')
       },
-      {
-        id: 'nav-dns',
-        group: navGroup,
-        label: t('app.nav.dns.tab'),
-        badge: 'Alt+5',
-        icon: Globe,
-        onSelect: () => onNavigate('dns')
-      },
-      {
-        id: 'nav-logs',
-        group: navGroup,
-        label: t('app.nav.logs.tab'),
-        badge: 'Alt+6',
-        icon: FileText,
-        onSelect: () => onNavigate('logs')
-      }
+      ...(experienceMode === 'expert'
+        ? [
+            {
+              id: 'nav-dns',
+              group: navGroup,
+              label: t('app.nav.dns.tab'),
+              badge: 'Alt+5',
+              icon: Globe,
+              onSelect: () => onNavigate('dns')
+            },
+            {
+              id: 'nav-logs',
+              group: navGroup,
+              label: t('app.nav.logs.tab'),
+              badge: 'Alt+6',
+              icon: FileText,
+              onSelect: () => onNavigate('logs')
+            }
+          ]
+        : [])
     ];
 
     const actionItems: PaletteItem[] = [
@@ -195,6 +203,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
   }, [
     t,
     palettes,
+    experienceMode,
     onNavigate,
     onToggleEngine,
     onTestAllProxies,
@@ -243,13 +252,9 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 pt-20 backdrop-blur-sm"
-      onClick={onClose}
-    >
+    <ModalContainer onClose={onClose} alignTop>
       <div
         className="tf-card w-full max-w-xl overflow-hidden shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
         onKeyDown={handleKeyDown}
       >
         <div className="flex items-center border-b border-tf-border px-4 py-3">
@@ -260,6 +265,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder={t('command_palette.modal.search_placeholder')}
+            aria-label={t('command_palette.modal.search_placeholder')}
             className="w-full bg-transparent text-sm text-tf-primary focus:outline-none"
           />
           <span className="rounded bg-tf-surface-alt px-2 py-0.5 font-mono text-[10px] text-tf-secondary">
@@ -323,6 +329,6 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
           )}
         </div>
       </div>
-    </div>
+    </ModalContainer>
   );
 };

@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 
-import React, { useState } from 'react';
+import React, { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Activity,
+  ArrowDown,
   ArrowRight,
+  ArrowUp,
   Copy,
   Edit3,
   FileCode2,
@@ -28,8 +30,10 @@ import {
   Plus,
   Server,
   Trash2,
+  X,
   Zap
 } from 'lucide-react';
+import { ModalContainer } from './ModalContainer';
 import { UI_CONFIG } from '../config/constants';
 import { generateClientId, routewardClient } from '../services/ipc';
 import {
@@ -74,6 +78,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   onRemoveChain
 }) => {
   const { t } = useTranslation();
+  const importTitleId = useId();
+  const proxyTitleId = useId();
+  const chainTitleId = useId();
   const [testingId, setTestingId] = useState<string | null>(null);
   const [showAddProxy, setShowAddProxy] = useState(false);
   const [showImportUri, setShowImportUri] = useState(false);
@@ -315,23 +322,29 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 </button>
                 <div className="flex items-center gap-2">
                   <button
+                    type="button"
                     onClick={() => openEditProxyModal(proxy)}
                     className="flex items-center gap-1 text-xs text-tf-secondary hover:text-tf-primary"
                     title={t('proxies.card.action.edit')}
+                    aria-label={t('proxies.card.action.edit')}
                   >
                     <Edit3 className="h-3.5 w-3.5" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => handleCopyNodeUri(proxy)}
                     className="flex items-center gap-1 text-xs text-tf-secondary hover:text-tf-primary"
                     title={t('proxies.card.action.copy_uri')}
+                    aria-label={t('proxies.card.action.copy_uri')}
                   >
                     <Copy className="h-3.5 w-3.5" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => onRemoveProxy(proxy.id)}
                     className="text-xs text-tf-secondary hover:text-tf-red"
                     title={t('proxies.card.action.delete')}
+                    aria-label={t('proxies.card.action.delete')}
                   >
                     <Trash2 className="h-4 w-4" />
                   </button>
@@ -385,7 +398,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       {t('proxies.section.chains.hops')}
                     </span>
                     <button
+                      type="button"
                       onClick={() => onRemoveChain(chain.id)}
+                      title={t('proxies.section.chains.delete')}
+                      aria-label={t('proxies.section.chains.delete')}
                       className="text-tf-secondary hover:text-tf-red"
                     >
                       <Trash2 className="h-4 w-4" />
@@ -419,13 +435,17 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
 
       {/* Batch Import URI Modal */}
       {showImportUri && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <ModalContainer
+          onClose={() => setShowImportUri(false)}
+          labelledBy={importTitleId}
+          backdropClassName="bg-black/70 p-4"
+        >
           <form
             onSubmit={handleBatchUriSubmit}
             className="tf-card w-full max-w-lg space-y-4 p-6"
           >
             <div>
-              <h3 className="text-base font-bold text-tf-primary">
+              <h3 id={importTitleId} className="text-base font-bold text-tf-primary">
                 {t('proxies.modal.import_uri.title')}
               </h3>
               <p className="mt-1 text-xs text-tf-secondary">
@@ -435,6 +455,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             <textarea
               rows={5}
               required
+              aria-label={t('proxies.modal.import_uri.title')}
               value={uriBatchText}
               onChange={(e) => setUriBatchText(e.target.value)}
               placeholder={t('proxies.modal.import_uri.placeholder')}
@@ -456,17 +477,21 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               </button>
             </div>
           </form>
-        </div>
+        </ModalContainer>
       )}
 
       {/* Add Proxy Modal */}
       {showAddProxy && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <ModalContainer
+          onClose={() => setShowAddProxy(false)}
+          labelledBy={proxyTitleId}
+          backdropClassName="bg-black/70 p-4"
+        >
           <form
             onSubmit={handleCreateProxy}
             className="tf-card w-full max-w-md space-y-4 p-6"
           >
-            <h3 className="text-base font-bold text-tf-primary">
+            <h3 id={proxyTitleId} className="text-base font-bold text-tf-primary">
               {editingProxyId
                 ? t('proxies.modal.add_proxy.edit_title')
                 : t('proxies.modal.add_proxy.title')}
@@ -611,17 +636,21 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               </button>
             </div>
           </form>
-        </div>
+        </ModalContainer>
       )}
 
       {/* Add Chain / Smart Group Modal */}
       {showAddChain && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <ModalContainer
+          onClose={() => setShowAddChain(false)}
+          labelledBy={chainTitleId}
+          backdropClassName="bg-black/70 p-4"
+        >
           <form
             onSubmit={handleCreateChain}
             className="tf-card w-full max-w-md space-y-4 p-6"
           >
-            <h3 className="text-base font-bold text-tf-primary">
+            <h3 id={chainTitleId} className="text-base font-bold text-tf-primary">
               {t('proxies.modal.add_chain.title')}
             </h3>
             <div>
@@ -681,9 +710,56 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   return (
                     <span
                       key={`${id}-${i}`}
-                      className="rounded bg-tf-accent/20 px-2 py-0.5 font-mono text-tf-accent"
+                      className="inline-flex items-center gap-1 rounded bg-tf-accent/20 px-2 py-0.5 font-mono text-tf-accent"
                     >
-                      {i + 1}. {p?.name || id}
+                      <span>
+                        {i + 1}. {p?.name || id}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={i === 0}
+                        onClick={() =>
+                          setSelectedHops((prev) => {
+                            const next = [...prev];
+                            [next[i - 1], next[i]] = [next[i], next[i - 1]];
+                            return next;
+                          })
+                        }
+                        aria-label={t('proxies.modal.add_chain.move_hop_up')}
+                        title={t('proxies.modal.add_chain.move_hop_up')}
+                        className="rounded p-0.5 hover:bg-tf-accent/20 disabled:opacity-30"
+                      >
+                        <ArrowUp className="h-3 w-3" />
+                      </button>
+                      <button
+                        type="button"
+                        disabled={i === selectedHops.length - 1}
+                        onClick={() =>
+                          setSelectedHops((prev) => {
+                            const next = [...prev];
+                            [next[i], next[i + 1]] = [next[i + 1], next[i]];
+                            return next;
+                          })
+                        }
+                        aria-label={t('proxies.modal.add_chain.move_hop_down')}
+                        title={t('proxies.modal.add_chain.move_hop_down')}
+                        className="rounded p-0.5 hover:bg-tf-accent/20 disabled:opacity-30"
+                      >
+                        <ArrowDown className="h-3 w-3" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelectedHops((prev) =>
+                            prev.filter((_, idx) => idx !== i)
+                          )
+                        }
+                        aria-label={t('proxies.modal.add_chain.remove_hop')}
+                        title={t('proxies.modal.add_chain.remove_hop')}
+                        className="rounded p-0.5 hover:text-tf-red"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
                     </span>
                   );
                 })}
@@ -705,7 +781,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               </button>
             </div>
           </form>
-        </div>
+        </ModalContainer>
       )}
     </div>
   );

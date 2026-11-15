@@ -1,3 +1,5 @@
+[Français](fr/troubleshooting.md) | English
+
 # Troubleshooting
 
 ## 1. Windows Firewall and Reflected Inbound Packets (`TCP 10810`)
