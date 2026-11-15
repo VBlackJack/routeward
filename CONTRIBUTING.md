@@ -42,5 +42,6 @@ cargo test --workspace
 And from the `ui/` directory:
 
 ```powershell
+npm test
 npm run build
 ```
