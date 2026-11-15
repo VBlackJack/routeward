@@ -3,6 +3,15 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
+## [v2026.1115.02] - 2026-11-15
+
+### Fixed
+- Harden pre-existing `%ProgramData%\RouteWard` directory permissions and ownership during daemon startup, add MSI `ProgramDataComponents` folder permissions (`SYSTEM` and `Administrators` `GenericAll`), prevent unprivileged desktop processes from writing to privileged directories, and separate UI diagnostics logging from daemon logs.
+- Capture and surface early exit codes from elevated `routeward daemon` UAC launches (`NotElevated`, `InsecureProfile`, `IpcBindFailed`, `ConfigInvalid`, `DaemonExitedEarly`) in `routeward-desktop`, and enforce upfront elevation checks in `routeward run`.
+
+### Changed
+- Synchronize the native desktop window title bar (DWM caption, text, border, and light/dark mode) plus WebView `color-scheme` and scrollbars with the active ThemeForge palette via `POST /api/theme`.
+
 ## [v2026.1115.01] - 2026-11-15
 
 ### Fixed

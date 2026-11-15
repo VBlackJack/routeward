@@ -2185,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "routeward-cli"
-version = "2026.1115.1"
+version = "2026.1115.2"
 dependencies = [
  "clap",
  "embed-resource",
@@ -2199,7 +2199,7 @@ dependencies = [
 
 [[package]]
 name = "routeward-core"
-version = "2026.1115.1"
+version = "2026.1115.2"
 dependencies = [
  "base64",
  "chrono",
@@ -2223,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "routeward-desktop"
-version = "2026.1115.1"
+version = "2026.1115.2"
 dependencies = [
  "embed-resource",
  "parking_lot",
