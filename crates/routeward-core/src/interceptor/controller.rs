@@ -57,7 +57,33 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+/// Upper bound of the wait, in `stop_engine`, for the listener tasks to drop their sockets.
+const ENGINE_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Receiving end of the per-start engine shutdown signal.
+pub(super) type ShutdownSignal = watch::Receiver<bool>;
+
+/// Shutdown signal and listener/ticker task handles of one `start_engine` call.
+pub(crate) struct EngineRuntime {
+    shutdown: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+/// Awaits `fut` unless the shutdown signal fires first, in which case `None` is returned and
+/// `fut` is dropped. A dropped sender counts as a shutdown.
+async fn or_shutdown<F: std::future::Future>(
+    signal: &mut ShutdownSignal,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        _ = signal.wait_for(|stopped| *stopped) => None,
+        out = fut => Some(out),
+    }
+}
 
 /// Listeners of the engine, bound before any task is spawned.
 struct EngineListeners {
@@ -140,6 +166,8 @@ impl RouteWardController {
             relay_caches: Arc::new(RelayCaches::new()),
             interceptor_backend,
             running: Arc::new(AtomicBool::new(false)),
+            engine_lifecycle: Arc::new(parking_lot::Mutex::new(())),
+            engine_runtime: Arc::new(parking_lot::Mutex::new(None)),
         };
 
         controller.telemetry.push_log(
@@ -273,6 +301,9 @@ impl RouteWardController {
     /// running afterwards (including when it already was) and the bind error when a listener could
     /// not be bound, in which case the engine stays stopped.
     pub fn start_engine(&self) -> RouteWardResult<()> {
+        // Serialises with `stop_engine` so a concurrent stop can never run between the start of
+        // this call and the storage of the shutdown handle. Listener tasks never take this lock.
+        let _lifecycle = self.engine_lifecycle.lock();
         if self
             .running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -304,36 +335,56 @@ impl RouteWardController {
 
         self.flush_os_dns_cache("startup");
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+
         let ticker_ctrl = self.clone();
-        tokio::spawn(async move {
+        let mut ticker_signal = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
             let interval =
                 Duration::from_millis(ticker_ctrl.constants.telemetry.sampling_interval_ms);
             while ticker_ctrl.is_running() {
                 ticker_ctrl.telemetry.tick_bandwidth_sample();
-                tokio::time::sleep(interval).await;
+                if or_shutdown(&mut ticker_signal, tokio::time::sleep(interval))
+                    .await
+                    .is_none()
+                {
+                    break;
+                }
             }
-        });
+        }));
 
         let relay_ctrl = self.clone();
         let relay_listener = listeners.relay;
-        tokio::spawn(async move {
+        let mut relay_signal = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
             while relay_ctrl.is_running() {
-                if let Ok((client_stream, peer_addr)) = relay_listener.accept().await {
-                    let conn_ctrl = relay_ctrl.clone();
-                    tokio::spawn(async move {
-                        let _ = conn_ctrl
-                            .handle_local_socks5_client(client_stream, peer_addr.port())
-                            .await;
-                    });
+                match or_shutdown(&mut relay_signal, relay_listener.accept()).await {
+                    None => break,
+                    Some(Ok((client_stream, peer_addr))) => {
+                        let conn_ctrl = relay_ctrl.clone();
+                        tokio::spawn(async move {
+                            let _ = conn_ctrl
+                                .handle_local_socks5_client(client_stream, peer_addr.port())
+                                .await;
+                        });
+                    }
+                    Some(Err(_)) => {}
                 }
             }
-        });
+        }));
 
         let trans_ctrl = self.clone();
         let trans_listener = listeners.transparent;
-        tokio::spawn(async move {
-            RouteWardController::accept_transparent_tcp_loop(trans_ctrl, trans_listener).await;
-        });
+        let trans_signal = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
+            RouteWardController::accept_transparent_tcp_loop(
+                trans_ctrl,
+                trans_listener,
+                trans_signal,
+            )
+            .await;
+        }));
 
         if let Some(v6_ip) = Self::ipv6_counterpart(&self.constants.network.transparent_bind_host) {
             let port = self.constants.network.default_transparent_tcp_port;
@@ -350,10 +401,15 @@ impl RouteWardController {
                         ),
                     );
                     let trans_v6_ctrl = self.clone();
-                    tokio::spawn(async move {
-                        RouteWardController::accept_transparent_tcp_loop(trans_v6_ctrl, listener)
-                            .await;
-                    });
+                    let trans_v6_signal = shutdown_rx.clone();
+                    tasks.push(tokio::spawn(async move {
+                        RouteWardController::accept_transparent_tcp_loop(
+                            trans_v6_ctrl,
+                            listener,
+                            trans_v6_signal,
+                        )
+                        .await;
+                    }));
                 }
                 Err(err) => {
                     self.telemetry.push_log(
@@ -369,34 +425,48 @@ impl RouteWardController {
 
         let dns_udp_ctrl = self.clone();
         let dns_udp_socket = listeners.dns_udp;
-        tokio::spawn(async move {
+        let mut dns_udp_signal = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; dns_udp_ctrl.constants.dns.udp_response_buffer_bytes];
+            let mut join_set = tokio::task::JoinSet::new();
             while dns_udp_ctrl.is_running() {
-                if let Ok((len, peer_addr, local_dst_ip)) =
-                    NftablesInterceptor::recv_udp_with_local_ip(&dns_udp_socket, &mut buf).await
-                {
-                    let query_bytes = buf[..len].to_vec();
-                    let sock_reply = Arc::clone(&dns_udp_socket);
-                    let ctrl_query = dns_udp_ctrl.clone();
-                    tokio::spawn(async move {
-                        let orig_resolver =
-                            ctrl_query.lookup_udp_orig_dns_resolver(peer_addr).await;
-                        let resp = ctrl_query
-                            .resolve_dns_query_async(&query_bytes, orig_resolver, true)
-                            .await;
-                        if !resp.is_empty() {
-                            let _ = NftablesInterceptor::send_udp_from_local_ip(
-                                &sock_reply,
-                                &resp,
-                                peer_addr,
-                                local_dst_ip,
-                            )
-                            .await;
-                        }
-                    });
+                while join_set.try_join_next().is_some() {}
+                let received = or_shutdown(
+                    &mut dns_udp_signal,
+                    NftablesInterceptor::recv_udp_with_local_ip(&dns_udp_socket, &mut buf),
+                )
+                .await;
+                match received {
+                    None => break,
+                    Some(Ok((len, peer_addr, local_dst_ip))) => {
+                        let query_bytes = buf[..len].to_vec();
+                        let sock_reply = Arc::clone(&dns_udp_socket);
+                        let ctrl_query = dns_udp_ctrl.clone();
+                        join_set.spawn(async move {
+                            let work = async {
+                                let orig_resolver =
+                                    ctrl_query.lookup_udp_orig_dns_resolver(peer_addr).await;
+                                let resp = ctrl_query
+                                    .resolve_dns_query_async(&query_bytes, orig_resolver, true)
+                                    .await;
+                                if !resp.is_empty() {
+                                    let _ = NftablesInterceptor::send_udp_from_local_ip(
+                                        &sock_reply,
+                                        &resp,
+                                        peer_addr,
+                                        local_dst_ip,
+                                    )
+                                    .await;
+                                }
+                            };
+                            work.await;
+                        });
+                    }
+                    Some(Err(_)) => {}
                 }
             }
-        });
+            join_set.shutdown().await;
+        }));
 
         if let Some(v6_ip) = Self::ipv6_counterpart(&self.constants.network.transparent_bind_host) {
             let port = self.constants.network.default_dns_listen_port;
@@ -414,36 +484,55 @@ impl RouteWardController {
                         format!("Listening for IPv6 UDP DNS queries on [{v6_ip}]:{port}"),
                     );
                     let dns_udp_v6_ctrl = self.clone();
-                    tokio::spawn(async move {
+                    let mut dns_udp_v6_signal = shutdown_rx.clone();
+                    tasks.push(tokio::spawn(async move {
                         let mut buf =
                             vec![0u8; dns_udp_v6_ctrl.constants.dns.udp_response_buffer_bytes];
+                        let mut join_set = tokio::task::JoinSet::new();
                         while dns_udp_v6_ctrl.is_running() {
-                            if let Ok((len, peer_addr, local_dst_ip)) =
-                                NftablesInterceptor::recv_udp_v6_with_local_ip(&socket, &mut buf)
-                                    .await
-                            {
-                                let query_bytes = buf[..len].to_vec();
-                                let sock_reply = Arc::clone(&socket);
-                                let ctrl_query = dns_udp_v6_ctrl.clone();
-                                tokio::spawn(async move {
-                                    let orig_resolver =
-                                        ctrl_query.lookup_udp_orig_dns_resolver(peer_addr).await;
-                                    let resp = ctrl_query
-                                        .resolve_dns_query_async(&query_bytes, orig_resolver, true)
-                                        .await;
-                                    if !resp.is_empty() {
-                                        let _ = NftablesInterceptor::send_udp_v6_from_local_ip(
-                                            &sock_reply,
-                                            &resp,
-                                            peer_addr,
-                                            local_dst_ip,
-                                        )
-                                        .await;
-                                    }
-                                });
+                            while join_set.try_join_next().is_some() {}
+                            let received = or_shutdown(
+                                &mut dns_udp_v6_signal,
+                                NftablesInterceptor::recv_udp_v6_with_local_ip(&socket, &mut buf),
+                            )
+                            .await;
+                            match received {
+                                None => break,
+                                Some(Ok((len, peer_addr, local_dst_ip))) => {
+                                    let query_bytes = buf[..len].to_vec();
+                                    let sock_reply = Arc::clone(&socket);
+                                    let ctrl_query = dns_udp_v6_ctrl.clone();
+                                    join_set.spawn(async move {
+                                        let work = async {
+                                            let orig_resolver = ctrl_query
+                                                .lookup_udp_orig_dns_resolver(peer_addr)
+                                                .await;
+                                            let resp = ctrl_query
+                                                .resolve_dns_query_async(
+                                                    &query_bytes,
+                                                    orig_resolver,
+                                                    true,
+                                                )
+                                                .await;
+                                            if !resp.is_empty() {
+                                                let _ =
+                                                    NftablesInterceptor::send_udp_v6_from_local_ip(
+                                                        &sock_reply,
+                                                        &resp,
+                                                        peer_addr,
+                                                        local_dst_ip,
+                                                    )
+                                                    .await;
+                                            }
+                                        };
+                                        work.await;
+                                    });
+                                }
+                                Some(Err(_)) => {}
                             }
                         }
-                    });
+                        join_set.shutdown().await;
+                    }));
                 }
                 Err(err) => {
                     self.telemetry.push_log(
@@ -457,11 +546,17 @@ impl RouteWardController {
 
         let dns_tcp_ctrl = self.clone();
         let dns_tcp_listener = listeners.dns_tcp;
-        tokio::spawn(async move {
+        let dns_tcp_signal = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
             let dns_port = dns_tcp_ctrl.constants.network.default_dns_listen_port;
-            RouteWardController::accept_dns_tcp_loop(dns_tcp_ctrl, dns_tcp_listener, dns_port)
-                .await;
-        });
+            RouteWardController::accept_dns_tcp_loop(
+                dns_tcp_ctrl,
+                dns_tcp_listener,
+                dns_port,
+                dns_tcp_signal,
+            )
+            .await;
+        }));
 
         if let Some(v6_ip) = Self::ipv6_counterpart(&self.constants.network.transparent_bind_host) {
             let dns_port = self.constants.network.default_dns_listen_port;
@@ -473,14 +568,16 @@ impl RouteWardController {
                         format!("Listening for IPv6 TCP DNS queries on [{v6_ip}]:{dns_port}"),
                     );
                     let dns_tcp_v6_ctrl = self.clone();
-                    tokio::spawn(async move {
+                    let dns_tcp_v6_signal = shutdown_rx.clone();
+                    tasks.push(tokio::spawn(async move {
                         RouteWardController::accept_dns_tcp_loop(
                             dns_tcp_v6_ctrl,
                             listener,
                             dns_port,
+                            dns_tcp_v6_signal,
                         )
                         .await;
-                    });
+                    }));
                 }
                 Err(err) => {
                     self.telemetry.push_log(
@@ -494,29 +591,38 @@ impl RouteWardController {
 
         let local_name_ctrl = self.clone();
         let local_name_socket = listeners.local_name;
-        tokio::spawn(async move {
+        let mut local_name_signal = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_UDP_DATAGRAM_BYTES];
+            let mut join_set = tokio::task::JoinSet::new();
             while local_name_ctrl.is_running() {
-                if let Ok((len, client_addr, orig_dst)) =
-                    NftablesInterceptor::recv_udp_tproxy_orig_dst(&local_name_socket, &mut buf)
-                        .await
-                {
-                    let pkt_bytes = buf[..len].to_vec();
-                    let sock_reply = Arc::clone(&local_name_socket);
-                    let ctrl_inspect = local_name_ctrl.clone();
-                    tokio::spawn(async move {
-                        ctrl_inspect
-                            .handle_tproxy_udp_datagram(
+                while join_set.try_join_next().is_some() {}
+                let received = or_shutdown(
+                    &mut local_name_signal,
+                    NftablesInterceptor::recv_udp_tproxy_orig_dst(&local_name_socket, &mut buf),
+                )
+                .await;
+                match received {
+                    None => break,
+                    Some(Ok((len, client_addr, orig_dst))) => {
+                        let pkt_bytes = buf[..len].to_vec();
+                        let sock_reply = Arc::clone(&local_name_socket);
+                        let ctrl_inspect = local_name_ctrl.clone();
+                        join_set.spawn(async move {
+                            let work = ctrl_inspect.handle_tproxy_udp_datagram(
                                 &pkt_bytes,
                                 SocketAddr::V4(client_addr),
                                 orig_dst.map(SocketAddr::V4),
                                 &sock_reply,
-                            )
-                            .await;
-                    });
+                            );
+                            work.await;
+                        });
+                    }
+                    Some(Err(_)) => {}
                 }
             }
-        });
+            join_set.shutdown().await;
+        }));
 
         if let Some(v6_ip) = Self::ipv6_counterpart(&self.constants.network.transparent_bind_host) {
             let inspect_port = self.constants.network.default_local_name_inspect_port;
@@ -542,29 +648,38 @@ impl RouteWardController {
                         ),
                     );
                     let local_name_v6_ctrl = self.clone();
-                    tokio::spawn(async move {
+                    let mut local_name_v6_signal = shutdown_rx.clone();
+                    tasks.push(tokio::spawn(async move {
                         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_BYTES];
+                        let mut join_set = tokio::task::JoinSet::new();
                         while local_name_v6_ctrl.is_running() {
-                            if let Ok((len, client_addr, orig_dst)) =
-                                NftablesInterceptor::recv_udp_tproxy_v6_orig_dst(&socket, &mut buf)
-                                    .await
-                            {
-                                let pkt_bytes = buf[..len].to_vec();
-                                let sock_reply = Arc::clone(&socket);
-                                let ctrl_inspect = local_name_v6_ctrl.clone();
-                                tokio::spawn(async move {
-                                    ctrl_inspect
-                                        .handle_tproxy_udp_datagram(
+                            while join_set.try_join_next().is_some() {}
+                            let received = or_shutdown(
+                                &mut local_name_v6_signal,
+                                NftablesInterceptor::recv_udp_tproxy_v6_orig_dst(&socket, &mut buf),
+                            )
+                            .await;
+                            match received {
+                                None => break,
+                                Some(Ok((len, client_addr, orig_dst))) => {
+                                    let pkt_bytes = buf[..len].to_vec();
+                                    let sock_reply = Arc::clone(&socket);
+                                    let ctrl_inspect = local_name_v6_ctrl.clone();
+                                    join_set.spawn(async move {
+                                        let work = ctrl_inspect.handle_tproxy_udp_datagram(
                                             &pkt_bytes,
                                             SocketAddr::V6(client_addr),
                                             orig_dst.map(SocketAddr::V6),
                                             &sock_reply,
-                                        )
-                                        .await;
-                                });
+                                        );
+                                        work.await;
+                                    });
+                                }
+                                Some(Err(_)) => {}
                             }
                         }
-                    });
+                        join_set.shutdown().await;
+                    }));
                 }
                 Err(err) => {
                     self.telemetry.push_log(
@@ -579,9 +694,24 @@ impl RouteWardController {
         }
 
         let bootstrap_ctrl = self.clone();
-        tokio::spawn(async move {
-            bootstrap_ctrl.bootstrap_resolve_proxy_hosts().await;
+        let mut bootstrap_signal = shutdown_rx;
+        tasks.push(tokio::spawn(async move {
+            let _ = or_shutdown(
+                &mut bootstrap_signal,
+                bootstrap_ctrl.bootstrap_resolve_proxy_hosts(),
+            )
+            .await;
+        }));
+
+        *self.engine_runtime.lock() = Some(EngineRuntime {
+            shutdown: shutdown_tx,
+            tasks,
         });
+        // Defence in depth: should the engine have been flagged stopped meanwhile, do not leave
+        // the freshly spawned tasks parked with an unfired signal.
+        if !self.is_running() {
+            self.shutdown_engine_tasks();
+        }
         Ok(())
     }
 
@@ -766,15 +896,20 @@ impl RouteWardController {
     pub(super) async fn accept_transparent_tcp_loop(
         ctrl: RouteWardController,
         listener: TcpListener,
+        mut signal: ShutdownSignal,
     ) {
         while ctrl.is_running() {
-            if let Ok((client_stream, peer_addr)) = listener.accept().await {
-                let conn_ctrl = ctrl.clone();
-                tokio::spawn(async move {
-                    let _ = conn_ctrl
-                        .handle_transparent_tcp_client(client_stream, peer_addr)
-                        .await;
-                });
+            match or_shutdown(&mut signal, listener.accept()).await {
+                None => break,
+                Some(Ok((client_stream, peer_addr))) => {
+                    let conn_ctrl = ctrl.clone();
+                    tokio::spawn(async move {
+                        let _ = conn_ctrl
+                            .handle_transparent_tcp_client(client_stream, peer_addr)
+                            .await;
+                    });
+                }
+                Some(Err(_)) => {}
             }
         }
     }
@@ -783,23 +918,28 @@ impl RouteWardController {
         ctrl: RouteWardController,
         listener: TcpListener,
         dns_port: u16,
+        mut signal: ShutdownSignal,
     ) {
         while ctrl.is_running() {
-            if let Ok((stream, _peer_addr)) = listener.accept().await {
-                let ctrl_query = ctrl.clone();
-                tokio::spawn(async move {
-                    #[cfg(not(windows))]
-                    let orig_resolver =
-                        NftablesInterceptor::query_original_dst_any(&stream, dns_port);
-                    #[cfg(windows)]
-                    let orig_resolver: Option<SocketAddr> = {
-                        let _ = dns_port;
-                        None
-                    };
-                    let _ = ctrl_query
-                        .handle_dns_tcp_stream(stream, orig_resolver)
-                        .await;
-                });
+            match or_shutdown(&mut signal, listener.accept()).await {
+                None => break,
+                Some(Ok((stream, _peer_addr))) => {
+                    let ctrl_query = ctrl.clone();
+                    tokio::spawn(async move {
+                        #[cfg(not(windows))]
+                        let orig_resolver =
+                            NftablesInterceptor::query_original_dst_any(&stream, dns_port);
+                        #[cfg(windows)]
+                        let orig_resolver: Option<SocketAddr> = {
+                            let _ = dns_port;
+                            None
+                        };
+                        let _ = ctrl_query
+                            .handle_dns_tcp_stream(stream, orig_resolver)
+                            .await;
+                    });
+                }
+                Some(Err(_)) => {}
             }
         }
     }
@@ -858,10 +998,12 @@ impl RouteWardController {
     }
 
     pub fn stop_engine(&self) {
+        let _lifecycle = self.engine_lifecycle.lock();
         let was_active = self.interceptor_backend.is_active();
         self.interceptor_backend.stop();
         self.udp_manager.clear_all();
         let was_running = self.running.swap(false, Ordering::SeqCst);
+        self.shutdown_engine_tasks();
         if was_running || was_active {
             self.flush_os_dns_cache("shutdown");
         }
@@ -871,6 +1013,49 @@ impl RouteWardController {
             self.i18n.t("app.header.engine.stopped"),
         );
         self.telemetry.flush_file_logger();
+    }
+
+    /// Fires the shutdown signal of the current start so every listener task drops its socket,
+    /// then waits (bounded) for those tasks to finish so the ports can be bound again at once.
+    ///
+    /// The wait only happens on a multi-thread runtime, where `block_in_place` hands the worker's
+    /// queue to another thread; on a current-thread runtime the tasks cannot make progress while
+    /// this thread blocks, so they finish at the caller's next await point instead.
+    fn shutdown_engine_tasks(&self) {
+        let Some(runtime) = self.engine_runtime.lock().take() else {
+            return;
+        };
+        let _ = runtime.shutdown.send(true);
+        let tasks = runtime.tasks;
+        let multi_thread = tokio::runtime::Handle::try_current()
+            .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false);
+        if !multi_thread {
+            return;
+        }
+        let unfinished = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let deadline = tokio::time::Instant::now() + ENGINE_SHUTDOWN_JOIN_TIMEOUT;
+                let mut unfinished = 0usize;
+                for mut task in tasks {
+                    if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                        task.abort();
+                        unfinished += 1;
+                    }
+                }
+                unfinished
+            })
+        });
+        if unfinished > 0 {
+            self.telemetry.push_log(
+                LogLevel::Warn,
+                COMPONENT_ENGINE,
+                format!(
+                    "{unfinished} engine task(s) did not stop within {} ms and were aborted",
+                    ENGINE_SHUTDOWN_JOIN_TIMEOUT.as_millis()
+                ),
+            );
+        }
     }
 
     /// Flushes the OS client DNS resolver cache (`dnsapi.dll!DnsFlushResolverCache` / `ipconfig /flushdns`
@@ -2222,6 +2407,104 @@ mod tests {
         assert!(controller.is_running());
         controller.stop_engine();
         assert!(!controller.is_running());
+    }
+
+    /// Interleavings tried by the concurrent start/stop test.
+    const CONCURRENT_LIFECYCLE_ROUNDS: usize = 20;
+
+    /// Time given to the listener tasks to run until they are parked in accept/recv.
+    const LISTENER_SETTLE_DELAY: Duration = Duration::from_millis(30);
+
+    /// Reserves `count` distinct ports that are free for both TCP and UDP on the loopback
+    /// interface. The probe sockets stay open until every port is chosen, so none repeats.
+    fn reserve_free_ports(host: &str, count: usize) -> Vec<u16> {
+        let mut probes = Vec::new();
+        while probes.len() < count {
+            let tcp = std::net::TcpListener::bind(format!("{host}:0")).expect("reserve tcp port");
+            let port = tcp.local_addr().expect("reserved addr").port();
+            if let Ok(udp) = std::net::UdpSocket::bind(format!("{host}:{port}")) {
+                probes.push((port, tcp, udp));
+            }
+        }
+        probes.iter().map(|(port, _, _)| *port).collect()
+    }
+
+    /// Lets every listener task run until it is parked in accept/recv.
+    async fn settle_listener_tasks() {
+        tokio::time::sleep(LISTENER_SETTLE_DELAY).await;
+    }
+
+    /// Constants whose listener ports are fixed (not ephemeral) so a restart must rebind them.
+    fn fixed_port_constants() -> SystemConstants {
+        let mut constants = test_constants();
+        let host = constants.network.transparent_bind_host.clone();
+        let ports = reserve_free_ports(&host, 4);
+        constants.network.default_relay_tcp_port = ports[0];
+        constants.network.default_transparent_tcp_port = ports[1];
+        constants.network.default_dns_listen_port = ports[2];
+        constants.network.default_local_name_inspect_port = ports[3];
+        constants
+    }
+
+    fn assert_relay_port_bindable(constants: &SystemConstants) {
+        let addr = format!(
+            "{}:{}",
+            constants.network.local_bind_host, constants.network.default_relay_tcp_port
+        );
+        std::net::TcpListener::bind(&addr)
+            .unwrap_or_else(|err| panic!("relay port {addr} must be free after stop: {err}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_restart_rebinds_listeners_after_stop() {
+        let constants = fixed_port_constants();
+        let controller = RouteWardController::new(constants.clone(), test_profile(), "en");
+
+        controller.start_engine().expect("first start");
+        settle_listener_tasks().await;
+        controller.stop_engine();
+        assert_relay_port_bindable(&constants);
+
+        controller.start_engine().expect("restart after stop");
+        assert!(controller.is_running());
+        controller.stop_engine();
+        assert_relay_port_bindable(&constants);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_start_and_stop_never_leave_listeners_bound() {
+        let constants = fixed_port_constants();
+        let controller = RouteWardController::new(constants.clone(), test_profile(), "en");
+        for _ in 0..CONCURRENT_LIFECYCLE_ROUNDS {
+            let starter = controller.clone();
+            let stopper = controller.clone();
+            let start = tokio::spawn(async move {
+                let _ = starter.start_engine();
+            });
+            let stop = tokio::spawn(async move { stopper.stop_engine() });
+            start.await.expect("start task");
+            stop.await.expect("stop task");
+            controller.stop_engine();
+            assert_relay_port_bindable(&constants);
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_restart_rebinds_listeners_on_a_current_thread_runtime() {
+        let constants = fixed_port_constants();
+        let controller = RouteWardController::new(constants.clone(), test_profile(), "en");
+
+        controller.start_engine().expect("first start");
+        settle_listener_tasks().await;
+        controller.stop_engine();
+        // On a current-thread runtime the listener tasks end at the next await point.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_relay_port_bindable(&constants);
+
+        controller.start_engine().expect("restart after stop");
+        controller.stop_engine();
     }
 
     #[test]

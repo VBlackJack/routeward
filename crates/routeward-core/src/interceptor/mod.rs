@@ -177,6 +177,10 @@ pub struct RouteWardController {
     pub(super) relay_caches: Arc<RelayCaches>,
     pub(super) interceptor_backend: Arc<dyn Interceptor>,
     pub(super) running: Arc<AtomicBool>,
+    /// Serialises `start_engine` and `stop_engine`; listener tasks never take it.
+    pub(super) engine_lifecycle: Arc<parking_lot::Mutex<()>>,
+    /// Shutdown signal and task handles of the current engine start, `None` while stopped.
+    pub(super) engine_runtime: Arc<parking_lot::Mutex<Option<controller::EngineRuntime>>>,
 }
 
 #[cfg(test)]
