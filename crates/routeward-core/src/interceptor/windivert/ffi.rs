@@ -151,6 +151,7 @@ pub(super) struct WinDivertApi {
     pub(super) calc_checksums: FnWinDivertHelperCalcChecksums,
 }
 
+#[cfg(windows)]
 fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
     let raw = path.to_string_lossy();
     if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
@@ -162,6 +163,7 @@ fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
     }
 }
 
+#[cfg(windows)]
 fn push_unique_candidate(candidates: &mut Vec<String>, path: &Path) {
     let normalized = strip_verbatim_prefix(path).to_string_lossy().into_owned();
     if normalized.is_empty() {
@@ -179,6 +181,7 @@ fn push_unique_candidate(candidates: &mut Vec<String>, path: &Path) {
     }
 }
 
+#[cfg(windows)]
 fn collect_windivert_candidates(
     search_paths: &[String],
     exe_dir: Option<&Path>,
@@ -211,6 +214,7 @@ fn collect_windivert_candidates(
     candidates
 }
 
+#[cfg(windows)]
 /// Returns `true` when `path` is absolute, free of `..` components and located under `exe_dir`.
 fn is_trusted_dll_path(path: &Path, exe_dir: &Path) -> bool {
     path.is_absolute()
@@ -334,7 +338,7 @@ impl WinDivertInterceptor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
