@@ -262,12 +262,16 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
         }
         IpcCommand::SetInterceptionMode { mode } => {
             controller.set_interception_mode(mode);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return IpcResponse::error(Some(id), err.to_string());
+            }
             IpcResponse::success(id, &controller.diagnostics())
         }
         IpcCommand::SetTheme { theme, accent } => {
             controller.set_theme_config(theme, accent);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return IpcResponse::error(Some(id), err.to_string());
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::GetProfile => {
@@ -284,32 +288,44 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
         }
         IpcCommand::UpsertRule { rule } => {
             controller.upsert_rule(rule);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return IpcResponse::error(Some(id), err.to_string());
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::RemoveRule { rule_id } => {
             controller.remove_rule(&rule_id);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return IpcResponse::error(Some(id), err.to_string());
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::UpsertProxy { node } => {
             controller.upsert_proxy(node);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return IpcResponse::error(Some(id), err.to_string());
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::RemoveProxy { proxy_id } => {
             controller.remove_proxy(&proxy_id);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return IpcResponse::error(Some(id), err.to_string());
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::UpsertChain { chain } => {
             controller.upsert_chain(chain);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return IpcResponse::error(Some(id), err.to_string());
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::RemoveChain { chain_id } => {
             controller.remove_chain(&chain_id);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return IpcResponse::error(Some(id), err.to_string());
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::EvaluateRule { request } => {

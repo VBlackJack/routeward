@@ -103,7 +103,22 @@ impl RouteWardError {
             | Self::UdpAssociateUnsupported { key, .. }
             | Self::InvalidProxyUri { key, .. }
             | Self::BlockedByPolicy { key, .. } => key,
-            Self::Io(_) => ERR_KEY_DAEMON_IPC_ERROR,
+            Self::Io(err) => Self::io_i18n_key(err),
+        }
+    }
+
+    /// Maps an I/O error to the most specific existing key; unknown kinds stay generic IPC errors.
+    fn io_i18n_key(err: &std::io::Error) -> &'static str {
+        use std::io::ErrorKind;
+        match err.kind() {
+            ErrorKind::TimedOut | ErrorKind::WouldBlock => ERR_KEY_CONNECTION_TIMEOUT,
+            ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::NotConnected
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof => ERR_KEY_DAEMON_DISCONNECTED,
+            _ => ERR_KEY_DAEMON_IPC_ERROR,
         }
     }
 
@@ -121,3 +136,22 @@ impl RouteWardError {
 }
 
 pub type RouteWardResult<T> = Result<T, RouteWardError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn io_errors_map_to_specific_keys() {
+        let key = |kind| RouteWardError::Io(Error::from(kind)).i18n_key();
+        assert_eq!(key(ErrorKind::TimedOut), ERR_KEY_CONNECTION_TIMEOUT);
+        assert_eq!(key(ErrorKind::BrokenPipe), ERR_KEY_DAEMON_DISCONNECTED);
+        assert_eq!(
+            key(ErrorKind::ConnectionRefused),
+            ERR_KEY_DAEMON_DISCONNECTED
+        );
+        assert_eq!(key(ErrorKind::PermissionDenied), ERR_KEY_DAEMON_IPC_ERROR);
+        assert_eq!(key(ErrorKind::Other), ERR_KEY_DAEMON_IPC_ERROR);
+    }
+}

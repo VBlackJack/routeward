@@ -19,9 +19,10 @@ use crate::dns::FakeIpEngine;
 use crate::process::ProcessResolver;
 use ipnet::IpNet;
 use parking_lot::RwLock;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -29,9 +30,46 @@ use std::sync::OnceLock;
 const DEFAULT_FALLBACK_RULE_ID: &str = "default-policy";
 const DEFAULT_FALLBACK_RULE_NAME: &str = "Default Profile Policy";
 const REGEX_PREFIX: &str = "regex:";
+/// Maximum number of compiled patterns kept per cache (user regexes and wildcard-derived
+/// regexes are cached separately). When full, the oldest entry is evicted (FIFO).
 const MAX_CACHED_REGEX_PATTERNS: usize = 2048;
 
-static REGEX_CACHE: OnceLock<RwLock<HashMap<String, Option<Regex>>>> = OnceLock::new();
+/// Bounded FIFO cache of compiled patterns. Invalid patterns are cached as `None`.
+struct PatternCache {
+    map: HashMap<String, Option<Regex>>,
+    order: VecDeque<String>,
+}
+
+impl PatternCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, key: &str, value: Option<Regex>) {
+        if self.map.contains_key(key) {
+            return;
+        }
+        while self.map.len() >= MAX_CACHED_REGEX_PATTERNS {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        self.order.push_back(key.to_string());
+        self.map.insert(key.to_string(), value);
+    }
+}
+
+/// User-supplied `regex:` patterns, keyed by the raw (case-preserved) regex body.
+static USER_REGEX_CACHE: OnceLock<RwLock<PatternCache>> = OnceLock::new();
+/// Wildcard patterns translated to anchored regexes, keyed by the wildcard text.
+/// Kept separate from `USER_REGEX_CACHE` so keys can never collide.
+static WILDCARD_CACHE: OnceLock<RwLock<PatternCache>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -85,10 +123,17 @@ impl RuleEngine {
             effective_domain = Some(request.target_host.to_lowercase());
         }
 
-        let mut sorted_rules: Vec<&RoutingRule> = rules.iter().filter(|r| r.enabled).collect();
-        sorted_rules.sort_by_key(|r| r.priority);
+        // Rules are normally stored already ordered (see `sort_rules`); only fall back to a
+        // per-call stable sort when the caller passes an unordered slice.
+        let ordered: Cow<'_, [RoutingRule]> = if Self::is_priority_ordered(rules) {
+            Cow::Borrowed(rules)
+        } else {
+            let mut copy = rules.to_vec();
+            Self::sort_rules(&mut copy);
+            Cow::Owned(copy)
+        };
 
-        for rule in sorted_rules {
+        for rule in ordered.iter().filter(|r| r.enabled) {
             if Self::matches_rule(
                 rule,
                 request,
@@ -111,6 +156,27 @@ impl RuleEngine {
             action: default_action.clone(),
             effective_domain,
             resolved_from_fake_ip,
+        }
+    }
+
+    /// Sorts rules by priority (stable: equal priorities keep their declared order).
+    /// Call once when a profile is loaded or replaced so `evaluate` never has to sort.
+    pub fn sort_rules(rules: &mut [RoutingRule]) {
+        rules.sort_by_key(|r| r.priority);
+    }
+
+    /// True when rules are already in evaluation order (non-decreasing priority).
+    pub fn is_priority_ordered(rules: &[RoutingRule]) -> bool {
+        rules.windows(2).all(|w| w[0].priority <= w[1].priority)
+    }
+
+    /// Strips a leading `regex:` marker, ASCII case-insensitively, preserving the body's case.
+    pub fn strip_regex_prefix(raw: &str) -> Option<&str> {
+        let head = raw.get(..REGEX_PREFIX.len())?;
+        if head.eq_ignore_ascii_case(REGEX_PREFIX) {
+            Some(&raw[REGEX_PREFIX.len()..])
+        } else {
+            None
         }
     }
 
@@ -301,30 +367,59 @@ impl RuleEngine {
             })
     }
 
-    fn get_or_compile_regex(raw_regex: &str) -> Option<Regex> {
-        let cache = REGEX_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-        if let Some(cached) = cache.read().get(raw_regex) {
+    fn cached_compile<F>(
+        cache: &'static OnceLock<RwLock<PatternCache>>,
+        key: &str,
+        compile: F,
+    ) -> Option<Regex>
+    where
+        F: FnOnce() -> Option<Regex>,
+    {
+        let cache = cache.get_or_init(|| RwLock::new(PatternCache::new()));
+        if let Some(cached) = cache.read().map.get(key) {
             return cached.clone();
         }
-        let compiled = Regex::new(raw_regex).ok();
-        let mut guard = cache.write();
-        if guard.len() >= MAX_CACHED_REGEX_PATTERNS {
-            guard.clear();
-        }
-        guard.insert(raw_regex.to_string(), compiled.clone());
+        let compiled = compile();
+        cache.write().insert(key, compiled.clone());
         compiled
     }
 
+    /// Compiles a user regex case-insensitively (flag set on the builder, never as a textual
+    /// `(?i)` prefix, because the PAC generator drops patterns starting with `(?`).
+    fn get_or_compile_user_regex(body: &str) -> Option<Regex> {
+        Self::cached_compile(&USER_REGEX_CACHE, body, || {
+            RegexBuilder::new(body).case_insensitive(true).build().ok()
+        })
+    }
+
+    fn get_or_compile_wildcard(pattern: &str) -> Option<Regex> {
+        Self::cached_compile(&WILDCARD_CACHE, pattern, || {
+            let escaped = regex::escape(pattern)
+                .replace("\\*", ".*")
+                .replace("\\?", ".");
+            Regex::new(&format!("^{escaped}$")).ok()
+        })
+    }
+
     pub fn domain_match(pattern: &str, domain: &str) -> bool {
-        let pat = pattern.trim().to_lowercase();
-        if let Some(raw_regex) = pat.strip_prefix(REGEX_PREFIX) {
-            if let Some(re) = Self::get_or_compile_regex(raw_regex) {
-                return re.is_match(domain);
-            }
-            return false;
+        let trimmed = pattern.trim();
+        if let Some(body) = Self::strip_regex_prefix(trimmed) {
+            return Self::get_or_compile_user_regex(body)
+                .map(|re| re.is_match(domain))
+                .unwrap_or(false);
         }
+        let pat: Cow<'_, str> =
+            if trimmed.bytes().any(|b| b.is_ascii_uppercase()) || !trimmed.is_ascii() {
+                Cow::Owned(trimmed.to_lowercase())
+            } else {
+                Cow::Borrowed(trimmed)
+            };
         if let Some(suffix) = pat.strip_prefix("*.") {
-            if domain == suffix || domain.ends_with(&format!(".{suffix}")) {
+            if domain == suffix
+                || (domain.len() > suffix.len()
+                    && domain.ends_with(suffix)
+                    && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.')
+            {
                 return true;
             }
         }
@@ -335,11 +430,7 @@ impl RuleEngine {
         if pattern == "*" {
             return true;
         }
-        let escaped = regex::escape(pattern)
-            .replace("\\*", ".*")
-            .replace("\\?", ".");
-        let anchored = format!("^{escaped}$");
-        Self::get_or_compile_regex(&anchored)
+        Self::get_or_compile_wildcard(pattern)
             .map(|re| re.is_match(candidate))
             .unwrap_or(false)
     }
@@ -612,5 +703,81 @@ mod tests {
             RuleEngine::evaluate(&wrong_browser, &rules, &RuleAction::Direct, None).action,
             RuleAction::Direct
         );
+    }
+
+    #[test]
+    fn regex_prefix_keeps_body_case_and_is_case_insensitive() {
+        assert!(RuleEngine::domain_match(r"regex:^\D+\.corp$", "abc.corp"));
+        assert!(!RuleEngine::domain_match(r"regex:^\D+\.corp$", "123.corp"));
+        assert!(RuleEngine::domain_match(r"REGEX:^\D+\.corp$", "abc.corp"));
+        assert!(!RuleEngine::domain_match(r"Regex:^\D+\.corp$", "123.corp"));
+        // Matching stays case-insensitive without a textual (?i) prefix.
+        assert!(RuleEngine::domain_match(r"regex:^API.corp$", "api.corp"));
+        assert_eq!(RuleEngine::strip_regex_prefix("ReGeX:abc"), Some("abc"));
+        assert_eq!(RuleEngine::strip_regex_prefix("re"), None);
+    }
+
+    #[test]
+    fn wildcard_and_regex_caches_do_not_collide() {
+        // A wildcard pattern and a regex body with identical text must not share a cache entry.
+        assert!(RuleEngine::wildcard_match("a?c", "abc"));
+        assert!(!RuleEngine::domain_match("regex:^a?c$", "abc"));
+        assert!(RuleEngine::domain_match("regex:^a?c$", "ac"));
+    }
+
+    fn simple_rule(id: &str, priority: i32, enabled: bool) -> crate::config::RoutingRule {
+        crate::config::RoutingRule {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled,
+            priority,
+            process_patterns: vec![],
+            domain_patterns: vec![],
+            ip_cidrs: vec![],
+            port_ranges: vec![],
+            protocol: TransportProtocol::Any,
+            action: RuleAction::Direct,
+        }
+    }
+
+    #[test]
+    fn rule_order_is_stable_for_equal_priorities() {
+        let rules = vec![
+            simple_rule("c", 30, true),
+            simple_rule("a1", 10, true),
+            simple_rule("a2", 10, true),
+            simple_rule("off", 5, false),
+        ];
+        let req = ConnectionRequest {
+            process_name: "x.exe".to_string(),
+            process_path: None,
+            target_host: "example.com".to_string(),
+            target_ip: None,
+            target_port: 80,
+            protocol: TransportProtocol::Tcp,
+        };
+        let unsorted = RuleEngine::evaluate(&req, &rules, &RuleAction::Direct, None);
+        assert_eq!(unsorted.matched_rule_id, "a1");
+
+        let mut sorted = rules.clone();
+        RuleEngine::sort_rules(&mut sorted);
+        assert!(RuleEngine::is_priority_ordered(&sorted));
+        let ids: Vec<&str> = sorted.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["off", "a1", "a2", "c"]);
+        let presorted = RuleEngine::evaluate(&req, &sorted, &RuleAction::Direct, None);
+        assert_eq!(presorted.matched_rule_id, "a1");
+    }
+
+    #[test]
+    fn pattern_cache_evicts_oldest_instead_of_clearing() {
+        let mut cache = PatternCache::new();
+        for i in 0..(MAX_CACHED_REGEX_PATTERNS + 5) {
+            cache.insert(&format!("k{i}"), None);
+        }
+        assert_eq!(cache.map.len(), MAX_CACHED_REGEX_PATTERNS);
+        assert!(!cache.map.contains_key("k0"));
+        assert!(cache
+            .map
+            .contains_key(&format!("k{}", MAX_CACHED_REGEX_PATTERNS + 4)));
     }
 }
