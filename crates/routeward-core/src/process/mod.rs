@@ -596,16 +596,6 @@ impl ProcessResolver {
         out
     }
 
-    #[cfg(not(windows))]
-    fn scan_exe_dir_bounded(
-        _dir: &std::path::Path,
-        _depth: usize,
-        _max_depth: usize,
-        _max_entries: usize,
-        _out: &mut Vec<(String, String)>,
-    ) {
-    }
-
     #[cfg(windows)]
     fn scan_exe_dir_bounded(
         dir: &std::path::Path,
