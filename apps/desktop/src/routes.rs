@@ -229,6 +229,15 @@ fn ok_json_response<T: serde::Serialize>(value: &T, json_ct: String) -> (u16, St
     (200, json_ct, serde_json::to_vec(value).unwrap_or_default())
 }
 
+/// Content type prefix of the embedded index page, the only response that carries a CSP.
+const HTML_CONTENT_TYPE_PREFIX: &str = "text/html";
+
+/// Policy applied to the embedded index page. The bundle is a single external script and
+/// stylesheet served from the same loopback origin. The session token is injected by the
+/// WebView initialization script (not an inline `<script>`), so `script-src 'self'` suffices.
+/// `style-src` keeps `'unsafe-inline'` because the theme engine and React write inline styles.
+pub const INDEX_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
 fn require_post(method: &str, json_ct: &str) -> Option<(u16, String, Vec<u8>)> {
     if method != "POST" {
         return Some((
@@ -268,6 +277,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/connections/terminate") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         let parsed: Result<TerminateConnectionRequest, _> = serde_json::from_str(body_str);
         return Some(match parsed {
             Ok(req) => match bridge.terminate_connection(req.connection_id).await {
@@ -285,6 +297,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/connections/clear") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         bridge.clear_closed_connections().await;
         return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
     }
@@ -296,6 +311,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/logs/clear") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         bridge.clear_logs().await;
         return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
     }
@@ -401,6 +419,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/profile/replace") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ProfileConfig>(body_str) {
             Ok(profile) => match bridge.replace_profile(profile).await {
                 Ok(updated) => {
@@ -460,6 +481,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/rules/upsert") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<RoutingRule>(body_str) {
             Ok(rule) => {
                 return Some(match bridge.upsert_rule(rule).await {
@@ -476,6 +500,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/rules/remove") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<RemoveRuleRequest>(body_str) {
             Ok(req) => {
                 return Some(match bridge.remove_rule(req.rule_id).await {
@@ -492,6 +519,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/rules/evaluate") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ConnectionRequest>(body_str) {
             Ok(request) => match bridge.evaluate_rule(request).await {
                 Ok(res) => {
@@ -513,6 +543,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/proxies/upsert") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ProxyNode>(body_str) {
             Ok(node) => {
                 return Some(match bridge.upsert_proxy(node).await {
@@ -529,6 +562,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/proxies/remove") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ProxyIdRequest>(body_str) {
             Ok(req) => {
                 return Some(match bridge.remove_proxy(req.proxy_id).await {
@@ -545,12 +581,18 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/proxies/test-all") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         let reports = bridge.test_all_proxies().await;
         let json = serde_json::to_vec(&reports).unwrap_or_default();
         return Some((200, json_ct, json));
     }
 
     if path.starts_with("/api/proxies/test") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ProxyIdRequest>(body_str) {
             Ok(req) => match bridge.test_proxy(req.proxy_id).await {
                 Ok(report) => {
@@ -572,6 +614,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/chains/upsert") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ProxyChain>(body_str) {
             Ok(chain) => {
                 return Some(match bridge.upsert_chain(chain).await {
@@ -588,6 +633,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/chains/remove") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<RemoveChainRequest>(body_str) {
             Ok(req) => {
                 return Some(match bridge.remove_chain(req.chain_id).await {
@@ -604,6 +652,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/dns/allocate") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         return Some(
             match serde_json::from_str::<AllocateFakeIpRequest>(body_str) {
                 Ok(req) => match bridge.allocate_fake_ip(req.domain).await {
@@ -629,11 +680,17 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/dns/flush") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         bridge.flush_fake_ip_cache().await;
         return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
     }
 
     if path.starts_with("/api/scan-os") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         let sockets = bridge.scan_os_sockets().await;
         let json = serde_json::to_vec(&sockets).unwrap_or_default();
         return Some((200, json_ct, json));
@@ -642,7 +699,7 @@ pub async fn handle_api_route(
     if path.starts_with("/api/system/pac") {
         if method == "POST" {
             match serde_json::from_str::<SystemProxyRequest>(body_str) {
-                Ok(parsed) => match bridge.set_system_pac(parsed.enabled) {
+                Ok(parsed) => match bridge.set_system_pac(parsed.enabled).await {
                     Ok((enabled, pac_url)) => {
                         let json = serde_json::to_vec(&serde_json::json!({
                             "enabled": enabled,
@@ -664,7 +721,7 @@ pub async fn handle_api_route(
                 }
             }
         }
-        let (enabled, pac_url) = bridge.get_system_pac_status();
+        let (enabled, pac_url) = bridge.get_system_pac_status().await;
         let json = serde_json::to_vec(&serde_json::json!({
             "enabled": enabled,
             "pacUrl": pac_url,
@@ -676,7 +733,7 @@ pub async fn handle_api_route(
     if path.starts_with("/api/system/autostart") {
         if method == "POST" {
             match serde_json::from_str::<SystemProxyRequest>(body_str) {
-                Ok(parsed) => match bridge.set_autostart(parsed.enabled) {
+                Ok(parsed) => match bridge.set_autostart(parsed.enabled).await {
                     Ok(enabled) => {
                         let json = serde_json::to_vec(&serde_json::json!({ "enabled": enabled }))
                             .unwrap_or_default();
@@ -695,7 +752,7 @@ pub async fn handle_api_route(
                 }
             }
         }
-        let enabled = bridge.get_autostart_status();
+        let enabled = bridge.get_autostart_status().await;
         let json =
             serde_json::to_vec(&serde_json::json!({ "enabled": enabled })).unwrap_or_default();
         return Some((200, json_ct, json));
@@ -816,8 +873,15 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/system-proxy") {
+        if method != "POST" {
+            let enabled = bridge.get_system_proxy_status().await;
+            return Some(ok_json_response(
+                &serde_json::json!({ "enabled": enabled }),
+                json_ct,
+            ));
+        }
         match serde_json::from_str::<SystemProxyRequest>(body_str) {
-            Ok(parsed) => match bridge.set_system_proxy(parsed.enabled) {
+            Ok(parsed) => match bridge.set_system_proxy(parsed.enabled).await {
                 Ok(status) => {
                     let json = serde_json::to_vec(&status).unwrap_or_default();
                     return Some((200, json_ct, json));
@@ -837,8 +901,14 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/launch-process") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<LaunchProcessRequest>(body_str) {
-            Ok(req) => match bridge.launch_process_with_proxy(&req.executable, &req.args) {
+            Ok(req) => match bridge
+                .launch_process_with_proxy(&req.executable, &req.args)
+                .await
+            {
                 Ok(res) => {
                     let json = serde_json::to_vec(&res).unwrap_or_default();
                     return Some((200, json_ct, json));
@@ -991,8 +1061,13 @@ pub async fn serve_loopback_http_connection<FStatic>(
 
     if let Some(asset_fn) = static_asset_handler {
         let (content_type, body) = asset_fn(&path);
+        let csp_header = if content_type.starts_with(HTML_CONTENT_TYPE_PREFIX) {
+            format!("Content-Security-Policy: {INDEX_CONTENT_SECURITY_POLICY}\r\n")
+        } else {
+            String::new()
+        };
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\n{csp_header}Connection: close\r\n\r\n",
             body.len()
         );
         let _ = stream.write_all(header.as_bytes()).await;

@@ -14,9 +14,7 @@
  * limitations under the License.
  */
 
-use crate::error::{
-    RouteWardError, RouteWardResult, ERR_KEY_DAEMON_INSECURE_PROFILE, ERR_KEY_DAEMON_IPC_ERROR,
-};
+use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_DAEMON_IPC_ERROR};
 use crate::ipc::transport::validate_and_canonicalize_allowed_sid;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -117,6 +115,7 @@ pub type ServiceMainRunner =
 #[cfg(windows)]
 mod win32_impl {
     use super::*;
+    use crate::error::ERR_KEY_SERVICE_INSECURE_BINARY;
     use parking_lot::Mutex;
     use std::ffi::c_void;
     use std::path::Path;
@@ -427,7 +426,7 @@ mod win32_impl {
         use std::os::windows::ffi::OsStrExt;
 
         let insecure = |detail: String| RouteWardError::DaemonError {
-            key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+            key: ERR_KEY_SERVICE_INSECURE_BINARY,
             detail,
         };
         let wide_path: Vec<u16> = path
@@ -499,7 +498,7 @@ mod win32_impl {
     /// Administrators, TrustedInstaller and CREATOR OWNER (the service runs as LocalSystem).
     pub(super) fn verify_service_binary_location(exe: &Path) -> RouteWardResult<()> {
         let dir = exe.parent().ok_or_else(|| RouteWardError::DaemonError {
-            key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+            key: ERR_KEY_SERVICE_INSECURE_BINARY,
             detail: format!(
                 "Service executable {} has no parent directory",
                 exe.display()
@@ -508,7 +507,7 @@ mod win32_impl {
         for target in [dir, exe] {
             if let Some((sid, mask)) = find_untrusted_writer(target)? {
                 return Err(RouteWardError::DaemonError {
-                    key: ERR_KEY_DAEMON_INSECURE_PROFILE,
+                    key: ERR_KEY_SERVICE_INSECURE_BINARY,
                     detail: format!(
                         "Refusing to register {} as a LocalSystem service: {} grants write access (mask 0x{mask:08x}) to {sid}. Install RouteWard under %ProgramFiles% with packaging/windows/install-service.ps1.",
                         exe.display(),
@@ -955,7 +954,10 @@ mod tests {
         let result = win32_impl::verify_service_binary_location(&exe);
         let _ = std::fs::remove_dir_all(&dir);
         let err = result.expect_err("a user-writable directory must be refused");
-        assert_eq!(err.i18n_key(), ERR_KEY_DAEMON_INSECURE_PROFILE);
+        assert_eq!(
+            err.i18n_key(),
+            crate::error::ERR_KEY_SERVICE_INSECURE_BINARY
+        );
     }
 
     #[cfg(windows)]

@@ -782,8 +782,12 @@
       "not_elevated": "Administrator or root privileges are required to run routeward daemon",
       "ipc_error": "Daemon IPC communication error",
       "disconnected": "Privileged RouteWard daemon is not connected",
+      "io_timeout": "Timed out while communicating with the RouteWard daemon",
       "insecure_profile": "Refusing to start: profile directory or file has insecure ownership or write permissions",
       "cleanup_refused_active": "Refusing to run cleanup while a RouteWard daemon is active (stop the daemon first or pass --force)"
+    },
+    "service": {
+      "insecure_binary_location": "Refusing to register the Windows service: the RouteWard executable or its folder is writable by non-administrators. Install it under Program Files."
     },
     "desktop": {
       "ui_init": "RouteWard could not initialize its desktop WebView window. Ensure Microsoft Edge WebView2 Runtime is installed and your user data folder is writable."

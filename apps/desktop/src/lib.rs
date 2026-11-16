@@ -29,7 +29,7 @@ use routeward_core::config::{ProfileConfig, SystemConstants, ThemeForgeCatalog};
 
 pub use routes::{
     handle_api_route, http_status_line, serve_loopback_api_connection,
-    serve_loopback_http_connection, HTTP_REQ_BUFFER_BYTES,
+    serve_loopback_http_connection, HTTP_REQ_BUFFER_BYTES, INDEX_CONTENT_SECURITY_POLICY,
 };
 pub use security::{
     constant_time_eq, extract_json_body, validate_loopback_http_request,

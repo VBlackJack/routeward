@@ -39,6 +39,8 @@ pub const ERR_KEY_DAEMON_NOT_ELEVATED: &str = "errors.daemon.not_elevated";
 pub const ERR_KEY_DAEMON_IPC_ERROR: &str = "errors.daemon.ipc_error";
 pub const ERR_KEY_DAEMON_DISCONNECTED: &str = "errors.daemon.disconnected";
 pub const ERR_KEY_DAEMON_INSECURE_PROFILE: &str = "errors.daemon.insecure_profile";
+pub const ERR_KEY_DAEMON_IO_TIMEOUT: &str = "errors.daemon.io_timeout";
+pub const ERR_KEY_SERVICE_INSECURE_BINARY: &str = "errors.service.insecure_binary_location";
 pub const ERR_KEY_CLEANUP_DAEMON_ACTIVE: &str = "errors.daemon.cleanup_refused_active";
 
 pub const DAEMON_EXIT_GENERAL_ERROR: u8 = 1;
@@ -111,7 +113,7 @@ impl RouteWardError {
     fn io_i18n_key(err: &std::io::Error) -> &'static str {
         use std::io::ErrorKind;
         match err.kind() {
-            ErrorKind::TimedOut | ErrorKind::WouldBlock => ERR_KEY_CONNECTION_TIMEOUT,
+            ErrorKind::TimedOut | ErrorKind::WouldBlock => ERR_KEY_DAEMON_IO_TIMEOUT,
             ErrorKind::ConnectionRefused
             | ErrorKind::ConnectionReset
             | ErrorKind::ConnectionAborted
@@ -145,7 +147,7 @@ mod tests {
     #[test]
     fn io_errors_map_to_specific_keys() {
         let key = |kind| RouteWardError::Io(Error::from(kind)).i18n_key();
-        assert_eq!(key(ErrorKind::TimedOut), ERR_KEY_CONNECTION_TIMEOUT);
+        assert_eq!(key(ErrorKind::TimedOut), ERR_KEY_DAEMON_IO_TIMEOUT);
         assert_eq!(key(ErrorKind::BrokenPipe), ERR_KEY_DAEMON_DISCONNECTED);
         assert_eq!(
             key(ErrorKind::ConnectionRefused),

@@ -782,8 +782,12 @@
       "not_elevated": "Les privilèges Administrateur ou root sont requis pour lancer routeward daemon",
       "ipc_error": "Erreur de communication IPC avec le démon",
       "disconnected": "Le démon privilégié RouteWard n'est pas connecté",
+      "io_timeout": "Délai dépassé lors de la communication avec le démon RouteWard",
       "insecure_profile": "Refus de démarrer : le dossier ou le fichier de profil a un propriétaire ou des droits d'écriture non sécurisés",
       "cleanup_refused_active": "Refus d'exécuter cleanup pendant qu'un démon RouteWard est actif (arrêtez le démon d'abord ou utilisez --force)"
+    },
+    "service": {
+      "insecure_binary_location": "Enregistrement du service Windows refusé : l'exécutable RouteWard ou son dossier est modifiable par des non-administrateurs. Installez-le sous Program Files."
     },
     "desktop": {
       "ui_init": "RouteWard n'a pas pu initialiser sa fenêtre WebView. Vérifiez que Microsoft Edge WebView2 Runtime est installé et que votre dossier utilisateur est accessible en écriture."

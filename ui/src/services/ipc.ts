@@ -1047,6 +1047,17 @@ export class RouteWardClientService {
     );
   }
 
+  public async getSystemProxyStatus(): Promise<AutostartStatus> {
+    try {
+      return await this.requestJson<AutostartStatus>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_PROXY,
+        'GET'
+      );
+    } catch {
+      return { enabled: false };
+    }
+  }
+
   public async getAutostartStatus(): Promise<AutostartStatus> {
     try {
       return await this.requestJson<AutostartStatus>(
