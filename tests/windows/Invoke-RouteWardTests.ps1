@@ -34,9 +34,6 @@ param(
     [string]$SystemConstantsJsonPath = "",
 
     [Parameter(Mandatory = $false)]
-    [string]$DefaultProfileJsonPath = "",
-
-    [Parameter(Mandatory = $false)]
     [string]$RouteWardExeName = "routeward.exe",
 
     [Parameter(Mandatory = $false)]
@@ -69,8 +66,21 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$FirewallRuleName = "",
 
+    # Name of the proxy rule this script provisions for curl.exe (the default profile ships no proxy and no rule).
     [Parameter(Mandatory = $false)]
     [string]$ExpectedProxyRuleName = "CLI Tools via SOCKS5 Proxy",
+
+    [Parameter(Mandatory = $false)]
+    [string]$ProvisionedProxyId = "proxy-win-regression-socks5",
+
+    [Parameter(Mandatory = $false)]
+    [string]$ProvisionedProxyName = "Windows Regression SOCKS5 Proxy",
+
+    [Parameter(Mandatory = $false)]
+    [string]$ProvisionedRuleId = "rule-win-regression-cli-socks5",
+
+    [Parameter(Mandatory = $false)]
+    [int]$ProvisionedRulePriority = 30,
 
     [Parameter(Mandatory = $false)]
     [string]$TempBlockRuleId = "rule-win-regression-block-curl",
@@ -515,23 +525,6 @@ if ([string]::IsNullOrWhiteSpace($PublicDnsTestDomain)) {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($DefaultProfileJsonPath) -and (-not [string]::IsNullOrWhiteSpace($repoRootCandidate))) {
-    $candidateProf = Join-Path $repoRootCandidate "configs\default_profile.json"
-    if (Test-Path -LiteralPath $candidateProf) {
-        $DefaultProfileJsonPath = $candidateProf
-    }
-}
-if (-not [string]::IsNullOrWhiteSpace($DefaultProfileJsonPath) -and (Test-Path -LiteralPath $DefaultProfileJsonPath)) {
-    $defProf = Get-Content -LiteralPath $DefaultProfileJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    $defProxies = @($defProf.proxies)
-    if (-not $PSBoundParameters.ContainsKey("Socks5Host") -and $defProxies.Count -gt 0) {
-        $Socks5Host = [string]$defProxies[0].host
-    }
-    if (-not $PSBoundParameters.ContainsKey("Socks5Port") -and $defProxies.Count -gt 0) {
-        $Socks5Port = [int]$defProxies[0].port
-    }
-}
-
 if ([string]::IsNullOrWhiteSpace($FirewallRuleName)) {
     $FirewallRuleName = "${FirewallRulePrefix}${TransparentRelayPort}"
 }
@@ -780,6 +773,41 @@ function Invoke-UnproxiedCurl {
     }
 }
 
+function New-RegressionProxyObject {
+    return [ordered]@{
+        id            = $ProvisionedProxyId
+        name          = $ProvisionedProxyName
+        protocol      = "socks5"
+        host          = $Socks5Host
+        port          = $Socks5Port
+        auth          = $null
+        udpEnabled    = $true
+        tls           = $false
+        sni           = $null
+        enabled       = $true
+        lastLatencyMs = $null
+        exitIp        = $null
+    }
+}
+
+function New-RegressionRuleObject {
+    return [ordered]@{
+        id              = $ProvisionedRuleId
+        name            = $ExpectedProxyRuleName
+        enabled         = $true
+        priority        = $ProvisionedRulePriority
+        processPatterns = @("curl.exe", "curl")
+        domainPatterns  = @()
+        ipCidrs         = @()
+        portRanges      = @()
+        protocol        = "tcp"
+        action          = [ordered]@{
+            type     = "proxy"
+            targetId = $ProvisionedProxyId
+        }
+    }
+}
+
 function Write-Utf8NoBomJsonTempFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -1015,6 +1043,16 @@ if ($DryRun.IsPresent) {
         throw "DryRun failed: temporary JSON file '$dryRunTempFile' was not removed in finally block."
     }
     Write-Host "[DRYRUN-PASS] Verified --json-file UTF-8 (no BOM) temporary file creation, JSON integrity, and cleanup under %TEMP%." -ForegroundColor Green
+
+    $dryRunFixtureProxy = (New-RegressionProxyObject | ConvertTo-Json -Depth 5 -Compress) | ConvertFrom-Json
+    $dryRunFixtureRule = (New-RegressionRuleObject | ConvertTo-Json -Depth 6 -Compress) | ConvertFrom-Json
+    if ($dryRunFixtureProxy.protocol -ne "socks5" -or $dryRunFixtureProxy.host -ne $Socks5Host -or [int]$dryRunFixtureProxy.port -ne $Socks5Port) {
+        throw "DryRun failed: regression proxy fixture does not target $($Socks5Host):$($Socks5Port)."
+    }
+    if ($dryRunFixtureRule.name -ne $ExpectedProxyRuleName -or $dryRunFixtureRule.action.type -ne "proxy" -or $dryRunFixtureRule.action.targetId -ne $dryRunFixtureProxy.id) {
+        throw "DryRun failed: regression rule fixture does not reference the regression proxy."
+    }
+    Write-Host "[DRYRUN-PASS] Built regression SOCKS5 proxy and curl.exe rule fixtures (no dependency on default profile proxies)." -ForegroundColor Green
 
     # 4. Load sample ctl responses fixture and verify strict parser
     if ([string]::IsNullOrWhiteSpace($SampleResponsesJsonPath)) {
@@ -1952,6 +1990,8 @@ if ($profileExistedAtStart) {
 }
 $profileCapturedAfterDaemonInit = $false
 $profileModifiedByScript = $false
+$fixtureProxyAdded = $false
+$fixtureRuleAdded = $false
 
 $scenarioResults = New-Object System.Collections.Generic.List[PSCustomObject]
 $auditNotes = New-Object System.Collections.Generic.List[string]
@@ -2123,6 +2163,42 @@ try {
         }
     } catch {
         Record-ScenarioResult -Id "c" -Status "FAIL" -Title "ctl status initial state" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Fixture setup (not a scenario): the default profile ships no proxy node and no proxy
+    # rule, so provision the SOCKS5 node (Socks5Host:Socks5Port parameters) and the curl.exe
+    # proxy rule used by scenarios (d), (k), and (j). Removed again in the finally block;
+    # the original profile bytes are restored as a second safety net.
+    # -----------------------------------------------------------------------
+    try {
+        $fixtureProxyFile = Write-Utf8NoBomJsonTempFile -JsonText ((New-RegressionProxyObject) | ConvertTo-Json -Depth 5 -Compress)
+        $fixtureRuleFile = Write-Utf8NoBomJsonTempFile -JsonText ((New-RegressionRuleObject) | ConvertTo-Json -Depth 6 -Compress)
+        try {
+            $fixtureProxyRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("upsert-proxy", "--json-file", $fixtureProxyFile) -Label "Fixture-upsert-proxy"
+            $fixtureProxyObj = ConvertFrom-CtlResponseJson -RawJson $fixtureProxyRes.RawText -Context "Fixture-upsert-proxy" -RequiredResultProperties @("ok")
+            if (-not $fixtureProxyObj.ok) {
+                throw "Failed to upsert regression SOCKS5 proxy '$ProvisionedProxyId'"
+            }
+            $fixtureProxyAdded = $true
+            $profileModifiedByScript = $true
+
+            $fixtureRuleRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("upsert-rule", "--json-file", $fixtureRuleFile) -Label "Fixture-upsert-rule"
+            $fixtureRuleObj = ConvertFrom-CtlResponseJson -RawJson $fixtureRuleRes.RawText -Context "Fixture-upsert-rule" -RequiredResultProperties @("ok")
+            if (-not $fixtureRuleObj.ok) {
+                throw "Failed to upsert regression proxy rule '$ProvisionedRuleId'"
+            }
+            $fixtureRuleAdded = $true
+            $auditNotes.Add("Provisioned regression SOCKS5 proxy '$ProvisionedProxyId' ($($Socks5Host):$($Socks5Port)) and rule '$ExpectedProxyRuleName' ('$ProvisionedRuleId').")
+        } finally {
+            foreach ($fixtureTmp in @($fixtureProxyFile, $fixtureRuleFile)) {
+                if (-not [string]::IsNullOrWhiteSpace($fixtureTmp) -and (Test-Path -LiteralPath $fixtureTmp)) {
+                    Remove-Item -LiteralPath $fixtureTmp -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    } catch {
+        $auditNotes.Add("WARNING: Fixture setup failed (scenarios needing the proxy rule will fail): $($_.Exception.Message)")
     }
 
     # -----------------------------------------------------------------------
@@ -3591,6 +3667,19 @@ try {
     # 4. Restore profile if modified
     # 5. Verify outbound curl connectivity and record it in the report
     # -----------------------------------------------------------------------
+    # Teardown of the provisioned proxy fixture while the daemon may still be reachable.
+    foreach ($fixtureTeardown in @(
+            @{ Added = $fixtureRuleAdded; Cmd = "remove-rule"; Id = $ProvisionedRuleId; Label = "Fixture-remove-rule" },
+            @{ Added = $fixtureProxyAdded; Cmd = "remove-proxy"; Id = $ProvisionedProxyId; Label = "Fixture-remove-proxy" })) {
+        if ($fixtureTeardown.Added) {
+            try {
+                $null = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @($fixtureTeardown.Cmd, "--id", $fixtureTeardown.Id) -Label $fixtureTeardown.Label
+            } catch {
+                $auditNotes.Add("WARNING: $($fixtureTeardown.Label) failed: $($_.Exception.Message)")
+            }
+        }
+    }
+
     Stop-AllTrackedUdpTestServers -IncludePrimarySocks5
     Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName
 
