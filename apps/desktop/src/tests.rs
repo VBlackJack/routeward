@@ -962,3 +962,131 @@ async fn engine_toggle_route_validates_payload_and_surfaces_transport_errors() {
     );
     svc_task.abort();
 }
+
+#[test]
+fn http_status_line_covers_payload_too_large_and_unprocessable_entity() {
+    use crate::http_status_line;
+
+    assert_eq!(http_status_line(413), "HTTP/1.1 413 Payload Too Large");
+    assert_eq!(http_status_line(422), "HTTP/1.1 422 Unprocessable Entity");
+    assert_eq!(http_status_line(409), "HTTP/1.1 409 Conflict");
+    assert_eq!(http_status_line(599), "HTTP/1.1 500 Internal Server Error");
+}
+
+#[test]
+fn ipc_error_status_maps_transport_protocol_and_remote_errors() {
+    use crate::routes::ipc_error_status;
+    use routeward_core::error::{
+        ERR_KEY_CHAIN_EMPTY, ERR_KEY_CLEANUP_DAEMON_ACTIVE, ERR_KEY_CONFIG_SAVE,
+        ERR_KEY_DAEMON_INSECURE_PROFILE, ERR_KEY_INVALID_URI,
+    };
+    use routeward_core::ipc::IpcCallError;
+
+    let remote = |key: Option<&str>| IpcCallError::Remote {
+        message: "rejected".to_string(),
+        error_key: key.map(ToString::to_string),
+    };
+
+    assert_eq!(
+        ipc_error_status(&IpcCallError::Transport("pipe closed".to_string())),
+        503
+    );
+    assert_eq!(
+        ipc_error_status(&IpcCallError::Protocol("bad json".to_string())),
+        500
+    );
+    assert_eq!(ipc_error_status(&remote(None)), 400);
+    assert_eq!(ipc_error_status(&remote(Some(ERR_KEY_INVALID_URI))), 400);
+    assert_eq!(ipc_error_status(&remote(Some(ERR_KEY_CHAIN_EMPTY))), 422);
+    assert_eq!(
+        ipc_error_status(&remote(Some(ERR_KEY_DAEMON_INSECURE_PROFILE))),
+        422
+    );
+    assert_eq!(
+        ipc_error_status(&remote(Some(ERR_KEY_CLEANUP_DAEMON_ACTIVE))),
+        409
+    );
+    assert_eq!(ipc_error_status(&remote(Some(ERR_KEY_CONFIG_SAVE))), 500);
+}
+
+#[tokio::test]
+async fn mutation_routes_surface_daemon_errors_instead_of_reporting_success() {
+    use crate::handle_api_route;
+
+    let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let unique_suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    #[cfg(windows)]
+    {
+        constants.ipc.windows_pipe_name =
+            format!(r"\\.\pipe\routeward-mutation-missing-{unique_suffix}");
+    }
+    #[cfg(not(windows))]
+    {
+        constants.ipc.unix_socket_path =
+            format!("/tmp/routeward-mutation-missing-{unique_suffix}.sock");
+    }
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let proxy_json = r#"{"id":"p1","name":"Proxy","protocol":"socks5","host":"127.0.0.1","port":1080,"auth":null,"udpEnabled":true,"tls":false,"sni":null,"enabled":true,"lastLatencyMs":null,"exitIp":null}"#.to_string();
+    let rule_json = r#"{"id":"r1","name":"Rule","enabled":true,"priority":10,"processPatterns":[],"domainPatterns":[],"ipCidrs":[],"portRanges":[],"protocol":"any","action":{"type":"direct"}}"#.to_string();
+    let chain_json =
+        r#"{"id":"c1","name":"Chain","strategy":"sequence","proxyIds":[],"enabled":true}"#
+            .to_string();
+    let profile_json = serde_json::to_string(&profile).expect("profile json");
+    let bridge = DesktopCommandBridge::new(constants, profile, "en");
+
+    let cases: Vec<(&str, String)> = vec![
+        ("/api/proxies/upsert", proxy_json),
+        ("/api/proxies/remove", r#"{"proxyId":"p1"}"#.to_string()),
+        ("/api/chains/upsert", chain_json),
+        ("/api/chains/remove", r#"{"chainId":"c1"}"#.to_string()),
+        ("/api/rules/upsert", rule_json),
+        ("/api/rules/remove", r#"{"ruleId":"r1"}"#.to_string()),
+        ("/api/engine/mode", r#"{"mode":"relay"}"#.to_string()),
+        ("/api/profile/replace", profile_json),
+        (
+            "/api/connections/terminate",
+            r#"{"connectionId":"conn-1"}"#.to_string(),
+        ),
+        (
+            "/api/dns/allocate",
+            r#"{"domain":"example.com"}"#.to_string(),
+        ),
+    ];
+    for (path, body) in cases {
+        let res = handle_api_route("POST", path, &body, &bridge, None)
+            .await
+            .unwrap_or_else(|| panic!("route {path} must answer"));
+        assert_eq!(res.0, 503, "{path} must report the unreachable daemon");
+        let json: serde_json::Value = serde_json::from_slice(&res.2).expect("json error body");
+        assert!(
+            json["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "{path} must carry an error message"
+        );
+        assert!(
+            json.get("errorKey").is_some(),
+            "{path} must carry an errorKey field"
+        );
+    }
+
+    // Malformed payloads are 400 on every mutation route, including the theme route.
+    for path in [
+        "/api/theme",
+        "/api/proxies/upsert",
+        "/api/connections/terminate",
+        "/api/dns/allocate",
+        "/api/engine/mode",
+    ] {
+        let res = handle_api_route("POST", path, "{not json", &bridge, None)
+            .await
+            .expect("route response");
+        assert_eq!(res.0, 400, "{path} must reject malformed JSON");
+    }
+}
