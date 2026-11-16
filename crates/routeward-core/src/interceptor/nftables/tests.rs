@@ -222,6 +222,7 @@ fn builds_dual_stack_ip6_nat_tproxy_ruleset_and_parses_sockaddr_in6() {
         true,
         true,
         &upstreams,
+        default_fake_ip_net_for_tests(),
     );
     assert!(batch.contains("ip6 daddr 2001:db8::10 tcp dport 1080 return"));
     assert!(batch.contains("ip6 daddr 2001:db8::10 udp dport 1080 return"));
@@ -238,6 +239,7 @@ fn builds_dual_stack_ip6_nat_tproxy_ruleset_and_parses_sockaddr_in6() {
         21079,
         53,
         853,
+        false,
         false,
     );
     assert!(fallback_ip6.contains("udp dport 53 reject"));
@@ -262,4 +264,159 @@ fn builds_dual_stack_ip6_nat_tproxy_ruleset_and_parses_sockaddr_in6() {
         10810,
     )
     .is_none());
+}
+
+fn default_fake_ip_net_for_tests() -> Ipv4Net {
+    "198.18.0.0/15".parse().unwrap()
+}
+
+#[test]
+fn fake_ip_drop_rules_follow_the_configured_cidr() {
+    let custom: Ipv4Net = "10.77.0.0/16".parse().unwrap();
+    let ruleset = NftablesInterceptor::build_nft_table_ruleset_with_fake_ip(
+        "routeward",
+        "output",
+        21079,
+        21080,
+        10810,
+        10853,
+        10854,
+        53,
+        853,
+        443,
+        5353,
+        5355,
+        137,
+        true,
+        true,
+        &[],
+        custom,
+    );
+    assert!(ruleset.contains("meta mark 21079 ip daddr 10.77.0.0/16 drop"));
+    assert!(ruleset.contains("meta mark != 21080 ip daddr 10.77.0.0/16 drop"));
+    assert!(!ruleset.contains("198.18.0.0/15"));
+
+    let legacy =
+        NftablesInterceptor::build_nft_table_ruleset("routeward", "output", 21079, 10810, &[]);
+    assert!(legacy.contains("meta mark 21079 ip daddr 198.18.0.0/15 drop"));
+}
+
+#[test]
+fn raw_socket_guard_follows_the_configured_cidr() {
+    let custom: Ipv4Net = "10.77.0.0/16".parse().unwrap();
+    let in_custom = SocketAddrV4::new(Ipv4Addr::new(10, 77, 3, 4), 5355);
+    let in_default = SocketAddrV4::new(Ipv4Addr::new(198, 18, 3, 4), 5355);
+
+    let err = NftablesInterceptor::check_fake_ip_egress(in_custom, custom)
+        .expect_err("address in the custom Fake-IP CIDR must be refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(NftablesInterceptor::check_fake_ip_egress(in_default, custom).is_ok());
+    assert!(NftablesInterceptor::is_fake_ip_in(
+        Ipv4Addr::new(10, 77, 255, 255),
+        custom
+    ));
+    assert!(!NftablesInterceptor::is_fake_ip_in(
+        Ipv4Addr::new(10, 78, 0, 1),
+        custom
+    ));
+}
+
+#[test]
+fn resolves_fake_ip_net_from_profile_then_constants_then_default() {
+    let net = NftablesInterceptor::resolve_fake_ip_net("10.77.0.0/16", "198.18.0.0/15");
+    assert_eq!(net.to_string(), "10.77.0.0/16");
+    let net = NftablesInterceptor::resolve_fake_ip_net("garbage", "172.30.0.0/16");
+    assert_eq!(net.to_string(), "172.30.0.0/16");
+    let net = NftablesInterceptor::resolve_fake_ip_net("garbage", "also-garbage");
+    assert_eq!(net.to_string(), "198.18.0.0/15");
+}
+
+#[test]
+fn ip6_fallback_with_kill_switch_rejects_everything_except_loopback_and_own_mark() {
+    let rules = NftablesInterceptor::build_nft_ip6_fallback_guard_ruleset(
+        "routeward",
+        "output",
+        21079,
+        53,
+        853,
+        true,
+        true,
+    );
+    assert!(rules.contains("meta mark 21079 return"));
+    assert!(rules.contains("ip6 daddr ::1 return"));
+    assert!(rules.contains("oifname \"lo\" return"));
+    assert!(rules.contains("meta l4proto tcp reject with tcp reset"));
+    assert!(rules.contains(
+        "        reject
+"
+    ));
+    let mark_pos = rules.find("meta mark 21079 return").unwrap();
+    let reject_pos = rules
+        .find(
+            "        reject
+",
+        )
+        .unwrap();
+    assert!(
+        mark_pos < reject_pos,
+        "own-mark accept must precede the catch-all reject"
+    );
+    assert!(!rules.contains("dport"));
+}
+
+#[test]
+fn ip6_fallback_without_kill_switch_keeps_dns_and_dot_guard_only() {
+    let rules = NftablesInterceptor::build_nft_ip6_fallback_guard_ruleset(
+        "routeward",
+        "output",
+        21079,
+        53,
+        853,
+        false,
+        true,
+    );
+    assert!(rules.contains("udp dport 53 reject"));
+    assert!(rules.contains("tcp dport 853 reject with tcp reset"));
+    assert!(!rules.contains(
+        "        reject
+"
+    ));
+    assert!(!rules.contains("l4proto"));
+
+    let no_dot = NftablesInterceptor::build_nft_ip6_fallback_guard_ruleset(
+        "routeward",
+        "output",
+        21079,
+        53,
+        853,
+        false,
+        false,
+    );
+    assert!(!no_dot.contains("853"));
+}
+
+#[test]
+fn table_listing_membership_is_locale_independent() {
+    let listing = "table inet filter
+table ip routeward
+table ip6 other
+";
+    assert!(NftablesInterceptor::tables_listing_contains(
+        listing,
+        "ip",
+        "routeward"
+    ));
+    assert!(!NftablesInterceptor::tables_listing_contains(
+        listing,
+        "ip6",
+        "routeward"
+    ));
+    assert!(NftablesInterceptor::tables_listing_contains(
+        listing, "ip6", "other"
+    ));
+    assert!(!NftablesInterceptor::tables_listing_contains(
+        "",
+        "ip",
+        "routeward"
+    ));
 }

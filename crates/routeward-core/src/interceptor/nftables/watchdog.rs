@@ -32,6 +32,37 @@ impl NftablesInterceptor {
         )
     }
 
+    /// Returns `true` unless `nft list tables` succeeds and does not list `<family> <table_name>`.
+    ///
+    /// Locale-independent: it relies on the exit status and the table inventory, never on the
+    /// wording of an error message. If the inventory cannot be read, the table is assumed present
+    /// so that a failed deletion is reported rather than masked.
+    fn nft_table_is_listed(nft_binary: &str, family: &str, table_name: &str) -> bool {
+        match Command::new(nft_binary)
+            .args(["list", "tables"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => Self::tables_listing_contains(
+                &String::from_utf8_lossy(&out.stdout),
+                family,
+                table_name,
+            ),
+            _ => true,
+        }
+    }
+
+    /// Returns `true` if `nft list tables` output contains a `table <family> <table_name>` line.
+    pub fn tables_listing_contains(listing: &str, family: &str, table_name: &str) -> bool {
+        listing.lines().any(|line| {
+            let mut parts = line.split_whitespace();
+            parts.next() == Some("table")
+                && parts.next() == Some(family)
+                && parts.next() == Some(table_name)
+        })
+    }
+
     /// Deletes the dedicated `nftables` tables (`ip` and `ip6`) if they exist.
     pub fn delete_nft_table(
         nft_binary: &str,
@@ -55,9 +86,7 @@ impl NftablesInterceptor {
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     let trimmed = stderr.trim();
-                    if trimmed.contains("No such file or directory")
-                        || trimmed.contains("does not exist")
-                    {
+                    if !Self::nft_table_is_listed(nft_binary, family, table_name) {
                         telemetry.push_log(
                             LogLevel::Info,
                             COMPONENT_NFTABLES,
