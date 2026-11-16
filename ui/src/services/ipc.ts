@@ -62,6 +62,9 @@ export {
   type ParsedSseFrame
 };
 
+/** HTTP status used for a request the daemon understood but could not apply. */
+const HTTP_STATUS_CONFLICT = 409;
+
 export class HttpResponseError extends Error {
   public readonly status: number;
   public readonly errorKey?: string;
@@ -373,14 +376,19 @@ export class RouteWardClientService {
   }
 
   /**
-   * Network-level failures flip the client to the disconnected state; an HTTP error answer
-   * means the bridge is reachable, so it is rethrown for the caller to report to the user.
+   * Network-level failures flip the client to the disconnected state. The error is then
+   * rethrown so a mutation never reports success to the caller: an HTTP error answer means the
+   * bridge is reachable, and an unreachable bridge means the change was not applied either.
+   * Read helpers that return a harmless fallback pass `rethrowNetworkError = false`.
    */
-  private handleRequestFailure(err: unknown): void {
+  private handleRequestFailure(err: unknown, rethrowNetworkError = true): void {
     if (err instanceof HttpResponseError) {
       throw err;
     }
     this.markDisconnectedState();
+    if (rethrowNetworkError) {
+      throw err;
+    }
   }
 
   private async requestJson<T>(
@@ -622,15 +630,24 @@ export class RouteWardClientService {
   public async terminateConnection(
     connectionId: string
   ): Promise<TrackedConnection[]> {
+    let terminated = false;
     try {
-      await this.requestJson<{ terminated: boolean }>(
+      const res = await this.requestJson<{ terminated: boolean }>(
         UI_CONFIG.API_ENDPOINTS.CONNECTIONS_TERMINATE,
         'POST',
         { connectionId }
       );
+      terminated = res?.terminated === true;
       await this.fetchState();
     } catch (err) {
       this.handleRequestFailure(err);
+    }
+    if (!terminated) {
+      // The daemon answered but there was nothing to terminate (already closed or unknown id).
+      throw new HttpResponseError(
+        HTTP_STATUS_CONFLICT,
+        `Connection ${connectionId} was not terminated`
+      );
     }
     return this.connections;
   }
@@ -659,7 +676,7 @@ export class RouteWardClientService {
         req
       );
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.handleRequestFailure(err, false);
       return null;
     }
   }
@@ -784,7 +801,7 @@ export class RouteWardClientService {
       await this.fetchState();
       return osConns;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.handleRequestFailure(err, false);
       return this.connections;
     }
   }

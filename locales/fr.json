@@ -62,14 +62,12 @@
         "relay": "Relais Local Espace Utilisateur"
       },
       "language": {
-        "switch": "Changer de langue",
         "en": "English",
         "fr": "Français"
       },
       "profile": {
         "import": "Importer un Profil",
-        "export": "Exporter le Profil",
-        "save": "Enregistrer"
+        "export": "Exporter le Profil"
       }
     },
     "nav": {
@@ -391,9 +389,7 @@
         "destination_section": "Destination & DNS Anti-Fuite",
         "remote_endpoint": "Hôte Distant",
         "resolved_domain": "Domaine Original (Fake-IP)",
-        "routing_section": "Routage Appliqué & Télémétrie",
         "matched_rule": "Règle Appliquée",
-        "upstream_route": "Tunnel / Route",
         "error_detail": "Motif du blocage / erreur",
         "quick_actions_title": "Création de Règle en 1 Clic & Contrôle Socket",
         "route_process_proxy": "Router ce Processus via Proxy",
@@ -448,8 +444,7 @@
         "testing": "Test en cours...",
         "copy_uri": "Copier l'URI",
         "edit": "Modifier / Mot de passe",
-        "delete": "Supprimer",
-        "toggle": "Activer / Désactiver"
+        "delete": "Supprimer"
       },
       "badge": {
         "udp_ready": "Support UDP",
@@ -458,8 +453,6 @@
         "tls_insecure": "TLS Non vérifié",
         "password_set": "Mot de passe défini",
         "untested": "Non testé",
-        "online": "En ligne",
-        "offline": "Injoignable",
         "exit_ip": "IP de sortie"
       }
     },
@@ -797,7 +790,6 @@
     "modal": {
       "title": "ThemeForge Studio - Palette & Teinte d'Accent",
       "subtitle": "Sélectionnez l'une des palettes canoniques Oklab de ThemeForge ou Contraste Élevé, ainsi qu'une teinte d'accent.",
-      "palette_label": "Palette de Thème",
       "accent_label": "Teinte d'Accent",
       "preview_label": "Aperçu des Jetons Sémantiques",
       "import_palette": "Charger une Palette JSON ThemeForge v1",

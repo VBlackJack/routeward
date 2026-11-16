@@ -117,6 +117,14 @@ function Copy-RouteWardBundle {
             New-Item -ItemType Directory -Path $windivertDest -Force | Out-Null
             Copy-Item -Path (Join-Path $windivertSource '*') -Destination $windivertDest -Recurse -Force
         }
+        # The first windivertDllPaths entry is a WinDivert.dll sitting next to routeward.exe:
+        # copy that root-level pair too (the driver is loaded from the same directory).
+        foreach ($rootFile in @('WinDivert.dll', 'WinDivert64.sys')) {
+            $rootSource = Join-Path $sourceDir $rootFile
+            if (Test-Path -LiteralPath $rootSource) {
+                Copy-Item -LiteralPath $rootSource -Destination (Join-Path $destFull $rootFile) -Force
+            }
+        }
     }
     catch {
         throw "Failed to copy RouteWard files to '$destFull': $($_.Exception.Message)"

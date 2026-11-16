@@ -1351,7 +1351,7 @@ async fn live_profile_replacement_reapplies_interception_and_flushes_dns_cache_o
     profile.security_policy.kill_switch_enabled = false;
 
     let controller = RouteWardController::new(constants, profile.clone(), "en");
-    controller.start_engine();
+    controller.start_engine().expect("engine start");
     assert!(controller.is_running());
 
     let mut updated_profile = profile;

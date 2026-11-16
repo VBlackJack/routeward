@@ -55,6 +55,9 @@ const ACCESS_FILE_APPEND_DATA: u32 = 0x0000_0004;
 /// FILE_DELETE_CHILD: allows deleting or renaming entries of a directory.
 #[cfg(any(windows, test))]
 const ACCESS_FILE_DELETE_CHILD: u32 = 0x0000_0040;
+/// DELETE: on a directory or file, allows deleting or renaming that very object.
+#[cfg(any(windows, test))]
+const ACCESS_DELETE: u32 = 0x0001_0000;
 #[cfg(any(windows, test))]
 const ACCESS_WRITE_DAC: u32 = 0x0004_0000;
 #[cfg(any(windows, test))]
@@ -77,6 +80,36 @@ const WRITE_CLASS_ACCESS_MASK: u32 = ACCESS_FILE_WRITE_DATA
 #[cfg(any(windows, test))]
 fn access_mask_grants_write(mask: u32) -> bool {
     mask & WRITE_CLASS_ACCESS_MASK != 0
+}
+
+/// Rights that let a principal replace or rename the object itself, or re-ACL it and then do so.
+#[cfg(any(windows, test))]
+const REPLACE_SELF_ACCESS_MASK: u32 = ACCESS_DELETE
+    | ACCESS_WRITE_DAC
+    | ACCESS_WRITE_OWNER
+    | ACCESS_GENERIC_ALL
+    | ACCESS_GENERIC_WRITE;
+
+/// Rights that matter on an ANCESTOR directory of the service binary: replacing or renaming the
+/// ancestor itself, or deleting/renaming its existing child (FILE_DELETE_CHILD). Creating new
+/// entries (FILE_ADD_FILE / FILE_ADD_SUBDIRECTORY) is deliberately NOT included: a new sibling
+/// folder cannot displace the existing one, and the volume root grants that right to
+/// Authenticated Users.
+#[cfg(any(windows, test))]
+const ANCESTOR_ACCESS_MASK: u32 = REPLACE_SELF_ACCESS_MASK | ACCESS_FILE_DELETE_CHILD;
+
+/// Returns true when `mask` on the service directory or the service executable lets a principal
+/// add, modify, delete or rename content, or take over the security descriptor.
+#[cfg(any(windows, test))]
+fn access_mask_compromises_target(mask: u32) -> bool {
+    access_mask_grants_write(mask) || mask & ACCESS_DELETE != 0
+}
+
+/// Returns true when `mask` on an ancestor directory lets a principal swap the next path
+/// component for another one (see `ANCESTOR_ACCESS_MASK`).
+#[cfg(any(windows, test))]
+fn access_mask_compromises_ancestor(mask: u32) -> bool {
+    mask & ANCESTOR_ACCESS_MASK != 0
 }
 
 /// Returns true for the principals that may legitimately write to the service binary directory.
@@ -131,7 +164,7 @@ mod win32_impl {
     };
     use windows_sys::Win32::Security::{
         GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     };
     use windows_sys::Win32::System::Services::{
         ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
@@ -420,9 +453,21 @@ mod win32_impl {
         Some(out)
     }
 
-    /// Returns the first allow entry of `path` that grants write-class rights to a principal
-    /// outside the trusted set, as `(sid, access_mask)`.
-    fn find_untrusted_writer(path: &Path) -> RouteWardResult<Option<(String, u32)>> {
+    /// Security facts about one path that matter for the service binary check.
+    struct PathSecurity {
+        /// Owner SID when it is not a trusted principal.
+        untrusted_owner: Option<String>,
+        /// First non-inherit-only allow entry matching the requested rights, as `(sid, mask)`.
+        untrusted_writer: Option<(String, u32)>,
+    }
+
+    /// Reads the owner and DACL of `path`. `rights_predicate` selects which access masks count as
+    /// dangerous for this path; the first allow entry of an untrusted principal matching it is
+    /// reported. Inherit-only entries do not apply to the object itself and are skipped.
+    fn inspect_path_security(
+        path: &Path,
+        rights_predicate: fn(u32) -> bool,
+    ) -> RouteWardResult<PathSecurity> {
         use std::os::windows::ffi::OsStrExt;
 
         let insecure = |detail: String| RouteWardError::DaemonError {
@@ -436,13 +481,14 @@ mod win32_impl {
             .collect();
 
         unsafe {
+            let mut owner: PSID = null_mut();
             let mut dacl: *mut ACL = null_mut();
             let mut sd: PSECURITY_DESCRIPTOR = null_mut();
             let status = GetNamedSecurityInfoW(
                 wide_path.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                null_mut(),
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                &mut owner,
                 null_mut(),
                 &mut dacl,
                 null_mut(),
@@ -450,14 +496,23 @@ mod win32_impl {
             );
             if status != ERROR_SUCCESS || sd.is_null() {
                 return Err(insecure(format!(
-                    "Cannot read the access control list of {} (Win32 error {status})",
+                    "Cannot read the security descriptor of {} (Win32 error {status})",
                     path.display()
                 )));
             }
+            let owner_sid = sid_to_string(owner).unwrap_or_else(|| "unknown".to_string());
+            let untrusted_owner = if is_trusted_writer_sid(&owner_sid) {
+                None
+            } else {
+                Some(owner_sid)
+            };
             if dacl.is_null() {
                 // A NULL DACL grants full access to everyone.
                 let _ = LocalFree(sd);
-                return Ok(Some(("S-1-1-0".to_string(), u32::MAX)));
+                return Ok(PathSecurity {
+                    untrusted_owner,
+                    untrusted_writer: Some(("S-1-1-0".to_string(), u32::MAX)),
+                });
             }
 
             let ace_count = (*dacl).AceCount as u32;
@@ -478,7 +533,7 @@ mod win32_impl {
                     continue;
                 }
                 let allowed = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
-                if !access_mask_grants_write(allowed.Mask) {
+                if !rights_predicate(allowed.Mask) {
                     continue;
                 }
                 let sid_ptr = &allowed.SidStart as *const u32 as PSID;
@@ -489,14 +544,33 @@ mod win32_impl {
                 }
             }
             let _ = LocalFree(sd);
-            Ok(found)
+            Ok(PathSecurity {
+                untrusted_owner,
+                untrusted_writer: found,
+            })
         }
     }
 
-    /// Refuses a service binary that a non-administrator could replace: neither its directory
-    /// nor the file itself may grant write-class rights to a principal other than SYSTEM,
-    /// Administrators, TrustedInstaller and CREATOR OWNER (the service runs as LocalSystem).
+    /// Refuses a service binary that a non-administrator could replace (the service runs as
+    /// LocalSystem). The rule, with trusted = SYSTEM, Administrators, TrustedInstaller and
+    /// CREATOR OWNER:
+    ///
+    /// 1. The executable and its directory must be OWNED by a trusted principal (an owner can
+    ///    always rewrite the DACL).
+    /// 2. Neither the executable nor its directory may grant an untrusted principal any
+    ///    write-class right, nor DELETE (add/modify content, rename or delete the object, or
+    ///    re-ACL it).
+    /// 3. Every ancestor directory up to the volume root must not grant an untrusted principal
+    ///    FILE_DELETE_CHILD, DELETE, WRITE_DAC, WRITE_OWNER or GENERIC_WRITE/ALL: such a principal
+    ///    could rename or replace the next path component and swap the whole folder.
+    ///    FILE_ADD_FILE and FILE_ADD_SUBDIRECTORY on an ancestor are accepted, because creating a
+    ///    NEW sibling cannot displace the existing child (the volume root grants them to
+    ///    Authenticated Users).
+    ///
+    /// Inherit-only entries are ignored since they do not apply to the object they sit on. A
+    /// default install under `%ProgramFiles%` and the `System32` directory satisfy every point.
     pub(super) fn verify_service_binary_location(exe: &Path) -> RouteWardResult<()> {
+        let exe = std::path::absolute(exe).unwrap_or_else(|_| exe.to_path_buf());
         let dir = exe.parent().ok_or_else(|| RouteWardError::DaemonError {
             key: ERR_KEY_SERVICE_INSECURE_BINARY,
             detail: format!(
@@ -504,16 +578,37 @@ mod win32_impl {
                 exe.display()
             ),
         })?;
-        for target in [dir, exe] {
-            if let Some((sid, mask)) = find_untrusted_writer(target)? {
-                return Err(RouteWardError::DaemonError {
-                    key: ERR_KEY_SERVICE_INSECURE_BINARY,
-                    detail: format!(
-                        "Refusing to register {} as a LocalSystem service: {} grants write access (mask 0x{mask:08x}) to {sid}. Install RouteWard under %ProgramFiles% with packaging/windows/install-service.ps1.",
-                        exe.display(),
-                        target.display()
-                    ),
-                });
+        let refuse = |detail: String| {
+            RouteWardError::DaemonError {
+            key: ERR_KEY_SERVICE_INSECURE_BINARY,
+            detail: format!(
+                "Refusing to register {} as a LocalSystem service: {detail}. Install RouteWard under %ProgramFiles% with packaging/windows/install-service.ps1.",
+                exe.display()
+            ),
+        }
+        };
+        for target in [dir, exe.as_path()] {
+            let security = inspect_path_security(target, access_mask_compromises_target)?;
+            if let Some(owner) = security.untrusted_owner {
+                return Err(refuse(format!(
+                    "{} is owned by the untrusted principal {owner}",
+                    target.display()
+                )));
+            }
+            if let Some((sid, mask)) = security.untrusted_writer {
+                return Err(refuse(format!(
+                    "{} grants write access (mask 0x{mask:08x}) to {sid}",
+                    target.display()
+                )));
+            }
+        }
+        for ancestor in dir.ancestors().skip(1) {
+            let security = inspect_path_security(ancestor, access_mask_compromises_ancestor)?;
+            if let Some((sid, mask)) = security.untrusted_writer {
+                return Err(refuse(format!(
+                    "ancestor directory {} grants {sid} rights (mask 0x{mask:08x}) to rename or replace its children",
+                    ancestor.display()
+                )));
             }
         }
         Ok(())
@@ -958,6 +1053,45 @@ mod tests {
             err.i18n_key(),
             crate::error::ERR_KEY_SERVICE_INSECURE_BINARY
         );
+    }
+
+    #[test]
+    fn ancestor_rule_ignores_child_creation_but_flags_rename_rights() {
+        // Authenticated Users on the volume root: create folders / append data (this folder only).
+        assert!(!access_mask_compromises_ancestor(ACCESS_FILE_APPEND_DATA));
+        assert!(!access_mask_compromises_ancestor(ACCESS_FILE_WRITE_DATA));
+        // Rename or replace rights on an ancestor are refused.
+        assert!(access_mask_compromises_ancestor(ACCESS_FILE_DELETE_CHILD));
+        assert!(access_mask_compromises_ancestor(ACCESS_DELETE));
+        assert!(access_mask_compromises_ancestor(ACCESS_WRITE_DAC));
+        assert!(access_mask_compromises_ancestor(ACCESS_WRITE_OWNER));
+        assert!(access_mask_compromises_ancestor(ACCESS_GENERIC_WRITE));
+        assert!(access_mask_compromises_ancestor(ACCESS_GENERIC_ALL));
+        // Read and execute only.
+        assert!(!access_mask_compromises_ancestor(0x0012_00A9));
+        // The target itself additionally refuses DELETE and any add/modify right.
+        assert!(access_mask_compromises_target(ACCESS_DELETE));
+        assert!(access_mask_compromises_target(ACCESS_FILE_APPEND_DATA));
+        assert!(!access_mask_compromises_target(0x0012_00A9));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_binary_under_program_files_is_accepted_when_present() {
+        let Some(program_files) = std::env::var_os("ProgramFiles") else {
+            return;
+        };
+        let program_files = std::path::PathBuf::from(program_files);
+        let candidates = [
+            program_files.join("RouteWard").join("routeward.exe"),
+            program_files.join("Windows Defender").join("MpCmdRun.exe"),
+        ];
+        let Some(exe) = candidates.iter().find(|p| p.is_file()) else {
+            eprintln!("skipped: no executable found under %ProgramFiles%");
+            return;
+        };
+        win32_impl::verify_service_binary_location(exe)
+            .expect("a default %ProgramFiles% location is only writable by trusted principals");
     }
 
     #[cfg(windows)]

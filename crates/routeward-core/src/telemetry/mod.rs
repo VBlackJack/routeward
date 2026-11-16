@@ -454,7 +454,8 @@ impl TelemetryHub {
                 return false;
             }
             // The record was evicted, cleared or terminated: start a fresh one below.
-            self.udp_flows.remove(flow_key);
+            self.udp_flows
+                .remove_if(flow_key, |_, flow| flow.conn_id == id);
         }
         if self.udp_flows.len() >= self.max_connections {
             self.sweep_idle_udp_flows();
@@ -465,19 +466,31 @@ impl TelemetryHub {
                 return false;
             }
         }
-        let mut template = make_template();
-        template.status = ConnectionStatus::Active;
-        template.rx_bytes = rx_bytes;
-        template.tx_bytes = tx_bytes;
-        self.udp_flows.insert(
-            flow_key.to_string(),
-            UdpFlow {
-                conn_id: template.id.clone(),
-                last_seen: Instant::now(),
-            },
-        );
-        self.record_connection(template, is_proxied);
-        true
+        // The entry API makes check-and-insert atomic: two threads racing on the same new flow
+        // cannot both create an Active record. The vacant entry is held while the record is
+        // stored, so a concurrent datagram of the same flow only sees it once it is complete;
+        // `record_connection` never touches `udp_flows`, so this cannot deadlock.
+        match self.udp_flows.entry(flow_key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                occupied.get_mut().last_seen = Instant::now();
+                let id = occupied.get().conn_id.clone();
+                drop(occupied);
+                self.update_connection_traffic(&id, rx_bytes, tx_bytes);
+                false
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let mut template = make_template();
+                template.status = ConnectionStatus::Active;
+                template.rx_bytes = rx_bytes;
+                template.tx_bytes = tx_bytes;
+                let _guard = vacant.insert(UdpFlow {
+                    conn_id: template.id.clone(),
+                    last_seen: Instant::now(),
+                });
+                self.record_connection(template, is_proxied);
+                true
+            }
+        }
     }
 
     /// Marks every UDP flow idle for longer than `udpFlowIdleTimeoutMs` as closed and forgets its
@@ -956,6 +969,38 @@ mod tests {
         let snap = hub.snapshot();
         assert_eq!(snap.total_tx_bytes, 100_000);
         assert_eq!(snap.direct_count, 1);
+    }
+
+    #[test]
+    fn concurrent_datagrams_of_one_new_flow_create_a_single_active_record() {
+        let hub = std::sync::Arc::new(udp_test_hub(1000, 20, 60_000));
+        let created = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|n| {
+                let hub = hub.clone();
+                let created = created.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if hub.record_udp_datagram(
+                        &udp_key(51000),
+                        || udp_template(&format!("race{n}")),
+                        false,
+                        0,
+                        10,
+                    ) {
+                        created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hub.snapshot().active_connections, 1);
+        assert_eq!(hub.list_connections().len(), 1);
     }
 
     #[test]

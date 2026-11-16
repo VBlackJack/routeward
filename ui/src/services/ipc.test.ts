@@ -384,7 +384,7 @@ describe('RouteWardClientService', () => {
     expect(client.getDiagnostics().daemonConnected).toBe(false);
   });
 
-  it('keeps the disconnected-state behavior on network errors for mutations', async () => {
+  it('marks the client disconnected and rejects mutations on network errors', async () => {
     const client = new RouteWardClientService();
     client.applyFullState({
       diagnostics: {
@@ -400,8 +400,25 @@ describe('RouteWardClientService', () => {
     });
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
 
-    await expect(client.setInterceptionMode('relay')).resolves.toBeDefined();
+    // An unreachable bridge must not look like a success to the caller.
+    await expect(client.setInterceptionMode('relay')).rejects.toThrow('Failed to fetch');
     expect(client.getDiagnostics().daemonConnected).toBe(false);
+    await expect(client.clearClosedConnections()).rejects.toThrow('Failed to fetch');
+  });
+
+  it('treats terminated:false as a failed termination', async () => {
+    const client = new RouteWardClientService();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ terminated: false })
+      })
+    );
+    await expect(client.terminateConnection('conn-1')).rejects.toBeInstanceOf(
+      HttpResponseError
+    );
   });
 
   it('reads the allocated fake IP from the bridge response', async () => {

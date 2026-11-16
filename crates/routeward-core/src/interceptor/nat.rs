@@ -1422,6 +1422,54 @@ fn parse_ipv4_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
     })
 }
 
+/// Where the UDP header sits inside the first fragment of an IPv6 datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ipv6FragmentPayload {
+    /// The UDP header starts at this packet offset.
+    Udp(usize),
+    /// The datagram carries another transport protocol.
+    NotUdp,
+    /// The datagram may be UDP but its header cannot be located (further extension headers that
+    /// are truncated or too numerous).
+    Unparseable,
+}
+
+/// Returns true for extension headers that share the generic `next header, length` layout.
+fn is_ipv6_walkable_ext_header(next_header: u8) -> bool {
+    matches!(next_header, 0 | 43 | 60)
+}
+
+/// Walks the extension headers that follow an IPv6 fragment header (starting at `offset` with
+/// `next_header`) to find the UDP header of a first fragment.
+fn locate_ipv6_fragment_udp_header(
+    packet: &[u8],
+    mut offset: usize,
+    mut next_header: u8,
+    total_len: usize,
+) -> Ipv6FragmentPayload {
+    for _ in 0..IPV6_MAX_EXT_HEADERS {
+        if next_header == IPPROTO_UDP {
+            return Ipv6FragmentPayload::Udp(offset);
+        }
+        if !is_ipv6_walkable_ext_header(next_header) {
+            return Ipv6FragmentPayload::NotUdp;
+        }
+        let Some(hdr) = packet.get(offset..offset.saturating_add(2)) else {
+            return Ipv6FragmentPayload::Unparseable;
+        };
+        next_header = hdr[0];
+        offset = offset.saturating_add(((hdr[1] as usize) + 1) * 8);
+        if offset > total_len {
+            return Ipv6FragmentPayload::Unparseable;
+        }
+    }
+    if next_header == IPPROTO_UDP {
+        Ipv6FragmentPayload::Udp(offset)
+    } else {
+        Ipv6FragmentPayload::Unparseable
+    }
+}
+
 fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
     if packet.len() < IPV6_HEADER_LEN {
         return None;
@@ -1453,8 +1501,21 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
                 let frag_field = u16::from_be_bytes([hdr[2], hdr[3]]);
                 let frag_offset = frag_field & IPV6_FRAG_OFFSET_MASK;
                 let more = (frag_field & IPV6_FRAG_MORE_FLAG) != 0;
-                if hdr[0] != IPPROTO_UDP || (frag_offset == 0 && !more) {
-                    // Not UDP, or an atomic fragment that the regular parser handles.
+                if frag_offset == 0 && !more {
+                    // An atomic fragment that the regular parser handles.
+                    return None;
+                }
+                let payload_start = offset.checked_add(IPV6_FRAGMENT_HEADER_LEN)?;
+                let payload = if frag_offset == 0 {
+                    locate_ipv6_fragment_udp_header(packet, payload_start, hdr[0], total_len)
+                } else if hdr[0] == IPPROTO_UDP || is_ipv6_walkable_ext_header(hdr[0]) {
+                    // Later fragments carry no transport header: the next-header value of the
+                    // fragment header is all that identifies the datagram.
+                    Ipv6FragmentPayload::Unparseable
+                } else {
+                    Ipv6FragmentPayload::NotUdp
+                };
+                if matches!(payload, Ipv6FragmentPayload::NotUdp) {
                     return None;
                 }
                 let fragment_id = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
@@ -1470,8 +1531,15 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
                         fragment_id,
                     });
                 }
-                let (src_port, dst_port) =
-                    read_udp_ports(packet, offset + IPV6_FRAGMENT_HEADER_LEN)?;
+                // A first fragment that is detected but whose UDP header cannot be located is
+                // reported with ports 0, so it is treated as unattributed (unknown-process policy
+                // and kill switch apply) instead of being reinjected unevaluated.
+                let (src_port, dst_port) = match payload {
+                    Ipv6FragmentPayload::Udp(udp_offset) => {
+                        read_udp_ports(packet, udp_offset).unwrap_or((0, 0))
+                    }
+                    _ => (0, 0),
+                };
                 return Some(UdpFragmentMeta {
                     kind: UdpFragmentKind::First,
                     src_ip,
@@ -2588,6 +2656,49 @@ mod tests {
 
         // Atomic fragment (offset 0, M=0) is left to the regular parser.
         pkt[42..44].copy_from_slice(&0u16.to_be_bytes());
+        assert!(parse_udp_fragment_meta(&pkt).is_none());
+    }
+
+    #[test]
+    fn ipv6_first_fragment_followed_by_extension_header_is_never_reinjected_unevaluated() {
+        // IPv6 header, fragment header (next = destination options), destination options
+        // (next = UDP), UDP ports.
+        let mut pkt = vec![0u8; 40 + 8 + 8 + 8];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&24u16.to_be_bytes());
+        pkt[6] = IPV6_EXT_HEADER_FRAGMENT;
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
+        pkt[24..40].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets());
+        pkt[40] = 60;
+        pkt[42..44].copy_from_slice(&0x0001u16.to_be_bytes()); // offset 0, M=1
+        pkt[44..48].copy_from_slice(&0x0BADF00Du32.to_be_bytes());
+        pkt[48] = IPPROTO_UDP; // destination options: next header
+        pkt[49] = 0; // 8 bytes long
+        pkt[56..58].copy_from_slice(&40000u16.to_be_bytes());
+        pkt[58..60].copy_from_slice(&5000u16.to_be_bytes());
+
+        let first = parse_udp_fragment_meta(&pkt).expect("first fragment with extension header");
+        assert_eq!(first.kind, UdpFragmentKind::First);
+        assert_eq!((first.src_port, first.dst_port), (40000, 5000));
+
+        // Extension header running past the packet: still detected, reported unattributed.
+        pkt[49] = 100;
+        let unparsed = parse_udp_fragment_meta(&pkt).expect("detected but unparseable");
+        assert_eq!(unparsed.kind, UdpFragmentKind::First);
+        assert_eq!((unparsed.src_port, unparsed.dst_port), (0, 0));
+        assert_eq!(unparsed.fragment_id, 0x0BADF00D);
+
+        // Later fragment of the same datagram shares the key.
+        pkt[42..44].copy_from_slice(&0x00B9u16.to_be_bytes());
+        let later = parse_udp_fragment_meta(&pkt).expect("later fragment");
+        assert_eq!(later.kind, UdpFragmentKind::NonFirst);
+        assert_eq!(later.key(), unparsed.key());
+
+        // A non-UDP payload behind the extension header is not a UDP fragment.
+        pkt[42..44].copy_from_slice(&0x0001u16.to_be_bytes());
+        pkt[49] = 0;
+        pkt[48] = IPPROTO_TCP;
         assert!(parse_udp_fragment_meta(&pkt).is_none());
     }
 

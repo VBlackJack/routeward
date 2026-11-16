@@ -41,6 +41,21 @@ const SOCKET_PROTOCOL_OFFSET: usize = 56;
 const EVENT_SHIFT: u32 = 8;
 const EVENT_MASK: u64 = 0xFF;
 
+/// `WINDIVERT_EVENT_SOCKET_BIND`: a socket was bound to a local address.
+#[cfg(test)]
+pub const WINDIVERT_EVENT_SOCKET_BIND: u8 = 3;
+/// `WINDIVERT_EVENT_SOCKET_CONNECT`: a socket connect was initiated (the owner is still alive).
+#[cfg(test)]
+pub const WINDIVERT_EVENT_SOCKET_CONNECT: u8 = 4;
+/// `WINDIVERT_EVENT_SOCKET_LISTEN`: a socket started listening.
+#[cfg(test)]
+pub const WINDIVERT_EVENT_SOCKET_LISTEN: u8 = 5;
+/// `WINDIVERT_EVENT_SOCKET_ACCEPT`: a socket accepted a connection.
+#[cfg(test)]
+pub const WINDIVERT_EVENT_SOCKET_ACCEPT: u8 = 6;
+/// `WINDIVERT_EVENT_SOCKET_CLOSE`: the socket described by an event was closed.
+pub const WINDIVERT_EVENT_SOCKET_CLOSE: u8 = 7;
+
 /// Decoded `WINDIVERT_LAYER_SOCKET` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SocketEvent {
@@ -51,6 +66,14 @@ pub struct SocketEvent {
     pub ipv6: bool,
     /// `WINDIVERT_EVENT_SOCKET_*` value.
     pub kind: u8,
+}
+
+impl SocketEvent {
+    /// Returns `true` when the event reports the socket being closed, so its previous owner must
+    /// be forgotten (the port may be reused by another process).
+    pub fn is_close(&self) -> bool {
+        self.kind == WINDIVERT_EVENT_SOCKET_CLOSE
+    }
 }
 
 impl WinDivertAddress {
@@ -74,7 +97,7 @@ impl WinDivertAddress {
     }
 
     /// Decodes a `WINDIVERT_LAYER_SOCKET` event: owner, local port, protocol, address family and
-    /// event kind (`WINDIVERT_EVENT_SOCKET_BIND`=0, `CONNECT`=1, `LISTEN`=2, `ACCEPT`=3, `CLOSE`=4).
+    /// event kind (`WINDIVERT_EVENT_SOCKET_BIND`=3, `CONNECT`=4, `LISTEN`=5, `ACCEPT`=6, `CLOSE`=7; 0..2 are the network and flow events).
     pub fn socket_event(&self) -> SocketEvent {
         let (pid, local_port) = self.socket_pid_and_local_port();
         SocketEvent {

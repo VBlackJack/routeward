@@ -403,6 +403,11 @@ impl NftablesInterceptor {
         );
         if kill_switch_enabled {
             script.push_str("        oifname \"lo\" return\n");
+            // Kernel neighbour discovery is unmarked: without it RouteWard's own IPv6 upstream
+            // breaks once the neighbour cache expires. Echo and other ICMPv6 stay rejected.
+            script.push_str(
+                "        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } return\n",
+            );
             script.push_str("        meta l4proto tcp reject with tcp reset\n");
             script.push_str("        reject\n");
         } else {

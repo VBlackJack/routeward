@@ -85,16 +85,23 @@ pub(super) fn decide_first_udp_fragment(
     };
 
     if matches!(action, RuleAction::Proxy { .. } | RuleAction::Chain { .. }) {
-        let drop_count = ctrl
-            .fragmented_udp_drop_count
-            .fetch_add(1, Ordering::SeqCst)
-            + 1;
+        // Only datagrams that are really dropped are counted; with the kill switch off the
+        // fragments are released directly and the log says so.
+        let outcome = if verdict == UdpFragmentVerdict::Drop {
+            let drop_count = ctrl
+                .fragmented_udp_drop_count
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            format!("dropped (#{drop_count})")
+        } else {
+            "released directly (not dropped)".to_string()
+        };
         ctrl.push_rate_limited_warn(
             "udp_fragmented_proxy",
             COMPONENT_ENGINE,
             format!(
-                "Fragmented UDP datagram #{drop_count} from process=\"{}\" -> {}:{} matched proxied rule \"{}\" (v1 does not reassemble UDP fragments; killSwitchEnabled={}, verdict={:?})",
-                process_label, frag.dst_ip, frag.dst_port, rule_name, kill_switch_enabled, verdict
+                "Fragmented UDP datagram from process=\"{}\" -> {}:{} matched proxied rule \"{}\" and was {} (v1 does not reassemble UDP fragments; killSwitchEnabled={}, verdict={:?})",
+                process_label, frag.dst_ip, frag.dst_port, rule_name, outcome, kill_switch_enabled, verdict
             ),
         );
     }
@@ -202,8 +209,15 @@ mod tests {
         assert_eq!(off.verdict, UdpFragmentVerdict::Reinject);
         assert_eq!(
             ctrl_off.fragmented_udp_drop_count.load(Ordering::SeqCst),
+            0,
+            "released fragments are not counted as drops"
+        );
+        let ctrl_on = controller(true);
+        decide_first_udp_fragment(&ctrl_on, Some(&voip), &frag);
+        assert_eq!(
+            ctrl_on.fragmented_udp_drop_count.load(Ordering::SeqCst),
             1,
-            "proxied fragments are counted"
+            "dropped proxied fragments are counted"
         );
     }
 

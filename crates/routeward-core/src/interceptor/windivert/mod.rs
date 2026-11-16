@@ -77,10 +77,6 @@ pub fn scoped_firewall_rule_name(relay_port: u16) -> String {
     format!("{FIREWALL_RULE_NAME_PREFIX}{relay_port}")
 }
 
-/// `WINDIVERT_EVENT_SOCKET_CLOSE`: the socket described by a `SOCKET` layer event was closed.
-#[cfg(windows)]
-const WINDIVERT_EVENT_SOCKET_CLOSE: u8 = 4;
-
 #[cfg(windows)]
 pub(super) const COMPONENT_WINDIVERT: &str = "WinDivert";
 #[cfg(windows)]
@@ -464,7 +460,7 @@ impl Interceptor for WinDivertInterceptor {
                     continue;
                 }
                 let key = SocketKey::new(event.protocol, event.ipv6, event.local_port);
-                if event.kind == WINDIVERT_EVENT_SOCKET_CLOSE {
+                if event.is_close() {
                     // The port may be reused by another process: forget the previous owner.
                     nat_for_sock.record_socket_close(key, event.pid);
                 } else {

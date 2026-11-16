@@ -27,6 +27,7 @@ use crate::dns::codec::{
 };
 use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_HANDSHAKE_FAILED};
 use crate::interceptor::nat::SelfPortGuard;
+use crate::proxy::udp::is_expected_relay_source;
 #[cfg(target_os = "linux")]
 use crate::proxy::ProxyConnector;
 use crate::rules::ConnectionRequest;
@@ -249,7 +250,9 @@ fn dns_reply_matches(
     if reply[..DNS_ID_LEN] != query[..DNS_ID_LEN] {
         return false;
     }
-    expected_source.is_none_or(|expected| expected == actual_source)
+    // Compare canonical IP and port only: a full `SocketAddr` equality would also compare the IPv6
+    // flow info and scope id, and would reject an IPv4-mapped source for an IPv4 resolver.
+    expected_source.is_none_or(|expected| is_expected_relay_source(actual_source, expected))
 }
 
 /// How a direct UDP DNS reply is authenticated against the query that was sent.
@@ -1406,6 +1409,34 @@ mod tests {
         ));
         assert!(dns_reply_matches(&query, &good, None, other));
         assert!(!dns_reply_matches(&query, &[0x12], None, other));
+    }
+
+    #[test]
+    fn dns_reply_matches_ignores_scope_id_and_ipv4_mapping() {
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        let query = query_for("example.test", 0x1234);
+        let reply = query_for("example.test", 0x1234);
+        let link_local: Ipv6Addr = "fe80::1".parse().expect("ipv6");
+        let expected = SocketAddr::V6(SocketAddrV6::new(link_local, 53, 0, 0));
+        let scoped = SocketAddr::V6(SocketAddrV6::new(link_local, 53, 7, 3));
+        assert!(dns_reply_matches(&query, &reply, Some(expected), scoped));
+        let other = SocketAddr::V6(SocketAddrV6::new(
+            "fe80::2".parse().expect("ipv6"),
+            53,
+            7,
+            0,
+        ));
+        assert!(!dns_reply_matches(&query, &reply, Some(expected), other));
+
+        let v4 = sa("192.0.2.1:53");
+        let mapped = sa("[::ffff:192.0.2.1]:53");
+        assert!(dns_reply_matches(&query, &reply, Some(v4), mapped));
+        assert!(!dns_reply_matches(
+            &query,
+            &reply,
+            Some(v4),
+            sa("[::ffff:192.0.2.1]:54")
+        ));
     }
 
     #[tokio::test]
