@@ -682,9 +682,12 @@ impl DesktopCommandBridge {
         self.state.read().profile.clone()
     }
 
-    pub async fn replace_profile(&self, profile: ProfileConfig) -> Result<ProfileConfig, String> {
+    pub async fn replace_profile(
+        &self,
+        profile: ProfileConfig,
+    ) -> Result<ProfileConfig, IpcCallError> {
         let updated = self
-            .call_daemon::<ProfileConfig>(IpcCommand::ReplaceProfile { profile })
+            .call_daemon_detailed::<ProfileConfig>(IpcCommand::ReplaceProfile { profile })
             .await?;
         let _ = self.refresh_state().await;
         Ok(updated)
@@ -694,17 +697,17 @@ impl DesktopCommandBridge {
         ThemeForgeCatalog::load_embedded().map_err(|e| e.to_string())
     }
 
-    pub async fn set_theme(&self, theme: String, accent: String) {
+    pub async fn set_theme(&self, theme: String, accent: String) -> Result<(), IpcCallError> {
         {
             let mut st = self.state.write();
             st.profile.theme_config.theme = theme.clone();
             st.profile.theme_config.accent = accent.clone();
         }
         if self.is_daemon_connected() {
-            let _ = self
-                .call_daemon::<serde_json::Value>(IpcCommand::SetTheme { theme, accent })
-                .await;
+            self.call_daemon_detailed::<serde_json::Value>(IpcCommand::SetTheme { theme, accent })
+                .await?;
         }
+        Ok(())
     }
 
     pub fn initial_window_theme(&self) -> crate::WindowThemeAppearance {
@@ -724,18 +727,14 @@ impl DesktopCommandBridge {
         self.state.read().connections.clone()
     }
 
-    pub async fn terminate_connection(&self, connection_id: String) -> bool {
+    pub async fn terminate_connection(&self, connection_id: String) -> Result<bool, IpcCallError> {
         #[derive(serde::Deserialize)]
         struct TerminateAck {
             terminated: bool,
         }
-        match self
-            .call_daemon::<TerminateAck>(IpcCommand::TerminateConnection { connection_id })
+        self.call_daemon_detailed::<TerminateAck>(IpcCommand::TerminateConnection { connection_id })
             .await
-        {
-            Ok(ack) => ack.terminated,
-            Err(_) => false,
-        }
+            .map(|ack| ack.terminated)
     }
 
     pub async fn clear_closed_connections(&self) {
@@ -775,46 +774,58 @@ impl DesktopCommandBridge {
             .unwrap_or_default()
     }
 
-    pub async fn upsert_proxy(&self, node: ProxyNode) -> ProfileConfig {
-        let _ = self
-            .call_daemon::<serde_json::Value>(IpcCommand::UpsertProxy { node })
+    pub async fn upsert_proxy(&self, node: ProxyNode) -> Result<ProfileConfig, IpcCallError> {
+        let outcome = self
+            .call_daemon_detailed::<serde_json::Value>(IpcCommand::UpsertProxy { node })
             .await;
-        self.refresh_state().await.profile
+        // Always resync, so the UI sees the real profile even when the daemon rejected the change.
+        let profile = self.refresh_state().await.profile;
+        outcome.map(|_| profile)
     }
 
-    pub async fn remove_proxy(&self, proxy_id: String) -> ProfileConfig {
-        let _ = self
-            .call_daemon::<serde_json::Value>(IpcCommand::RemoveProxy { proxy_id })
+    pub async fn remove_proxy(&self, proxy_id: String) -> Result<ProfileConfig, IpcCallError> {
+        let outcome = self
+            .call_daemon_detailed::<serde_json::Value>(IpcCommand::RemoveProxy { proxy_id })
             .await;
-        self.refresh_state().await.profile
+        // Always resync, so the UI sees the real profile even when the daemon rejected the change.
+        let profile = self.refresh_state().await.profile;
+        outcome.map(|_| profile)
     }
 
-    pub async fn upsert_chain(&self, chain: ProxyChain) -> ProfileConfig {
-        let _ = self
-            .call_daemon::<serde_json::Value>(IpcCommand::UpsertChain { chain })
+    pub async fn upsert_chain(&self, chain: ProxyChain) -> Result<ProfileConfig, IpcCallError> {
+        let outcome = self
+            .call_daemon_detailed::<serde_json::Value>(IpcCommand::UpsertChain { chain })
             .await;
-        self.refresh_state().await.profile
+        // Always resync, so the UI sees the real profile even when the daemon rejected the change.
+        let profile = self.refresh_state().await.profile;
+        outcome.map(|_| profile)
     }
 
-    pub async fn remove_chain(&self, chain_id: String) -> ProfileConfig {
-        let _ = self
-            .call_daemon::<serde_json::Value>(IpcCommand::RemoveChain { chain_id })
+    pub async fn remove_chain(&self, chain_id: String) -> Result<ProfileConfig, IpcCallError> {
+        let outcome = self
+            .call_daemon_detailed::<serde_json::Value>(IpcCommand::RemoveChain { chain_id })
             .await;
-        self.refresh_state().await.profile
+        // Always resync, so the UI sees the real profile even when the daemon rejected the change.
+        let profile = self.refresh_state().await.profile;
+        outcome.map(|_| profile)
     }
 
-    pub async fn upsert_rule(&self, rule: RoutingRule) -> ProfileConfig {
-        let _ = self
-            .call_daemon::<serde_json::Value>(IpcCommand::UpsertRule { rule })
+    pub async fn upsert_rule(&self, rule: RoutingRule) -> Result<ProfileConfig, IpcCallError> {
+        let outcome = self
+            .call_daemon_detailed::<serde_json::Value>(IpcCommand::UpsertRule { rule })
             .await;
-        self.refresh_state().await.profile
+        // Always resync, so the UI sees the real profile even when the daemon rejected the change.
+        let profile = self.refresh_state().await.profile;
+        outcome.map(|_| profile)
     }
 
-    pub async fn remove_rule(&self, rule_id: String) -> ProfileConfig {
-        let _ = self
-            .call_daemon::<serde_json::Value>(IpcCommand::RemoveRule { rule_id })
+    pub async fn remove_rule(&self, rule_id: String) -> Result<ProfileConfig, IpcCallError> {
+        let outcome = self
+            .call_daemon_detailed::<serde_json::Value>(IpcCommand::RemoveRule { rule_id })
             .await;
-        self.refresh_state().await.profile
+        // Always resync, so the UI sees the real profile even when the daemon rejected the change.
+        let profile = self.refresh_state().await.profile;
+        outcome.map(|_| profile)
     }
 
     pub async fn toggle_engine(&self, start: bool) -> Result<SystemDiagnostics, IpcCallError> {
@@ -837,20 +848,27 @@ impl DesktopCommandBridge {
         }
     }
 
-    pub async fn set_interception_mode(&self, mode: InterceptionMode) -> SystemDiagnostics {
-        if let Ok(mut diag) = self
-            .call_daemon::<SystemDiagnostics>(IpcCommand::SetInterceptionMode { mode })
+    pub async fn set_interception_mode(
+        &self,
+        mode: InterceptionMode,
+    ) -> Result<SystemDiagnostics, IpcCallError> {
+        match self
+            .call_daemon_detailed::<SystemDiagnostics>(IpcCommand::SetInterceptionMode { mode })
             .await
         {
-            diag.daemon_connected = true;
-            diag.active_locale = self.i18n.get_locale();
-            self.state.write().diagnostics = diag.clone();
-            self.emit_resync();
-            self.notify_tray();
-            return diag;
+            Ok(mut diag) => {
+                diag.daemon_connected = true;
+                diag.active_locale = self.i18n.get_locale();
+                self.state.write().diagnostics = diag.clone();
+                self.emit_resync();
+                self.notify_tray();
+                Ok(diag)
+            }
+            Err(err) => {
+                self.notify_tray();
+                Err(err)
+            }
         }
-        self.notify_tray();
-        self.get_diagnostics()
     }
 
     pub async fn start_privileged_daemon(&self) -> Result<DaemonFullState, DaemonLaunchError> {
@@ -901,14 +919,12 @@ impl DesktopCommandBridge {
         self.state.read().fake_ips.clone()
     }
 
-    pub async fn allocate_fake_ip(&self, domain: String) -> Option<String> {
-        let allocated = self
-            .call_daemon::<Option<String>>(IpcCommand::AllocateFakeIp { domain })
-            .await
-            .ok()
-            .flatten();
+    pub async fn allocate_fake_ip(&self, domain: String) -> Result<Option<String>, IpcCallError> {
+        let outcome = self
+            .call_daemon_detailed::<Option<String>>(IpcCommand::AllocateFakeIp { domain })
+            .await;
         let _ = self.refresh_state().await;
-        allocated
+        outcome
     }
 
     pub async fn flush_fake_ip_cache(&self) {

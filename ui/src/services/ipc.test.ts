@@ -15,7 +15,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SYSTEM_CONSTANTS } from '../config/constants';
+import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
 import {
   HttpResponseError,
   RouteWardClientService,
@@ -329,5 +329,163 @@ describe('RouteWardClientService', () => {
     const connections = client.listConnections();
     expect(connections).toHaveLength(limit);
     expect(connections.some((c) => c.id === 'conn-active-oldest')).toBe(true);
+  });
+
+  it('rethrows HttpResponseError with errorKey from every mutation instead of swallowing it', async () => {
+    const client = new RouteWardClientService();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        json: async () => ({
+          error: 'Invalid proxy URI format',
+          errorKey: 'errors.proxy.invalid_uri'
+        })
+      })
+    );
+    const node = client.parseSingleProxyUri('socks5://127.0.0.1:1080');
+    expect(node).not.toBeNull();
+    const profile = client.getProfile();
+    const rule = profile.rules[0];
+
+    const mutations: Array<() => Promise<unknown>> = [
+      () => client.upsertProxy(node!),
+      () => client.removeProxy('p1'),
+      () =>
+        client.upsertChain({
+          id: 'c1',
+          name: 'c',
+          strategy: 'sequence',
+          proxyIds: [],
+          enabled: true
+        }),
+      () => client.removeChain('c1'),
+      () => client.upsertRule(rule),
+      () => client.removeRule('r1'),
+      () => client.setInterceptionMode('relay'),
+      () => client.replaceProfile(profile),
+      () => client.updateSecurityPolicy({ killSwitchEnabled: false }),
+      () => client.terminateConnection('conn-1'),
+      () => client.clearClosedConnections(),
+      () => client.flushFakeIps(),
+      () => client.clearLogs(),
+      () => client.allocateFakeIp('example.com'),
+      () => client.testProxy('p1'),
+      () => client.testAllProxies()
+    ];
+    for (const mutation of mutations) {
+      await expect(mutation()).rejects.toMatchObject({
+        name: 'HttpResponseError',
+        status: 400,
+        errorKey: 'errors.proxy.invalid_uri'
+      });
+    }
+    expect(client.getDiagnostics().daemonConnected).toBe(false);
+  });
+
+  it('keeps the disconnected-state behavior on network errors for mutations', async () => {
+    const client = new RouteWardClientService();
+    client.applyFullState({
+      diagnostics: {
+        ...client.getDiagnostics(),
+        daemonConnected: true,
+        running: true
+      },
+      profile: client.getProfile(),
+      telemetry: client.getTelemetry(),
+      connections: [],
+      logs: [],
+      fakeIps: []
+    });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+
+    await expect(client.setInterceptionMode('relay')).resolves.toBeDefined();
+    expect(client.getDiagnostics().daemonConnected).toBe(false);
+  });
+
+  it('reads the allocated fake IP from the bridge response', async () => {
+    const client = new RouteWardClientService();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ allocated: '198.18.0.7', entries: [] })
+      })
+      .mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({})
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(client.allocateFakeIp('Example.com')).resolves.toBe('198.18.0.7');
+  });
+
+  it('coalesces listener notifications of an SSE burst into a single pass', () => {
+    vi.useFakeTimers();
+    try {
+      const client = new RouteWardClientService();
+      const listener = vi.fn();
+      client.subscribe(listener);
+      for (let i = 0; i < 20; i += 1) {
+        client.applyStreamEvent({
+          streamType: 'event',
+          payload: {
+            event: 'log',
+            data: {
+              id: `burst-id-${i}`,
+              timestamp: '2026-11-16T08:00:00Z',
+              level: 'INFO',
+              component: 'test',
+              message: `burst-${i}`
+            }
+          }
+        });
+      }
+      expect(listener).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(UI_CONFIG.STREAM_NOTIFY_COALESCE_MS + 1);
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(client.listLogs()).toHaveLength(20);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('restarts the realtime stream for a new AbortSignal after the previous one was aborted', async () => {
+    const fetchMock = vi.fn().mockImplementation(
+      (_url: string, init?: { signal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError'))
+          );
+        })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new RouteWardClientService();
+
+    const first = new AbortController();
+    client.startRealtimeStream(first.signal);
+    const callsAfterFirst = fetchMock.mock.calls.length;
+    // Same live signal: ignored
+    client.startRealtimeStream(first.signal);
+    expect(fetchMock.mock.calls.length).toBe(callsAfterFirst);
+
+    first.abort();
+    const second = new AbortController();
+    client.startRealtimeStream(second.signal);
+    await vi.waitFor(() => {
+      expect(fetchMock.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+    });
+    second.abort();
+  });
+
+  it('rejects out-of-range or non-numeric ports in proxy URIs', () => {
+    const client = new RouteWardClientService();
+    expect(client.parseSingleProxyUri('socks5://127.0.0.1:70000')).toBeNull();
+    expect(client.parseSingleProxyUri('socks5://127.0.0.1:65536')).toBeNull();
+    expect(client.parseSingleProxyUri('socks5://127.0.0.1:1e3')).toBeNull();
+    expect(client.parseSingleProxyUri('socks5://127.0.0.1:0')).toBeNull();
+    expect(client.parseSingleProxyUri('socks5://127.0.0.1:65535')?.port).toBe(65535);
   });
 });

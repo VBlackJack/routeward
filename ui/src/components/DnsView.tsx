@@ -66,6 +66,7 @@ export const DnsView: React.FC<DnsViewProps> = ({
           value={domainInput}
           onChange={(e) => setDomainInput(e.target.value)}
           placeholder={t('dns.allocate.placeholder')}
+          aria-label={t('dns.allocate.placeholder')}
           className="tf-input flex-1 px-3 py-1.5 text-xs"
         />
         <button

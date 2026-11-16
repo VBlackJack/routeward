@@ -16,6 +16,7 @@
 
 use crate::{DesktopWindowCommand, TrayStatusSnapshot};
 use parking_lot::Mutex;
+use routeward_core::i18n::I18nRegistry;
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::iter::once;
@@ -76,62 +77,45 @@ pub fn encode_utf16_tip_truncated(text: &str, out: &mut [u16; 128]) {
 }
 
 pub struct TrayMenuLabels {
-    pub tooltip: &'static str,
-    pub status_line: &'static str,
-    pub open_app: &'static str,
-    pub toggle_engine: &'static str,
+    pub tooltip: String,
+    pub status_line: String,
+    pub open_app: String,
+    pub toggle_engine: String,
     pub toggle_enabled: bool,
-    pub quit_app: &'static str,
+    pub quit_app: String,
 }
 
+const TRAY_KEY_STATUS_OFFLINE: &str = "tray.status.offline";
+const TRAY_KEY_STATUS_PROTECTED: &str = "tray.status.protected";
+const TRAY_KEY_STATUS_PAUSED: &str = "tray.status.paused";
+const TRAY_KEY_MENU_PAUSE: &str = "tray.menu.pause";
+const TRAY_KEY_MENU_ENABLE: &str = "tray.menu.enable";
+const TRAY_KEY_MENU_OPEN: &str = "tray.menu.open";
+const TRAY_KEY_MENU_QUIT: &str = "tray.menu.quit";
+
+/// Builds the tray tooltip and menu labels from the shared locale files for the snapshot locale.
 pub fn build_tray_labels(snapshot: &TrayStatusSnapshot) -> TrayMenuLabels {
-    let is_fr = snapshot
-        .locale
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("fr");
-    if is_fr {
-        let status_line = if !snapshot.daemon_connected {
-            "RouteWard - Service arrêté"
-        } else if snapshot.running {
-            "RouteWard - Protégé"
-        } else {
-            "RouteWard - En pause"
-        };
-        let toggle_engine = if snapshot.daemon_connected && snapshot.running {
-            "Mettre en pause"
-        } else {
-            "Activer la protection"
-        };
-        TrayMenuLabels {
-            tooltip: status_line,
-            status_line,
-            open_app: "Ouvrir RouteWard",
-            toggle_engine,
-            toggle_enabled: snapshot.daemon_connected,
-            quit_app: "Quitter",
-        }
+    let i18n = I18nRegistry::new(snapshot.locale.trim());
+    let status_key = if !snapshot.daemon_connected {
+        TRAY_KEY_STATUS_OFFLINE
+    } else if snapshot.running {
+        TRAY_KEY_STATUS_PROTECTED
     } else {
-        let status_line = if !snapshot.daemon_connected {
-            "RouteWard - Service Offline"
-        } else if snapshot.running {
-            "RouteWard - Protected"
-        } else {
-            "RouteWard - Paused"
-        };
-        let toggle_engine = if snapshot.daemon_connected && snapshot.running {
-            "Pause Protection"
-        } else {
-            "Enable Protection"
-        };
-        TrayMenuLabels {
-            tooltip: status_line,
-            status_line,
-            open_app: "Open RouteWard",
-            toggle_engine,
-            toggle_enabled: snapshot.daemon_connected,
-            quit_app: "Exit",
-        }
+        TRAY_KEY_STATUS_PAUSED
+    };
+    let toggle_key = if snapshot.daemon_connected && snapshot.running {
+        TRAY_KEY_MENU_PAUSE
+    } else {
+        TRAY_KEY_MENU_ENABLE
+    };
+    let status_line = i18n.t(status_key);
+    TrayMenuLabels {
+        tooltip: status_line.clone(),
+        status_line,
+        open_app: i18n.t(TRAY_KEY_MENU_OPEN),
+        toggle_engine: i18n.t(toggle_key),
+        toggle_enabled: snapshot.daemon_connected,
+        quit_app: i18n.t(TRAY_KEY_MENU_QUIT),
     }
 }
 
@@ -147,7 +131,7 @@ impl TrayWindowState {
         let snap = self.snapshot.lock().clone();
         let labels = build_tray_labels(&snap);
         let mut nid = self.nid.borrow_mut();
-        encode_utf16_tip_truncated(labels.tooltip, &mut nid.szTip);
+        encode_utf16_tip_truncated(&labels.tooltip, &mut nid.szTip);
         nid.uFlags = NIF_TIP | NIF_SHOWTIP;
         unsafe {
             Shell_NotifyIconW(NIM_MODIFY, &*nid);
@@ -158,7 +142,7 @@ impl TrayWindowState {
         let snap = self.snapshot.lock().clone();
         let labels = build_tray_labels(&snap);
         let mut nid = self.nid.borrow_mut();
-        encode_utf16_tip_truncated(labels.tooltip, &mut nid.szTip);
+        encode_utf16_tip_truncated(&labels.tooltip, &mut nid.szTip);
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         unsafe {
             if Shell_NotifyIconW(NIM_ADD, &*nid) == 0 {
@@ -187,10 +171,10 @@ impl TrayWindowState {
                 return;
             }
 
-            let status_w = to_wide_null(labels.status_line);
-            let open_w = to_wide_null(labels.open_app);
-            let toggle_w = to_wide_null(labels.toggle_engine);
-            let quit_w = to_wide_null(labels.quit_app);
+            let status_w = to_wide_null(&labels.status_line);
+            let open_w = to_wide_null(&labels.open_app);
+            let toggle_w = to_wide_null(&labels.toggle_engine);
+            let quit_w = to_wide_null(&labels.quit_app);
 
             AppendMenuW(
                 menu,

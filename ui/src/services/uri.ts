@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
+import { UI_CONFIG } from '../config/constants';
 import { ProxyNode, ProxyProtocol } from '../types/routeward';
+
+const PORT_PATTERN = /^\d{1,5}$/;
 
 let idSequenceCounter = 0;
 
@@ -129,8 +132,10 @@ export function parseSingleProxyUri(uri: string): ProxyNode | null {
     portStr = hostPort.slice(colonIdx + 1);
   }
 
-  const port = Number(portStr.replace(/\/$/, ''));
-  if (!host || Number.isNaN(port) || port <= 0) return null;
+  const portText = portStr.replace(/\/$/, '');
+  if (!PORT_PATTERN.test(portText)) return null;
+  const port = Number(portText);
+  if (!host || port <= 0 || port > UI_CONFIG.MAX_PORT) return null;
 
   let auth: ProxyNode['auth'] = null;
   if (userInfo) {

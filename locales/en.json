@@ -1,10 +1,7 @@
 {
   "app": {
     "titlebar": {
-      "minimize": "Minimize",
-      "maximize": "Maximize / Restore",
-      "close": "Close",
-      "native_badge": "Native Desktop"
+      "close": "Close"
     },
     "launcher": {
       "button": "Run App via Proxy",
@@ -73,13 +70,6 @@
         "import": "Import Profile",
         "export": "Export Profile",
         "save": "Save Profile"
-      },
-      "theme": {
-        "button": "ThemeForge"
-      },
-      "command_palette": {
-        "button": "Command Palette",
-        "shortcut": "Ctrl+K"
       }
     },
     "nav": {
@@ -98,24 +88,6 @@
       },
       "settings": {
         "tab": "Settings"
-      },
-      "dashboard": {
-        "tab": "Dashboard"
-      },
-      "connections": {
-        "tab": "Live Connections"
-      },
-      "proxies": {
-        "tab": "Proxies & Chains"
-      },
-      "rules": {
-        "tab": "Routing Rules"
-      },
-      "dns": {
-        "tab": "Fake-IP DNS"
-      },
-      "logs": {
-        "tab": "Event Logs"
       }
     },
     "statusbar": {
@@ -207,7 +179,11 @@
         "not_elevated": "Elevated daemon did not receive administrator privileges",
         "config_invalid": "Daemon could not load configuration profile",
         "daemon_exited": "Elevated daemon exited unexpectedly during startup"
-      }
+      },
+      "error": {
+        "generic": "The operation failed"
+      },
+      "dismiss": "Dismiss notification"
     }
   },
   "command_palette": {
@@ -216,7 +192,8 @@
       "empty": "No matching command or resource found.",
       "group_navigation": "Navigation",
       "group_actions": "Quick Engine Actions",
-      "group_themes": "ThemeForge Palettes"
+      "group_themes": "ThemeForge Palettes",
+      "title": "Command palette"
     },
     "actions": {
       "toggle_engine": "Toggle Interceptor Engine Start / Stop",
@@ -244,7 +221,6 @@
       "metric_leaks_blocked": "Leaks & Blocks Stopped",
       "metric_protected_traffic": "Total Traffic Handled",
       "proxy_summary_label": "Active Proxy Server",
-      "no_proxy_configured": "No proxy server configured yet",
       "direct_filter_mode_title": "Direct Filter Mode (No External Proxy)",
       "direct_filter_mode_desc": "Active filtering, tracker blocking, and LAN rules apply directly using your normal Internet connection.",
       "configure_proxy_cta": "Set up a Proxy",
@@ -362,9 +338,6 @@
         "active": "Active",
         "blocked": "Blocked",
         "closed": "Closed"
-      },
-      "simulate": {
-        "button": "Simulate Connection"
       },
       "scan_os": {
         "button": "Scan Real OS Sockets"
@@ -905,7 +878,7 @@
         "simple": "Your custom traffic laws: e.g., 'Firefox goes through Proxy', 'Steam connects Directly', and 'Windows Telemetry is Blocked'.",
         "expert": "Deterministic ascending-priority evaluator matching process globs, domain wildcards, IPv4/IPv6 CIDR subnets, and port ranges."
       },
-        "system_proxy": {
+      "system_proxy": {
         "term": "System Proxy vs App Launcher",
         "simple": "'System Proxy' configures all of Windows in 1 click. 'Run App via Proxy' launches a single chosen program inside the proxy tunnel.",
         "expert": "Toggles HKCU Internet Settings registry keys or spawns a child process with injected ALL_PROXY / HTTP_PROXY / HTTPS_PROXY environment variables."
@@ -972,6 +945,19 @@
       "subtab_overview": "Overview",
       "subtab_dns": "Fake-IP DNS Cache",
       "subtab_logs": "Event Logs"
+    }
+  },
+  "tray": {
+    "status": {
+      "offline": "RouteWard - Service Offline",
+      "protected": "RouteWard - Protected",
+      "paused": "RouteWard - Paused"
+    },
+    "menu": {
+      "pause": "Pause Protection",
+      "enable": "Enable Protection",
+      "open": "Open RouteWard",
+      "quit": "Exit"
     }
   }
 }

@@ -39,6 +39,36 @@ const ThemeForgeContext = createContext<ThemeForgeContextValue | null>(null);
 
 const HEX_BASE = 16;
 const MAX_CHANNEL = 255;
+const HEX_COLOR_PATTERN = /^#(?:[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$/;
+const SUPPORTED_PALETTE_VERSION = 1;
+
+/**
+ * Returns true when `value` is a usable palette: supported version, a name, and a valid hex
+ * string for every color slot listed in `requiredSlots`.
+ */
+export function isValidThemePalette(
+  value: unknown,
+  requiredSlots: readonly string[]
+): value is ThemeForgePalette {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Partial<ThemeForgePalette>;
+  if (
+    candidate.version !== SUPPORTED_PALETTE_VERSION ||
+    typeof candidate.name !== 'string' ||
+    !candidate.name.trim() ||
+    !candidate.colors ||
+    typeof candidate.colors !== 'object'
+  ) {
+    return false;
+  }
+  const colors = candidate.colors as unknown as Record<string, unknown>;
+  return requiredSlots.every((slot) => {
+    const slotValue = colors[slot];
+    return typeof slotValue === 'string' && HEX_COLOR_PATTERN.test(slotValue);
+  });
+}
 
 function shiftHexColor(hex: string, delta: number): string {
   const clean = hex.replace('#', '');
@@ -77,13 +107,20 @@ export const ThemeForgeProvider: React.FC<{ children: React.ReactNode }> = ({
 }) => {
   const builtInPalettes = THEMEFORGE_CATALOG_DATA.palettes as ThemeForgePalette[];
   const accents = THEMEFORGE_CATALOG_DATA.accents as AccentTint[];
+  const requiredColorSlots = Object.keys(builtInPalettes[0].colors);
 
   const [customPalettes, setCustomPalettes] = useState<ThemeForgePalette[]>(() => {
     try {
       const raw = window.localStorage.getItem(
         UI_CONFIG.STORAGE_KEYS.CUSTOM_PALETTES
       );
-      return raw ? (JSON.parse(raw) as ThemeForgePalette[]) : [];
+      const stored: unknown = raw ? JSON.parse(raw) : [];
+      // A stored palette that fails validation is dropped so it cannot break the UI at startup.
+      return Array.isArray(stored)
+        ? stored.filter((p): p is ThemeForgePalette =>
+            isValidThemePalette(p, requiredColorSlots)
+          )
+        : [];
     } catch {
       return [];
     }
@@ -152,13 +189,16 @@ export const ThemeForgeProvider: React.FC<{ children: React.ReactNode }> = ({
         : UI_CONFIG.STANDARD_BORDER_PX
     );
     root.style.colorScheme = Boolean(activePalette.isLight) ? 'light' : 'dark';
-    void routewardClient.setDesktopTheme({
+    void routewardClient
+      .setDesktopTheme({
       theme: activePalette.name,
       accent: activeAccent,
       isLight: Boolean(activePalette.isLight),
       surfaceHex: normalizeHex(effectiveColors.Surface),
       textPrimaryHex: normalizeHex(effectiveColors.TextPrimary),
       borderHex: normalizeHex(effectiveColors.Border)
+    }).catch(() => {
+      // Window chrome theming is cosmetic; a bridge rejection must not break the UI
     });
   }, [effectiveColors, activePalette, activeAccent]);
 
@@ -174,16 +214,17 @@ export const ThemeForgeProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const importExternalPalette = (jsonText: string): boolean => {
     try {
-      const parsed = JSON.parse(jsonText) as ThemeForgePalette;
-      if (
-        parsed.version !== 1 ||
-        !parsed.name ||
-        !parsed.colors ||
-        !parsed.colors.Background ||
-        !parsed.colors.Foreground
-      ) {
+      const raw: unknown = JSON.parse(jsonText);
+      if (!isValidThemePalette(raw, requiredColorSlots)) {
         return false;
       }
+      const parsed: ThemeForgePalette = {
+        ...raw,
+        displayName:
+          typeof raw.displayName === 'string' && raw.displayName.trim()
+            ? raw.displayName
+            : raw.name
+      };
       const next = [
         ...customPalettes.filter((p) => p.name !== parsed.name),
         parsed

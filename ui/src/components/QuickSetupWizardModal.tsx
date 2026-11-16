@@ -48,6 +48,8 @@ interface QuickSetupWizardModalProps {
   onAddRule: (rule: RoutingRule) => Promise<unknown> | void;
   onSelectMode: (mode: ExperienceMode) => void;
   onComplete: (hasEnabledProxy?: boolean) => void;
+  /** Called when applying the wizard fails; the modal stays open so the user can retry. */
+  onError?: (err: unknown) => void;
   onClose: () => void;
 }
 
@@ -61,10 +63,12 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   onAddRule,
   onSelectMode,
   onComplete,
+  onError,
   onClose
 }) => {
   const { t } = useTranslation();
   const titleId = useId();
+  const uriTextareaId = useId();
   const [step, setStep] = useState(1);
   const [goal, setGoal] = useState<GoalProfile>('privacy');
   const [customUri, setCustomUri] = useState('');
@@ -156,6 +160,8 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
       onSelectMode(selectedMode);
       onComplete(hasEnabledProxy);
       onClose();
+    } catch (err) {
+      onError?.(err);
     } finally {
       setApplying(false);
     }
@@ -288,10 +294,14 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
             )}
 
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-tf-secondary">
+              <label
+                htmlFor={uriTextareaId}
+                className="mb-1.5 block text-xs font-medium text-tf-secondary"
+              >
                 {t('wizard.modal.step2_paste_uri')}
               </label>
               <textarea
+                id={uriTextareaId}
                 rows={3}
                 value={customUri}
                 onChange={(e) => setCustomUri(e.target.value)}

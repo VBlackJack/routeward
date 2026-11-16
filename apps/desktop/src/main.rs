@@ -136,7 +136,19 @@ fn spawn_embedded_ui_server(
         bridge.log_info(format!(
             "Loopback UI server listening on http://127.0.0.1:{bound_port}"
         ));
-        let listener = TcpListener::from_std(std_listener).expect("Async listener");
+        let listener = match TcpListener::from_std(std_listener) {
+            Ok(listener) => listener,
+            Err(err) => {
+                // Without its loopback listener the UI can never load: report it and stop serving.
+                let bridge_for_report = Arc::clone(&bridge);
+                let detail = format!("Loopback listener error: {err}");
+                let _ = tokio::task::spawn_blocking(move || {
+                    report_fatal_ui_error(&bridge_for_report, &detail);
+                })
+                .await;
+                return;
+            }
+        };
         let token_arc = Arc::new(ephemeral_token);
 
         while let Ok((stream, _)) = listener.accept().await {
