@@ -38,6 +38,25 @@ const WIN_INET_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion
 const WIN_RUN_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
 const AUTOSTART_VALUE_NAME: &str = "RouteWardDesktop";
+/// Registry value holding the per-user system proxy switch (REG_DWORD, 1 = enabled).
+const PROXY_ENABLE_VALUE_NAME: &str = "ProxyEnable";
+/// Token `reg query` prints for a DWORD value; it is not localized.
+const REG_DWORD_TYPE_TOKEN: &str = "REG_DWORD";
+
+/// Extracts the numeric data of a `reg query` DWORD value line, locale-independently.
+///
+/// Only the `REG_DWORD` type token and the `0x` hexadecimal data are inspected; the value name
+/// and any surrounding text are ignored. Returns `None` when no DWORD line is present.
+fn parse_reg_dword_value(stdout: &str) -> Option<u32> {
+    stdout.lines().find_map(|line| {
+        let idx = line.find(REG_DWORD_TYPE_TOKEN)?;
+        let data = line[idx + REG_DWORD_TYPE_TOKEN.len()..].trim();
+        let hex = data
+            .strip_prefix("0x")
+            .or_else(|| data.strip_prefix("0X"))?;
+        u32::from_str_radix(hex.split_whitespace().next()?, 16).ok()
+    })
+}
 
 /// Resolves `<System32>\<exe_name>` through `GetSystemDirectoryW`.
 ///
@@ -219,6 +238,28 @@ impl SystemProxyManager {
         }
     }
 
+    /// Reads whether the per-user system proxy switch (`ProxyEnable`) is currently on.
+    /// Any failure to query it (missing value, tool error) counts as off; always off elsewhere.
+    pub fn is_system_proxy_enabled() -> bool {
+        #[cfg(windows)]
+        {
+            let Ok(output) = Command::new(windows_system_tool_path("reg.exe"))
+                .args(["query", WIN_INET_REG_PATH, "/v", PROXY_ENABLE_VALUE_NAME])
+                .output()
+            else {
+                return false;
+            };
+            if !output.status.success() {
+                return false;
+            }
+            parse_reg_dword_value(&String::from_utf8_lossy(&output.stdout)) == Some(1)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub fn get_system_pac_url() -> Option<String> {
         #[cfg(windows)]
         {
@@ -342,6 +383,30 @@ impl SystemProxyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_reg_dword_enabled_and_disabled() {
+        let on =
+            "\r\nHKEY_CURRENT_USER\\Software\\X\r\n    ProxyEnable    REG_DWORD    0x1\r\n\r\n";
+        let off = "    ProxyEnable    REG_DWORD    0x0";
+        assert_eq!(parse_reg_dword_value(on), Some(1));
+        assert_eq!(parse_reg_dword_value(off), Some(0));
+    }
+
+    #[test]
+    fn parses_reg_dword_ignores_localized_text_and_rejects_other_types() {
+        let fr = "Valeur ProxyEnable\n    ProxyEnable    REG_DWORD    0x00000001\n";
+        assert_eq!(parse_reg_dword_value(fr), Some(1));
+        assert_eq!(
+            parse_reg_dword_value("    AutoConfigURL    REG_SZ    http://x"),
+            None
+        );
+        assert_eq!(
+            parse_reg_dword_value("    ProxyEnable    REG_DWORD    garbage"),
+            None
+        );
+        assert_eq!(parse_reg_dword_value(""), None);
+    }
 
     #[cfg(windows)]
     #[test]

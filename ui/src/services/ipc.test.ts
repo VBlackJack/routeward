@@ -422,6 +422,23 @@ describe('RouteWardClientService', () => {
     await expect(client.allocateFakeIp('Example.com')).resolves.toBe('198.18.0.7');
   });
 
+  it('reads the system proxy switch with a GET and falls back to off on failure', async () => {
+    const client = new RouteWardClientService();
+    const fetchMock = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ enabled: true })
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(client.getSystemProxyStatus()).resolves.toEqual({ enabled: true });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain('/api/system-proxy');
+    expect(init.method).toBe('GET');
+
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+    await expect(client.getSystemProxyStatus()).resolves.toEqual({ enabled: false });
+  });
+
   it('coalesces listener notifications of an SSE burst into a single pass', () => {
     vi.useFakeTimers();
     try {

@@ -322,6 +322,9 @@ export const App: React.FC = () => {
     void routewardClient.getAutostartStatus().then((res) => {
       setAutostartEnabled(res.enabled);
     });
+    void routewardClient.getSystemProxyStatus().then((res) => {
+      setSystemProxyEnabled(res.enabled);
+    });
   }, []);
 
   useEffect(() => {

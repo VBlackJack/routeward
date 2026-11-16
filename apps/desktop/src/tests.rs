@@ -1090,3 +1090,138 @@ async fn mutation_routes_surface_daemon_errors_instead_of_reporting_success() {
         assert_eq!(res.0, 400, "{path} must reject malformed JSON");
     }
 }
+
+async fn spawn_test_loopback_server(
+    bridge: Arc<DesktopCommandBridge>,
+    with_static_assets: bool,
+) -> (u16, String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let port = listener.local_addr().expect("local_addr").port();
+    let token = generate_ephemeral_token();
+    let token_for_server = token.clone();
+    let server_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let b = Arc::clone(&bridge);
+            let t = token_for_server.clone();
+            tokio::spawn(async move {
+                if with_static_assets {
+                    serve_loopback_http_connection(
+                        stream,
+                        port,
+                        &t,
+                        &b,
+                        None,
+                        Some(|path: &str| {
+                            if path.starts_with("/assets/app.js") {
+                                ("application/javascript; charset=utf-8", &b"void 0;"[..])
+                            } else {
+                                ("text/html; charset=utf-8", &b"<html></html>"[..])
+                            }
+                        }),
+                    )
+                    .await;
+                } else {
+                    serve_loopback_api_connection(stream, port, &t, &b).await;
+                }
+            });
+        }
+    });
+    (port, token, server_task)
+}
+
+#[tokio::test]
+async fn mutating_routes_reject_get_and_system_proxy_getter_reports_state() {
+    let constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let bridge = Arc::new(DesktopCommandBridge::new(constants, profile, "en"));
+    let (port, token, server_task) = spawn_test_loopback_server(bridge, false).await;
+
+    let mutating_paths = [
+        "/api/connections/terminate",
+        "/api/connections/clear",
+        "/api/logs/clear",
+        "/api/profile/replace",
+        "/api/rules/upsert",
+        "/api/rules/remove",
+        "/api/rules/evaluate",
+        "/api/proxies/upsert",
+        "/api/proxies/remove",
+        "/api/proxies/test",
+        "/api/proxies/test-all",
+        "/api/chains/upsert",
+        "/api/chains/remove",
+        "/api/dns/allocate",
+        "/api/dns/flush",
+        "/api/scan-os",
+        "/api/launch-process",
+    ];
+    for route in mutating_paths {
+        let resp = send_raw_http(
+            port,
+            &format!(
+                "GET {route} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-RouteWard-Token: {token}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "Expected 405 on GET {route}, got: {resp}"
+        );
+    }
+
+    let get_proxy_resp = send_raw_http(
+        port,
+        &format!(
+            "GET /api/system-proxy HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-RouteWard-Token: {token}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        get_proxy_resp.starts_with("HTTP/1.1 200 OK"),
+        "Expected 200 on GET /api/system-proxy, got: {get_proxy_resp}"
+    );
+    assert!(
+        get_proxy_resp.contains("\"enabled\":"),
+        "GET /api/system-proxy must report the enabled flag, got: {get_proxy_resp}"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn index_page_carries_csp_while_scripts_do_not() {
+    let constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let bridge = Arc::new(DesktopCommandBridge::new(constants, profile, "en"));
+    let (port, _token, server_task) = spawn_test_loopback_server(bridge, true).await;
+
+    let index_resp = send_raw_http(
+        port,
+        &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    )
+    .await;
+    let expected_header = format!("Content-Security-Policy: {INDEX_CONTENT_SECURITY_POLICY}\r\n");
+    assert!(
+        index_resp.contains(&expected_header),
+        "index response must carry the CSP, got: {index_resp}"
+    );
+    assert!(INDEX_CONTENT_SECURITY_POLICY.contains("default-src 'self'"));
+    assert!(INDEX_CONTENT_SECURITY_POLICY.contains("script-src 'self';"));
+    assert!(INDEX_CONTENT_SECURITY_POLICY.contains("connect-src 'self'"));
+
+    let js_resp = send_raw_http(
+        port,
+        &format!("GET /assets/app.js HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    )
+    .await;
+    assert!(
+        !js_resp.contains("Content-Security-Policy"),
+        "script assets must not carry the page CSP, got: {js_resp}"
+    );
+
+    server_task.abort();
+}

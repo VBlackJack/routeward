@@ -543,10 +543,29 @@ impl DesktopCommandBridge {
         }
     }
 
-    pub fn set_system_proxy(&self, enabled: bool) -> Result<bool, String> {
-        let diag = self.get_diagnostics();
-        SystemProxyManager::set_system_proxy(enabled, &diag.relay_tcp_endpoint)
-            .map_err(|e| e.to_string())
+    /// Runs a blocking system call (registry tools, process spawn) off the async worker.
+    async fn run_blocking<T, F>(task: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(task)
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    pub async fn set_system_proxy(&self, enabled: bool) -> Result<bool, String> {
+        let endpoint = self.get_diagnostics().relay_tcp_endpoint;
+        Self::run_blocking(move || {
+            SystemProxyManager::set_system_proxy(enabled, &endpoint).map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn get_system_proxy_status(&self) -> bool {
+        tokio::task::spawn_blocking(SystemProxyManager::is_system_proxy_enabled)
+            .await
+            .unwrap_or(false)
     }
 
     pub fn pac_url(&self) -> String {
@@ -556,31 +575,45 @@ impl DesktopCommandBridge {
         )
     }
 
-    pub fn get_system_pac_status(&self) -> (bool, String) {
+    pub async fn get_system_pac_status(&self) -> (bool, String) {
         let expected = self.pac_url();
-        let active = SystemProxyManager::get_system_pac_url()
-            .map(|url| url.eq_ignore_ascii_case(&expected))
-            .unwrap_or(false);
+        let expected_for_task = expected.clone();
+        let active = tokio::task::spawn_blocking(move || {
+            SystemProxyManager::get_system_pac_url()
+                .map(|url| url.eq_ignore_ascii_case(&expected_for_task))
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
         (active, expected)
     }
 
-    pub fn set_system_pac(&self, enabled: bool) -> Result<(bool, String), String> {
+    pub async fn set_system_pac(&self, enabled: bool) -> Result<(bool, String), String> {
         let expected = self.pac_url();
-        SystemProxyManager::set_system_pac(enabled, &expected)
-            .map(|res| (res, expected))
-            .map_err(|e| e.to_string())
+        let expected_for_task = expected.clone();
+        Self::run_blocking(move || {
+            SystemProxyManager::set_system_pac(enabled, &expected_for_task)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map(|res| (res, expected))
     }
 
-    pub fn get_autostart_status(&self) -> bool {
-        SystemProxyManager::is_autostart_enabled()
+    pub async fn get_autostart_status(&self) -> bool {
+        tokio::task::spawn_blocking(SystemProxyManager::is_autostart_enabled)
+            .await
+            .unwrap_or(false)
     }
 
-    pub fn set_autostart(&self, enabled: bool) -> Result<bool, String> {
+    pub async fn set_autostart(&self, enabled: bool) -> Result<bool, String> {
         let exe_path = std::env::current_exe()
             .map_err(|e| e.to_string())?
             .to_string_lossy()
             .into_owned();
-        SystemProxyManager::set_autostart(enabled, &exe_path).map_err(|e| e.to_string())
+        Self::run_blocking(move || {
+            SystemProxyManager::set_autostart(enabled, &exe_path).map_err(|e| e.to_string())
+        })
+        .await
     }
 
     pub async fn import_foxyproxy_json(
@@ -663,19 +696,24 @@ impl DesktopCommandBridge {
         .unwrap_or_default()
     }
 
-    pub fn launch_process_with_proxy(
+    pub async fn launch_process_with_proxy(
         &self,
         executable_path: &str,
         args: &[String],
     ) -> Result<LaunchedProcessReport, String> {
         let diag = self.get_diagnostics();
-        SystemProxyManager::spawn_process_with_proxy(
-            executable_path,
-            args,
-            &diag.relay_tcp_endpoint,
-            &diag.relay_http_endpoint,
-        )
-        .map_err(|e| e.to_string())
+        let executable_path = executable_path.to_string();
+        let args = args.to_vec();
+        Self::run_blocking(move || {
+            SystemProxyManager::spawn_process_with_proxy(
+                &executable_path,
+                &args,
+                &diag.relay_tcp_endpoint,
+                &diag.relay_http_endpoint,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .await
     }
 
     pub fn get_profile(&self) -> ProfileConfig {
