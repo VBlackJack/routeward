@@ -38,11 +38,14 @@ const WIN_INET_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion
 const WIN_RUN_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
 const AUTOSTART_VALUE_NAME: &str = "RouteWardDesktop";
+#[cfg(windows)]
 /// Registry value holding the per-user system proxy switch (REG_DWORD, 1 = enabled).
 const PROXY_ENABLE_VALUE_NAME: &str = "ProxyEnable";
+#[cfg(any(windows, test))]
 /// Token `reg query` prints for a DWORD value; it is not localized.
 const REG_DWORD_TYPE_TOKEN: &str = "REG_DWORD";
 
+#[cfg(any(windows, test))]
 /// Extracts the numeric data of a `reg query` DWORD value line, locale-independently.
 ///
 /// Only the `REG_DWORD` type token and the `0x` hexadecimal data are inspected; the value name
