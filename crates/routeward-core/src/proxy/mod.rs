@@ -31,8 +31,10 @@ use base64::Engine;
 use ntlm::{
     extract_challenge_token, select_sspi_scheme, sspi_step_async, SspiClientSession, SspiScheme,
 };
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -44,6 +46,16 @@ const MAX_HTTP_BODY_DRAIN_BYTES: usize = 65536;
 const MAX_HTTP_AUTH_ATTEMPTS: usize = 4;
 const SOCKS4A_SENTINEL_IPV4: [u8; 4] = [0, 0, 0, 1];
 const MAX_SOCKS4A_DOMAIN_LEN: usize = 255;
+/// Maximum length of a textual host name (RFC 1035, without the root label).
+const MAX_HOSTNAME_BYTES: usize = 253;
+/// Maximum length of one host name label (RFC 1035).
+const MAX_HOSTNAME_LABEL_BYTES: usize = 63;
+/// Maximum length of a SOCKS5 domain name (one length byte on the wire).
+const MAX_SOCKS5_DOMAIN_BYTES: usize = u8::MAX as usize;
+/// Prefix of a Basic `Proxy-Authorization` header line.
+const BASIC_AUTH_HEADER_PREFIX: &str = "Proxy-Authorization: Basic ";
+/// Authentication scheme name offered by Basic proxies in `Proxy-Authenticate`.
+const BASIC_SCHEME_NAME: &str = "Basic";
 
 pub trait AsyncTunnelStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncTunnelStream for T {}
@@ -65,14 +77,92 @@ struct ParsedHttpResponse {
     connection_close: bool,
 }
 
+/// Returns true when `name` is safe to embed in a text protocol request line (HTTP CONNECT) or a
+/// SOCKS5 domain field: non-empty, at most 253 bytes, labels at most 63 bytes, and no ASCII
+/// control characters, whitespace or non-printable characters. Underscores and other printable
+/// characters stay accepted (no strict LDH enforcement).
+pub fn is_safe_hostname(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_HOSTNAME_BYTES {
+        return false;
+    }
+    if name.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    name.split('.')
+        .all(|label| label.len() <= MAX_HOSTNAME_LABEL_BYTES)
+}
+
+fn ensure_safe_target_host(host: &str) -> RouteWardResult<()> {
+    if is_safe_hostname(host) {
+        Ok(())
+    } else {
+        Err(RouteWardError::ProtocolHandshake {
+            key: ERR_KEY_HANDSHAKE_FAILED,
+            detail: "Refusing target host with control characters, whitespace or invalid length"
+                .to_string(),
+        })
+    }
+}
+
+/// In-memory set of proxy endpoints that already accepted Basic credentials, so later connections
+/// to a known Basic-only proxy skip the extra 407 round trip. Keyed by id, host and port so an
+/// edited node never inherits the verdict of a previous configuration.
+fn basic_accepted_nodes() -> &'static Mutex<HashSet<String>> {
+    static CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn basic_cache_key(node: &ProxyNode) -> String {
+    format!("{}|{}:{}", node.id, node.host, node.port)
+}
+
+fn remember_basic_accepted(node: &ProxyNode) {
+    if let Ok(mut set) = basic_accepted_nodes().lock() {
+        set.insert(basic_cache_key(node));
+    }
+}
+
+fn forget_basic_accepted(node: &ProxyNode) {
+    if let Ok(mut set) = basic_accepted_nodes().lock() {
+        set.remove(&basic_cache_key(node));
+    }
+}
+
+fn is_basic_known_accepted(node: &ProxyNode) -> bool {
+    basic_accepted_nodes()
+        .lock()
+        .map(|set| set.contains(&basic_cache_key(node)))
+        .unwrap_or(false)
+}
+
+/// Header sent on the first CONNECT. Basic credentials are pre-emptive only when the hop to the
+/// proxy is TLS (or the node is already known to accept Basic); otherwise nothing is sent until
+/// the proxy challenges with a 407.
 fn initial_basic_auth_header(node: &ProxyNode) -> Option<String> {
+    if !ProxyConnector::requires_tls(node) && !is_basic_known_accepted(node) {
+        return None;
+    }
+    basic_auth_header(node)
+}
+
+fn basic_auth_header(node: &ProxyNode) -> Option<String> {
     let creds = node.auth.as_ref()?;
     let pass = creds.password_str();
     if creds.username.is_empty() && pass.is_empty() {
         return None;
     }
     let token = BASE64_STANDARD.encode(format!("{}:{pass}", creds.username));
-    Some(format!("Proxy-Authorization: Basic {token}\r\n"))
+    Some(format!("{BASIC_AUTH_HEADER_PREFIX}{token}\r\n"))
+}
+
+fn challenges_offer_basic(challenges: &[String]) -> bool {
+    challenges.iter().any(|value| {
+        value.split(',').any(|raw| {
+            raw.split_whitespace()
+                .next()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(BASIC_SCHEME_NAME))
+        })
+    })
 }
 
 async fn read_http_response_headers<S: AsyncTunnelStream>(
@@ -383,19 +473,37 @@ impl ProxyConnector {
         spn_host_override: Option<&str>,
         constants: &SystemConstants,
     ) -> RouteWardResult<Box<dyn AsyncTunnelStream>> {
+        let (stream, _local, _peer) =
+            Self::open_transport_with_addrs(node, proxy_addr, spn_host_override, constants).await?;
+        Ok(stream)
+    }
+
+    /// Opens the TCP (and TLS, when the node requires it) transport to `node` and also returns the
+    /// local and peer socket addresses of the underlying TCP connection.
+    pub(crate) async fn open_transport_with_addrs(
+        node: &ProxyNode,
+        proxy_addr: &str,
+        spn_host_override: Option<&str>,
+        constants: &SystemConstants,
+    ) -> RouteWardResult<(
+        Box<dyn AsyncTunnelStream>,
+        Option<SocketAddr>,
+        Option<SocketAddr>,
+    )> {
         let connect_timeout = Duration::from_millis(constants.network.tcp_connect_timeout_ms);
         let handshake_timeout = Duration::from_millis(constants.network.proxy_handshake_timeout_ms);
-        let mut stream: Box<dyn AsyncTunnelStream> = Box::new(
-            timeout(
-                connect_timeout,
-                Self::connect_tcp_marked(proxy_addr, constants.network.linux_fwmark),
-            )
-            .await
-            .map_err(|_| RouteWardError::ConnectionTimeout {
-                key: ERR_KEY_CONNECTION_TIMEOUT,
-            })?
-            .map_err(RouteWardError::Io)?,
-        );
+        let tcp_stream = timeout(
+            connect_timeout,
+            Self::connect_tcp_marked(proxy_addr, constants.network.linux_fwmark),
+        )
+        .await
+        .map_err(|_| RouteWardError::ConnectionTimeout {
+            key: ERR_KEY_CONNECTION_TIMEOUT,
+        })?
+        .map_err(RouteWardError::Io)?;
+        let local_addr = tcp_stream.local_addr().ok();
+        let peer_addr = tcp_stream.peer_addr().ok();
+        let mut stream: Box<dyn AsyncTunnelStream> = Box::new(tcp_stream);
 
         if Self::requires_tls(node) {
             let sni_host = tls::resolve_tls_server_name(node, spn_host_override);
@@ -409,7 +517,7 @@ impl ProxyConnector {
             })??;
         }
 
-        Ok(stream)
+        Ok((stream, local_addr, peer_addr))
     }
 
     async fn connect_http_single_with_reconnect(
@@ -739,6 +847,9 @@ impl ProxyConnector {
                 detail: "Invalid SOCKS4 target host".to_string(),
             });
         }
+        if IpAddr::from_str(clean_host).is_err() {
+            ensure_safe_target_host(clean_host)?;
+        }
 
         let userid = node
             .auth
@@ -822,6 +933,9 @@ impl ProxyConnector {
         command: u8,
         proto: &ProtocolConstants,
     ) -> RouteWardResult<Option<SocketAddr>> {
+        if IpAddr::from_str(target_host).is_err() {
+            ensure_safe_target_host(target_host)?;
+        }
         let has_auth = node
             .auth
             .as_ref()
@@ -893,7 +1007,7 @@ impl ProxyConnector {
         }
 
         let mut req = vec![proto.socks5_version, command, 0x00];
-        Self::encode_socks5_address(&mut req, target_host, target_port, proto);
+        Self::encode_socks5_address(&mut req, target_host, target_port, proto)?;
         stream.write_all(&req).await?;
 
         let mut reply_head = [0u8; 4];
@@ -1006,8 +1120,10 @@ impl ProxyConnector {
         pending_auth_header: &mut Option<String>,
         sspi_session: &mut Option<SspiClientSession>,
     ) -> RouteWardResult<HttpConnectOutcome> {
+        ensure_safe_target_host(target_host)?;
         let host_port = Self::format_host_port(target_host, target_port);
         let auth_hdr = pending_auth_header.take().unwrap_or_default();
+        let sent_basic = auth_hdr.starts_with(BASIC_AUTH_HEADER_PREFIX);
         let request = format!(
             "CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n{auth_hdr}Proxy-Connection: Keep-Alive\r\n\r\n"
         );
@@ -1015,11 +1131,32 @@ impl ProxyConnector {
 
         let parsed = read_http_response_headers(stream).await?;
         if (200..300).contains(&parsed.status_code) {
+            if sent_basic {
+                remember_basic_accepted(node);
+            }
             return Ok(HttpConnectOutcome::Connected);
         }
 
         if parsed.status_code == 407 {
+            if sent_basic {
+                forget_basic_accepted(node);
+            }
             let Some(scheme) = select_sspi_scheme(&parsed.proxy_auth_challenges) else {
+                // Reactive Basic: only when the proxy offers it, nothing stronger was available
+                // and Basic was not already rejected on this attempt.
+                if !sent_basic && challenges_offer_basic(&parsed.proxy_auth_challenges) {
+                    if let Some(header) = basic_auth_header(node) {
+                        if !parsed.connection_close {
+                            drain_http_body(stream, &parsed).await?;
+                        }
+                        *pending_auth_header = Some(header);
+                        return Ok(if parsed.connection_close {
+                            HttpConnectOutcome::ReconnectRequired
+                        } else {
+                            HttpConnectOutcome::ContinueSameStream
+                        });
+                    }
+                }
                 tracing::warn!(
                     target: "routeward::proxy::http_connect",
                     "HTTP proxy rejected CONNECT with 407: {}",
@@ -1096,7 +1233,7 @@ impl ProxyConnector {
         target_host: &str,
         target_port: u16,
         proto: &ProtocolConstants,
-    ) {
+    ) -> RouteWardResult<()> {
         if let Ok(ip) = IpAddr::from_str(target_host) {
             match ip {
                 IpAddr::V4(v4) => {
@@ -1110,12 +1247,18 @@ impl ProxyConnector {
             }
         } else {
             let domain_bytes = target_host.as_bytes();
-            let len = domain_bytes.len().min(u8::MAX as usize);
+            if domain_bytes.len() > MAX_SOCKS5_DOMAIN_BYTES {
+                return Err(RouteWardError::ProtocolHandshake {
+                    key: ERR_KEY_HANDSHAKE_FAILED,
+                    detail: "SOCKS5 domain name exceeds 255 bytes".to_string(),
+                });
+            }
             buf.push(proto.socks5_atyp_domain);
-            buf.push(len as u8);
-            buf.extend_from_slice(&domain_bytes[..len]);
+            buf.push(domain_bytes.len() as u8);
+            buf.extend_from_slice(domain_bytes);
         }
         buf.extend_from_slice(&target_port.to_be_bytes());
+        Ok(())
     }
 }
 
@@ -1317,5 +1460,274 @@ mod tests {
         let mut tail = [0u8; 4];
         client.read_exact(&mut tail).await.unwrap();
         assert_eq!(&tail, b"NEXT");
+    }
+
+    fn http_test_node(id: &str, tls: bool, with_auth: bool) -> ProxyNode {
+        ProxyNode {
+            id: id.to_string(),
+            name: "HTTP".to_string(),
+            protocol: ProxyProtocol::Http,
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            auth: with_auth.then(|| ProxyCredentials::new("alice", "secret")),
+            tls,
+            tls_skip_verify: false,
+            sni: None,
+            udp_enabled: false,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        }
+    }
+
+    async fn read_request_head<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> String {
+        let mut collected = Vec::new();
+        let mut byte = [0u8; 1];
+        while !collected.ends_with(b"\r\n\r\n") {
+            if reader.read_exact(&mut byte).await.is_err() {
+                break;
+            }
+            collected.push(byte[0]);
+        }
+        String::from_utf8_lossy(&collected).into_owned()
+    }
+
+    #[tokio::test]
+    async fn plaintext_proxy_receives_no_authorization_on_first_request() {
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let node = http_test_node("plain-first-request", false, true);
+        let (mut client, mut server) = duplex(2048);
+        let server_task = tokio::spawn(async move {
+            let head = read_request_head(&mut server).await;
+            server
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            head
+        });
+
+        ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
+            .await
+            .expect("CONNECT without challenge succeeds");
+        let head = server_task.await.unwrap();
+        assert!(head.starts_with("CONNECT example.com:443 HTTP/1.1"));
+        assert!(
+            !head.to_ascii_lowercase().contains("proxy-authorization"),
+            "no credentials may be sent before a 407 challenge: {head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn basic_only_407_is_answered_with_basic_and_succeeds() {
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let node = http_test_node("basic-only-reactive", false, true);
+        let (mut client, mut server) = duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let first = read_request_head(&mut server).await;
+            server
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"corp\"\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let second = read_request_head(&mut server).await;
+            server
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            (first, second)
+        });
+
+        ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
+            .await
+            .expect("Basic-only proxy must be served after the 407");
+        let (first, second) = server_task.await.unwrap();
+        assert!(!first.to_ascii_lowercase().contains("proxy-authorization"));
+        let expected_token = BASE64_STANDARD.encode("alice:secret");
+        assert!(
+            second.contains(&format!("Proxy-Authorization: Basic {expected_token}")),
+            "second request must carry Basic credentials: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn basic_rejected_after_basic_does_not_loop() {
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let node = http_test_node("basic-rejected", false, true);
+        let (mut client, mut server) = duplex(4096);
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let _ = read_request_head(&mut server).await;
+                server
+                    .write_all(
+                        b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"corp\"\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let err =
+            ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
+                .await
+                .expect_err("wrong Basic credentials must be rejected");
+        assert!(matches!(err, RouteWardError::AuthenticationRejected { .. }));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ntlm_challenge_never_triggers_basic() {
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let node = http_test_node("ntlm-never-basic", false, true);
+        let (mut client, mut server) = duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let mut seen = read_request_head(&mut server).await;
+            server
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: NTLM\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            // Whatever follows (an NTLM Type 1 token, or nothing when SSPI is unavailable) is
+            // recorded; the stream is then closed.
+            let mut rest = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_millis(500), server.read_to_end(&mut rest))
+                .await;
+            seen.push_str(&String::from_utf8_lossy(&rest));
+            seen
+        });
+
+        let _ =
+            ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
+                .await;
+        drop(client);
+        let seen = server_task.await.unwrap();
+        assert!(
+            !seen.contains("Basic "),
+            "Basic credentials must never answer an NTLM challenge: {seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn basic_offered_alongside_ntlm_prefers_ntlm() {
+        let challenges = vec!["Basic realm=\"x\"".to_string(), "NTLM".to_string()];
+        assert!(select_sspi_scheme(&challenges).is_some());
+        assert!(challenges_offer_basic(&challenges));
+        assert!(!challenges_offer_basic(&["NTLM".to_string()]));
+        assert!(challenges_offer_basic(&["basic realm=\"y\"".to_string()]));
+    }
+
+    #[test]
+    fn tls_hop_keeps_preemptive_basic_and_plaintext_does_not() {
+        let tls_node = http_test_node("preemptive-tls", true, true);
+        let header = initial_basic_auth_header(&tls_node).expect("TLS keeps pre-emptive Basic");
+        assert!(header.starts_with(BASIC_AUTH_HEADER_PREFIX));
+
+        let plain_node = http_test_node("preemptive-plain", false, true);
+        assert!(initial_basic_auth_header(&plain_node).is_none());
+
+        remember_basic_accepted(&plain_node);
+        assert!(initial_basic_auth_header(&plain_node).is_some());
+        forget_basic_accepted(&plain_node);
+        assert!(initial_basic_auth_header(&plain_node).is_none());
+    }
+
+    #[tokio::test]
+    async fn known_basic_proxy_skips_the_extra_round_trip() {
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let node = http_test_node("basic-cache-hit", false, true);
+        remember_basic_accepted(&node);
+        let (mut client, mut server) = duplex(2048);
+        let server_task = tokio::spawn(async move {
+            let head = read_request_head(&mut server).await;
+            server
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            head
+        });
+        ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
+            .await
+            .expect("cached Basic proxy succeeds first try");
+        let head = server_task.await.unwrap();
+        assert!(head.contains(BASIC_AUTH_HEADER_PREFIX));
+        forget_basic_accepted(&node);
+    }
+
+    #[test]
+    fn hostname_validation_rejects_injection_and_oversize_but_keeps_underscores() {
+        assert!(is_safe_hostname("_dmarc.example.com"));
+        assert!(is_safe_hostname("2001:db8::1"));
+        assert!(!is_safe_hostname(""));
+        assert!(!is_safe_hostname("a.com\r\nHost: evil"));
+        assert!(!is_safe_hostname("a b.com"));
+        assert!(!is_safe_hostname("a\u{7f}.com"));
+        assert!(!is_safe_hostname("a\u{0}.com"));
+        let label_63 = "a".repeat(63);
+        let label_64 = "a".repeat(64);
+        assert!(is_safe_hostname(&format!("{label_63}.com")));
+        assert!(!is_safe_hostname(&format!("{label_64}.com")));
+        let name_253 = format!("{label_63}.{label_63}.{label_63}.{}", "a".repeat(61));
+        assert_eq!(name_253.len(), 253);
+        assert!(is_safe_hostname(&name_253));
+        assert!(!is_safe_hostname(&format!("{name_253}a")));
+    }
+
+    #[tokio::test]
+    async fn http_connect_refuses_target_with_crlf_injection() {
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let node = http_test_node("crlf-target", false, false);
+        let (mut client, _server) = duplex(1024);
+        let err = ProxyConnector::negotiate_http_connect(
+            &mut client,
+            &node,
+            "a.com HTTP/1.1\r\nX-Injected: 1\r\n\r\nGET /",
+            443,
+            &proto,
+        )
+        .await
+        .expect_err("CRLF in target host must be refused");
+        assert!(err.to_string().contains("Refusing target host"));
+    }
+
+    #[tokio::test]
+    async fn socks5_refuses_domains_over_255_bytes_instead_of_truncating() {
+        let proto = SystemConstants::load_embedded().unwrap().protocols;
+        let mut buf = Vec::new();
+        let long = "a".repeat(300);
+        assert!(ProxyConnector::encode_socks5_address(&mut buf, &long, 443, &proto).is_err());
+        assert!(buf.is_empty());
+
+        let mut ok_buf = Vec::new();
+        ProxyConnector::encode_socks5_address(&mut ok_buf, &"b".repeat(255), 443, &proto)
+            .expect("255 bytes fits the one-byte length");
+        assert_eq!(ok_buf[1], 255);
+
+        let node = http_test_node("socks5-long", false, false);
+        let (mut client, _server) = duplex(1024);
+        let err = ProxyConnector::negotiate_socks5(
+            &mut client,
+            &node,
+            &long,
+            443,
+            proto.socks5_cmd_connect,
+            &proto,
+        )
+        .await
+        .expect_err("overlong SOCKS5 domain must be refused before any write");
+        assert!(err.to_string().contains("Refusing target host"));
+
+        let (mut client2, _server2) = duplex(1024);
+        let err = ProxyConnector::negotiate_socks5(
+            &mut client2,
+            &node,
+            "evil.com\r\nx",
+            443,
+            proto.socks5_cmd_connect,
+            &proto,
+        )
+        .await
+        .expect_err("control characters in SOCKS5 domain must be refused");
+        assert!(err.to_string().contains("Refusing target host"));
     }
 }
