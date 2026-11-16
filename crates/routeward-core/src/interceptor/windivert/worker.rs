@@ -57,7 +57,7 @@ impl WinDivertInterceptor {
                 started_at: Utc::now(),
                 error_detail: None,
             },
-            true,
+            false,
             0,
             dgram.payload_len,
         );

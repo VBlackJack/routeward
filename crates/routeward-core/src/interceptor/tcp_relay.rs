@@ -36,7 +36,25 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use uuid::Uuid;
 
+/// Smallest number of bytes peeked from a new stream to look for an SNI / Host header.
+const MIN_PEEK_BYTES: usize = 64;
+/// Largest number of bytes peeked from a new stream (a TLS record is at most 16 KiB).
+const MAX_PEEK_BYTES: usize = 16384;
+/// Shortest peek timeout accepted from the configuration, in milliseconds.
+const MIN_PEEK_TIMEOUT_MS: u64 = 10;
+
 impl RouteWardController {
+    /// Removes the NAT session of a finished relay peer after `sessionCloseGraceMs`, so the final
+    /// FIN/RST and the client's trailing ACK/FIN are still reflected by the interceptor.
+    pub(super) fn remove_relay_session_after_grace(&self, peer_ip: IpAddr, peer_port: u16) {
+        let nat_cleanup = self.nat_table.clone();
+        let grace = Duration::from_millis(self.constants.network.session_close_grace_ms);
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            nat_cleanup.remove_session_by_relay_peer(peer_ip, peer_port);
+        });
+    }
+
     pub(super) async fn handle_local_socks5_client(
         &self,
         mut client: TcpStream,
@@ -82,7 +100,10 @@ impl RouteWardController {
         client.read_exact(&mut port_bytes).await?;
         let target_port = u16::from_be_bytes(port_bytes);
 
-        let proc_id = self.process_resolver.resolve_by_local_tcp_port(client_port);
+        let proc_id = self
+            .process_resolver
+            .resolve_by_local_tcp_port_async(client_port)
+            .await;
 
         if req_head[1] == proto.socks5_cmd_udp_associate {
             let udp_relay =
@@ -370,9 +391,18 @@ impl RouteWardController {
     /// and maximum buffer size) to extract the TLS `ClientHello` SNI hostname without consuming
     /// bytes from the socket receive buffer.
     pub(super) async fn peek_tls_client_hello_sni(&self, client: &TcpStream) -> Option<String> {
-        let max_bytes = self.constants.network.tls_sni_max_bytes.clamp(64, 16384);
-        let timeout_dur =
-            Duration::from_millis(self.constants.network.tls_sni_peek_timeout_ms.max(10));
+        let max_bytes = self
+            .constants
+            .network
+            .tls_sni_max_bytes
+            .clamp(MIN_PEEK_BYTES, MAX_PEEK_BYTES);
+        let timeout_dur = Duration::from_millis(
+            self.constants
+                .network
+                .tls_sni_peek_timeout_ms
+                .max(MIN_PEEK_TIMEOUT_MS),
+        );
+        let poll_interval = Duration::from_millis(self.constants.network.peek_poll_interval_ms);
         let deadline = tokio::time::Instant::now() + timeout_dur;
         let mut buf = vec![0u8; max_bytes];
 
@@ -404,16 +434,25 @@ impl RouteWardController {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(poll_interval).await;
         }
     }
 
     /// Peeks at the initial bytes of a plaintext HTTP TCP stream on inspected ports to extract
     /// the `Host:` header hostname without consuming bytes from the socket receive buffer.
     pub(super) async fn peek_http_host_header(&self, client: &TcpStream) -> Option<String> {
-        let max_bytes = self.constants.network.http_host_max_bytes.clamp(64, 16384);
-        let timeout_dur =
-            Duration::from_millis(self.constants.network.http_host_peek_timeout_ms.max(10));
+        let max_bytes = self
+            .constants
+            .network
+            .http_host_max_bytes
+            .clamp(MIN_PEEK_BYTES, MAX_PEEK_BYTES);
+        let timeout_dur = Duration::from_millis(
+            self.constants
+                .network
+                .http_host_peek_timeout_ms
+                .max(MIN_PEEK_TIMEOUT_MS),
+        );
+        let poll_interval = Duration::from_millis(self.constants.network.peek_poll_interval_ms);
         let deadline = tokio::time::Instant::now() + timeout_dur;
         let mut buf = vec![0u8; max_bytes];
 
@@ -442,7 +481,7 @@ impl RouteWardController {
                 return None;
             }
 
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(poll_interval).await;
         }
     }
 
@@ -480,13 +519,7 @@ impl RouteWardController {
                         Some(SocketAddr::new(session.orig_dst_ip, target_port)),
                     )
                     .await;
-                let nat_cleanup = self.nat_table.clone();
-                let cleanup_ip = peer_addr.ip();
-                let cleanup_port = peer_addr.port();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    nat_cleanup.remove_session_by_relay_peer(cleanup_ip, cleanup_port);
-                });
+                self.remove_relay_session_after_grace(peer_addr.ip(), peer_addr.port());
                 return res;
             }
             let is_fake_ip = self.is_in_fake_subnet_any(&session.orig_dst_ip);
@@ -718,8 +751,11 @@ impl RouteWardController {
                 .telemetry
                 .relay_bidirectional_with_telemetry(&conn_id, &mut client, &mut outbound)
                 .await;
-            self.nat_table
-                .remove_session_by_relay_peer(session.orig_dst_ip, session.client_port);
+            // Close both sockets first so the final FIN/RST is emitted while the NAT session
+            // still exists, then keep the session for the grace period before removing it.
+            drop(outbound);
+            drop(client);
+            self.remove_relay_session_after_grace(session.orig_dst_ip, session.client_port);
 
             return Ok(());
         }
@@ -747,7 +783,8 @@ impl RouteWardController {
 
                 let attribution = self
                     .process_resolver
-                    .resolve_tcp_port_attribution(client_port);
+                    .resolve_tcp_port_attribution_async(client_port)
+                    .await;
 
                 let (
                     pid,
@@ -1133,6 +1170,9 @@ impl RouteWardController {
 
     pub(super) fn register_self_proxy_connect_hint(&self, node: &ProxyNode) -> Option<()> {
         if let Ok(ip) = node.host.parse::<IpAddr>() {
+            // Same lock as `sync_upstream_proxy_exclusions`: the read-modify-write must not
+            // interleave with a concurrent replacement of the whole list.
+            let _guard = self.relay_caches.upstream_endpoints.lock();
             let mut endpoints = self.nat_table.upstream_endpoints();
             if !endpoints.contains(&(ip, node.port)) {
                 endpoints.push((ip, node.port));
@@ -1205,5 +1245,85 @@ impl RouteWardController {
         }
         node.host = first_ip.to_string();
         Ok((node, Some(orig_host)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ProfileConfig, ProxyNode, ProxyProtocol, SystemConstants};
+    use crate::interceptor::nat::{NatSessionEntry, PidResolutionSource};
+
+    fn test_controller(grace_ms: u64) -> RouteWardController {
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        constants.network.session_close_grace_ms = grace_ms;
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        RouteWardController::new(constants, profile, "en")
+    }
+
+    #[tokio::test]
+    async fn relay_session_is_kept_for_the_grace_period_then_removed() {
+        let controller = test_controller(150);
+        let ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        controller.nat_table.insert_session(NatSessionEntry {
+            client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            client_port: 50555,
+            orig_dst_ip: ip,
+            orig_dst_port: 443,
+            pid: 1,
+            process_name: "a.exe".to_string(),
+            process_path: "a.exe".to_string(),
+            resolution_source: PidResolutionSource::SocketLayer,
+            action: RuleAction::Direct,
+            matched_rule_name: "r".to_string(),
+            created_at: Instant::now(),
+        });
+        assert_eq!(controller.nat_table.session_count(), 1);
+
+        controller.remove_relay_session_after_grace(ip, 50555);
+        assert_eq!(
+            controller.nat_table.session_count(),
+            1,
+            "the session must survive the relay end during the grace period"
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(controller.nat_table.session_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_connect_hints_never_lose_an_upstream_endpoint() {
+        let controller = test_controller(250);
+        let threads: Vec<_> = (1..=16u8)
+            .map(|i| {
+                let ctrl = controller.clone();
+                std::thread::spawn(move || {
+                    let node = ProxyNode {
+                        id: format!("p{i}"),
+                        name: format!("p{i}"),
+                        protocol: ProxyProtocol::Socks5,
+                        host: format!("192.0.2.{i}"),
+                        port: 1080,
+                        auth: None,
+                        udp_enabled: false,
+                        tls: false,
+                        tls_skip_verify: false,
+                        sni: None,
+                        enabled: true,
+                        last_latency_ms: None,
+                        exit_ip: None,
+                    };
+                    let _ = ctrl.register_self_proxy_connect_hint(&node);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("hint thread");
+        }
+        let endpoints = controller.nat_table.upstream_endpoints();
+        for i in 1..=16u8 {
+            let expected = (IpAddr::V4(Ipv4Addr::new(192, 0, 2, i)), 1080);
+            assert!(endpoints.contains(&expected), "missing {expected:?}");
+        }
     }
 }
