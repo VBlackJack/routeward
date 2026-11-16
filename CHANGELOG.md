@@ -3,6 +3,13 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
+## [v2026.1116.00] - 2026-11-16
+
+### Changed
+- Remove misleading `127.0.0.1:1080` and `127.0.0.1:8080` demo proxies, demo chains, and hardcoded `proxy-socks5-primary` fallbacks across `configs/default_profile.json`, `QuickSetupWizardModal`, `ProxiesView`, `RulesView`, `ConnectionsView`, and `App`.
+- Make Direct Filter Mode (no external proxy required) a first-class default in `configs/system_constants.json`, `DashboardView`, `ProxiesView`, `QuickSetupWizardModal`, and 1-click scenarios (`handleApplyUseCase`), with explicit external-proxy messaging and guardrails so `proxy` or `chain` rules are never created without an active proxy hop.
+- Enhance Simple Mode rule creation and editing in `RulesView` with a 1-click `+ Edge (msedge.exe)` chip and optional combined domain patterns (such as `meshcore.net, *.meshcore.net`) while preserving round-trip editing in Simple Mode.
+
 ## [v2026.1115.03] - 2026-11-15
 
 ### Fixed
