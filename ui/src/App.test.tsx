@@ -17,7 +17,7 @@
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import './i18n';
+import i18n from './i18n';
 import { App } from './App';
 import { UI_CONFIG } from './config/constants';
 import { ThemeForgeProvider } from './theme/ThemeForgeContext';
@@ -163,5 +163,77 @@ describe('App navigation and accessible modals', () => {
         screen.getByText(/droits ou propriétaire non sécurisés|insecure ownership or permissions/i)
       ).toBeInTheDocument();
     });
+  });
+
+  it('shows a persistent translated error toast, not a success toast, when adding a proxy fails', async () => {
+    window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.LOCALE, 'en');
+    await i18n.changeLanguage('en');
+    const upsertSpy = vi
+      .spyOn(routewardClient, 'upsertProxy')
+      .mockRejectedValue(
+        new HttpResponseError(400, 'Invalid proxy URI format', 'errors.proxy.invalid_uri')
+      );
+
+    renderApp();
+    fireEvent.keyDown(window, { key: '3', altKey: true });
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: i18n.t('proxies.simple.add')
+      })
+    );
+    fireEvent.change(screen.getByLabelText(i18n.t('proxies.modal.add_proxy.name_label')), {
+      target: { value: 'Broken' }
+    });
+    fireEvent.change(screen.getByLabelText(i18n.t('proxies.modal.add_proxy.host_label')), {
+      target: { value: '127.0.0.1' }
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('proxies.modal.add_proxy.submit') })
+    );
+
+    await waitFor(() => expect(upsertSpy).toHaveBeenCalledTimes(1));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(i18n.t('errors.proxy.invalid_uri'));
+    expect(screen.queryByText(i18n.t('app.toast.proxy.added'))).not.toBeInTheDocument();
+
+    // Error toasts are not auto-dismissed and can be closed explicitly
+    await new Promise((resolve) => setTimeout(resolve, UI_CONFIG.TOAST_DURATION_MS + 200));
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('app.toast.dismiss') }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  }, 10000);
+
+  it('shows the success toast only after the mutation resolved', async () => {
+    window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.LOCALE, 'en');
+    await i18n.changeLanguage('en');
+    let resolveUpsert: (value: ReturnType<typeof routewardClient.getProfile>) => void =
+      () => {};
+    vi.spyOn(routewardClient, 'upsertProxy').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveUpsert = resolve;
+        })
+    );
+
+    renderApp();
+    fireEvent.keyDown(window, { key: '3', altKey: true });
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: i18n.t('proxies.simple.add')
+      })
+    );
+    fireEvent.change(screen.getByLabelText(i18n.t('proxies.modal.add_proxy.name_label')), {
+      target: { value: 'Ok' }
+    });
+    fireEvent.change(screen.getByLabelText(i18n.t('proxies.modal.add_proxy.host_label')), {
+      target: { value: '127.0.0.1' }
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('proxies.modal.add_proxy.submit') })
+    );
+
+    expect(screen.queryByText(i18n.t('app.toast.proxy.added'))).not.toBeInTheDocument();
+    resolveUpsert(routewardClient.getProfile());
+    expect(await screen.findByText(i18n.t('app.toast.proxy.added'))).toBeInTheDocument();
   });
 });

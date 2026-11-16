@@ -1,10 +1,7 @@
 {
   "app": {
     "titlebar": {
-      "minimize": "Réduire",
-      "maximize": "Agrandir / Restaurer",
-      "close": "Fermer",
-      "native_badge": "Bureau Natif"
+      "close": "Fermer"
     },
     "launcher": {
       "button": "Lancer App via Proxy",
@@ -73,13 +70,6 @@
         "import": "Importer un Profil",
         "export": "Exporter le Profil",
         "save": "Enregistrer"
-      },
-      "theme": {
-        "button": "ThemeForge"
-      },
-      "command_palette": {
-        "button": "Palette de Commandes",
-        "shortcut": "Ctrl+K"
       }
     },
     "nav": {
@@ -98,24 +88,6 @@
       },
       "settings": {
         "tab": "Réglages"
-      },
-      "dashboard": {
-        "tab": "Tableau de Bord"
-      },
-      "connections": {
-        "tab": "Connexions Temps Réel"
-      },
-      "proxies": {
-        "tab": "Proxies & Chaînes"
-      },
-      "rules": {
-        "tab": "Règles de Routage"
-      },
-      "dns": {
-        "tab": "DNS Fake-IP"
-      },
-      "logs": {
-        "tab": "Journaux d'Événements"
       }
     },
     "statusbar": {
@@ -207,7 +179,11 @@
         "not_elevated": "Le démon n'a pas reçu les privilèges administrateur",
         "config_invalid": "Impossible de charger le profil de configuration du démon",
         "daemon_exited": "Le démon privilégié s'est arrêté pendant le démarrage"
-      }
+      },
+      "error": {
+        "generic": "L'opération a échoué"
+      },
+      "dismiss": "Fermer la notification"
     }
   },
   "command_palette": {
@@ -216,7 +192,8 @@
       "empty": "Aucune commande ou ressource correspondante.",
       "group_navigation": "Navigation Rapide",
       "group_actions": "Actions du Moteur",
-      "group_themes": "Palettes ThemeForge"
+      "group_themes": "Palettes ThemeForge",
+      "title": "Palette de commandes"
     },
     "actions": {
       "toggle_engine": "Démarrer / Mettre en pause le moteur d'interception",
@@ -244,7 +221,6 @@
       "metric_leaks_blocked": "Fuites & Blocs Stoppés",
       "metric_protected_traffic": "Trafic Total Traité",
       "proxy_summary_label": "Serveur Proxy Actif",
-      "no_proxy_configured": "Aucun serveur proxy configuré",
       "direct_filter_mode_title": "Mode Filtrage Direct (Sans Proxy Externe)",
       "direct_filter_mode_desc": "Le filtrage actif, le blocage des pisteurs et vos règles locales s'appliquent directement sur votre connexion Internet.",
       "configure_proxy_cta": "Configurer un Proxy",
@@ -362,9 +338,6 @@
         "active": "Actifs",
         "blocked": "Bloqués",
         "closed": "Fermés"
-      },
-      "simulate": {
-        "button": "Simuler une Connexion"
       },
       "scan_os": {
         "button": "Scanner Sockets OS Réels"
@@ -972,6 +945,19 @@
       "subtab_overview": "Vue d'ensemble",
       "subtab_dns": "Cache DNS Fake-IP",
       "subtab_logs": "Journaux d'Événements"
+    }
+  },
+  "tray": {
+    "status": {
+      "offline": "RouteWard - Service arrêté",
+      "protected": "RouteWard - Protégé",
+      "paused": "RouteWard - En pause"
+    },
+    "menu": {
+      "pause": "Mettre en pause",
+      "enable": "Activer la protection",
+      "open": "Ouvrir RouteWard",
+      "quit": "Quitter"
     }
   }
 }

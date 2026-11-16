@@ -139,6 +139,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const { t } = useTranslation();
   const addRuleModalTitleId = useId();
   const foxyModalTitleId = useId();
+  const formId = useId();
   const foxyFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const enabledProxies = proxies.filter((p) => p.enabled);
@@ -1185,10 +1186,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
                 )}
             <div className="grid grid-cols-3 gap-3">
               <div className="col-span-2">
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f1`} className="block text-xs text-tf-secondary">
                   {t('rules.modal.add.name_label')}
                 </label>
-                <input
+                <input id={`${formId}-f1`}
                   type="text"
                   required
                   value={ruleName}
@@ -1197,10 +1198,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
                 />
               </div>
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f2`} className="block text-xs text-tf-secondary">
                   {t('rules.modal.add.priority_label')}
                 </label>
-                <input
+                <input id={`${formId}-f2`}
                   type="number"
                   required
                   value={priority}
@@ -1212,7 +1213,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
             <div>
               <div className="flex items-center justify-between gap-2">
-                <label className="block text-xs text-tf-secondary">
+                <label
+                  htmlFor={`${formId}-processes`}
+                  className="block text-xs text-tf-secondary"
+                >
                   {t('rules.modal.add.processes_label')}
                 </label>
                 <button
@@ -1227,6 +1231,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                 </button>
               </div>
               <input
+                id={`${formId}-processes`}
                 type="text"
                 value={processesText}
                 onChange={(e) => setProcessesText(e.target.value)}
@@ -1275,10 +1280,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f3`} className="block text-xs text-tf-secondary">
                   {t('rules.modal.add.domains_label')}
                 </label>
-                <input
+                <input id={`${formId}-f3`}
                   type="text"
                   value={domainsText}
                   onChange={(e) => setDomainsText(e.target.value)}
@@ -1286,10 +1291,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
                 />
               </div>
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f4`} className="block text-xs text-tf-secondary">
                   {t('rules.modal.add.cidrs_label')}
                 </label>
-                <input
+                <input id={`${formId}-f4`}
                   type="text"
                   value={cidrsText}
                   onChange={(e) => setCidrsText(e.target.value)}
@@ -1303,10 +1308,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
             <div className="grid grid-cols-3 gap-3">
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f5`} className="block text-xs text-tf-secondary">
                   {t('rules.modal.add.ports_label')}
                 </label>
-                <input
+                <input id={`${formId}-f5`}
                   type="text"
                   value={portsText}
                   onChange={(e) => setPortsText(e.target.value)}
@@ -1314,10 +1319,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
                 />
               </div>
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f6`} className="block text-xs text-tf-secondary">
                   {t('rules.modal.add.protocol_label')}
                 </label>
-                <select
+                <select id={`${formId}-f6`}
                   value={protocol}
                   onChange={(e) =>
                     setProtocol(e.target.value as TransportProtocol)
@@ -1330,10 +1335,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
                 </select>
               </div>
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f7`} className="block text-xs text-tf-secondary">
                   {t('rules.modal.add.action_type_label')}
                 </label>
-                <select
+                <select id={`${formId}-f7`}
                   value={actionType}
                   onChange={(e) => {
                     const nextType = e.target.value as RuleAction['type'];
@@ -1360,10 +1365,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
             {(actionType === 'proxy' || actionType === 'chain') && (
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f8`} className="block text-xs text-tf-secondary">
                   {t('rules.modal.add.action_target_label')}
                 </label>
-                <select
+                <select id={`${formId}-f8`}
                   value={actionTargetId}
                   onChange={(e) => setActionTargetId(e.target.value)}
                   className="tf-input mt-1 w-full px-3 py-1.5 text-sm"

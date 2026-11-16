@@ -39,7 +39,7 @@ import {
   Wand2
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { SYSTEM_CONSTANTS } from '../config/constants';
+import { buildDefaultPacUrl } from '../config/constants';
 import {
   AccentTint,
   FakeIpEntry,
@@ -115,7 +115,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onFlushDns,
   onClearLogs,
   pacEnabled = false,
-  pacUrl = `http://${SYSTEM_CONSTANTS.network.localBindHost}:${SYSTEM_CONSTANTS.network.defaultPacPort}/proxy.pac`,
+  pacUrl = buildDefaultPacUrl(),
   autostartEnabled = false,
   profiles = [],
   onTogglePac,
@@ -513,10 +513,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    if (navigator.clipboard) {
-                      navigator.clipboard.writeText(pacUrl).catch(() => {});
+                    if (!navigator.clipboard) {
+                      return;
                     }
-                    onCopyPacUrl?.(pacUrl);
+                    navigator.clipboard
+                      .writeText(pacUrl)
+                      .then(() => onCopyPacUrl?.(pacUrl))
+                      .catch(() => {});
                   }}
                   className="inline-flex shrink-0 items-center gap-1 rounded px-2 py-0.5 text-[11px] font-semibold text-tf-secondary hover:bg-tf-surface hover:text-tf-primary"
                 >
@@ -608,6 +611,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   value={newProfileName}
                   onChange={(e) => setNewProfileName(e.target.value)}
                   placeholder={t('settings.profiles.save_placeholder')}
+                  aria-label={t('settings.profiles.save_placeholder')}
                   className="tf-input px-3 py-1.5 text-xs"
                 />
                 <button

@@ -292,6 +292,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
               value={filterText}
               onChange={(e) => setFilterText(e.target.value)}
               placeholder={t('connections.simple.search_placeholder')}
+              aria-label={t('connections.simple.search_placeholder')}
               className="tf-input w-full py-2 pl-9 pr-4 text-sm"
             />
           </div>
@@ -433,6 +434,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
             value={filterText}
             onChange={(e) => setFilterText(e.target.value)}
             placeholder={t('connections.toolbar.search.placeholder')}
+            aria-label={t('connections.toolbar.search.placeholder')}
             className="tf-input w-full py-2 pl-9 pr-4 text-sm"
           />
         </div>
@@ -540,6 +542,17 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                       <tr
                         key={conn.id}
                         onClick={() => setSelectedConnId(conn.id)}
+                        onKeyDown={(e) => {
+                          if (
+                            e.target === e.currentTarget &&
+                            (e.key === 'Enter' || e.key === ' ')
+                          ) {
+                            e.preventDefault();
+                            setSelectedConnId(conn.id);
+                          }
+                        }}
+                        tabIndex={0}
+                        aria-current={isSelected ? 'true' : undefined}
                         className={`cursor-pointer transition ${
                           isSelected
                             ? 'bg-tf-surface-alt'

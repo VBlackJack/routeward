@@ -17,6 +17,7 @@
 import React, { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Play, Terminal, X } from 'lucide-react';
+import { UI_CONFIG } from '../config/constants';
 import { ModalContainer } from './ModalContainer';
 
 interface ProcessLauncherModalProps {
@@ -24,12 +25,6 @@ interface ProcessLauncherModalProps {
   onLaunch: (executable: string, args: string[]) => Promise<void>;
   onClose: () => void;
 }
-
-const QUICK_LAUNCH_BINARIES = [
-  { exe: 'curl.exe', args: 'https://api.ipify.org?format=json' },
-  { exe: 'powershell.exe', args: '-NoExit' },
-  { exe: 'cmd.exe', args: '' }
-];
 
 export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
   relayEndpoint,
@@ -40,8 +35,8 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
   const titleId = useId();
   const exeInputId = useId();
   const argsInputId = useId();
-  const [executable, setExecutable] = useState('curl.exe');
-  const [rawArgs, setRawArgs] = useState('https://api.ipify.org?format=json');
+  const [executable, setExecutable] = useState<string>(UI_CONFIG.QUICK_LAUNCH_PRESETS[0].exe);
+  const [rawArgs, setRawArgs] = useState<string>(UI_CONFIG.IP_CHECK_URL);
   const [launching, setLaunching] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -91,7 +86,7 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
 
         <form onSubmit={handleSubmit} className="mt-4 space-y-4">
           <div className="flex flex-wrap gap-1.5">
-            {QUICK_LAUNCH_BINARIES.map((preset) => (
+            {UI_CONFIG.QUICK_LAUNCH_PRESETS.map((preset) => (
               <button
                 key={preset.exe}
                 type="button"
