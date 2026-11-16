@@ -298,17 +298,11 @@ impl FakeIpEngine {
             return Some(existing.fake_ip);
         }
 
-        let mut evicted_ip = None;
         if self.domain_to_record.len() >= capacity {
             self.evict_expired();
             while self.domain_to_record.len() >= capacity {
-                match self.evict_oldest() {
-                    Some(ip) => {
-                        if evicted_ip.is_none() {
-                            evicted_ip = Some(ip);
-                        }
-                    }
-                    None => break,
+                if self.evict_oldest().is_none() {
+                    break;
                 }
             }
         }
@@ -317,17 +311,7 @@ impl FakeIpEngine {
             return None;
         }
 
-        let candidate_ip = self.next_ip_in_subnet();
-        let allocated_ip = if self.ip_to_domain.contains_key(&candidate_ip) {
-            evicted_ip.unwrap_or(candidate_ip)
-        } else {
-            candidate_ip
-        };
-        if let Some(prev_domain) = self.ip_to_domain.insert(allocated_ip, normalized.clone()) {
-            if prev_domain != normalized {
-                self.domain_to_record.remove(&prev_domain);
-            }
-        }
+        let allocated_ip = self.claim_free_ip(&normalized)?;
         let record = InternalRecord {
             fake_ip: allocated_ip,
             domain: normalized.clone(),
@@ -336,8 +320,88 @@ impl FakeIpEngine {
             seq,
         };
 
-        self.domain_to_record.insert(normalized, record);
-        Some(allocated_ip)
+        // Atomic per domain: if a concurrent call inserted this domain meanwhile, keep its
+        // mapping and release the address claimed above.
+        match self.domain_to_record.entry(normalized.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                let existing = occupied.get_mut();
+                existing.hits += 1;
+                existing.expires_at = next_expiry;
+                existing.seq = seq;
+                let existing_ip = existing.fake_ip;
+                drop(occupied);
+                if existing_ip != allocated_ip {
+                    self.ip_to_domain
+                        .remove_if(&allocated_ip, |_, owner| *owner == normalized);
+                }
+                Some(existing_ip)
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(record);
+                Some(allocated_ip)
+            }
+        }
+    }
+
+    /// Atomically reserves a free address for `domain` in the reverse map.
+    ///
+    /// Walks the cursor at most one full lap of the pool so that an address still mapped to a
+    /// live domain is never reused. When the pool is exhausted, expired entries are purged and,
+    /// as a last resort, the least recently used mapping is evicted.
+    fn claim_free_ip(&self, domain: &str) -> Option<Ipv4Addr> {
+        if let Some(ip) = self.try_claim_from_cursor(domain) {
+            return Some(ip);
+        }
+        self.evict_expired();
+        if let Some(ip) = self.try_claim_from_cursor(domain) {
+            return Some(ip);
+        }
+        let freed = self.evict_oldest()?;
+        self.try_claim_specific(freed, domain)
+            .then_some(freed)
+            .or_else(|| self.try_claim_from_cursor(domain))
+    }
+
+    fn try_claim_from_cursor(&self, domain: &str) -> Option<Ipv4Addr> {
+        let usable_hosts = self.usable_host_count();
+        for _ in 0..usable_hosts {
+            let candidate = self.next_ip_in_subnet();
+            if self.try_claim_specific(candidate, domain) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Claims `ip` for `domain` when it is free or only referenced by a stale reverse entry.
+    fn try_claim_specific(&self, ip: Ipv4Addr, domain: &str) -> bool {
+        match self.ip_to_domain.entry(ip) {
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(domain.to_string());
+                true
+            }
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                let owner = occupied.get().clone();
+                let live = owner != domain
+                    && self
+                        .domain_to_record
+                        .get(&owner)
+                        .map(|rec| rec.fake_ip == ip)
+                        .unwrap_or(false);
+                if live {
+                    false
+                } else {
+                    occupied.insert(domain.to_string());
+                    true
+                }
+            }
+        }
+    }
+
+    fn usable_host_count(&self) -> u32 {
+        let base = u32::from(self.subnet.network());
+        let broadcast = u32::from(self.subnet.broadcast());
+        broadcast.saturating_sub(base + 1).max(1)
     }
 
     fn effective_capacity(&self) -> usize {
@@ -443,8 +507,7 @@ impl FakeIpEngine {
 
     fn next_ip_in_subnet(&self) -> Ipv4Addr {
         let base = u32::from(self.subnet.network());
-        let broadcast = u32::from(self.subnet.broadcast());
-        let usable_hosts = broadcast.saturating_sub(base + 1).max(1);
+        let usable_hosts = self.usable_host_count();
 
         let mut cursor = self.cursor.lock();
         let current_offset = *cursor;
@@ -506,9 +569,10 @@ pub fn detect_system_dns_suffixes() -> Vec<String> {
             r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
             r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient",
         ] {
-            if let Ok(output) = std::process::Command::new("reg")
-                .args(["query", reg_key])
-                .output()
+            if let Ok(output) =
+                std::process::Command::new(crate::system::windows_system_tool_path("reg.exe"))
+                    .args(["query", reg_key])
+                    .output()
             {
                 if output.status.success() {
                     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -831,7 +895,7 @@ pub fn flush_os_dns_cache() -> Result<&'static str, String> {
             return Ok("dnsapi.dll!DnsFlushResolverCache");
         }
 
-        match std::process::Command::new("ipconfig")
+        match std::process::Command::new(crate::system::windows_system_tool_path("ipconfig.exe"))
             .arg("/flushdns")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -1096,5 +1160,84 @@ nameserver 10.200.1.1
             engine.classify_local_name_query(&[0x00, 0x01, 0x02]),
             LocalNameQueryDecision::BlockMalformed
         );
+    }
+
+    fn tiny_engine(cidr: &str) -> FakeIpEngine {
+        let mut constants = SystemConstants::load_embedded().unwrap();
+        constants.dns.max_cache_entries = 1000;
+        let mut profile = ProfileConfig::load_embedded_default().unwrap();
+        profile.dns_config.fake_ip_cidr = cidr.to_string();
+        FakeIpEngine::new(&profile.dns_config, &constants.dns)
+    }
+
+    #[test]
+    fn cursor_wrap_never_steals_a_live_mapping() {
+        // /29 -> 6 usable host addresses.
+        let engine = tiny_engine("198.18.0.0/29");
+        let mut ips = Vec::new();
+        for i in 0..6 {
+            ips.push(
+                engine
+                    .allocate_or_get(&format!("d{i}.example.com"))
+                    .unwrap(),
+            );
+        }
+        let mut unique = ips.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 6);
+
+        // Pool is full: the 7th domain must evict exactly one entry (the oldest), not corrupt others.
+        let extra = engine.allocate_or_get("extra.example.com").unwrap();
+        assert_eq!(extra, ips[0]);
+        assert_eq!(engine.count(), 6);
+        assert!(engine.resolve_fake_ip(&extra).as_deref() == Some("extra.example.com"));
+        for (i, ip) in ips.iter().enumerate().skip(1) {
+            assert_eq!(
+                engine.resolve_fake_ip(ip).as_deref(),
+                Some(format!("d{i}.example.com").as_str())
+            );
+        }
+        assert_eq!(engine.ip_to_domain.len(), 6);
+    }
+
+    #[test]
+    fn freed_slot_is_reused_after_cursor_wrap_without_eviction() {
+        let engine = tiny_engine("198.18.0.0/29");
+        let mut ips = Vec::new();
+        for i in 0..6 {
+            ips.push(
+                engine
+                    .allocate_or_get(&format!("d{i}.example.com"))
+                    .unwrap(),
+            );
+        }
+        // Free one slot in the middle; the cursor has wrapped and must skip live ones.
+        engine.domain_to_record.remove("d3.example.com");
+        engine.ip_to_domain.remove(&ips[3]);
+        let fresh = engine.allocate_or_get("fresh.example.com").unwrap();
+        assert_eq!(fresh, ips[3]);
+        for (i, ip) in ips.iter().enumerate() {
+            if i != 3 {
+                assert_eq!(
+                    engine.resolve_fake_ip(ip).as_deref(),
+                    Some(format!("d{i}.example.com").as_str())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_first_lookups_of_one_domain_share_one_address() {
+        let engine = tiny_engine("198.18.0.0/24");
+        let results: Vec<Ipv4Addr> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| engine.allocate_or_get("race.example.com").unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(results.iter().all(|ip| *ip == results[0]));
+        assert_eq!(engine.count(), 1);
+        assert_eq!(engine.ip_to_domain.len(), 1);
     }
 }

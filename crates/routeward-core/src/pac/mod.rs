@@ -367,7 +367,7 @@ fn domain_pattern_to_js(inner: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Some(raw_re) = trimmed.strip_prefix("regex:") {
+    if let Some(raw_re) = crate::rules::RuleEngine::strip_regex_prefix(trimmed) {
         if raw_re.is_empty() || raw_re.starts_with("(?") {
             return None;
         }
