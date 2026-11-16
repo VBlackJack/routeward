@@ -1156,10 +1156,49 @@ impl NftablesInterceptor {
         Ok((len, client_v6, None))
     }
 
-    /// Returns `true` if `ip` belongs to the RFC 2544 Fake-IP pool (`198.18.0.0/15`).
+    /// Resolves the effective Fake-IP network: the profile CIDR first, then the system constant,
+    /// then the RFC 2544 default. Mirrors the resolution order of the DNS Fake-IP engine.
+    pub fn resolve_fake_ip_net(profile_cidr: &str, constants_cidr: &str) -> Ipv4Net {
+        profile_cidr
+            .parse::<Ipv4Net>()
+            .or_else(|_| constants_cidr.parse::<Ipv4Net>())
+            .unwrap_or_else(|_| ruleset::default_fake_ip_net())
+    }
+
+    /// Sets the Fake-IP network enforced by the raw-socket egress guard.
+    pub fn set_fake_ip_guard_net(net: Ipv4Net) {
+        *FAKE_IP_GUARD_NET.write() = Some(net);
+    }
+
+    /// Returns the Fake-IP network enforced by the raw-socket egress guard
+    /// (RFC 2544 `198.18.0.0/15` until a configured network is set).
+    pub fn fake_ip_guard_net() -> Ipv4Net {
+        FAKE_IP_GUARD_NET
+            .read()
+            .unwrap_or_else(ruleset::default_fake_ip_net)
+    }
+
+    /// Returns `true` if `ip` belongs to the given Fake-IP network.
+    pub fn is_fake_ip_in(ip: Ipv4Addr, net: Ipv4Net) -> bool {
+        net.contains(&ip)
+    }
+
+    /// Returns `true` if `ip` belongs to the currently configured Fake-IP network.
     pub fn is_rfc2544_fake_ip(ip: Ipv4Addr) -> bool {
-        let octets = ip.octets();
-        octets[0] == 198 && (octets[1] & 0xfe) == 18
+        Self::is_fake_ip_in(ip, Self::fake_ip_guard_net())
+    }
+
+    /// Final egress guard: refuses raw packets addressed to an untranslated Fake-IP in `net`.
+    pub(super) fn check_fake_ip_egress(dst: SocketAddrV4, net: Ipv4Net) -> std::io::Result<()> {
+        if Self::is_fake_ip_in(*dst.ip(), net) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Final Fake-IP egress guard blocked raw UDP packet to untranslated Fake-IP destination {dst}"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Emits a raw IPv4 + UDP datagram (`src -> dst`) using `SOCK_RAW` + `IP_HDRINCL` + `SO_MARK`
@@ -1172,14 +1211,7 @@ impl NftablesInterceptor {
         payload: &[u8],
         fwmark: u32,
     ) -> std::io::Result<usize> {
-        if Self::is_rfc2544_fake_ip(*dst.ip()) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "Final Fake-IP egress guard blocked raw UDP packet to untranslated Fake-IP destination {dst}"
-                ),
-            ));
-        }
+        Self::check_fake_ip_egress(dst, Self::fake_ip_guard_net())?;
 
         let raw_pkt = crate::interceptor::nat::build_forged_ipv4_udp_reply(
             *src.ip(),
@@ -1284,14 +1316,7 @@ impl NftablesInterceptor {
         _payload: &[u8],
         _fwmark: u32,
     ) -> std::io::Result<usize> {
-        if Self::is_rfc2544_fake_ip(*dst.ip()) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "Final Fake-IP egress guard blocked raw UDP packet to untranslated Fake-IP destination {dst}"
-                ),
-            ));
-        }
+        Self::check_fake_ip_egress(dst, Self::fake_ip_guard_net())?;
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "send_raw_ipv4_udp_packet is only supported on Linux",

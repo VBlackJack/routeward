@@ -25,7 +25,8 @@ use crate::error::{
 use crate::interceptor::backend::Interceptor;
 use crate::interceptor::RouteWardController;
 use crate::telemetry::{LogLevel, TelemetryHub};
-use parking_lot::Mutex;
+use ipnet::Ipv4Net;
+use parking_lot::{Mutex, RwLock};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +43,10 @@ pub(super) const COMPONENT_NFTABLES: &str = "NftablesInterceptor";
 pub(super) const AF_INET_U16: u16 = 2;
 pub(super) const AF_INET6_U16: u16 = 10;
 pub(super) const DEFAULT_TPROXY_FWMARK: u32 = 21080;
+
+/// Fake-IP network enforced by the raw-socket egress guard (`None` until configured, which
+/// means the RFC 2544 default).
+static FAKE_IP_GUARD_NET: RwLock<Option<Ipv4Net>> = RwLock::new(None);
 
 /// Policy routing and `TPROXY` parameters loaded from `SystemConstants.network`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +87,37 @@ impl NftablesInterceptor {
         Self {
             active: Arc::new(AtomicBool::new(false)),
             state: Mutex::new(None),
+        }
+    }
+}
+
+impl NftablesInterceptor {
+    /// Feeds `script` to `nft -f -` and reports spawn, write, and exit-status failures
+    /// (including the trimmed stderr) as a descriptive error string.
+    #[cfg(target_os = "linux")]
+    fn apply_nft_script(nft_bin: &str, script: &str) -> Result<(), String> {
+        use std::io::Write;
+
+        let mut child = Command::new(nft_bin)
+            .args(["-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("could not spawn {nft_bin} -f -: {err}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(script.as_bytes())
+                .map_err(|err| format!("could not write ruleset to {nft_bin}: {err}"))?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|err| format!("failed waiting for {nft_bin} -f -: {err}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(format!("exit={:?}: {stderr}", out.status.code()))
         }
     }
 }
@@ -216,7 +252,14 @@ impl Interceptor for NftablesInterceptor {
                 prof.security_policy.block_quic_udp_443,
             )
         };
-        let _ = kill_switch_enabled;
+        let fake_ip_net = {
+            let prof = controller.profile.read();
+            Self::resolve_fake_ip_net(
+                &prof.dns_config.fake_ip_cidr,
+                &controller.constants.dns.fake_ip_cidr,
+            )
+        };
+        Self::set_fake_ip_guard_net(fake_ip_net);
 
         let mut ipv6_tproxy_active = false;
         let ip6_ruleset = Self::build_nft_ip6_table_ruleset_with_tproxy(
@@ -236,52 +279,65 @@ impl Interceptor for NftablesInterceptor {
             block_quic_udp_443,
             &upstream_v6,
         );
-        if let Ok(mut ip6_child) = Command::new(&nft_bin)
-            .args(["-f", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            if let Some(mut stdin) = ip6_child.stdin.take() {
-                let _ = stdin.write_all(ip6_ruleset.as_bytes());
+        match Self::apply_nft_script(&nft_bin, &ip6_ruleset) {
+            Ok(()) => {
+                ipv6_tproxy_active = true;
+                controller.telemetry.push_log(
+                    LogLevel::Info,
+                    COMPONENT_NFTABLES,
+                    format!("Installed nftables IPv6 dual-stack table \"ip6 {table_name}\""),
+                );
             }
-            if let Ok(out) = ip6_child.wait_with_output() {
-                if out.status.success() {
-                    ipv6_tproxy_active = true;
-                    controller.telemetry.push_log(
-                        LogLevel::Info,
-                        COMPONENT_NFTABLES,
-                        format!("Installed nftables IPv6 dual-stack table \"ip6 {table_name}\""),
-                    );
-                } else {
-                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    controller.telemetry.push_log(
-                        LogLevel::Warn,
-                        COMPONENT_NFTABLES,
-                        format!(
-                            "Could not install full IPv6 NAT/TPROXY table \"ip6 {table_name}\" ({stderr}); falling back to IPv6 DNS/DoT guard"
-                        ),
-                    );
-                    let fallback_ip6 = Self::build_nft_ip6_fallback_guard_ruleset(
-                        &table_name,
-                        &chain_name,
-                        fwmark,
-                        dns_standard_port,
-                        dot_port,
-                        block_encrypted_dns,
-                    );
-                    if let Ok(mut fb_child) = Command::new(&nft_bin)
-                        .args(["-f", "-"])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()
-                    {
-                        if let Some(mut stdin) = fb_child.stdin.take() {
-                            let _ = stdin.write_all(fallback_ip6.as_bytes());
-                        }
-                        let _ = fb_child.wait();
+            Err(detail) => {
+                controller.telemetry.push_log(
+                    LogLevel::Warn,
+                    COMPONENT_NFTABLES,
+                    format!(
+                        "Could not install full IPv6 NAT/TPROXY table \"ip6 {table_name}\" ({detail}); falling back to the IPv6 guard (killSwitchEnabled={kill_switch_enabled})"
+                    ),
+                );
+                let fallback_ip6 = Self::build_nft_ip6_fallback_guard_ruleset(
+                    &table_name,
+                    &chain_name,
+                    fwmark,
+                    dns_standard_port,
+                    dot_port,
+                    kill_switch_enabled,
+                    block_encrypted_dns,
+                );
+                match Self::apply_nft_script(&nft_bin, &fallback_ip6) {
+                    Ok(()) => {
+                        controller.telemetry.push_log(
+                            LogLevel::Info,
+                            COMPONENT_NFTABLES,
+                            format!("Installed IPv6 fallback guard table \"ip6 {table_name}\""),
+                        );
+                    }
+                    Err(fb_detail) if kill_switch_enabled => {
+                        controller.telemetry.push_log(
+                            LogLevel::Error,
+                            COMPONENT_NFTABLES,
+                            format!(
+                                "Could not install IPv6 fallback guard \"ip6 {table_name}\" with the kill switch enabled: {fb_detail}"
+                            ),
+                        );
+                        Self::delete_tproxy_routing(&ip_bin, tproxy_spec, &controller.telemetry);
+                        self.active.store(false, Ordering::SeqCst);
+                        return Err(RouteWardError::InterceptorError {
+                            key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                            detail: format!(
+                                "IPv6 kill switch guard \"ip6 {table_name}\" could not be installed: {fb_detail}"
+                            ),
+                        });
+                    }
+                    Err(fb_detail) => {
+                        controller.telemetry.push_log(
+                            LogLevel::Warn,
+                            COMPONENT_NFTABLES,
+                            format!(
+                                "Could not install IPv6 fallback guard \"ip6 {table_name}\": {fb_detail}"
+                            ),
+                        );
                     }
                 }
             }
@@ -335,7 +391,7 @@ impl Interceptor for NftablesInterceptor {
             telemetry: controller.telemetry.clone(),
         });
 
-        let ruleset = Self::build_nft_table_ruleset_with_tproxy(
+        let ruleset = Self::build_nft_table_ruleset_with_fake_ip(
             &table_name,
             &chain_name,
             fwmark,
@@ -352,6 +408,7 @@ impl Interceptor for NftablesInterceptor {
             block_encrypted_dns,
             block_quic_udp_443,
             &upstream_v4,
+            fake_ip_net,
         );
 
         let mut apply_child = match Command::new(&nft_bin)
@@ -455,6 +512,15 @@ impl Interceptor for NftablesInterceptor {
             )
         };
 
+        let fake_ip_net = {
+            let prof = controller.profile.read();
+            Self::resolve_fake_ip_net(
+                &prof.dns_config.fake_ip_cidr,
+                &controller.constants.dns.fake_ip_cidr,
+            )
+        };
+        Self::set_fake_ip_guard_net(fake_ip_net);
+
         let (prev_spec, ipv6_tproxy_active) = {
             let guard = self.state.lock();
             (
@@ -499,6 +565,7 @@ impl Interceptor for NftablesInterceptor {
                 block_encrypted_dns,
                 block_quic_udp_443,
                 &upstream_endpoints,
+                fake_ip_net,
             )
         } else {
             let up4: Vec<(Ipv4Addr, u16)> = upstream_endpoints
@@ -511,7 +578,7 @@ impl Interceptor for NftablesInterceptor {
             let mut batch = String::with_capacity(2048);
             batch.push_str(&format!("table ip {table_name}\n"));
             batch.push_str(&format!("delete table ip {table_name}\n"));
-            batch.push_str(&Self::build_nft_table_ruleset_with_tproxy(
+            batch.push_str(&Self::build_nft_table_ruleset_with_fake_ip(
                 &table_name,
                 &chain_name,
                 fwmark,
@@ -528,6 +595,7 @@ impl Interceptor for NftablesInterceptor {
                 block_encrypted_dns,
                 block_quic_udp_443,
                 &up4,
+                fake_ip_net,
             ));
             batch.push_str(&format!("table ip6 {table_name}\n"));
             batch.push_str(&format!("delete table ip6 {table_name}\n"));
@@ -537,6 +605,7 @@ impl Interceptor for NftablesInterceptor {
                 fwmark,
                 dns_standard_port,
                 dot_port,
+                kill_switch_enabled,
                 block_encrypted_dns,
             ));
             batch
