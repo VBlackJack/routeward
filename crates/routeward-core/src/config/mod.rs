@@ -201,6 +201,24 @@ pub struct NetworkConstants {
     pub pending_udp_timeout_ms: u64,
     #[serde(default = "default_max_pending_udp_packets")]
     pub max_pending_udp_packets: usize,
+    /// Capacity of the pending outbound SYN queue; the oldest SYN is dropped when it is full.
+    #[serde(default = "default_max_pending_syn_packets")]
+    pub max_pending_syn_packets: usize,
+    /// Lifetime of a socket-to-PID cache entry (protocol, family, local port) in milliseconds.
+    #[serde(default = "default_socket_pid_cache_ttl_ms")]
+    pub socket_pid_cache_ttl_ms: u64,
+    /// Age after which a NAT session never accepted by the local relay is removed.
+    #[serde(default = "default_nat_half_open_session_ttl_secs")]
+    pub nat_half_open_session_ttl_secs: u64,
+    /// Interval between sweeps of expired NAT sessions and cache entries, in milliseconds.
+    #[serde(default = "default_nat_session_sweep_interval_ms")]
+    pub nat_session_sweep_interval_ms: u64,
+    /// How long the verdict of a fragmented UDP datagram is remembered for its later fragments.
+    #[serde(default = "default_udp_fragment_verdict_ttl_ms")]
+    pub udp_fragment_verdict_ttl_ms: u64,
+    /// Maximum number of remembered fragmented UDP datagram verdicts.
+    #[serde(default = "default_max_udp_fragment_verdicts")]
+    pub max_udp_fragment_verdicts: usize,
     pub windivert_priority: i16,
     pub windivert_dll_paths: Vec<String>,
     #[serde(default = "default_linux_fwmark")]
@@ -307,6 +325,30 @@ fn default_pending_udp_timeout_ms() -> u64 {
 
 fn default_max_pending_udp_packets() -> usize {
     256
+}
+
+fn default_max_pending_syn_packets() -> usize {
+    1024
+}
+
+fn default_socket_pid_cache_ttl_ms() -> u64 {
+    5000
+}
+
+fn default_nat_half_open_session_ttl_secs() -> u64 {
+    60
+}
+
+fn default_nat_session_sweep_interval_ms() -> u64 {
+    5000
+}
+
+fn default_udp_fragment_verdict_ttl_ms() -> u64 {
+    10000
+}
+
+fn default_max_udp_fragment_verdicts() -> usize {
+    4096
 }
 
 fn default_linux_ip_binary() -> String {
@@ -459,6 +501,21 @@ pub struct TelemetryConstants {
     pub log_flush_interval_ms: u64,
     #[serde(default = "default_event_broadcast_capacity")]
     pub event_broadcast_capacity: usize,
+    /// A UDP flow with no datagram for this long is marked closed in telemetry.
+    #[serde(default = "default_udp_flow_idle_timeout_ms")]
+    pub udp_flow_idle_timeout_ms: u64,
+    /// Minimum delay between two `ConnectionUpdated` events for the same connection while its
+    /// traffic counters grow; a final update is always emitted when the connection closes.
+    #[serde(default = "default_telemetry_update_interval_ms")]
+    pub telemetry_update_interval_ms: u64,
+}
+
+fn default_udp_flow_idle_timeout_ms() -> u64 {
+    30000
+}
+
+fn default_telemetry_update_interval_ms() -> u64 {
+    250
 }
 
 fn default_max_connection_history_entries() -> usize {
@@ -1275,7 +1332,7 @@ mod tests {
         let junction_link = temp_root.join("JunctionLink");
         assert!(!security::is_symlink_or_reparse_point(&junction_target)
             .expect("check non-reparse dir"));
-        let mklink = std::process::Command::new("cmd")
+        let mklink = std::process::Command::new(crate::system::windows_system_tool_path("cmd.exe"))
             .args([
                 "/C",
                 "mklink",

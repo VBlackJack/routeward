@@ -26,6 +26,12 @@
     "pendingSynTimeoutMs": 40,
     "pendingUdpTimeoutMs": 40,
     "maxPendingUdpPackets": 256,
+    "maxPendingSynPackets": 1024,
+    "socketPidCacheTtlMs": 5000,
+    "natHalfOpenSessionTtlSecs": 60,
+    "natSessionSweepIntervalMs": 5000,
+    "udpFragmentVerdictTtlMs": 10000,
+    "maxUdpFragmentVerdicts": 4096,
     "windivertPriority": 0,
     "windivertDllPaths": [
       "WinDivert.dll",
@@ -123,7 +129,9 @@
     "linuxUserFallbackWebviewDir": ".local/share/routeward/webview",
     "logAppName": "RouteWard",
     "logFlushIntervalMs": 500,
-    "eventBroadcastCapacity": 256
+    "eventBroadcastCapacity": 256,
+    "udpFlowIdleTimeoutMs": 30000,
+    "telemetryUpdateIntervalMs": 250
   },
   "ipc": {
     "unixSocketPath": "/run/routeward/routeward.sock",

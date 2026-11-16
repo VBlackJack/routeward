@@ -36,11 +36,12 @@ use crate::interceptor::nat::{
     build_forged_ipv4_icmp_port_unreachable, build_forged_ipv4_udp_reply,
     build_forged_ipv6_icmpv6_port_unreachable, build_forged_ipv6_udp_reply,
     is_ipv4_packet_fragmented, is_private_or_local_ipv4, parse_ipv4_tcp_meta, parse_ipv4_udp_meta,
-    parse_ipv6_tcp_meta, parse_ipv6_transport_meta, reflect_outbound_ipv6_to_local_relay,
-    reflect_outbound_to_local_relay, reflect_relay_reply_ipv6_to_client,
-    reflect_relay_reply_to_client, Ipv4TcpPacketMeta, Ipv4UdpPacketMeta, Ipv6TransportPacketMeta,
-    NatSessionEntry, PendingSynOutcome, PendingSynQueue, PendingUdpOutcome, PendingUdpQueue,
-    PidResolutionSource,
+    parse_ipv6_tcp_meta, parse_ipv6_transport_meta, parse_udp_fragment_meta,
+    reflect_outbound_ipv6_to_local_relay, reflect_outbound_to_local_relay,
+    reflect_relay_reply_ipv6_to_client, reflect_relay_reply_to_client, Ipv4TcpPacketMeta,
+    Ipv4UdpPacketMeta, Ipv6TransportPacketMeta, NatSessionEntry, PendingSynOutcome,
+    PendingSynQueue, PendingUdpOutcome, PendingUdpQueue, PidResolutionSource, SocketKey,
+    UdpFragmentKind, UdpFragmentMeta, UdpFragmentVerdict, IPPROTO_TCP, IPPROTO_UDP,
 };
 #[cfg(windows)]
 use crate::process::ProcessResolver;
@@ -67,11 +68,25 @@ use uuid::Uuid;
 
 pub(super) const BACKEND_NAME: &str = "WinDivert";
 
+/// Prefix of the scoped inbound firewall rule that allows the local transparent relay port.
+const FIREWALL_RULE_NAME_PREFIX: &str = "RouteWard_TransparentRelay_";
+
+/// Returns the name of the scoped inbound firewall rule for the transparent relay on `relay_port`.
+/// The single source of truth for creating, removing and cleaning up that rule.
+pub fn scoped_firewall_rule_name(relay_port: u16) -> String {
+    format!("{FIREWALL_RULE_NAME_PREFIX}{relay_port}")
+}
+
+/// `WINDIVERT_EVENT_SOCKET_CLOSE`: the socket described by a `SOCKET` layer event was closed.
+#[cfg(windows)]
+const WINDIVERT_EVENT_SOCKET_CLOSE: u8 = 4;
+
 #[cfg(windows)]
 pub(super) const COMPONENT_WINDIVERT: &str = "WinDivert";
 #[cfg(windows)]
 pub(super) const COMPONENT_FIREWALL: &str = "WindowsFirewall";
-#[cfg(windows)]
+/// Debug-only override of the `WinDivert.dll` location; release builds never read it.
+#[cfg(all(windows, debug_assertions))]
 pub(super) const ENV_WINDIVERT_DLL_PATH: &str = "ROUTEWARD_WINDIVERT_DLL_PATH";
 #[cfg(windows)]
 pub(super) const WINDIVERT_LAYER_NETWORK: u32 = 0;
@@ -89,9 +104,12 @@ pub(super) const SOCKET_FILTER_TCP_OUTBOUND: &str = "outbound and !loopback and 
 pub(super) const PACKET_BUFFER_SIZE: usize = 65535;
 pub(super) const BIT_OUTBOUND: u64 = 1 << 17;
 pub(super) const BIT_IMPOSTOR: u64 = 1 << 19;
+pub(super) const BIT_IPV6: u64 = 1 << 20;
 
 mod ffi;
 mod filters;
+#[cfg(any(windows, test))]
+mod fragments;
 #[cfg(test)]
 mod tests;
 #[cfg(windows)]
@@ -147,9 +165,33 @@ impl WinDivertInterceptor {
         }
     }
 
+    /// Builds a `netsh.exe` command from the System32 directory (never a bare name: this process
+    /// runs elevated and a binary planted next to the executable must not be picked up).
+    #[cfg(windows)]
+    fn netsh_command() -> Command {
+        Command::new(crate::system::windows_system_tool_path("netsh.exe"))
+    }
+
+    /// Returns whether the named firewall rule exists, judged only by `netsh` exit status
+    /// (0 = found, 1 = no match) so the answer does not depend on the Windows display language.
+    #[cfg(windows)]
+    fn firewall_rule_exists(rule_name: &str) -> Option<bool> {
+        let name_arg = format!("name={rule_name}");
+        let status = Self::netsh_command()
+            .args(["advfirewall", "firewall", "show", "rule", &name_arg])
+            .output()
+            .ok()?
+            .status;
+        match status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
+        }
+    }
+
     #[cfg(windows)]
     pub(super) fn create_scoped_firewall_rule(relay_port: u16, telemetry: &TelemetryHub) -> String {
-        let rule_name = format!("RouteWard_TransparentRelay_{relay_port}");
+        let rule_name = scoped_firewall_rule_name(relay_port);
         let exe_path = std::env::current_exe()
             .ok()
             .and_then(|p| p.canonicalize().ok().or(Some(p)))
@@ -160,7 +202,7 @@ impl WinDivertInterceptor {
             .unwrap_or_else(|| "routeward.exe".to_string());
 
         // Remove any stale rule with the same name first
-        let _ = Command::new("netsh")
+        let _ = Self::netsh_command()
             .args([
                 "advfirewall",
                 "firewall",
@@ -174,7 +216,7 @@ impl WinDivertInterceptor {
         let name_arg = format!("name={rule_name}");
         let prog_arg = format!("program={exe_path}");
 
-        match Command::new("netsh")
+        match Self::netsh_command()
             .args([
                 "advfirewall",
                 "firewall",
@@ -227,7 +269,7 @@ impl WinDivertInterceptor {
     #[cfg(windows)]
     pub(crate) fn remove_scoped_firewall_rule(rule_name: &str, telemetry: &TelemetryHub) {
         let name_arg = format!("name={rule_name}");
-        match Command::new("netsh")
+        match Self::netsh_command()
             .args(["advfirewall", "firewall", "delete", "rule", &name_arg])
             .output()
         {
@@ -242,10 +284,9 @@ impl WinDivertInterceptor {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let combined = format!("{} {}", stdout.trim(), stderr.trim());
-                if combined.contains("No rules match")
-                    || combined.contains("Aucune")
-                    || out.status.code() == Some(1)
-                {
+                // Exit status only: the "no rules match" text is localized. A failed delete is
+                // "already absent" only when a second query confirms that the rule does not exist.
+                if Self::firewall_rule_exists(rule_name) == Some(false) {
                     telemetry.push_log(
                         LogLevel::Info,
                         COMPONENT_FIREWALL,
@@ -364,12 +405,18 @@ impl Interceptor for WinDivertInterceptor {
         let sock_handle_usize = socket_handle as usize;
         let net_handle_usize = network_handle as usize;
         let shared_net_handle = Arc::new(AtomicUsize::new(net_handle_usize));
+        controller.nat_table.configure(
+            Duration::from_millis(net_consts.socket_pid_cache_ttl_ms),
+            Duration::from_secs(net_consts.nat_half_open_session_ttl_secs),
+            Duration::from_millis(net_consts.udp_fragment_verdict_ttl_ms),
+            net_consts.max_udp_fragment_verdicts,
+        );
         let pending_syn_queue: PendingSynQueue<(Vec<u8>, WinDivertAddress)> =
-            PendingSynQueue::new();
+            PendingSynQueue::with_capacity(net_consts.max_pending_syn_packets);
         let pending_syn_v6_queue: PendingSynQueue<
             (Vec<u8>, WinDivertAddress),
             Ipv6TransportPacketMeta,
-        > = PendingSynQueue::new();
+        > = PendingSynQueue::with_capacity(net_consts.max_pending_syn_packets);
         let pending_udp_queue: PendingUdpQueue<(Vec<u8>, WinDivertAddress)> =
             PendingUdpQueue::new(net_consts.max_pending_udp_packets);
         let pending_udp_v6_queue: PendingUdpQueue<
@@ -394,6 +441,7 @@ impl Interceptor for WinDivertInterceptor {
         // 1. Spawn WINDIVERT_LAYER_SOCKET listener thread
         let active_sock = Arc::clone(&self.active);
         let nat_for_sock = controller.nat_table.clone();
+        let telemetry_for_sock = controller.telemetry.clone();
         std::thread::spawn(move || {
             let handle = sock_handle_usize as *mut c_void;
             let mut addr = WinDivertAddress::default();
@@ -411,8 +459,26 @@ impl Interceptor for WinDivertInterceptor {
                 if ok == 0 {
                     break;
                 }
-                let (pid, local_port) = addr.socket_pid_and_local_port();
-                nat_for_sock.record_socket_event(local_port, pid);
+                let event = addr.socket_event();
+                if event.protocol != IPPROTO_TCP && event.protocol != IPPROTO_UDP {
+                    continue;
+                }
+                let key = SocketKey::new(event.protocol, event.ipv6, event.local_port);
+                if event.kind == WINDIVERT_EVENT_SOCKET_CLOSE {
+                    // The port may be reused by another process: forget the previous owner.
+                    nat_for_sock.record_socket_close(key, event.pid);
+                } else {
+                    nat_for_sock.record_socket_event(key, event.pid);
+                }
+            }
+            // The socket listener ends only when its handle is closed (stop) or the driver fails.
+            // Attribution then degrades to table lookups, so make a failure visible.
+            if active_sock.load(Ordering::Relaxed) {
+                telemetry_for_sock.push_log(
+                    LogLevel::Error,
+                    COMPONENT_WINDIVERT,
+                    "WinDivertRecv failed on the socket handle; attribution falls back to socket table lookups".to_string(),
+                );
             }
         });
 
@@ -432,6 +498,15 @@ impl Interceptor for WinDivertInterceptor {
                 Duration::from_millis(ctrl_syn.constants.network.pending_syn_timeout_ms);
             let udp_timeout =
                 Duration::from_millis(ctrl_syn.constants.network.pending_udp_timeout_ms);
+
+            let sweep_interval = Duration::from_millis(
+                ctrl_syn
+                    .constants
+                    .network
+                    .nat_session_sweep_interval_ms
+                    .max(1),
+            );
+            let mut last_sweep = Instant::now();
 
             while active_syn.load(Ordering::Relaxed) {
                 let handle_usize = net_handle_for_syn.load(Ordering::Acquire);
@@ -579,6 +654,18 @@ impl Interceptor for WinDivertInterceptor {
                             Self::send_packet_guarded(&ctrl_syn, &api, handle, &pkt, &addr);
                         }
                     }
+                }
+
+                if last_sweep.elapsed() >= sweep_interval {
+                    let expired = ctrl_syn.nat_table.sweep_expired();
+                    if expired > 0 {
+                        ctrl_syn.telemetry.push_log(
+                            LogLevel::Debug,
+                            COMPONENT_WINDIVERT,
+                            format!("Expired {expired} half-open NAT session(s)"),
+                        );
+                    }
+                    last_sweep = Instant::now();
                 }
 
                 std::thread::sleep(poll_interval);
