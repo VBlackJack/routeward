@@ -21,7 +21,9 @@ param(
     [switch]$NoStart,
     [string[]]$AllowSid = @(),
     [switch]$AllowCurrentUser,
-    [string]$BinaryPath = (Join-Path $PSScriptRoot 'routeward.exe')
+    [string]$BinaryPath = (Join-Path $PSScriptRoot 'routeward.exe'),
+    # Admin-only location the LocalSystem service binary is copied to (never run from the extraction folder).
+    [string]$InstallDir = (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'RouteWard')
 )
 
 Set-StrictMode -Version Latest
@@ -88,6 +90,42 @@ if ($Uninstall) {
     Invoke-RouteWardServiceCli -CliArgs @('service', 'uninstall')
     exit 0
 }
+
+# The service runs as LocalSystem: its binary must live in a directory only administrators can write to.
+# Copy the bundle out of the (user-writable) extraction folder and register the installed copy.
+function Copy-RouteWardBundle {
+    param([string]$SourceExe, [string]$DestDir)
+
+    $sourceDir = Split-Path -Parent (Resolve-Path -LiteralPath $SourceExe).Path
+    $destFull = [System.IO.Path]::GetFullPath($DestDir).TrimEnd('\')
+    if ([string]::Equals($sourceDir.TrimEnd('\'), $destFull, [StringComparison]::OrdinalIgnoreCase)) {
+        return (Join-Path $destFull (Split-Path -Leaf $SourceExe))
+    }
+
+    try {
+        # A running service keeps its executable locked: stop it before replacing the files.
+        Invoke-RouteWardServiceCli -CliArgs @('service', 'stop') -IgnoreFailure -Quiet
+        New-Item -ItemType Directory -Path $destFull -Force | Out-Null
+        Copy-Item -LiteralPath $SourceExe -Destination (Join-Path $destFull 'routeward.exe') -Force
+        $desktopExe = Join-Path $sourceDir 'routeward-desktop.exe'
+        if (Test-Path -LiteralPath $desktopExe) {
+            Copy-Item -LiteralPath $desktopExe -Destination (Join-Path $destFull 'routeward-desktop.exe') -Force
+        }
+        $windivertSource = Join-Path $sourceDir 'third_party\windivert\bin'
+        if (Test-Path -LiteralPath $windivertSource) {
+            $windivertDest = Join-Path $destFull 'third_party\windivert\bin'
+            New-Item -ItemType Directory -Path $windivertDest -Force | Out-Null
+            Copy-Item -Path (Join-Path $windivertSource '*') -Destination $windivertDest -Recurse -Force
+        }
+    }
+    catch {
+        throw "Failed to copy RouteWard files to '$destFull': $($_.Exception.Message)"
+    }
+    return (Join-Path $destFull 'routeward.exe')
+}
+
+$BinaryPath = Copy-RouteWardBundle -SourceExe $BinaryPath -DestDir $InstallDir
+Write-Output "RouteWard service binary: $BinaryPath"
 
 $installArgs = [System.Collections.Generic.List[string]]::new()
 $installArgs.Add('service')
