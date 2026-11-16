@@ -671,7 +671,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Run { duration_secs } => {
             let shutdown_signals = ShutdownSignals::register();
             println!("=== {} ===", controller.i18n.t("cli.engine.startup.banner"));
-            controller.start_engine();
+            controller.start_engine()?;
             let diag = controller.diagnostics();
             println!(
                 "{}: {}",

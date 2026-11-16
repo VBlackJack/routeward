@@ -269,13 +269,16 @@ impl RouteWardController {
         })
     }
 
-    pub fn start_engine(&self) {
+    /// Starts the relay, transparent and DNS listeners. Returns `Ok(())` when the engine is
+    /// running afterwards (including when it already was) and the bind error when a listener could
+    /// not be bound, in which case the engine stays stopped.
+    pub fn start_engine(&self) -> RouteWardResult<()> {
         if self
             .running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return;
+            return Ok(());
         }
 
         self.telemetry.push_log(
@@ -295,7 +298,7 @@ impl RouteWardController {
                     format!("Engine startup aborted, no listener was started: {err}"),
                 );
                 self.running.store(false, Ordering::SeqCst);
-                return;
+                return Err(err);
             }
         };
 
@@ -579,6 +582,7 @@ impl RouteWardController {
         tokio::spawn(async move {
             bootstrap_ctrl.bootstrap_resolve_proxy_hosts().await;
         });
+        Ok(())
     }
 
     pub(super) fn ipv6_counterpart(bind_host: &str) -> Option<Ipv6Addr> {
@@ -2188,7 +2192,7 @@ mod tests {
             blocker.local_addr().expect("blocker addr").port();
         let controller = RouteWardController::new(constants, test_profile(), "en");
 
-        controller.start_engine();
+        assert!(controller.start_engine().is_err());
 
         assert!(
             !controller.is_running(),
@@ -2214,7 +2218,7 @@ mod tests {
     #[tokio::test]
     async fn engine_start_succeeds_when_every_port_is_free() {
         let controller = RouteWardController::new(test_constants(), test_profile(), "en");
-        controller.start_engine();
+        controller.start_engine().expect("engine start");
         assert!(controller.is_running());
         controller.stop_engine();
         assert!(!controller.is_running());

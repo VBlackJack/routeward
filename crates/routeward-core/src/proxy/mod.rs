@@ -112,8 +112,24 @@ fn basic_accepted_nodes() -> &'static Mutex<HashSet<String>> {
     CACHE.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Cache key of a node: id, endpoint and a hash of the username, so changing the credentials of a
+/// node does not inherit the previous Basic verdict. Only a hash of the username is kept in
+/// memory; the password never enters the key.
 fn basic_cache_key(node: &ProxyNode) -> String {
-    format!("{}|{}:{}", node.id, node.host, node.port)
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    node.auth
+        .as_ref()
+        .map(|creds| creds.username.as_str())
+        .unwrap_or("")
+        .hash(&mut hasher);
+    format!(
+        "{}|{}:{}|{:016x}",
+        node.id,
+        node.host,
+        node.port,
+        hasher.finish()
+    )
 }
 
 fn remember_basic_accepted(node: &ProxyNode) {
@@ -1630,6 +1646,25 @@ mod tests {
         assert!(initial_basic_auth_header(&plain_node).is_some());
         forget_basic_accepted(&plain_node);
         assert!(initial_basic_auth_header(&plain_node).is_none());
+    }
+
+    #[test]
+    fn basic_cache_key_changes_with_username_and_never_contains_credentials() {
+        let alice = http_test_node("key-user", false, true);
+        let mut bob = alice.clone();
+        bob.auth = Some(ProxyCredentials::new("bob", "secret"));
+        let mut other_password = alice.clone();
+        other_password.auth = Some(ProxyCredentials::new("alice", "different"));
+
+        assert_ne!(basic_cache_key(&alice), basic_cache_key(&bob));
+        assert_eq!(basic_cache_key(&alice), basic_cache_key(&other_password));
+        let key = basic_cache_key(&alice);
+        assert!(!key.contains("alice") && !key.contains("secret"));
+
+        remember_basic_accepted(&alice);
+        assert!(is_basic_known_accepted(&alice));
+        assert!(!is_basic_known_accepted(&bob));
+        forget_basic_accepted(&alice);
     }
 
     #[tokio::test]

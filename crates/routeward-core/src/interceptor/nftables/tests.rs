@@ -347,6 +347,12 @@ fn ip6_fallback_with_kill_switch_rejects_everything_except_loopback_and_own_mark
     assert!(rules.contains("oifname \"lo\" return"));
     assert!(rules.contains("meta l4proto tcp reject with tcp reset"));
     assert!(rules.contains(
+        "icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } return"
+    ));
+    assert!(!rules.contains("echo-request"));
+    let nd_pos = rules.find("icmpv6 type").unwrap();
+    assert!(nd_pos < rules.find("meta l4proto tcp reject").unwrap());
+    assert!(rules.contains(
         "        reject
 "
     ));

@@ -62,14 +62,12 @@
         "relay": "User-Space Local Relay"
       },
       "language": {
-        "switch": "Switch Language",
         "en": "English",
         "fr": "Français"
       },
       "profile": {
         "import": "Import Profile",
-        "export": "Export Profile",
-        "save": "Save Profile"
+        "export": "Export Profile"
       }
     },
     "nav": {
@@ -391,9 +389,7 @@
         "destination_section": "Destination & Anti-Leak DNS",
         "remote_endpoint": "Remote Endpoint",
         "resolved_domain": "Fake-IP Original Domain",
-        "routing_section": "Applied Routing & Telemetry",
         "matched_rule": "Matched Rule",
-        "upstream_route": "Upstream Tunnel",
         "error_detail": "Block / Failure Reason",
         "quick_actions_title": "1-Click Rule Creation & Socket Control",
         "route_process_proxy": "Route Process via Proxy",
@@ -448,8 +444,7 @@
         "testing": "Testing...",
         "copy_uri": "Copy URI",
         "edit": "Edit / Password",
-        "delete": "Remove",
-        "toggle": "Toggle Enable"
+        "delete": "Remove"
       },
       "badge": {
         "udp_ready": "UDP Ready",
@@ -458,8 +453,6 @@
         "tls_insecure": "TLS Unverified",
         "password_set": "Password Set",
         "untested": "Untested",
-        "online": "Online",
-        "offline": "Unreachable",
         "exit_ip": "Exit IP"
       }
     },
@@ -797,7 +790,6 @@
     "modal": {
       "title": "ThemeForge Studio - Palette & Accent",
       "subtitle": "Select one of the canonical ThemeForge Oklab palettes or High Contrast, and apply an optional accent tint.",
-      "palette_label": "Theme Palette",
       "accent_label": "Accent Tint",
       "preview_label": "Semantic Token Preview",
       "import_palette": "Load External ThemeForge v1 JSON",
