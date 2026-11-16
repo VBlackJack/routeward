@@ -4,10 +4,10 @@
 
 ## Prerequisites
 
-- **Rust Toolchain**: Stable Rust (`1.80+`, edition 2021) with `cargo`, `rustfmt`, and `clippy`.
+- **Rust Toolchain**: Stable Rust toolchain (see `rust-toolchain.toml`; edition 2021) with `cargo`, `rustfmt`, and `clippy`.
   - `rust-toolchain.toml` specifies `channel = "stable"` so the workspace builds cleanly on both Windows and Linux.
   - **Windows Target Requirement**: On Windows, use the MSVC toolchain (`x86_64-pc-windows-msvc`). If your host default toolchain is `gnu`, either set MSVC as default (`rustup default stable-x86_64-pc-windows-msvc`) or invoke Cargo with `cargo +stable-x86_64-pc-windows-msvc`.
-- **Node.js**: Node.js `20+` and `npm` (required to build the `ui/dist` frontend bundle embedded by `routeward-desktop`).
+- **Node.js**: Node.js `20.19+` or `22.12+` (required by Vite 8) and `npm` (required to build the `ui/dist` frontend bundle embedded by `routeward-desktop`).
 - **Platform Dependencies**:
   - **Windows**: Microsoft Edge WebView2 Runtime (pre-installed on Windows 10/11) and Windows SDK / MSVC C++ build tools.
   - **Linux**: `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, and `pkg-config`.
@@ -106,6 +106,8 @@ The daemon binds `\\.\pipe\routeward-daemon` with an explicit DACL restricting a
 
 ### Windows Service Mode (SCM) & Packaging
 For persistent background execution under `LocalSystem`, register RouteWard as a Windows Service while granting your desktop account SID access to the Named Pipe:
+
+`install-service.ps1` first copies `routeward.exe`, `routeward-desktop.exe`, and any bundled WinDivert files from the (user-writable) extraction folder to `%ProgramFiles%\RouteWard` (override with `-InstallDir`) and registers the installed copy. `routeward.exe service install` itself refuses a service binary whose directory, or any parent directory, is writable by non-administrators, because the service runs as `LocalSystem`.
 
 ```powershell
 # Register and start the Windows Service (Elevated PowerShell):

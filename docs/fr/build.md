@@ -4,10 +4,10 @@
 
 ## Prérequis
 
-- **Toolchain Rust** : Rust stable (`1.80+`, édition 2021) avec `cargo`, `rustfmt` et `clippy`.
+- **Toolchain Rust** : Toolchain Rust stable (voir `rust-toolchain.toml` ; édition 2021) avec `cargo`, `rustfmt` et `clippy`.
   - `rust-toolchain.toml` spécifie `channel = "stable"` afin d'assurer la compatibilité multi-plateforme (Windows et Linux).
   - **Cible Windows MSVC** : Sous Windows, utiliser la cible MSVC (`x86_64-pc-windows-msvc`). Si la toolchain par défaut du poste est `gnu`, définir MSVC par défaut (`rustup default stable-x86_64-pc-windows-msvc`) ou appeler Cargo avec `cargo +stable-x86_64-pc-windows-msvc`.
-- **Node.js** : Node.js `20+` et `npm` (requis pour compiler le bundle `ui/dist` embarqué par `routeward-desktop`).
+- **Node.js** : Node.js `20.19+` ou `22.12+` (requis par Vite 8) et `npm` (requis pour compiler le bundle `ui/dist` embarqué par `routeward-desktop`).
 - **Dépendances système** :
   - **Windows** : Microsoft Edge WebView2 Runtime (inclus dans Windows 10/11) et outils de compilation C++ MSVC / Windows SDK.
   - **Linux** : `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev` et `pkg-config`.
@@ -106,6 +106,8 @@ Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant u
 
 ### Mode Service Windows (SCM) & Empaquetage
 Pour une exécution persistante sous `LocalSystem`, enregistrez RouteWard comme service Windows en autorisant le SID de votre compte utilisateur sur le Named Pipe :
+
+`install-service.ps1` copie d'abord `routeward.exe`, `routeward-desktop.exe` et les fichiers WinDivert fournis depuis le dossier d'extraction (modifiable par l'utilisateur) vers `%ProgramFiles%\RouteWard` (modifiable avec `-InstallDir`), puis enregistre la copie installée. `routeward.exe service install` refuse de son côté un binaire de service dont le dossier, ou un dossier parent, est modifiable par des non-administrateurs, car le service s'exécute sous `LocalSystem`.
 
 ```powershell
 # Installer et démarrer le service Windows (PowerShell Administrateur) :
