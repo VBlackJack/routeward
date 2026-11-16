@@ -29,9 +29,14 @@ import {
   ShieldAlert,
   Sparkles,
   Terminal,
-  Wand2
+  Wand2,
+  X
 } from 'lucide-react';
-import { SYSTEM_CONSTANTS, UI_CONFIG } from './config/constants';
+import {
+  buildDefaultPacUrl,
+  SYSTEM_CONSTANTS,
+  UI_CONFIG
+} from './config/constants';
 import {
   generateClientId,
   HttpResponseError,
@@ -66,8 +71,6 @@ import {
 } from './components/QuickSetupWizardModal';
 import { GlossaryModal } from './components/GlossaryModal';
 
-const TOAST_DURATION_MS = 3200;
-
 export const App: React.FC = () => {
   const { t, i18n } = useTranslation();
   const { activePalette, activeAccent } = useThemeForge();
@@ -86,9 +89,7 @@ export const App: React.FC = () => {
   const [showGlossaryModal, setShowGlossaryModal] = useState(false);
   const [systemProxyEnabled, setSystemProxyEnabled] = useState(false);
   const [pacEnabled, setPacEnabled] = useState(false);
-  const [pacUrl, setPacUrl] = useState(
-    `http://${SYSTEM_CONSTANTS.network.localBindHost}:${SYSTEM_CONSTANTS.network.defaultPacPort}/proxy.pac`
-  );
+  const [pacUrl, setPacUrl] = useState(buildDefaultPacUrl());
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [namedProfiles, setNamedProfiles] = useState<ProfileSummary[]>([]);
   const [startingDaemon, setStartingDaemon] = useState(false);
@@ -138,15 +139,63 @@ export const App: React.FC = () => {
     }
   }, [diagnostics.daemonConnected]);
 
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
   const pushToast = useCallback(
     (message: string, severity: ToastNotification['severity'] = 'success') => {
       const id = generateClientId('toast');
       setToasts((prev) => [...prev, { id, message, severity }]);
-      window.setTimeout(() => {
-        setToasts((prev) => prev.filter((item) => item.id !== id));
-      }, TOAST_DURATION_MS);
+      // Error toasts stay until dismissed (WCAG 2.2.1); other toasts auto-dismiss.
+      if (severity !== 'error') {
+        window.setTimeout(() => {
+          dismissToast(id);
+        }, UI_CONFIG.TOAST_DURATION_MS);
+      }
     },
-    []
+    [dismissToast]
+  );
+
+  /** Builds the user-facing message of a failed call: translated errorKey, else detail, else fallback. */
+  const describeError = useCallback(
+    (err: unknown, fallbackKey: string): string => {
+      if (err instanceof HttpResponseError) {
+        if (err.errorKey && i18n.exists(err.errorKey)) {
+          return t(err.errorKey);
+        }
+        if (err.message && !/^HTTP \d+$/.test(err.message)) {
+          return err.message;
+        }
+      }
+      return t(fallbackKey);
+    },
+    [i18n, t]
+  );
+
+  const pushErrorToast = useCallback(
+    (err: unknown, fallbackKey: string = 'app.toast.error.generic') => {
+      pushToast(describeError(err, fallbackKey), 'error');
+    },
+    [describeError, pushToast]
+  );
+
+  /** Runs a mutation: the success callback fires only after it resolves, otherwise an error toast shows. */
+  const runMutation = useCallback(
+    <T,>(
+      operation: () => Promise<T>,
+      onSuccess?: (result: T) => void,
+      fallbackKey?: string
+    ): void => {
+      void operation()
+        .then((result) => {
+          onSuccess?.(result);
+        })
+        .catch((err: unknown) => {
+          pushErrorToast(err, fallbackKey);
+        });
+    },
+    [pushErrorToast]
   );
 
   const syncFromClient = useCallback(() => {
@@ -273,6 +322,9 @@ export const App: React.FC = () => {
     void routewardClient.getAutostartStatus().then((res) => {
       setAutostartEnabled(res.enabled);
     });
+    void routewardClient.getSystemProxyStatus().then((res) => {
+      setSystemProxyEnabled(res.enabled);
+    });
   }, []);
 
   useEffect(() => {
@@ -295,8 +347,8 @@ export const App: React.FC = () => {
           : t('app.toast.system.proxy_disabled'),
         applied ? 'success' : 'info'
       );
-    } catch {
-      pushToast(t('app.toast.system.proxy_error'), 'error');
+    } catch (err) {
+      pushErrorToast(err, 'app.toast.system.proxy_error');
     }
   };
 
@@ -312,8 +364,8 @@ export const App: React.FC = () => {
           : t('app.toast.system.pac_disabled'),
         res.enabled ? 'success' : 'info'
       );
-    } catch {
-      pushToast(t('app.toast.system.pac_error'), 'error');
+    } catch (err) {
+      pushErrorToast(err, 'app.toast.system.pac_error');
     }
   };
 
@@ -328,8 +380,8 @@ export const App: React.FC = () => {
           : t('app.toast.system.autostart_disabled'),
         res.enabled ? 'success' : 'info'
       );
-    } catch {
-      pushToast(t('app.toast.system.autostart_error'), 'error');
+    } catch (err) {
+      pushErrorToast(err, 'app.toast.system.autostart_error');
     }
   };
 
@@ -338,8 +390,8 @@ export const App: React.FC = () => {
       const list = await routewardClient.saveNamedProfile(undefined, name);
       setNamedProfiles(list);
       pushToast(`${t('app.toast.profile.saved_named')}: ${name}`, 'success');
-    } catch {
-      pushToast(t('app.toast.profile.error'), 'error');
+    } catch (err) {
+      pushErrorToast(err, 'app.toast.profile.error');
     }
   };
 
@@ -352,8 +404,8 @@ export const App: React.FC = () => {
         `${t('app.toast.profile.switched')}: ${switched.name}`,
         'info'
       );
-    } catch {
-      pushToast(t('app.toast.profile.error'), 'error');
+    } catch (err) {
+      pushErrorToast(err, 'app.toast.profile.error');
     }
   };
 
@@ -362,12 +414,12 @@ export const App: React.FC = () => {
       const list = await routewardClient.deleteNamedProfile(profileId);
       setNamedProfiles(list);
       pushToast(t('app.toast.profile.deleted'), 'warning');
-    } catch {
-      pushToast(t('app.toast.profile.error'), 'error');
+    } catch (err) {
+      pushErrorToast(err, 'app.toast.profile.error');
     }
   };
 
-  const handleApplyUseCase = async (useCase: DashboardUseCaseId) => {
+  const applyUseCase = async (useCase: DashboardUseCaseId) => {
     const enabledProxies = profile.proxies.filter((p) => p.enabled);
     const hasEnabledProxy = enabledProxies.length > 0;
     const enabledChains = hasEnabledProxy
@@ -471,6 +523,14 @@ export const App: React.FC = () => {
     );
   };
 
+  const handleApplyUseCase = async (useCase: DashboardUseCaseId) => {
+    try {
+      await applyUseCase(useCase);
+    } catch (err) {
+      pushErrorToast(err);
+    }
+  };
+
   const handleExportProfile = () => {
     const json = routewardClient.exportProfileJson();
     const blob = new Blob([json], { type: 'application/json' });
@@ -492,8 +552,8 @@ export const App: React.FC = () => {
           .then(() => {
             pushToast(t('app.toast.profile.imported'));
           })
-          .catch(() => {
-            pushToast(t('app.toast.profile.import_error'), 'error');
+          .catch((err: unknown) => {
+            pushErrorToast(err, 'app.toast.profile.import_error');
           });
       }
     };
@@ -768,13 +828,14 @@ export const App: React.FC = () => {
             }}
             onApplyUseCase={handleApplyUseCase}
             onTestPrimaryProxy={(proxyId) => {
-              void routewardClient.testProxy(proxyId).then(() => {
-                pushToast(t('app.toast.proxy.tested'));
-              });
+              runMutation(
+                () => routewardClient.testProxy(proxyId),
+                () => pushToast(t('app.toast.proxy.tested'))
+              );
             }}
             onNavigateProxy={() => setActiveTab('proxy')}
             onUpdateSecurityPolicy={(partial) => {
-              void routewardClient.updateSecurityPolicy(partial);
+              runMutation(() => routewardClient.updateSecurityPolicy(partial));
             }}
             onOpenWizard={() => setShowWizardModal(true)}
             onNavigateRules={() => setActiveTab('apps')}
@@ -791,25 +852,33 @@ export const App: React.FC = () => {
             onEvaluateRule={(req) => routewardClient.evaluateRule(req)}
             onAddRule={(rule) => {
               const isUpdate = profile.rules.some((r) => r.id === rule.id);
-              void routewardClient.upsertRule(rule).then(() => {
-                pushToast(
-                  t(isUpdate ? 'app.toast.rule.updated' : 'app.toast.rule.created'),
-                  isUpdate ? 'info' : 'success'
-                );
-              });
+              runMutation(
+                () => routewardClient.upsertRule(rule),
+                () =>
+                  pushToast(
+                    t(
+                      isUpdate
+                        ? 'app.toast.rule.updated'
+                        : 'app.toast.rule.created'
+                    ),
+                    isUpdate ? 'info' : 'success'
+                  )
+              );
             }}
             onToggleRule={(id) => {
-              void routewardClient.toggleRuleEnabled(id).then(() => {
-                pushToast(t('app.toast.rule.updated'), 'info');
-              });
+              runMutation(
+                () => routewardClient.toggleRuleEnabled(id),
+                () => pushToast(t('app.toast.rule.updated'), 'info')
+              );
             }}
             onReorderRule={(id, dir) => {
-              void routewardClient.reorderRulePriority(id, dir);
+              runMutation(() => routewardClient.reorderRulePriority(id, dir));
             }}
             onRemoveRule={(id) => {
-              void routewardClient.removeRule(id).then(() => {
-                pushToast(t('app.toast.rule.deleted'), 'warning');
-              });
+              runMutation(
+                () => routewardClient.removeRule(id),
+                () => pushToast(t('app.toast.rule.deleted'), 'warning')
+              );
             }}
             onImportFoxyProxy={async (jsonText, processPatterns) => {
               try {
@@ -822,8 +891,8 @@ export const App: React.FC = () => {
                   'success'
                 );
                 return res;
-              } catch {
-                pushToast(t('app.toast.foxyproxy.import_error'), 'error');
+              } catch (err) {
+                pushErrorToast(err, 'app.toast.foxyproxy.import_error');
                 return null;
               }
             }}
@@ -841,36 +910,50 @@ export const App: React.FC = () => {
             chains={profile.chains}
             experienceMode={experienceMode}
             onTestProxy={async (id) => {
-              await routewardClient.testProxy(id);
-              pushToast(t('app.toast.proxy.tested'));
+              try {
+                await routewardClient.testProxy(id);
+                pushToast(t('app.toast.proxy.tested'));
+              } catch (err) {
+                pushErrorToast(err);
+              }
             }}
             onTestAllProxies={async () => {
-              await routewardClient.testAllProxies();
-              pushToast(t('app.toast.proxy.tested'));
+              try {
+                await routewardClient.testAllProxies();
+                pushToast(t('app.toast.proxy.tested'));
+              } catch (err) {
+                pushErrorToast(err);
+              }
             }}
             onAddProxy={(node) => {
-              void routewardClient.upsertProxy(node).then(() => {
-                pushToast(t('app.toast.proxy.added'));
-              });
+              runMutation(
+                () => routewardClient.upsertProxy(node),
+                () => pushToast(t('app.toast.proxy.added'))
+              );
             }}
             onImportUris={(text) => {
-              void routewardClient.importProxyUris(text).then((count) => {
-                if (count > 0) {
-                  pushToast(`${t('app.toast.proxy.imported_uris')} (${count})`);
+              runMutation(
+                () => routewardClient.importProxyUris(text),
+                (count) => {
+                  if (count > 0) {
+                    pushToast(
+                      `${t('app.toast.proxy.imported_uris')} (${count})`
+                    );
+                  }
                 }
-              });
+              );
             }}
             onCopyUri={() => {
               pushToast(t('app.toast.proxy.copied_uri'), 'info');
             }}
             onRemoveProxy={(id) => {
-              void routewardClient.removeProxy(id);
+              runMutation(() => routewardClient.removeProxy(id));
             }}
             onAddChain={(chain) => {
-              void routewardClient.upsertChain(chain);
+              runMutation(() => routewardClient.upsertChain(chain));
             }}
             onRemoveChain={(id) => {
-              void routewardClient.removeChain(id);
+              runMutation(() => routewardClient.removeChain(id));
             }}
           />
         )}
@@ -881,21 +964,27 @@ export const App: React.FC = () => {
             proxies={profile.proxies}
             experienceMode={experienceMode}
             onScanOsSockets={async () => {
-              await routewardClient.scanRealOsSockets();
-              pushToast(t('app.toast.connection.os_scanned'), 'info');
+              try {
+                await routewardClient.scanRealOsSockets();
+                pushToast(t('app.toast.connection.os_scanned'), 'info');
+              } catch (err) {
+                pushErrorToast(err);
+              }
             }}
             onClearClosed={() => {
-              void routewardClient.clearClosedConnections();
+              runMutation(() => routewardClient.clearClosedConnections());
             }}
             onTerminateConnection={(connId) => {
-              void routewardClient.terminateConnection(connId).then(() => {
-                pushToast(t('app.toast.connection.terminated'), 'warning');
-              });
+              runMutation(
+                () => routewardClient.terminateConnection(connId),
+                () => pushToast(t('app.toast.connection.terminated'), 'warning')
+              );
             }}
             onQuickCreateRule={(rule) => {
-              void routewardClient.upsertRule(rule).then(() => {
-                pushToast(t('app.toast.rule.created'));
-              });
+              runMutation(
+                () => routewardClient.upsertRule(rule),
+                () => pushToast(t('app.toast.rule.created'))
+              );
             }}
             onMissingProxy={() => {
               pushToast(t('app.toast.proxy.required_for_rule'), 'warning');
@@ -923,10 +1012,10 @@ export const App: React.FC = () => {
             activeAccent={activeAccent}
             language={i18n.language.startsWith('fr') ? 'fr' : 'en'}
             onUpdateSecurityPolicy={(partial) => {
-              void routewardClient.updateSecurityPolicy(partial);
+              runMutation(() => routewardClient.updateSecurityPolicy(partial));
             }}
             onSetInterceptionMode={(mode: InterceptionMode) => {
-              void routewardClient.setInterceptionMode(mode);
+              runMutation(() => routewardClient.setInterceptionMode(mode));
             }}
             onToggleSystemProxy={handleToggleSystemProxy}
             onOpenThemeForge={() => setShowThemeModal(true)}
@@ -937,15 +1026,16 @@ export const App: React.FC = () => {
             onImportProfile={handleImportProfileFile}
             onExportProfile={handleExportProfile}
             onAllocateDns={(dom) => {
-              void routewardClient.allocateFakeIp(dom);
+              runMutation(() => routewardClient.allocateFakeIp(dom));
             }}
             onFlushDns={() => {
-              void routewardClient.flushFakeIps().then(() => {
-                pushToast(t('app.toast.dns.flushed'), 'info');
-              });
+              runMutation(
+                () => routewardClient.flushFakeIps(),
+                () => pushToast(t('app.toast.dns.flushed'), 'info')
+              );
             }}
             onClearLogs={() => {
-              void routewardClient.clearLogs();
+              runMutation(() => routewardClient.clearLogs());
             }}
             pacEnabled={pacEnabled}
             pacUrl={pacUrl}
@@ -1028,6 +1118,16 @@ export const App: React.FC = () => {
                 <CheckCircle2 className="h-4 w-4 text-tf-accent" />
               )}
               <span>{toast.message}</span>
+              {toast.severity === 'error' && (
+                <button
+                  type="button"
+                  onClick={() => dismissToast(toast.id)}
+                  aria-label={t('app.toast.dismiss')}
+                  className="ml-1 rounded-tf-sm p-0.5 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -1052,6 +1152,7 @@ export const App: React.FC = () => {
           }}
           onAddRule={(rule) => routewardClient.upsertRule(rule)}
           onSelectMode={(mode) => handleSetExperienceMode(mode)}
+          onError={(err) => pushErrorToast(err)}
           onComplete={(hasEnabledProxy) => {
             window.localStorage.setItem(
               UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED,
@@ -1100,18 +1201,25 @@ export const App: React.FC = () => {
             void handleToggleEngine(!isEngineRunning);
           }}
           onTestAllProxies={async () => {
-            await routewardClient.testAllProxies();
-            pushToast(t('app.toast.proxy.tested'));
+            try {
+              await routewardClient.testAllProxies();
+              pushToast(t('app.toast.proxy.tested'));
+            } catch (err) {
+              pushErrorToast(err);
+            }
           }}
           onFlushDns={() => {
-            void routewardClient.flushFakeIps().then(() => {
-              pushToast(t('app.toast.dns.flushed'), 'info');
-            });
+            runMutation(
+              () => routewardClient.flushFakeIps(),
+              () => pushToast(t('app.toast.dns.flushed'), 'info')
+            );
           }}
           onToggleKillSwitch={() => {
-            void routewardClient.updateSecurityPolicy({
-              killSwitchEnabled: !securityPolicy.killSwitchEnabled
-            });
+            runMutation(() =>
+              routewardClient.updateSecurityPolicy({
+                killSwitchEnabled: !securityPolicy.killSwitchEnabled
+              })
+            );
           }}
           onOpenThemeForge={() => setShowThemeModal(true)}
           onSwitchLanguage={handleToggleLanguage}

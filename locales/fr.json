@@ -1,10 +1,7 @@
 {
   "app": {
     "titlebar": {
-      "minimize": "Réduire",
-      "maximize": "Agrandir / Restaurer",
-      "close": "Fermer",
-      "native_badge": "Bureau Natif"
+      "close": "Fermer"
     },
     "launcher": {
       "button": "Lancer App via Proxy",
@@ -65,21 +62,12 @@
         "relay": "Relais Local Espace Utilisateur"
       },
       "language": {
-        "switch": "Changer de langue",
         "en": "English",
         "fr": "Français"
       },
       "profile": {
         "import": "Importer un Profil",
-        "export": "Exporter le Profil",
-        "save": "Enregistrer"
-      },
-      "theme": {
-        "button": "ThemeForge"
-      },
-      "command_palette": {
-        "button": "Palette de Commandes",
-        "shortcut": "Ctrl+K"
+        "export": "Exporter le Profil"
       }
     },
     "nav": {
@@ -98,24 +86,6 @@
       },
       "settings": {
         "tab": "Réglages"
-      },
-      "dashboard": {
-        "tab": "Tableau de Bord"
-      },
-      "connections": {
-        "tab": "Connexions Temps Réel"
-      },
-      "proxies": {
-        "tab": "Proxies & Chaînes"
-      },
-      "rules": {
-        "tab": "Règles de Routage"
-      },
-      "dns": {
-        "tab": "DNS Fake-IP"
-      },
-      "logs": {
-        "tab": "Journaux d'Événements"
       }
     },
     "statusbar": {
@@ -207,7 +177,11 @@
         "not_elevated": "Le démon n'a pas reçu les privilèges administrateur",
         "config_invalid": "Impossible de charger le profil de configuration du démon",
         "daemon_exited": "Le démon privilégié s'est arrêté pendant le démarrage"
-      }
+      },
+      "error": {
+        "generic": "L'opération a échoué"
+      },
+      "dismiss": "Fermer la notification"
     }
   },
   "command_palette": {
@@ -216,7 +190,8 @@
       "empty": "Aucune commande ou ressource correspondante.",
       "group_navigation": "Navigation Rapide",
       "group_actions": "Actions du Moteur",
-      "group_themes": "Palettes ThemeForge"
+      "group_themes": "Palettes ThemeForge",
+      "title": "Palette de commandes"
     },
     "actions": {
       "toggle_engine": "Démarrer / Mettre en pause le moteur d'interception",
@@ -244,7 +219,6 @@
       "metric_leaks_blocked": "Fuites & Blocs Stoppés",
       "metric_protected_traffic": "Trafic Total Traité",
       "proxy_summary_label": "Serveur Proxy Actif",
-      "no_proxy_configured": "Aucun serveur proxy configuré",
       "direct_filter_mode_title": "Mode Filtrage Direct (Sans Proxy Externe)",
       "direct_filter_mode_desc": "Le filtrage actif, le blocage des pisteurs et vos règles locales s'appliquent directement sur votre connexion Internet.",
       "configure_proxy_cta": "Configurer un Proxy",
@@ -363,9 +337,6 @@
         "blocked": "Bloqués",
         "closed": "Fermés"
       },
-      "simulate": {
-        "button": "Simuler une Connexion"
-      },
       "scan_os": {
         "button": "Scanner Sockets OS Réels"
       },
@@ -418,9 +389,7 @@
         "destination_section": "Destination & DNS Anti-Fuite",
         "remote_endpoint": "Hôte Distant",
         "resolved_domain": "Domaine Original (Fake-IP)",
-        "routing_section": "Routage Appliqué & Télémétrie",
         "matched_rule": "Règle Appliquée",
-        "upstream_route": "Tunnel / Route",
         "error_detail": "Motif du blocage / erreur",
         "quick_actions_title": "Création de Règle en 1 Clic & Contrôle Socket",
         "route_process_proxy": "Router ce Processus via Proxy",
@@ -475,8 +444,7 @@
         "testing": "Test en cours...",
         "copy_uri": "Copier l'URI",
         "edit": "Modifier / Mot de passe",
-        "delete": "Supprimer",
-        "toggle": "Activer / Désactiver"
+        "delete": "Supprimer"
       },
       "badge": {
         "udp_ready": "Support UDP",
@@ -485,8 +453,6 @@
         "tls_insecure": "TLS Non vérifié",
         "password_set": "Mot de passe défini",
         "untested": "Non testé",
-        "online": "En ligne",
-        "offline": "Injoignable",
         "exit_ip": "IP de sortie"
       }
     },
@@ -809,8 +775,12 @@
       "not_elevated": "Les privilèges Administrateur ou root sont requis pour lancer routeward daemon",
       "ipc_error": "Erreur de communication IPC avec le démon",
       "disconnected": "Le démon privilégié RouteWard n'est pas connecté",
+      "io_timeout": "Délai dépassé lors de la communication avec le démon RouteWard",
       "insecure_profile": "Refus de démarrer : le dossier ou le fichier de profil a un propriétaire ou des droits d'écriture non sécurisés",
       "cleanup_refused_active": "Refus d'exécuter cleanup pendant qu'un démon RouteWard est actif (arrêtez le démon d'abord ou utilisez --force)"
+    },
+    "service": {
+      "insecure_binary_location": "Enregistrement du service Windows refusé : l'exécutable RouteWard ou son dossier est modifiable par des non-administrateurs. Installez-le sous Program Files."
     },
     "desktop": {
       "ui_init": "RouteWard n'a pas pu initialiser sa fenêtre WebView. Vérifiez que Microsoft Edge WebView2 Runtime est installé et que votre dossier utilisateur est accessible en écriture."
@@ -820,7 +790,6 @@
     "modal": {
       "title": "ThemeForge Studio - Palette & Teinte d'Accent",
       "subtitle": "Sélectionnez l'une des palettes canoniques Oklab de ThemeForge ou Contraste Élevé, ainsi qu'une teinte d'accent.",
-      "palette_label": "Palette de Thème",
       "accent_label": "Teinte d'Accent",
       "preview_label": "Aperçu des Jetons Sémantiques",
       "import_palette": "Charger une Palette JSON ThemeForge v1",
@@ -972,6 +941,19 @@
       "subtab_overview": "Vue d'ensemble",
       "subtab_dns": "Cache DNS Fake-IP",
       "subtab_logs": "Journaux d'Événements"
+    }
+  },
+  "tray": {
+    "status": {
+      "offline": "RouteWard - Service arrêté",
+      "protected": "RouteWard - Protégé",
+      "paused": "RouteWard - En pause"
+    },
+    "menu": {
+      "pause": "Mettre en pause",
+      "enable": "Activer la protection",
+      "open": "Ouvrir RouteWard",
+      "quit": "Quitter"
     }
   }
 }

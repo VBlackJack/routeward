@@ -20,6 +20,12 @@ use crate::error::RouteWardResult;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
+#[cfg(windows)]
+const WINDOWS_SYSTEM_DIR_FALLBACK: &str = r"C:\Windows\System32";
+/// Capacity (UTF-16 units) of the buffer handed to `GetSystemDirectoryW`; far above `MAX_PATH`.
+#[cfg(windows)]
+const WINDOWS_SYSTEM_DIR_BUF_LEN: usize = 520;
+
 const ENV_ALL_PROXY: &str = "ALL_PROXY";
 const ENV_HTTP_PROXY: &str = "HTTP_PROXY";
 const ENV_HTTPS_PROXY: &str = "HTTPS_PROXY";
@@ -32,6 +38,50 @@ const WIN_INET_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion
 const WIN_RUN_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
 const AUTOSTART_VALUE_NAME: &str = "RouteWardDesktop";
+#[cfg(windows)]
+/// Registry value holding the per-user system proxy switch (REG_DWORD, 1 = enabled).
+const PROXY_ENABLE_VALUE_NAME: &str = "ProxyEnable";
+#[cfg(any(windows, test))]
+/// Token `reg query` prints for a DWORD value; it is not localized.
+const REG_DWORD_TYPE_TOKEN: &str = "REG_DWORD";
+
+#[cfg(any(windows, test))]
+/// Extracts the numeric data of a `reg query` DWORD value line, locale-independently.
+///
+/// Only the `REG_DWORD` type token and the `0x` hexadecimal data are inspected; the value name
+/// and any surrounding text are ignored. Returns `None` when no DWORD line is present.
+fn parse_reg_dword_value(stdout: &str) -> Option<u32> {
+    stdout.lines().find_map(|line| {
+        let idx = line.find(REG_DWORD_TYPE_TOKEN)?;
+        let data = line[idx + REG_DWORD_TYPE_TOKEN.len()..].trim();
+        let hex = data
+            .strip_prefix("0x")
+            .or_else(|| data.strip_prefix("0X"))?;
+        u32::from_str_radix(hex.split_whitespace().next()?, 16).ok()
+    })
+}
+
+/// Resolves `<System32>\<exe_name>` through `GetSystemDirectoryW`.
+///
+/// The elevated daemon and the LocalSystem service must never start `reg`, `netsh`, `ipconfig`
+/// and similar tools by bare name: the Win32 search order looks in the application directory
+/// first, so a binary planted next to `routeward.exe` would run with SYSTEM rights. The
+/// directory is also never taken from an environment variable (`SystemRoot`, `windir`), which
+/// a lower-privileged parent could have altered. Only if the API itself fails does this fall
+/// back to the conventional `C:\Windows\System32`.
+#[cfg(windows)]
+pub fn windows_system_tool_path(exe_name: &str) -> std::path::PathBuf {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buf = [0u16; WINDOWS_SYSTEM_DIR_BUF_LEN];
+    let written = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let dir = if written == 0 || written >= buf.len() {
+        std::path::PathBuf::from(WINDOWS_SYSTEM_DIR_FALLBACK)
+    } else {
+        std::path::PathBuf::from(String::from_utf16_lossy(&buf[..written]))
+    };
+    dir.join(exe_name)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,7 +96,9 @@ pub struct SystemProxyManager;
 impl SystemProxyManager {
     #[cfg(windows)]
     fn run_reg_add(args: &[&str]) -> RouteWardResult<()> {
-        let output = Command::new("reg").args(args).output()?;
+        let output = Command::new(windows_system_tool_path("reg.exe"))
+            .args(args)
+            .output()?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(std::io::Error::other(if detail.is_empty() {
@@ -57,6 +109,41 @@ impl SystemProxyManager {
             .into());
         }
         Ok(())
+    }
+
+    /// Deletes a registry value, treating "value not found" as success.
+    ///
+    /// `reg delete` reports every failure with exit code 1 and a localized message, so the
+    /// "not found" case is told apart locale-independently: after a failed delete, a `reg query`
+    /// of the same value must also fail for the value to count as already absent.
+    #[cfg(windows)]
+    fn run_reg_delete_value(key: &str, value_name: &str) {
+        let reg = windows_system_tool_path("reg.exe");
+        let deleted = Command::new(&reg)
+            .args(["delete", key, "/v", value_name, "/f"])
+            .output();
+        match deleted {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let still_present = Command::new(&reg)
+                    .args(["query", key, "/v", value_name])
+                    .output()
+                    .map(|q| q.status.success())
+                    .unwrap_or(true);
+                if still_present {
+                    tracing::warn!(
+                        key,
+                        value_name,
+                        status = %out.status,
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "reg delete failed and the value is still present"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(key, value_name, error = %err, "failed to run reg delete");
+            }
+        }
     }
 
     pub fn set_system_proxy(enable: bool, socks_endpoint: &str) -> RouteWardResult<bool> {
@@ -143,9 +230,7 @@ impl SystemProxyManager {
                     "/f",
                 ])?;
             } else {
-                let _ = Command::new("reg")
-                    .args(["delete", WIN_INET_REG_PATH, "/v", "AutoConfigURL", "/f"])
-                    .output();
+                Self::run_reg_delete_value(WIN_INET_REG_PATH, "AutoConfigURL");
             }
             Ok(enable)
         }
@@ -156,10 +241,32 @@ impl SystemProxyManager {
         }
     }
 
+    /// Reads whether the per-user system proxy switch (`ProxyEnable`) is currently on.
+    /// Any failure to query it (missing value, tool error) counts as off; always off elsewhere.
+    pub fn is_system_proxy_enabled() -> bool {
+        #[cfg(windows)]
+        {
+            let Ok(output) = Command::new(windows_system_tool_path("reg.exe"))
+                .args(["query", WIN_INET_REG_PATH, "/v", PROXY_ENABLE_VALUE_NAME])
+                .output()
+            else {
+                return false;
+            };
+            if !output.status.success() {
+                return false;
+            }
+            parse_reg_dword_value(&String::from_utf8_lossy(&output.stdout)) == Some(1)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub fn get_system_pac_url() -> Option<String> {
         #[cfg(windows)]
         {
-            let output = Command::new("reg")
+            let output = Command::new(windows_system_tool_path("reg.exe"))
                 .args(["query", WIN_INET_REG_PATH, "/v", "AutoConfigURL"])
                 .output()
                 .ok()?;
@@ -186,7 +293,7 @@ impl SystemProxyManager {
     pub fn is_autostart_enabled() -> bool {
         #[cfg(windows)]
         {
-            let Ok(output) = Command::new("reg")
+            let Ok(output) = Command::new(windows_system_tool_path("reg.exe"))
                 .args(["query", WIN_RUN_REG_PATH, "/v", AUTOSTART_VALUE_NAME])
                 .output()
             else {
@@ -225,9 +332,7 @@ impl SystemProxyManager {
                     "/f",
                 ])?;
             } else {
-                let _ = Command::new("reg")
-                    .args(["delete", WIN_RUN_REG_PATH, "/v", AUTOSTART_VALUE_NAME, "/f"])
-                    .output();
+                Self::run_reg_delete_value(WIN_RUN_REG_PATH, AUTOSTART_VALUE_NAME);
             }
             Ok(enable)
         }
@@ -281,6 +386,49 @@ impl SystemProxyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_reg_dword_enabled_and_disabled() {
+        let on =
+            "\r\nHKEY_CURRENT_USER\\Software\\X\r\n    ProxyEnable    REG_DWORD    0x1\r\n\r\n";
+        let off = "    ProxyEnable    REG_DWORD    0x0";
+        assert_eq!(parse_reg_dword_value(on), Some(1));
+        assert_eq!(parse_reg_dword_value(off), Some(0));
+    }
+
+    #[test]
+    fn parses_reg_dword_ignores_localized_text_and_rejects_other_types() {
+        let fr = "Valeur ProxyEnable\n    ProxyEnable    REG_DWORD    0x00000001\n";
+        assert_eq!(parse_reg_dword_value(fr), Some(1));
+        assert_eq!(
+            parse_reg_dword_value("    AutoConfigURL    REG_SZ    http://x"),
+            None
+        );
+        assert_eq!(
+            parse_reg_dword_value("    ProxyEnable    REG_DWORD    garbage"),
+            None
+        );
+        assert_eq!(parse_reg_dword_value(""), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_tool_path_resolves_into_the_system_directory() {
+        let reg = windows_system_tool_path("reg.exe");
+        assert!(reg.is_absolute());
+        assert!(reg.ends_with("reg.exe"));
+        assert!(
+            reg.exists(),
+            "{} should exist on a Windows host",
+            reg.display()
+        );
+        let dir = reg
+            .parent()
+            .expect("parent dir")
+            .to_string_lossy()
+            .to_lowercase();
+        assert!(dir.ends_with("system32"), "unexpected directory {dir}");
+    }
 
     #[test]
     fn rejects_empty_executable_path_without_split_whitespace() {

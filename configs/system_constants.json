@@ -26,6 +26,20 @@
     "pendingSynTimeoutMs": 40,
     "pendingUdpTimeoutMs": 40,
     "maxPendingUdpPackets": 256,
+    "maxPendingSynPackets": 1024,
+    "socketPidCacheTtlMs": 5000,
+    "natHalfOpenSessionTtlSecs": 60,
+    "natSessionSweepIntervalMs": 5000,
+    "udpFragmentVerdictTtlMs": 10000,
+    "maxUdpFragmentVerdicts": 4096,
+    "sessionCloseGraceMs": 250,
+    "peekPollIntervalMs": 5,
+    "directUdpSocketPoolSize": 16,
+    "udpDirectTimeoutMinMs": 300,
+    "udpDirectTimeoutMaxMs": 1500,
+    "localNameQueryTimeoutMs": 300,
+    "conntrackCacheTtlMs": 1000,
+    "conntrackMinRefreshIntervalMs": 100,
     "windivertPriority": 0,
     "windivertDllPaths": [
       "WinDivert.dll",
@@ -94,7 +108,13 @@
       "9.e.f.ip6.arpa",
       "a.e.f.ip6.arpa",
       "b.e.f.ip6.arpa"
-    ]
+    ],
+    "directQueryTimeoutMinMs": 500,
+    "directQueryTimeoutMaxMs": 2500,
+    "udpResponseBufferBytes": 4096,
+    "fakeIpRealResolutionTtlSecs": 30,
+    "fakeIpRealResolutionMaxEntries": 1024,
+    "systemResolversCacheTtlMs": 5000
   },
   "checker": {
     "probeTargetHost": "1.1.1.1",
@@ -123,7 +143,9 @@
     "linuxUserFallbackWebviewDir": ".local/share/routeward/webview",
     "logAppName": "RouteWard",
     "logFlushIntervalMs": 500,
-    "eventBroadcastCapacity": 256
+    "eventBroadcastCapacity": 256,
+    "udpFlowIdleTimeoutMs": 30000,
+    "telemetryUpdateIntervalMs": 250
   },
   "ipc": {
     "unixSocketPath": "/run/routeward/routeward.sock",

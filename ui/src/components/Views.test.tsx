@@ -224,10 +224,21 @@ describe('Core UI view components', () => {
     fireEvent.click(screen.getByRole('button', { name: i18n.t('proxies.card.action.test') }));
     await waitFor(() => expect(onTestProxy).toHaveBeenCalledWith('p1'));
 
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText },
+      configurable: true
+    });
     fireEvent.click(
       screen.getByRole('button', { name: i18n.t('proxies.card.action.copy_uri') })
     );
-    expect(onCopyUri).toHaveBeenCalledWith(
+    // The copy confirmation fires only after the clipboard write resolved.
+    await waitFor(() =>
+      expect(onCopyUri).toHaveBeenCalledWith(
+        'socks5://[2001:db8::1]:1080#Frankfurt%20SOCKS5'
+      )
+    );
+    expect(writeText).toHaveBeenCalledWith(
       'socks5://[2001:db8::1]:1080#Frankfurt%20SOCKS5'
     );
 

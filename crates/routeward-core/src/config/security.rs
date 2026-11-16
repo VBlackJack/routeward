@@ -110,20 +110,16 @@ pub fn is_symlink_or_reparse_point(path: &Path) -> RouteWardResult<bool> {
         }
     };
 
-    if meta.file_type().is_symlink() {
-        return Ok(true);
-    }
+    let is_link = meta.file_type().is_symlink();
 
     #[cfg(windows)]
-    {
+    let is_link = is_link || {
         use std::os::windows::fs::MetadataExt;
         use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return Ok(true);
-        }
-    }
+        (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    };
 
-    Ok(false)
+    Ok(is_link)
 }
 
 #[cfg(windows)]

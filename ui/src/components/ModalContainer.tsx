@@ -24,6 +24,9 @@ interface ModalContainerProps {
   children: React.ReactNode;
 }
 
+const FOCUSABLE_SELECTOR =
+  'a[href], input:not([type="hidden"]):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 /**
  * Shared accessible modal wrapper that handles ARIA dialog semantics, Escape
  * key closing, backdrop click closing, initial focus, and focus restoration.
@@ -45,10 +48,14 @@ export const ModalContainer: React.FC<ModalContainerProps> = ({
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const node = containerRef.current;
+    const listFocusable = (): HTMLElement[] =>
+      node
+        ? Array.from(
+            node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)
+          ).filter((el) => !el.hasAttribute('hidden') && el.tabIndex >= 0)
+        : [];
     if (node) {
-      const focusTarget = node.querySelector<HTMLElement>(
-        'input:not([type="hidden"]):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])'
-      );
+      const focusTarget = listFocusable()[0];
       if (focusTarget) {
         focusTarget.focus();
       } else {
@@ -60,6 +67,29 @@ export const ModalContainer: React.FC<ModalContainerProps> = ({
       if (e.key === 'Escape') {
         e.preventDefault();
         onCloseRef.current();
+        return;
+      }
+      if (e.key !== 'Tab' || !node) {
+        return;
+      }
+      const focusable = listFocusable();
+      if (focusable.length === 0) {
+        e.preventDefault();
+        node.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (!active || !node.contains(active) || active === node) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      } else if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -84,7 +114,7 @@ export const ModalContainer: React.FC<ModalContainerProps> = ({
         aria-modal="true"
         aria-labelledby={labelledBy}
         tabIndex={-1}
-        className="contents"
+        className="flex max-h-full w-full justify-center outline-none"
         onClick={(e) => e.stopPropagation()}
       >
         {children}

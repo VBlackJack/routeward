@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Activity,
@@ -66,6 +66,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
   onSwitchLanguage
 }) => {
   const { t } = useTranslation();
+  const titleId = useId();
   const { palettes, setTheme } = useThemeForge();
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -230,11 +231,14 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
   };
 
   return (
-    <ModalContainer onClose={onClose} alignTop>
+    <ModalContainer onClose={onClose} alignTop labelledBy={titleId}>
       <div
         className="tf-card w-full max-w-xl overflow-hidden shadow-2xl"
         onKeyDown={handleKeyDown}
       >
+        <h2 id={titleId} className="sr-only">
+          {t('command_palette.modal.title')}
+        </h2>
         <div className="flex items-center border-b border-tf-border px-4 py-3">
           <Search className="mr-3 h-4 w-4 text-tf-accent" />
           <input

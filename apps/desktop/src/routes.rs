@@ -19,6 +19,12 @@ use crate::security::{extract_json_body, validate_loopback_http_request_with_met
 use crate::sse::stream_sse_events;
 use crate::{parse_hex_colorref, resolve_palette_window_appearance, DesktopWindowCommand};
 use routeward_core::config::{InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule};
+use routeward_core::error::{
+    ERR_KEY_CHAIN_EMPTY, ERR_KEY_CLEANUP_DAEMON_ACTIVE, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_SAVE,
+    ERR_KEY_DAEMON_ALREADY_RUNNING, ERR_KEY_DAEMON_INSECURE_PROFILE,
+    ERR_KEY_INTERCEPTOR_NFT_FAILED, ERR_KEY_INTERCEPTOR_OPEN,
+};
+use routeward_core::ipc::IpcCallError;
 use routeward_core::rules::ConnectionRequest;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -186,6 +192,52 @@ struct SetLocaleRequest {
     locale: String,
 }
 
+/// Maps a daemon IPC failure to the HTTP status the UI should observe.
+///
+/// Transport loss is 503, protocol faults are 500, and a clean daemon rejection is classified by
+/// its error key: conflicts 409, unusable stored configuration 422, server-side faults 500, and
+/// everything else (validation failures) 400.
+pub fn ipc_error_status(err: &IpcCallError) -> u16 {
+    match err {
+        IpcCallError::Transport(_) => 503,
+        IpcCallError::Protocol(_) => 500,
+        IpcCallError::Remote { error_key, .. } => match error_key.as_deref() {
+            Some(ERR_KEY_DAEMON_ALREADY_RUNNING | ERR_KEY_CLEANUP_DAEMON_ACTIVE) => 409,
+            Some(ERR_KEY_DAEMON_INSECURE_PROFILE | ERR_KEY_CONFIG_JSON | ERR_KEY_CHAIN_EMPTY) => {
+                422
+            }
+            Some(
+                ERR_KEY_CONFIG_SAVE | ERR_KEY_INTERCEPTOR_OPEN | ERR_KEY_INTERCEPTOR_NFT_FAILED,
+            ) => 500,
+            _ => 400,
+        },
+    }
+}
+
+/// Builds the `{error, errorKey}` JSON error response for a failed daemon call.
+fn ipc_error_response(err: &IpcCallError, json_ct: String) -> (u16, String, Vec<u8>) {
+    let json = serde_json::to_vec(&serde_json::json!({
+        "error": err.message(),
+        "errorKey": err.error_key(),
+    }))
+    .unwrap_or_default();
+    (ipc_error_status(err), json_ct, json)
+}
+
+/// Builds the 200 response carrying a serializable payload.
+fn ok_json_response<T: serde::Serialize>(value: &T, json_ct: String) -> (u16, String, Vec<u8>) {
+    (200, json_ct, serde_json::to_vec(value).unwrap_or_default())
+}
+
+/// Content type prefix of the embedded index page, the only response that carries a CSP.
+const HTML_CONTENT_TYPE_PREFIX: &str = "text/html";
+
+/// Policy applied to the embedded index page. The bundle is a single external script and
+/// stylesheet served from the same loopback origin. The session token is injected by the
+/// WebView initialization script (not an inline `<script>`), so `script-src 'self'` suffices.
+/// `style-src` keeps `'unsafe-inline'` because the theme engine and React write inline styles.
+pub const INDEX_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
 fn require_post(method: &str, json_ct: &str) -> Option<(u16, String, Vec<u8>)> {
     if method != "POST" {
         return Some((
@@ -225,17 +277,29 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/connections/terminate") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         let parsed: Result<TerminateConnectionRequest, _> = serde_json::from_str(body_str);
-        let terminated = match parsed {
-            Ok(req) => bridge.terminate_connection(req.connection_id).await,
-            Err(_) => false,
-        };
-        let json = serde_json::to_vec(&serde_json::json!({ "terminated": terminated }))
-            .unwrap_or_default();
-        return Some((200, json_ct, json));
+        return Some(match parsed {
+            Ok(req) => match bridge.terminate_connection(req.connection_id).await {
+                Ok(terminated) => {
+                    ok_json_response(&serde_json::json!({ "terminated": terminated }), json_ct)
+                }
+                Err(err) => ipc_error_response(&err, json_ct),
+            },
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                    .unwrap_or_default();
+                (400, json_ct, json)
+            }
+        });
     }
 
     if path.starts_with("/api/connections/clear") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         bridge.clear_closed_connections().await;
         return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
     }
@@ -247,6 +311,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/logs/clear") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         bridge.clear_logs().await;
         return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
     }
@@ -291,9 +358,10 @@ pub async fn handle_api_route(
         }
         match serde_json::from_str::<SetModeRequest>(body_str) {
             Ok(req) => {
-                let diag = bridge.set_interception_mode(req.mode).await;
-                let json = serde_json::to_vec(&diag).unwrap_or_default();
-                return Some((200, json_ct, json));
+                return Some(match bridge.set_interception_mode(req.mode).await {
+                    Ok(diag) => ok_json_response(&diag, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
             }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
@@ -351,17 +419,16 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/profile/replace") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ProfileConfig>(body_str) {
             Ok(profile) => match bridge.replace_profile(profile).await {
                 Ok(updated) => {
                     let json = serde_json::to_vec(&updated).unwrap_or_default();
                     return Some((200, json_ct, json));
                 }
-                Err(err) => {
-                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                        .unwrap_or_default();
-                    return Some((500, json_ct, json));
-                }
+                Err(err) => return Some(ipc_error_response(&err, json_ct)),
             },
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
@@ -375,40 +442,54 @@ pub async fn handle_api_route(
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
         }
-        if let Ok(req) = serde_json::from_str::<SetThemeRequest>(body_str) {
-            let fallback = resolve_palette_window_appearance(&req.theme);
-            let appearance = crate::WindowThemeAppearance {
-                is_light: req.is_light.unwrap_or(fallback.is_light),
-                caption_color: req
-                    .surface_hex
-                    .as_deref()
-                    .and_then(parse_hex_colorref)
-                    .or(fallback.caption_color),
-                text_color: req
-                    .text_primary_hex
-                    .as_deref()
-                    .and_then(parse_hex_colorref)
-                    .or(fallback.text_color),
-                border_color: req
-                    .border_hex
-                    .as_deref()
-                    .and_then(parse_hex_colorref)
-                    .or(fallback.border_color),
-            };
-            bridge.set_theme(req.theme, req.accent).await;
-            if let Some(cb) = on_window_cmd {
-                cb(DesktopWindowCommand::ApplyTheme(appearance));
+        match serde_json::from_str::<SetThemeRequest>(body_str) {
+            Ok(req) => {
+                let fallback = resolve_palette_window_appearance(&req.theme);
+                let appearance = crate::WindowThemeAppearance {
+                    is_light: req.is_light.unwrap_or(fallback.is_light),
+                    caption_color: req
+                        .surface_hex
+                        .as_deref()
+                        .and_then(parse_hex_colorref)
+                        .or(fallback.caption_color),
+                    text_color: req
+                        .text_primary_hex
+                        .as_deref()
+                        .and_then(parse_hex_colorref)
+                        .or(fallback.text_color),
+                    border_color: req
+                        .border_hex
+                        .as_deref()
+                        .and_then(parse_hex_colorref)
+                        .or(fallback.border_color),
+                };
+                let outcome = bridge.set_theme(req.theme, req.accent).await;
+                if let Some(cb) = on_window_cmd {
+                    cb(DesktopWindowCommand::ApplyTheme(appearance));
+                }
+                return Some(match outcome {
+                    Ok(()) => (200, json_ct, b"{\"ok\":true}".to_vec()),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
+            }
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                    .unwrap_or_default();
+                return Some((400, json_ct, json));
             }
         }
-        return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
     }
 
     if path.starts_with("/api/rules/upsert") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<RoutingRule>(body_str) {
             Ok(rule) => {
-                let prof = bridge.upsert_rule(rule).await;
-                let json = serde_json::to_vec(&prof).unwrap_or_default();
-                return Some((200, json_ct, json));
+                return Some(match bridge.upsert_rule(rule).await {
+                    Ok(prof) => ok_json_response(&prof, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
             }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
@@ -419,11 +500,15 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/rules/remove") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<RemoveRuleRequest>(body_str) {
             Ok(req) => {
-                let prof = bridge.remove_rule(req.rule_id).await;
-                let json = serde_json::to_vec(&prof).unwrap_or_default();
-                return Some((200, json_ct, json));
+                return Some(match bridge.remove_rule(req.rule_id).await {
+                    Ok(prof) => ok_json_response(&prof, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
             }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
@@ -434,6 +519,9 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/rules/evaluate") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ConnectionRequest>(body_str) {
             Ok(request) => match bridge.evaluate_rule(request).await {
                 Ok(res) => {
@@ -455,11 +543,15 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/proxies/upsert") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ProxyNode>(body_str) {
             Ok(node) => {
-                let prof = bridge.upsert_proxy(node).await;
-                let json = serde_json::to_vec(&prof).unwrap_or_default();
-                return Some((200, json_ct, json));
+                return Some(match bridge.upsert_proxy(node).await {
+                    Ok(prof) => ok_json_response(&prof, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
             }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
@@ -470,11 +562,15 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/proxies/remove") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ProxyIdRequest>(body_str) {
             Ok(req) => {
-                let prof = bridge.remove_proxy(req.proxy_id).await;
-                let json = serde_json::to_vec(&prof).unwrap_or_default();
-                return Some((200, json_ct, json));
+                return Some(match bridge.remove_proxy(req.proxy_id).await {
+                    Ok(prof) => ok_json_response(&prof, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
             }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
@@ -485,12 +581,18 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/proxies/test-all") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         let reports = bridge.test_all_proxies().await;
         let json = serde_json::to_vec(&reports).unwrap_or_default();
         return Some((200, json_ct, json));
     }
 
     if path.starts_with("/api/proxies/test") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ProxyIdRequest>(body_str) {
             Ok(req) => match bridge.test_proxy(req.proxy_id).await {
                 Ok(report) => {
@@ -512,11 +614,15 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/chains/upsert") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<ProxyChain>(body_str) {
             Ok(chain) => {
-                let prof = bridge.upsert_chain(chain).await;
-                let json = serde_json::to_vec(&prof).unwrap_or_default();
-                return Some((200, json_ct, json));
+                return Some(match bridge.upsert_chain(chain).await {
+                    Ok(prof) => ok_json_response(&prof, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
             }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
@@ -527,11 +633,15 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/chains/remove") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<RemoveChainRequest>(body_str) {
             Ok(req) => {
-                let prof = bridge.remove_chain(req.chain_id).await;
-                let json = serde_json::to_vec(&prof).unwrap_or_default();
-                return Some((200, json_ct, json));
+                return Some(match bridge.remove_chain(req.chain_id).await {
+                    Ok(prof) => ok_json_response(&prof, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
             }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
@@ -542,25 +652,45 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/dns/allocate") {
-        let allocated = match serde_json::from_str::<AllocateFakeIpRequest>(body_str) {
-            Ok(req) => bridge.allocate_fake_ip(req.domain).await,
-            Err(_) => None,
-        };
-        let entries = bridge.list_fake_ip_entries();
-        let json = serde_json::to_vec(&serde_json::json!({
-            "allocated": allocated,
-            "entries": entries,
-        }))
-        .unwrap_or_default();
-        return Some((200, json_ct, json));
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        return Some(
+            match serde_json::from_str::<AllocateFakeIpRequest>(body_str) {
+                Ok(req) => match bridge.allocate_fake_ip(req.domain).await {
+                    Ok(allocated) => {
+                        let entries = bridge.list_fake_ip_entries();
+                        ok_json_response(
+                            &serde_json::json!({
+                                "allocated": allocated,
+                                "entries": entries,
+                            }),
+                            json_ct,
+                        )
+                    }
+                    Err(err) => ipc_error_response(&err, json_ct),
+                },
+                Err(err) => {
+                    let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                        .unwrap_or_default();
+                    (400, json_ct, json)
+                }
+            },
+        );
     }
 
     if path.starts_with("/api/dns/flush") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         bridge.flush_fake_ip_cache().await;
         return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
     }
 
     if path.starts_with("/api/scan-os") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         let sockets = bridge.scan_os_sockets().await;
         let json = serde_json::to_vec(&sockets).unwrap_or_default();
         return Some((200, json_ct, json));
@@ -569,7 +699,7 @@ pub async fn handle_api_route(
     if path.starts_with("/api/system/pac") {
         if method == "POST" {
             match serde_json::from_str::<SystemProxyRequest>(body_str) {
-                Ok(parsed) => match bridge.set_system_pac(parsed.enabled) {
+                Ok(parsed) => match bridge.set_system_pac(parsed.enabled).await {
                     Ok((enabled, pac_url)) => {
                         let json = serde_json::to_vec(&serde_json::json!({
                             "enabled": enabled,
@@ -591,7 +721,7 @@ pub async fn handle_api_route(
                 }
             }
         }
-        let (enabled, pac_url) = bridge.get_system_pac_status();
+        let (enabled, pac_url) = bridge.get_system_pac_status().await;
         let json = serde_json::to_vec(&serde_json::json!({
             "enabled": enabled,
             "pacUrl": pac_url,
@@ -603,7 +733,7 @@ pub async fn handle_api_route(
     if path.starts_with("/api/system/autostart") {
         if method == "POST" {
             match serde_json::from_str::<SystemProxyRequest>(body_str) {
-                Ok(parsed) => match bridge.set_autostart(parsed.enabled) {
+                Ok(parsed) => match bridge.set_autostart(parsed.enabled).await {
                     Ok(enabled) => {
                         let json = serde_json::to_vec(&serde_json::json!({ "enabled": enabled }))
                             .unwrap_or_default();
@@ -622,7 +752,7 @@ pub async fn handle_api_route(
                 }
             }
         }
-        let enabled = bridge.get_autostart_status();
+        let enabled = bridge.get_autostart_status().await;
         let json =
             serde_json::to_vec(&serde_json::json!({ "enabled": enabled })).unwrap_or_default();
         return Some((200, json_ct, json));
@@ -743,8 +873,15 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/system-proxy") {
+        if method != "POST" {
+            let enabled = bridge.get_system_proxy_status().await;
+            return Some(ok_json_response(
+                &serde_json::json!({ "enabled": enabled }),
+                json_ct,
+            ));
+        }
         match serde_json::from_str::<SystemProxyRequest>(body_str) {
-            Ok(parsed) => match bridge.set_system_proxy(parsed.enabled) {
+            Ok(parsed) => match bridge.set_system_proxy(parsed.enabled).await {
                 Ok(status) => {
                     let json = serde_json::to_vec(&status).unwrap_or_default();
                     return Some((200, json_ct, json));
@@ -764,8 +901,14 @@ pub async fn handle_api_route(
     }
 
     if path.starts_with("/api/launch-process") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
         match serde_json::from_str::<LaunchProcessRequest>(body_str) {
-            Ok(req) => match bridge.launch_process_with_proxy(&req.executable, &req.args) {
+            Ok(req) => match bridge
+                .launch_process_with_proxy(&req.executable, &req.args)
+                .await
+            {
                 Ok(res) => {
                     let json = serde_json::to_vec(&res).unwrap_or_default();
                     return Some((200, json_ct, json));
@@ -836,6 +979,8 @@ pub fn http_status_line(code: u16) -> &'static str {
         404 => "HTTP/1.1 404 Not Found",
         405 => "HTTP/1.1 405 Method Not Allowed",
         409 => "HTTP/1.1 409 Conflict",
+        413 => "HTTP/1.1 413 Payload Too Large",
+        422 => "HTTP/1.1 422 Unprocessable Entity",
         501 => "HTTP/1.1 501 Not Implemented",
         503 => "HTTP/1.1 503 Service Unavailable",
         _ => "HTTP/1.1 500 Internal Server Error",
@@ -916,8 +1061,13 @@ pub async fn serve_loopback_http_connection<FStatic>(
 
     if let Some(asset_fn) = static_asset_handler {
         let (content_type, body) = asset_fn(&path);
+        let csp_header = if content_type.starts_with(HTML_CONTENT_TYPE_PREFIX) {
+            format!("Content-Security-Policy: {INDEX_CONTENT_SECURITY_POLICY}\r\n")
+        } else {
+            String::new()
+        };
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\n{csp_header}Connection: close\r\n\r\n",
             body.len()
         );
         let _ = stream.write_all(header.as_bytes()).await;

@@ -3,6 +3,42 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
+## [Unreleased]
+
+### Security
+- Stop sending HTTP proxy `Basic` credentials pre-emptively over plaintext: they are now sent only after a `407` that offers `Basic` (Negotiate and NTLM preferred), and remain pre-emptive only when the hop to the proxy is TLS.
+- `install-service.ps1` copies the binaries to `%ProgramFiles%\RouteWard` before registering the LocalSystem service, and `routeward service install` refuses a binary whose directory, file or ancestors can be modified by non-administrators.
+- The elevated daemon resolves `reg`, `netsh`, `ipconfig` and `cmd` from the System32 directory instead of the default search order, loads `WinDivert.dll` only from under the executable directory, and honours `ROUTEWARD_WINDIVERT_DLL_PATH` in debug builds only.
+- First UDP fragments now follow the routing rule and kill switch decision instead of being reinjected unevaluated.
+- Reject control characters and whitespace in SNI and DNS names before they reach `CONNECT` or SOCKS5 requests, and refuse SOCKS5 domains over 255 bytes instead of truncating them.
+- Accept SOCKS5 UDP relay datagrams and direct DNS replies only from the expected source, and verify direct DNS transaction IDs.
+- With the kill switch on, the Linux IPv6 nftables fallback rejects all IPv6 egress except loopback, RouteWard's own traffic and neighbour discovery, and startup fails if it cannot be installed.
+- Key the WinDivert PID cache by protocol, address family and port, purge it on socket close, and shorten its TTL.
+- Desktop: add a Content-Security-Policy to the UI page and require `POST` on every mutating API route.
+- CI and release workflows run with least-privilege permissions and SHA-pinned actions.
+
+### Fixed
+- Desktop bridge and UI report daemon errors (`{error, errorKey}` with 4xx/5xx status) instead of returning `200` and showing a success toast; error toasts stay until dismissed.
+- The system proxy toggle reflects the real Windows setting through the new `GET /api/system-proxy`.
+- UDP telemetry keeps one record per flow with an idle timeout instead of one never-closed record per datagram.
+- `regex:` rules keep the case of their pattern (`\D`, `\W`, `\S` were turned into `\d`, `\w`, `\s`) and match case-insensitively; PAC handles the prefix the same way.
+- Fake-IP allocation no longer overwrites a live mapping when the pool wraps, and concurrent lookups of one domain share one address.
+- Retry IP Helper table reads when the table grows, so connections are no longer intermittently attributed to an unknown process and blocked.
+- SOCKS5 UDP associations through TLS proxy nodes and IPv6 proxy hosts.
+- Linux: the Fake-IP drop rules and raw-socket guard follow the configured `fakeIpCidr`.
+- Listener bind failures now abort engine start with an error instead of silently black-holing traffic.
+- NAT sessions expire, the pending SYN queue is bounded, and relay teardown no longer leaks the client's trailing packets.
+- Editing a proxy keeps its imported SNI and enabled state; invalid imported palettes no longer crash the UI.
+- Service start, stop and `reg delete` failures are reported instead of ignored.
+- CI builds the UI in each job instead of passing it through artifacts, which had exhausted the artifact quota and skipped every Rust job.
+
+### Changed
+- Throttle connection update events and keep the log file open with a periodic flush (`logFlushIntervalMs`).
+- Cache direct resolutions of Fake-IP targets, the system resolver list and the Linux conntrack table.
+- Accessibility: modal focus trap, labelled form fields, keyboard-selectable connection rows, and a higher-contrast Dracula secondary text color.
+- New tunables in `configs/system_constants.json` (UDP flow idle timeout, telemetry update interval, PID cache TTL, NAT session expiry, SYN queue size, fragment verdict cache, relay close grace, DNS and conntrack caches).
+- The Windows test suite provisions its own SOCKS5 proxy and rule; the repository guard covers more file types, enumerates tracked files and checks locale key usage and release notes.
+
 ## [v2026.1116.00] - 2026-11-16
 
 ### Changed

@@ -41,6 +41,8 @@ Bien que WinDivert soit une bibliothèque d'interception réseau open-source lé
 **Solution** :
 Les binaires WinDivert ne sont jamais versionnés dans Git. Télécharger et vérifier l'archive officielle WinDivert 2.2.2-A via le script fourni :
 
+`WinDivert.dll` n'est chargée que depuis le dossier de l'exécutable (les entrées de `windivertDllPaths` y sont résolues) : la placer à côté de `routeward.exe` ou sous `third_party/windivert/bin/` à cet endroit. La variable `ROUTEWARD_WINDIVERT_DLL_PATH` n'est prise en compte que par les builds de débogage ; les builds de production l'ignorent.
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
 ```
@@ -114,6 +116,7 @@ Les flux routés via un noeud `http` ou `https` échouent avec une erreur `407 P
 
 **Solution** :
 - **SSPI Windows (`Negotiate` / `NTLM`)** : Laisser les champs utilisateur et mot de passe vides sur le noeud pour utiliser la session Windows active, ou renseigner des identifiants explicites si le proxy exige une authentification basique.
+- **Identifiants Basic** : les identifiants Basic ne sont plus envoyés de façon préemptive à un proxy HTTP en clair. RouteWard envoie d'abord `CONNECT` sans identifiants et répond par eux à un `407` proposant `Basic` ; avec un noeud proxy `https` (TLS), ils partent toujours dès la première requête.
 - **Certificat d'inspection auto-signé** : Activer `tlsSkipVerify` sur le noeud proxy `https` uniquement pour un proxy d'entreprise de confiance dont l'autorité racine n'est pas installée sur le poste.
 
 ## 10. Erreur de permission sur les profils nommés (dossier `profiles/`)

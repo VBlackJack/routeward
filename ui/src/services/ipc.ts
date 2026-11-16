@@ -15,6 +15,7 @@
  */
 
 import {
+  buildDefaultPacUrl,
   DEFAULT_PROFILE_DATA,
   SYSTEM_CONSTANTS,
   UI_CONFIG
@@ -61,7 +62,8 @@ export {
   type ParsedSseFrame
 };
 
-const PRIORITY_STEP = 5;
+/** HTTP status used for a request the daemon understood but could not apply. */
+const HTTP_STATUS_CONFLICT = 409;
 
 export class HttpResponseError extends Error {
   public readonly status: number;
@@ -151,7 +153,8 @@ export class RouteWardClientService {
   private logs: LogEntry[] = [];
   private fakeIps: FakeIpEntry[] = [];
   private listeners = new Set<() => void>();
-  private streamRunning = false;
+  private activeStreamSignal: AbortSignal | null = null;
+  private pendingNotifyTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     this.profile = createInitialProfile();
@@ -167,9 +170,29 @@ export class RouteWardClientService {
   }
 
   private notifyListeners(): void {
+    if (this.pendingNotifyTimer !== null) {
+      clearTimeout(this.pendingNotifyTimer);
+      this.pendingNotifyTimer = null;
+    }
     for (const listener of this.listeners) {
       listener();
     }
+  }
+
+  /**
+   * Coalesces notifications triggered by SSE bursts: at most one listener pass per
+   * `STREAM_NOTIFY_COALESCE_MS`, so a burst of events costs a single UI render.
+   */
+  private scheduleNotifyListeners(): void {
+    if (this.pendingNotifyTimer !== null) {
+      return;
+    }
+    this.pendingNotifyTimer = setTimeout(() => {
+      this.pendingNotifyTimer = null;
+      for (const listener of this.listeners) {
+        listener();
+      }
+    }, UI_CONFIG.STREAM_NOTIFY_COALESCE_MS);
   }
 
   public applyFullState(state: DaemonFullState): void {
@@ -222,7 +245,7 @@ export class RouteWardClientService {
     if (event.streamType === 'event' && event.payload) {
       const wasDisconnected = !this.diagnostics.daemonConnected;
       this.applyTelemetryPayload(event.payload);
-      this.notifyListeners();
+      this.scheduleNotifyListeners();
       return wasDisconnected;
     }
     return false;
@@ -306,7 +329,8 @@ export class RouteWardClientService {
   ): TrackedConnection[] {
     const cap = Math.max(
       1,
-      SYSTEM_CONSTANTS.telemetry.maxConnectionHistoryEntries ?? 500
+      SYSTEM_CONSTANTS.telemetry.maxConnectionHistoryEntries ??
+        UI_CONFIG.CONNECTION_CACHE_FALLBACK_ENTRIES
     );
     if (list.length <= cap) {
       return list;
@@ -351,16 +375,27 @@ export class RouteWardClientService {
     );
   }
 
-  private handleRequestFailure(err: unknown): void {
-    if (!(err instanceof HttpResponseError)) {
-      this.markDisconnectedState();
+  /**
+   * Network-level failures flip the client to the disconnected state. The error is then
+   * rethrown so a mutation never reports success to the caller: an HTTP error answer means the
+   * bridge is reachable, and an unreachable bridge means the change was not applied either.
+   * Read helpers that return a harmless fallback pass `rethrowNetworkError = false`.
+   */
+  private handleRequestFailure(err: unknown, rethrowNetworkError = true): void {
+    if (err instanceof HttpResponseError) {
+      throw err;
+    }
+    this.markDisconnectedState();
+    if (rethrowNetworkError) {
+      throw err;
     }
   }
 
   private async requestJson<T>(
     url: string,
     method: 'GET' | 'POST' = 'GET',
-    body?: unknown
+    body?: unknown,
+    timeoutMs: number = UI_CONFIG.REQUEST_TIMEOUT_MS
   ): Promise<T> {
     const headers = buildAuthHeaders(
       body !== undefined ? { 'Content-Type': 'application/json' } : undefined
@@ -369,6 +404,11 @@ export class RouteWardClientService {
       method,
       headers,
       cache: 'no-store',
+      signal:
+        typeof AbortSignal !== 'undefined' &&
+        typeof AbortSignal.timeout === 'function'
+          ? AbortSignal.timeout(timeoutMs)
+          : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined
     });
     if (!response.ok) {
@@ -419,10 +459,11 @@ export class RouteWardClientService {
   }
 
   public startRealtimeStream(abortSignal?: AbortSignal): void {
-    if (this.streamRunning) {
+    if (this.activeStreamSignal && !this.activeStreamSignal.aborted) {
       return;
     }
-    this.streamRunning = true;
+    const streamSignal = abortSignal ?? new AbortController().signal;
+    this.activeStreamSignal = streamSignal;
 
     void runRealtimeSseLoop(
       {
@@ -435,9 +476,11 @@ export class RouteWardClientService {
         onDisconnected: () => this.markDisconnectedState(),
         onStreamEvent: (ev) => this.applyStreamEvent(ev)
       },
-      abortSignal
+      streamSignal
     ).finally(() => {
-      this.streamRunning = false;
+      if (this.activeStreamSignal === streamSignal) {
+        this.activeStreamSignal = null;
+      }
     });
   }
 
@@ -587,15 +630,24 @@ export class RouteWardClientService {
   public async terminateConnection(
     connectionId: string
   ): Promise<TrackedConnection[]> {
+    let terminated = false;
     try {
-      await this.requestJson<{ terminated: boolean }>(
+      const res = await this.requestJson<{ terminated: boolean }>(
         UI_CONFIG.API_ENDPOINTS.CONNECTIONS_TERMINATE,
         'POST',
         { connectionId }
       );
+      terminated = res?.terminated === true;
       await this.fetchState();
     } catch (err) {
       this.handleRequestFailure(err);
+    }
+    if (!terminated) {
+      // The daemon answered but there was nothing to terminate (already closed or unknown id).
+      throw new HttpResponseError(
+        HTTP_STATUS_CONFLICT,
+        `Connection ${connectionId} was not terminated`
+      );
     }
     return this.connections;
   }
@@ -624,7 +676,7 @@ export class RouteWardClientService {
         req
       );
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.handleRequestFailure(err, false);
       return null;
     }
   }
@@ -634,7 +686,8 @@ export class RouteWardClientService {
       const report = await this.requestJson<ProxyHealthReport>(
         UI_CONFIG.API_ENDPOINTS.PROXIES_TEST,
         'POST',
-        { proxyId }
+        { proxyId },
+        UI_CONFIG.LONG_REQUEST_TIMEOUT_MS
       );
       await this.fetchState();
       return report;
@@ -649,7 +702,8 @@ export class RouteWardClientService {
       const reports = await this.requestJson<ProxyHealthReport[]>(
         UI_CONFIG.API_ENDPOINTS.PROXIES_TEST_ALL,
         'POST',
-        {}
+        {},
+        UI_CONFIG.LONG_REQUEST_TIMEOUT_MS
       );
       await this.fetchState();
       return reports;
@@ -698,12 +752,23 @@ export class RouteWardClientService {
       .map((l) => l.trim())
       .filter((l) => l && !l.startsWith('#'));
 
+    let firstFailure: HttpResponseError | null = null;
     for (const line of lines) {
       const parsed = this.parseSingleProxyUri(line);
       if (parsed) {
-        await this.upsertProxy(parsed);
-        imported += 1;
+        try {
+          await this.upsertProxy(parsed);
+          imported += 1;
+        } catch (err) {
+          if (!(err instanceof HttpResponseError)) {
+            throw err;
+          }
+          firstFailure = firstFailure ?? err;
+        }
       }
+    }
+    if (imported === 0 && firstFailure) {
+      throw firstFailure;
     }
     return imported;
   }
@@ -730,12 +795,13 @@ export class RouteWardClientService {
       const osConns = await this.requestJson<TrackedConnection[]>(
         UI_CONFIG.API_ENDPOINTS.SCAN_OS,
         'POST',
-        {}
+        {},
+        UI_CONFIG.LONG_REQUEST_TIMEOUT_MS
       );
       await this.fetchState();
       return osConns;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.handleRequestFailure(err, false);
       return this.connections;
     }
   }
@@ -852,8 +918,8 @@ export class RouteWardClientService {
       if (current.priority === neighbor.priority) {
         current.priority =
           direction === 'up'
-            ? Math.max(1, neighbor.priority - PRIORITY_STEP)
-            : neighbor.priority + PRIORITY_STEP;
+            ? Math.max(1, neighbor.priority - UI_CONFIG.PRIORITY_STEP)
+            : neighbor.priority + UI_CONFIG.PRIORITY_STEP;
       } else {
         const temp = current.priority;
         current.priority = neighbor.priority;
@@ -886,13 +952,13 @@ export class RouteWardClientService {
     const clean = domain.trim().toLowerCase();
     if (!clean) return null;
     try {
-      const res = await this.requestJson<{ fakeIp: string | null }>(
+      const res = await this.requestJson<{ allocated: string | null }>(
         UI_CONFIG.API_ENDPOINTS.DNS_ALLOCATE,
         'POST',
         { domain: clean }
       );
       await this.fetchState();
-      return res.fakeIp;
+      return res.allocated;
     } catch (err) {
       this.handleRequestFailure(err);
       return null;
@@ -930,7 +996,12 @@ export class RouteWardClientService {
       started: boolean;
       connected: boolean;
       state?: DaemonFullState;
-    }>(UI_CONFIG.API_ENDPOINTS.DAEMON_START, 'POST', {});
+    }>(
+      UI_CONFIG.API_ENDPOINTS.DAEMON_START,
+      'POST',
+      {},
+      UI_CONFIG.LONG_REQUEST_TIMEOUT_MS
+    );
     if (res.state) {
       this.applyFullState(res.state);
     } else {
@@ -965,14 +1036,16 @@ export class RouteWardClientService {
         'POST',
         payload
       );
-    } catch {
+    } catch (err) {
+      if (err instanceof HttpResponseError) {
+        throw err;
+      }
       // Ignore network errors when UI runs standalone outside desktop host
     }
   }
 
   public async getPacStatus(): Promise<PacStatus> {
-    const net = SYSTEM_CONSTANTS.network;
-    const fallbackUrl = `http://${net.localBindHost}:${net.defaultPacPort}/proxy.pac`;
+    const fallbackUrl = buildDefaultPacUrl();
     try {
       return await this.requestJson<PacStatus>(
         UI_CONFIG.API_ENDPOINTS.SYSTEM_PAC,
@@ -989,6 +1062,17 @@ export class RouteWardClientService {
       'POST',
       { enabled }
     );
+  }
+
+  public async getSystemProxyStatus(): Promise<AutostartStatus> {
+    try {
+      return await this.requestJson<AutostartStatus>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_PROXY,
+        'GET'
+      );
+    } catch {
+      return { enabled: false };
+    }
   }
 
   public async getAutostartStatus(): Promise<AutostartStatus> {

@@ -20,6 +20,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const UNKNOWN_PROCESS_NAME: &str = "system";
+
+/// Maximum size-query/fetch attempts for the IP Helper tables. The TCP/UDP tables can grow
+/// between the size query and the fetch (ERROR_INSUFFICIENT_BUFFER), so the call is retried
+/// with the size reported by the failed attempt.
+#[cfg(windows)]
+const IPHELPER_MAX_FETCH_ATTEMPTS: usize = 8;
+
+/// Upper bound for the PID identity cache. Expired entries are purged first; if the cache is
+/// still full the oldest entries are dropped.
+const MAX_PID_CACHE_ENTRIES: usize = 4096;
 const PATH_SEPARATORS: &[char] = &['/', '\\'];
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -131,6 +141,59 @@ impl ProcessResolver {
             return self.resolve_by_pid(pid);
         }
         ProcessIdentity::default()
+    }
+
+    /// Async-safe variant of [`Self::find_pid_for_tcp_port`]: the OS table walk runs on the
+    /// blocking thread pool so it never stalls the async runtime.
+    pub async fn find_pid_for_tcp_port_async(local_port: u16) -> Option<u32> {
+        tokio::task::spawn_blocking(move || Self::find_pid_for_tcp_port(local_port))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Async-safe variant of [`Self::find_pid_for_udp_port`].
+    pub async fn find_pid_for_udp_port_async(local_port: u16) -> Option<u32> {
+        tokio::task::spawn_blocking(move || Self::find_pid_for_udp_port(local_port))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Async-safe variant of [`Self::resolve_by_local_tcp_port`].
+    pub async fn resolve_by_local_tcp_port_async(&self, local_port: u16) -> ProcessIdentity {
+        let resolver = self.clone();
+        tokio::task::spawn_blocking(move || resolver.resolve_by_local_tcp_port(local_port))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Async-safe variant of [`Self::resolve_by_local_udp_port`].
+    pub async fn resolve_by_local_udp_port_async(&self, local_port: u16) -> ProcessIdentity {
+        let resolver = self.clone();
+        tokio::task::spawn_blocking(move || resolver.resolve_by_local_udp_port(local_port))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Async-safe variant of [`Self::resolve_tcp_port_attribution`].
+    pub async fn resolve_tcp_port_attribution_async(&self, local_port: u16) -> ProcessAttribution {
+        let resolver = self.clone();
+        tokio::task::spawn_blocking(move || resolver.resolve_tcp_port_attribution(local_port))
+            .await
+            .unwrap_or_else(|e| ProcessAttribution::Unknown {
+                reason: format!("attribution task failed: {e}"),
+            })
+    }
+
+    /// Async-safe variant of [`Self::resolve_udp_port_attribution`].
+    pub async fn resolve_udp_port_attribution_async(&self, local_port: u16) -> ProcessAttribution {
+        let resolver = self.clone();
+        tokio::task::spawn_blocking(move || resolver.resolve_udp_port_attribution(local_port))
+            .await
+            .unwrap_or_else(|e| ProcessAttribution::Unknown {
+                reason: format!("attribution task failed: {e}"),
+            })
     }
 
     /// Resolves the owning process(es) for `local_port` (TCP), distinguishing single-owner,
@@ -343,6 +406,7 @@ impl ProcessResolver {
         };
 
         if has_resolved_image {
+            self.purge_cache_if_full();
             self.cache.insert(
                 pid,
                 CachedProcess {
@@ -353,6 +417,29 @@ impl ProcessResolver {
         }
 
         identity
+    }
+
+    /// Keeps the PID cache bounded: drops expired entries, then the oldest ones if still full.
+    fn purge_cache_if_full(&self) {
+        if self.cache.len() < MAX_PID_CACHE_ENTRIES {
+            return;
+        }
+        let ttl = self.cache_ttl;
+        self.cache
+            .retain(|_, entry| entry.cached_at.elapsed() < ttl);
+        while self.cache.len() >= MAX_PID_CACHE_ENTRIES {
+            let oldest = self
+                .cache
+                .iter()
+                .min_by_key(|item| item.value().cached_at)
+                .map(|item| *item.key());
+            match oldest {
+                Some(pid) => {
+                    self.cache.remove(&pid);
+                }
+                None => break,
+            }
+        }
     }
 
     pub fn extract_basename(path_str: &str) -> String {
@@ -509,16 +596,6 @@ impl ProcessResolver {
         out
     }
 
-    #[cfg(not(windows))]
-    fn scan_exe_dir_bounded(
-        _dir: &std::path::Path,
-        _depth: usize,
-        _max_depth: usize,
-        _max_entries: usize,
-        _out: &mut Vec<(String, String)>,
-    ) {
-    }
-
     #[cfg(windows)]
     fn scan_exe_dir_bounded(
         dir: &std::path::Path,
@@ -588,137 +665,115 @@ impl ProcessResolver {
             return None;
         }
 
-        let mut buffer = vec![0u8; buffer_size as usize];
-        if fetch(buffer.as_mut_ptr(), &mut buffer_size) != NO_ERROR {
-            return None;
+        // The table can grow between the size query and the fetch: retry with the size the
+        // failed attempt reported instead of giving up (which would look like "unknown process").
+        for _ in 0..IPHELPER_MAX_FETCH_ATTEMPTS {
+            let mut buffer = vec![0u8; buffer_size as usize];
+            match fetch(buffer.as_mut_ptr(), &mut buffer_size) {
+                NO_ERROR => return Some(buffer),
+                ERROR_INSUFFICIENT_BUFFER => continue,
+                _ => return None,
+            }
         }
-        Some(buffer)
+        None
+    }
+
+    /// Views an IP Helper `MIB_*TABLE_OWNER_PID` buffer as its row slice.
+    ///
+    /// All of these tables are a `u32` entry count followed by the row array, so one generic
+    /// accessor serves TCP/UDP over IPv4/IPv6. The declared count is clamped to the buffer.
+    ///
+    /// # Safety
+    /// `buffer` must hold a table of rows of type `R` filled in by the matching IP Helper call.
+    #[cfg(windows)]
+    unsafe fn iphelper_rows<R>(buffer: &[u8]) -> &[R] {
+        let header = std::mem::size_of::<u32>().next_multiple_of(std::mem::align_of::<R>());
+        if buffer.len() < header {
+            return &[];
+        }
+        let declared = unsafe { *(buffer.as_ptr() as *const u32) } as usize;
+        let capacity = (buffer.len() - header) / std::mem::size_of::<R>().max(1);
+        let count = declared.min(capacity);
+        unsafe { std::slice::from_raw_parts(buffer.as_ptr().add(header) as *const R, count) }
+    }
+
+    /// Finds the owning PID of `local_port` in one IP Helper table (one family/protocol).
+    /// `row_port_pid` extracts the raw network-order port field and the owning PID from a row.
+    #[cfg(windows)]
+    fn find_pid_in_table<R>(
+        buffer: &[u8],
+        local_port: u16,
+        row_port_pid: impl Fn(&R) -> (u32, u32),
+    ) -> Option<u32> {
+        let rows: &[R] = unsafe { Self::iphelper_rows::<R>(buffer) };
+        rows.iter().find_map(|row| {
+            let (raw_port, pid) = row_port_pid(row);
+            (u16::from_be((raw_port & 0xFFFF) as u16) == local_port).then_some(pid)
+        })
     }
 
     #[cfg(windows)]
     pub fn find_pid_for_tcp_port(local_port: u16) -> Option<u32> {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
-            GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
-            MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+            GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
+            TCP_TABLE_OWNER_PID_ALL,
         };
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
-        if let Some(buffer) = Self::query_iphelper_buffer(|ptr, size| unsafe {
-            GetExtendedTcpTable(
-                ptr as *mut _,
-                size,
-                0,
-                AF_INET as u32,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            )
-        }) {
-            let table_ptr = buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
-            let num_entries = unsafe { (*table_ptr).dwNumEntries } as usize;
-            let first_row_ptr = unsafe { (*table_ptr).table.as_ptr() };
-            let rows: &[MIB_TCPROW_OWNER_PID] =
-                unsafe { std::slice::from_raw_parts(first_row_ptr, num_entries) };
+        let fetch_family = |family: u32| {
+            Self::query_iphelper_buffer(|ptr, size| unsafe {
+                GetExtendedTcpTable(ptr as *mut _, size, 0, family, TCP_TABLE_OWNER_PID_ALL, 0)
+            })
+        };
 
-            for row in rows {
-                let port_net = (row.dwLocalPort & 0xFFFF) as u16;
-                if u16::from_be(port_net) == local_port {
-                    return Some(row.dwOwningPid);
-                }
+        if let Some(buffer) = fetch_family(AF_INET as u32) {
+            if let Some(pid) =
+                Self::find_pid_in_table::<MIB_TCPROW_OWNER_PID>(&buffer, local_port, |r| {
+                    (r.dwLocalPort, r.dwOwningPid)
+                })
+            {
+                return Some(pid);
             }
         }
-
-        if let Some(buffer) = Self::query_iphelper_buffer(|ptr, size| unsafe {
-            GetExtendedTcpTable(
-                ptr as *mut _,
-                size,
-                0,
-                AF_INET6 as u32,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            )
-        }) {
-            let table_ptr = buffer.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
-            let num_entries = unsafe { (*table_ptr).dwNumEntries } as usize;
-            let first_row_ptr = unsafe { (*table_ptr).table.as_ptr() };
-            let rows: &[MIB_TCP6ROW_OWNER_PID] =
-                unsafe { std::slice::from_raw_parts(first_row_ptr, num_entries) };
-
-            for row in rows {
-                let port_net = (row.dwLocalPort & 0xFFFF) as u16;
-                if u16::from_be(port_net) == local_port {
-                    return Some(row.dwOwningPid);
-                }
-            }
-        }
-
-        None
+        let buffer = fetch_family(AF_INET6 as u32)?;
+        Self::find_pid_in_table::<MIB_TCP6ROW_OWNER_PID>(&buffer, local_port, |r| {
+            (r.dwLocalPort, r.dwOwningPid)
+        })
     }
 
     #[cfg(windows)]
     pub fn find_pid_for_udp_port(local_port: u16) -> Option<u32> {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
-            GetExtendedUdpTable, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
-            MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
+            GetExtendedUdpTable, MIB_UDP6ROW_OWNER_PID, MIB_UDPROW_OWNER_PID, UDP_TABLE_OWNER_PID,
         };
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
-        if let Some(buffer) = Self::query_iphelper_buffer(|ptr, size| unsafe {
-            GetExtendedUdpTable(
-                ptr as *mut _,
-                size,
-                0,
-                AF_INET as u32,
-                UDP_TABLE_OWNER_PID,
-                0,
-            )
-        }) {
-            let table_ptr = buffer.as_ptr() as *const MIB_UDPTABLE_OWNER_PID;
-            let num_entries = unsafe { (*table_ptr).dwNumEntries } as usize;
-            let first_row_ptr = unsafe { (*table_ptr).table.as_ptr() };
-            let rows: &[MIB_UDPROW_OWNER_PID] =
-                unsafe { std::slice::from_raw_parts(first_row_ptr, num_entries) };
+        let fetch_family = |family: u32| {
+            Self::query_iphelper_buffer(|ptr, size| unsafe {
+                GetExtendedUdpTable(ptr as *mut _, size, 0, family, UDP_TABLE_OWNER_PID, 0)
+            })
+        };
 
-            for row in rows {
-                let port_net = (row.dwLocalPort & 0xFFFF) as u16;
-                if u16::from_be(port_net) == local_port {
-                    return Some(row.dwOwningPid);
-                }
+        if let Some(buffer) = fetch_family(AF_INET as u32) {
+            if let Some(pid) =
+                Self::find_pid_in_table::<MIB_UDPROW_OWNER_PID>(&buffer, local_port, |r| {
+                    (r.dwLocalPort, r.dwOwningPid)
+                })
+            {
+                return Some(pid);
             }
         }
-
-        if let Some(buffer) = Self::query_iphelper_buffer(|ptr, size| unsafe {
-            GetExtendedUdpTable(
-                ptr as *mut _,
-                size,
-                0,
-                AF_INET6 as u32,
-                UDP_TABLE_OWNER_PID,
-                0,
-            )
-        }) {
-            let table_ptr = buffer.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID;
-            let num_entries = unsafe { (*table_ptr).dwNumEntries } as usize;
-            let first_row_ptr = unsafe { (*table_ptr).table.as_ptr() };
-            let rows: &[MIB_UDP6ROW_OWNER_PID] =
-                unsafe { std::slice::from_raw_parts(first_row_ptr, num_entries) };
-
-            for row in rows {
-                let port_net = (row.dwLocalPort & 0xFFFF) as u16;
-                if u16::from_be(port_net) == local_port {
-                    return Some(row.dwOwningPid);
-                }
-            }
-        }
-
-        None
+        let buffer = fetch_family(AF_INET6 as u32)?;
+        Self::find_pid_in_table::<MIB_UDP6ROW_OWNER_PID>(&buffer, local_port, |r| {
+            (r.dwLocalPort, r.dwOwningPid)
+        })
     }
 
     #[cfg(windows)]
     fn enumerate_established_tcp_rows(max_entries: usize) -> Vec<(u32, u16, String, u16)> {
         use std::net::{Ipv4Addr, Ipv6Addr};
         use windows_sys::Win32::NetworkManagement::IpHelper::{
-            GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
-            MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_ESTAB,
+            GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCP_STATE_ESTAB,
             TCP_TABLE_OWNER_PID_CONNECTIONS,
         };
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
@@ -734,11 +789,7 @@ impl ProcessResolver {
                 0,
             )
         }) {
-            let table_ptr = buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
-            let num_entries = unsafe { (*table_ptr).dwNumEntries } as usize;
-            let first_row_ptr = unsafe { (*table_ptr).table.as_ptr() };
-            let rows: &[MIB_TCPROW_OWNER_PID] =
-                unsafe { std::slice::from_raw_parts(first_row_ptr, num_entries) };
+            let rows: &[MIB_TCPROW_OWNER_PID] = unsafe { Self::iphelper_rows(&buffer) };
 
             for row in rows {
                 if row.dwState != MIB_TCP_STATE_ESTAB as u32 {
@@ -773,11 +824,7 @@ impl ProcessResolver {
                     0,
                 )
             }) {
-                let table_ptr = buffer.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
-                let num_entries = unsafe { (*table_ptr).dwNumEntries } as usize;
-                let first_row_ptr = unsafe { (*table_ptr).table.as_ptr() };
-                let rows: &[MIB_TCP6ROW_OWNER_PID] =
-                    unsafe { std::slice::from_raw_parts(first_row_ptr, num_entries) };
+                let rows: &[MIB_TCP6ROW_OWNER_PID] = unsafe { Self::iphelper_rows(&buffer) };
 
                 for row in rows {
                     if row.dwState != MIB_TCP_STATE_ESTAB as u32 {
@@ -1265,5 +1312,85 @@ mod tests {
                 app.name
             );
         }
+    }
+
+    #[test]
+    fn pid_cache_stays_bounded() {
+        let resolver = ProcessResolver::new(60_000);
+        for pid in 1..=(MAX_PID_CACHE_ENTRIES as u32 + 10) {
+            resolver.purge_cache_if_full();
+            resolver.cache.insert(
+                pid,
+                CachedProcess {
+                    identity: ProcessIdentity::default(),
+                    cached_at: Instant::now(),
+                },
+            );
+        }
+        assert!(resolver.cache.len() <= MAX_PID_CACHE_ENTRIES);
+    }
+
+    #[test]
+    fn expired_pid_entries_are_purged_when_cache_is_full() {
+        let resolver = ProcessResolver::new(0);
+        for pid in 1..=(MAX_PID_CACHE_ENTRIES as u32) {
+            resolver.cache.insert(
+                pid,
+                CachedProcess {
+                    identity: ProcessIdentity::default(),
+                    cached_at: Instant::now(),
+                },
+            );
+        }
+        resolver.purge_cache_if_full();
+        assert_eq!(resolver.cache.len(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iphelper_buffer_fetch_retries_when_table_grows() {
+        use std::cell::Cell;
+        use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+
+        let calls = Cell::new(0u32);
+        let buffer = ProcessResolver::query_iphelper_buffer(|ptr, size| {
+            let n = calls.get();
+            calls.set(n + 1);
+            match n {
+                // Size query reports 16 bytes.
+                0 => {
+                    *size = 16;
+                    ERROR_INSUFFICIENT_BUFFER
+                }
+                // The table grew meanwhile: first fetch is too small.
+                1 => {
+                    *size = 32;
+                    ERROR_INSUFFICIENT_BUFFER
+                }
+                _ => {
+                    assert!(*size >= 32);
+                    assert!(!ptr.is_null());
+                    NO_ERROR
+                }
+            }
+        });
+        assert_eq!(buffer.map(|b| b.len()), Some(32));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn iphelper_rows_clamps_declared_count_to_buffer() {
+        let mut buffer = vec![0u8; 4 + 8];
+        buffer[..4].copy_from_slice(&1000u32.to_ne_bytes());
+        let rows: &[[u32; 2]] = unsafe { ProcessResolver::iphelper_rows(&buffer) };
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn async_port_lookup_wrappers_do_not_block_runtime() {
+        // An unused high port resolves to None; the call must complete via spawn_blocking.
+        let _ = ProcessResolver::find_pid_for_tcp_port_async(1).await;
+        let _ = ProcessResolver::find_pid_for_udp_port_async(1).await;
     }
 }

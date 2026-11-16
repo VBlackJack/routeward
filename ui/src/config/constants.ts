@@ -22,6 +22,8 @@ export const SYSTEM_CONSTANTS = systemConstantsJson;
 export const DEFAULT_PROFILE_DATA = defaultProfileJson;
 export const THEMEFORGE_CATALOG_DATA = themeForgeCatalogJson;
 
+const IP_CHECK_URL = 'https://api.ipify.org?format=json';
+
 export const UI_CONFIG = {
   DEFAULT_LOCALE: 'fr',
   SUPPORTED_LOCALES: ['fr', 'en'] as const,
@@ -46,6 +48,27 @@ export const UI_CONFIG = {
   DEFAULT_TEST_PORT: 443,
   TOKEN_HEADER: 'X-RouteWard-Token',
   SSE_RECONNECT_DELAY_MS: 1500,
+  /** Minimum delay between two UI renders triggered by a burst of SSE events. */
+  STREAM_NOTIFY_COALESCE_MS: 100,
+  /** Timeout applied to ordinary bridge requests. */
+  REQUEST_TIMEOUT_MS: 30000,
+  /** Timeout for slow bridge operations (health checks, socket scan, daemon launch). */
+  LONG_REQUEST_TIMEOUT_MS: 120000,
+  /** Auto-dismiss delay for non-error toasts; error toasts stay until dismissed. */
+  TOAST_DURATION_MS: 3200,
+  /** Priority gap used when reordering rules. */
+  PRIORITY_STEP: 5,
+  /** Connection cache bound used when system constants do not provide one. */
+  CONNECTION_CACHE_FALLBACK_ENTRIES: 500,
+  MAX_PORT: 65535,
+  PAC_PATH: '/proxy.pac',
+  /** Quick-launch presets of the process launcher modal. */
+  IP_CHECK_URL,
+  QUICK_LAUNCH_PRESETS: [
+    { exe: 'curl.exe', args: IP_CHECK_URL },
+    { exe: 'powershell.exe', args: '-NoExit' },
+    { exe: 'cmd.exe', args: '' }
+  ],
   API_ENDPOINTS: {
     STATE: '/api/state',
     EVENTS: '/api/events',
@@ -82,3 +105,9 @@ export const UI_CONFIG = {
     LOCALE: '/api/locale'
   }
 } as const;
+
+/** Default PAC URL served by the desktop bridge, built from the shipped system constants. */
+export function buildDefaultPacUrl(): string {
+  const net = SYSTEM_CONSTANTS.network;
+  return `http://${net.localBindHost}:${net.defaultPacPort}${UI_CONFIG.PAC_PATH}`;
+}

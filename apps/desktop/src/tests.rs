@@ -935,7 +935,7 @@ async fn engine_toggle_route_validates_payload_and_surfaces_transport_errors() {
 
     let ctrl =
         routeward_core::interceptor::RouteWardController::new(custom_consts.clone(), profile, "en");
-    let svc = DaemonIpcService::bind(ctrl).expect("bind test ipc");
+    let svc = DaemonIpcService::bind_for_test(ctrl).expect("bind test ipc");
     let svc_task = tokio::spawn(async move {
         let _ = svc.run_accept_loop().await;
     });
@@ -961,4 +961,267 @@ async fn engine_toggle_route_validates_payload_and_surfaces_transport_errors() {
         Some(ERR_KEY_INTERCEPTOR_DRIVER)
     );
     svc_task.abort();
+}
+
+#[test]
+fn http_status_line_covers_payload_too_large_and_unprocessable_entity() {
+    use crate::http_status_line;
+
+    assert_eq!(http_status_line(413), "HTTP/1.1 413 Payload Too Large");
+    assert_eq!(http_status_line(422), "HTTP/1.1 422 Unprocessable Entity");
+    assert_eq!(http_status_line(409), "HTTP/1.1 409 Conflict");
+    assert_eq!(http_status_line(599), "HTTP/1.1 500 Internal Server Error");
+}
+
+#[test]
+fn ipc_error_status_maps_transport_protocol_and_remote_errors() {
+    use crate::routes::ipc_error_status;
+    use routeward_core::error::{
+        ERR_KEY_CHAIN_EMPTY, ERR_KEY_CLEANUP_DAEMON_ACTIVE, ERR_KEY_CONFIG_SAVE,
+        ERR_KEY_DAEMON_INSECURE_PROFILE, ERR_KEY_INVALID_URI,
+    };
+    use routeward_core::ipc::IpcCallError;
+
+    let remote = |key: Option<&str>| IpcCallError::Remote {
+        message: "rejected".to_string(),
+        error_key: key.map(ToString::to_string),
+    };
+
+    assert_eq!(
+        ipc_error_status(&IpcCallError::Transport("pipe closed".to_string())),
+        503
+    );
+    assert_eq!(
+        ipc_error_status(&IpcCallError::Protocol("bad json".to_string())),
+        500
+    );
+    assert_eq!(ipc_error_status(&remote(None)), 400);
+    assert_eq!(ipc_error_status(&remote(Some(ERR_KEY_INVALID_URI))), 400);
+    assert_eq!(ipc_error_status(&remote(Some(ERR_KEY_CHAIN_EMPTY))), 422);
+    assert_eq!(
+        ipc_error_status(&remote(Some(ERR_KEY_DAEMON_INSECURE_PROFILE))),
+        422
+    );
+    assert_eq!(
+        ipc_error_status(&remote(Some(ERR_KEY_CLEANUP_DAEMON_ACTIVE))),
+        409
+    );
+    assert_eq!(ipc_error_status(&remote(Some(ERR_KEY_CONFIG_SAVE))), 500);
+}
+
+#[tokio::test]
+async fn mutation_routes_surface_daemon_errors_instead_of_reporting_success() {
+    use crate::handle_api_route;
+
+    let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let unique_suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    #[cfg(windows)]
+    {
+        constants.ipc.windows_pipe_name =
+            format!(r"\\.\pipe\routeward-mutation-missing-{unique_suffix}");
+    }
+    #[cfg(not(windows))]
+    {
+        constants.ipc.unix_socket_path =
+            format!("/tmp/routeward-mutation-missing-{unique_suffix}.sock");
+    }
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let proxy_json = r#"{"id":"p1","name":"Proxy","protocol":"socks5","host":"127.0.0.1","port":1080,"auth":null,"udpEnabled":true,"tls":false,"sni":null,"enabled":true,"lastLatencyMs":null,"exitIp":null}"#.to_string();
+    let rule_json = r#"{"id":"r1","name":"Rule","enabled":true,"priority":10,"processPatterns":[],"domainPatterns":[],"ipCidrs":[],"portRanges":[],"protocol":"any","action":{"type":"direct"}}"#.to_string();
+    let chain_json =
+        r#"{"id":"c1","name":"Chain","strategy":"sequence","proxyIds":[],"enabled":true}"#
+            .to_string();
+    let profile_json = serde_json::to_string(&profile).expect("profile json");
+    let bridge = DesktopCommandBridge::new(constants, profile, "en");
+
+    let cases: Vec<(&str, String)> = vec![
+        ("/api/proxies/upsert", proxy_json),
+        ("/api/proxies/remove", r#"{"proxyId":"p1"}"#.to_string()),
+        ("/api/chains/upsert", chain_json),
+        ("/api/chains/remove", r#"{"chainId":"c1"}"#.to_string()),
+        ("/api/rules/upsert", rule_json),
+        ("/api/rules/remove", r#"{"ruleId":"r1"}"#.to_string()),
+        ("/api/engine/mode", r#"{"mode":"relay"}"#.to_string()),
+        ("/api/profile/replace", profile_json),
+        (
+            "/api/connections/terminate",
+            r#"{"connectionId":"conn-1"}"#.to_string(),
+        ),
+        (
+            "/api/dns/allocate",
+            r#"{"domain":"example.com"}"#.to_string(),
+        ),
+    ];
+    for (path, body) in cases {
+        let res = handle_api_route("POST", path, &body, &bridge, None)
+            .await
+            .unwrap_or_else(|| panic!("route {path} must answer"));
+        assert_eq!(res.0, 503, "{path} must report the unreachable daemon");
+        let json: serde_json::Value = serde_json::from_slice(&res.2).expect("json error body");
+        assert!(
+            json["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "{path} must carry an error message"
+        );
+        assert!(
+            json.get("errorKey").is_some(),
+            "{path} must carry an errorKey field"
+        );
+    }
+
+    // Malformed payloads are 400 on every mutation route, including the theme route.
+    for path in [
+        "/api/theme",
+        "/api/proxies/upsert",
+        "/api/connections/terminate",
+        "/api/dns/allocate",
+        "/api/engine/mode",
+    ] {
+        let res = handle_api_route("POST", path, "{not json", &bridge, None)
+            .await
+            .expect("route response");
+        assert_eq!(res.0, 400, "{path} must reject malformed JSON");
+    }
+}
+
+async fn spawn_test_loopback_server(
+    bridge: Arc<DesktopCommandBridge>,
+    with_static_assets: bool,
+) -> (u16, String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let port = listener.local_addr().expect("local_addr").port();
+    let token = generate_ephemeral_token();
+    let token_for_server = token.clone();
+    let server_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let b = Arc::clone(&bridge);
+            let t = token_for_server.clone();
+            tokio::spawn(async move {
+                if with_static_assets {
+                    serve_loopback_http_connection(
+                        stream,
+                        port,
+                        &t,
+                        &b,
+                        None,
+                        Some(|path: &str| {
+                            if path.starts_with("/assets/app.js") {
+                                ("application/javascript; charset=utf-8", &b"void 0;"[..])
+                            } else {
+                                ("text/html; charset=utf-8", &b"<html></html>"[..])
+                            }
+                        }),
+                    )
+                    .await;
+                } else {
+                    serve_loopback_api_connection(stream, port, &t, &b).await;
+                }
+            });
+        }
+    });
+    (port, token, server_task)
+}
+
+#[tokio::test]
+async fn mutating_routes_reject_get_and_system_proxy_getter_reports_state() {
+    let constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let bridge = Arc::new(DesktopCommandBridge::new(constants, profile, "en"));
+    let (port, token, server_task) = spawn_test_loopback_server(bridge, false).await;
+
+    let mutating_paths = [
+        "/api/connections/terminate",
+        "/api/connections/clear",
+        "/api/logs/clear",
+        "/api/profile/replace",
+        "/api/rules/upsert",
+        "/api/rules/remove",
+        "/api/rules/evaluate",
+        "/api/proxies/upsert",
+        "/api/proxies/remove",
+        "/api/proxies/test",
+        "/api/proxies/test-all",
+        "/api/chains/upsert",
+        "/api/chains/remove",
+        "/api/dns/allocate",
+        "/api/dns/flush",
+        "/api/scan-os",
+        "/api/launch-process",
+    ];
+    for route in mutating_paths {
+        let resp = send_raw_http(
+            port,
+            &format!(
+                "GET {route} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-RouteWard-Token: {token}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "Expected 405 on GET {route}, got: {resp}"
+        );
+    }
+
+    let get_proxy_resp = send_raw_http(
+        port,
+        &format!(
+            "GET /api/system-proxy HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-RouteWard-Token: {token}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        get_proxy_resp.starts_with("HTTP/1.1 200 OK"),
+        "Expected 200 on GET /api/system-proxy, got: {get_proxy_resp}"
+    );
+    assert!(
+        get_proxy_resp.contains("\"enabled\":"),
+        "GET /api/system-proxy must report the enabled flag, got: {get_proxy_resp}"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn index_page_carries_csp_while_scripts_do_not() {
+    let constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let bridge = Arc::new(DesktopCommandBridge::new(constants, profile, "en"));
+    let (port, _token, server_task) = spawn_test_loopback_server(bridge, true).await;
+
+    let index_resp = send_raw_http(
+        port,
+        &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    )
+    .await;
+    let expected_header = format!("Content-Security-Policy: {INDEX_CONTENT_SECURITY_POLICY}\r\n");
+    assert!(
+        index_resp.contains(&expected_header),
+        "index response must carry the CSP, got: {index_resp}"
+    );
+    assert!(INDEX_CONTENT_SECURITY_POLICY.contains("default-src 'self'"));
+    assert!(INDEX_CONTENT_SECURITY_POLICY.contains("script-src 'self';"));
+    assert!(INDEX_CONTENT_SECURITY_POLICY.contains("connect-src 'self'"));
+
+    let js_resp = send_raw_http(
+        port,
+        &format!("GET /assets/app.js HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    )
+    .await;
+    assert!(
+        !js_resp.contains("Content-Security-Policy"),
+        "script assets must not carry the page CSP, got: {js_resp}"
+    );
+
+    server_task.abort();
 }

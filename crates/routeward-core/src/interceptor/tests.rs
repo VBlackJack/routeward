@@ -113,13 +113,18 @@ async fn run_transparent_session(
 
 #[tokio::test]
 async fn transparent_relay_rejects_and_logs_unknown_peer_connection() {
-    let constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    // The listener stands in for the relay, so it must own the relay port: on a
+    // Linux host with conntrack loaded, a direct loopback connection reports its
+    // real destination as the original one, and only a destination equal to the
+    // relay port is recognised as "not redirected".
+    let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+    constants.network.default_transparent_tcp_port = addr.port();
     let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
     profile.enable_logging = false;
     let controller = RouteWardController::new(constants, profile, "en");
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
 
     let client_task = tokio::spawn(async move {
         let mut client = TcpStream::connect(addr).await.expect("connect");
@@ -1351,7 +1356,7 @@ async fn live_profile_replacement_reapplies_interception_and_flushes_dns_cache_o
     profile.security_policy.kill_switch_enabled = false;
 
     let controller = RouteWardController::new(constants, profile.clone(), "en");
-    controller.start_engine();
+    controller.start_engine().expect("engine start");
     assert!(controller.is_running());
 
     let mut updated_profile = profile;

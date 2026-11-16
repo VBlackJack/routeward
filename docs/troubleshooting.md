@@ -41,6 +41,8 @@ Although WinDivert is a legitimate open-source packet interception library, some
 **Resolution**:
 WinDivert binaries are never committed to Git. Download and verify the official WinDivert 2.2.2-A binaries using the included PowerShell script:
 
+`WinDivert.dll` is only loaded from under the executable directory (the `windivertDllPaths` entries are resolved against it), so place it next to `routeward.exe` or under `third_party/windivert/bin/` there. The `ROUTEWARD_WINDIVERT_DLL_PATH` override is honoured by debug builds only; release builds ignore it.
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\fetch-windivert.ps1
 ```
@@ -114,6 +116,7 @@ Connections through an upstream `http` or `https` proxy fail with authentication
 
 **Resolution**:
 - **Windows SSPI (`Negotiate` / `NTLM`)**: Leave username and password empty on the upstream node to authenticate with the active Windows session, or supply explicit credentials if basic authentication is required.
+- **Basic credentials**: Basic credentials are no longer sent pre-emptively to a plaintext HTTP proxy. RouteWard first sends `CONNECT` without credentials and answers a `407` that offers `Basic` with them; over an `https` proxy node (TLS) they are still sent on the first request.
 - **Self-signed inspection proxies**: Enable `tlsSkipVerify` on the `https` proxy node only when connecting to a trusted enterprise proxy whose root CA is not in the system trust store.
 
 ## 10. Named Profiles Permission Error (`profiles/` Directory)

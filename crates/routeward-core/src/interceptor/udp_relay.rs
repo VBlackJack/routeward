@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use super::dns_handler::DnsReplyCheck;
 use super::{
     RouteWardController, COMPONENT_DNS, COMPONENT_ENGINE, COMPONENT_PROXY, COMPONENT_TRANSPARENT,
     ROUTE_BLOCK_LABEL, ROUTE_DIRECT_LABEL,
@@ -28,7 +29,7 @@ use crate::interceptor::nftables::NftablesInterceptor;
 use crate::process::ProcessResolver;
 use crate::proxy::udp::Socks5UdpTarget;
 use crate::rules::ConnectionRequest;
-use crate::telemetry::{ConnectionStatus, LogLevel, TrackedConnection};
+use crate::telemetry::{udp_flow_key, ConnectionStatus, LogLevel, TrackedConnection};
 use chrono::Utc;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -36,7 +37,101 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use uuid::Uuid;
 
+/// One relayed UDP datagram, ready to be accounted on its aggregated telemetry flow.
+struct UdpDatagramRecord {
+    client_addr: SocketAddr,
+    pid: u32,
+    process_name: String,
+    process_path: String,
+    target_host: String,
+    resolved_domain: Option<String>,
+    target_port: u16,
+    matched_rule: String,
+    route_label: String,
+    /// Real destination when it differs from `target_host` (Direct traffic), for the flow log.
+    real_ip: Option<IpAddr>,
+    latency_ms: u64,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    /// `true` when the datagram went through a proxy or a proxy chain.
+    is_proxied: bool,
+}
+
 impl RouteWardController {
+    /// Accounts one datagram on its (client, target, route) flow: the first datagram creates a
+    /// single telemetry record and an INFO log line, later ones only add their byte counts and are
+    /// logged at debug level.
+    fn record_udp_datagram_flow(&self, rec: UdpDatagramRecord) {
+        let flow_key = match rec.target_host.parse::<IpAddr>() {
+            Ok(ip) => udp_flow_key(
+                rec.client_addr,
+                SocketAddr::new(ip, rec.target_port),
+                &rec.route_label,
+            ),
+            Err(_) => format!(
+                "udp|{}|{}:{}|{}",
+                rec.client_addr, rec.target_host, rec.target_port, rec.route_label
+            ),
+        };
+        let real_ip_fragment = rec
+            .real_ip
+            .map(|ip| format!(", realIp={ip}"))
+            .unwrap_or_default();
+        let started = self.telemetry.record_udp_datagram(
+            &flow_key,
+            || TrackedConnection {
+                id: Uuid::new_v4().to_string(),
+                pid: rec.pid,
+                process_name: rec.process_name.clone(),
+                process_path: rec.process_path.clone(),
+                target_host: rec.target_host.clone(),
+                resolved_domain: rec.resolved_domain.clone(),
+                target_port: rec.target_port,
+                protocol: TransportProtocol::Udp,
+                matched_rule: rec.matched_rule.clone(),
+                route_label: rec.route_label.clone(),
+                latency_ms: rec.latency_ms,
+                rx_bytes: 0,
+                tx_bytes: 0,
+                status: ConnectionStatus::Active,
+                started_at: Utc::now(),
+                error_detail: None,
+            },
+            rec.is_proxied,
+            rec.rx_bytes,
+            rec.tx_bytes,
+        );
+        if started {
+            self.telemetry.push_log(
+                LogLevel::Info,
+                COMPONENT_TRANSPARENT,
+                format!(
+                    "Routed UDP PID={} process=\"{}\" exe=\"{}\" -> {}:{} (domain={:?}{}) via {} [rule=\"{}\"]",
+                    rec.pid,
+                    rec.process_name,
+                    rec.process_path,
+                    rec.target_host,
+                    rec.target_port,
+                    rec.resolved_domain,
+                    real_ip_fragment,
+                    rec.route_label,
+                    rec.matched_rule
+                ),
+            );
+        } else {
+            tracing::debug!(
+                component = COMPONENT_TRANSPARENT,
+                "UDP datagram {} -> {}:{} ({} bytes out, {} bytes in) on existing flow via {}",
+                rec.client_addr,
+                rec.target_host,
+                rec.target_port,
+                rec.tx_bytes,
+                rec.rx_bytes,
+                rec.route_label
+            );
+        }
+    }
+
     /// Evaluates routing rules for a single UDP datagram and forwards it through a SOCKS5 `UDP ASSOCIATE`
     /// session (`Proxy` / `Chain`) or directly (`Direct`), enforcing per-datagram rule evaluation,
     /// Fake-IP reverse lookup (`ATYP = 0x03`), QUIC (`UDP 443`) and DoQ (`UDP 853`) blocking,
@@ -176,7 +271,7 @@ impl RouteWardController {
                     Socks5UdpTarget::Ipv4(ip, port) => {
                         if self.dns.is_in_fake_subnet(ip) {
                             if let Some(dom) = self.dns.resolve_fake_ip(ip) {
-                                self.resolve_host_direct_ipv4(&dom)
+                                self.resolve_host_direct_ipv4_cached(&dom)
                                     .await
                                     .map(|real_ip| SocketAddr::new(IpAddr::V4(real_ip), *port))
                             } else {
@@ -191,7 +286,7 @@ impl RouteWardController {
                     }
                     Socks5UdpTarget::Ipv6(ip, port) => Ok(SocketAddr::new(IpAddr::V6(*ip), *port)),
                     Socks5UdpTarget::Domain(dom, port) => self
-                        .resolve_host_direct_ipv4(dom)
+                        .resolve_host_direct_ipv4_cached(dom)
                         .await
                         .map(|real_ip| SocketAddr::new(IpAddr::V4(real_ip), *port)),
                 };
@@ -249,11 +344,14 @@ impl RouteWardController {
                     }
                 };
 
+                let net_consts = &self.constants.network;
                 let timeout_dur = Duration::from_millis(
-                    self.constants
-                        .network
-                        .tcp_connect_timeout_ms
-                        .clamp(300, 1500),
+                    net_consts.tcp_connect_timeout_ms.clamp(
+                        net_consts.udp_direct_timeout_min_ms,
+                        net_consts
+                            .udp_direct_timeout_max_ms
+                            .max(net_consts.udp_direct_timeout_min_ms),
+                    ),
                 );
                 let direct_start = Instant::now();
                 let resp = self
@@ -261,43 +359,22 @@ impl RouteWardController {
                     .await
                     .map_err(RouteWardError::Io)?;
                 let measured_latency_ms = direct_start.elapsed().as_millis().max(1) as u64;
-                self.telemetry.push_log(
-                    LogLevel::Info,
-                    COMPONENT_TRANSPARENT,
-                    format!(
-                        "Routed UDP PID={} process=\"{}\" exe=\"{}\" -> {}:{} (domain={:?}, realIp={}) via {} [rule=\"{}\"]",
-                        pid,
-                        proc_basename,
-                        proc_path_str,
-                        raw_host,
-                        target_port,
-                        eval.effective_domain,
-                        dst_addr.ip(),
-                        ROUTE_DIRECT_LABEL,
-                        eval.matched_rule_name
-                    ),
-                );
-                self.telemetry.record_connection(
-                    TrackedConnection {
-                        id: Uuid::new_v4().to_string(),
-                        pid,
-                        process_name: proc_basename,
-                        process_path: proc_path_str,
-                        target_host: raw_host,
-                        resolved_domain: eval.effective_domain,
-                        target_port,
-                        protocol: TransportProtocol::Udp,
-                        matched_rule: eval.matched_rule_name,
-                        route_label: ROUTE_DIRECT_LABEL.to_string(),
-                        latency_ms: measured_latency_ms,
-                        rx_bytes: resp.len() as u64,
-                        tx_bytes: payload.len() as u64,
-                        status: ConnectionStatus::Active,
-                        started_at: Utc::now(),
-                        error_detail: None,
-                    },
-                    false,
-                );
+                self.record_udp_datagram_flow(UdpDatagramRecord {
+                    client_addr,
+                    pid,
+                    process_name: proc_basename,
+                    process_path: proc_path_str,
+                    target_host: raw_host,
+                    resolved_domain: eval.effective_domain,
+                    target_port,
+                    matched_rule: eval.matched_rule_name,
+                    route_label: ROUTE_DIRECT_LABEL.to_string(),
+                    real_ip: Some(dst_addr.ip()),
+                    latency_ms: measured_latency_ms,
+                    rx_bytes: resp.len() as u64,
+                    tx_bytes: payload.len() as u64,
+                    is_proxied: false,
+                });
                 Ok(resp)
             }
             RuleAction::Proxy { target_id } => {
@@ -356,42 +433,22 @@ impl RouteWardController {
                         let measured_latency_ms =
                             exchange_start.elapsed().as_millis().max(1) as u64;
                         let route_label = format!("{} (SOCKS5 UDP)", reply.proxy_name);
-                        self.telemetry.push_log(
-                            LogLevel::Info,
-                            COMPONENT_TRANSPARENT,
-                            format!(
-                                "Routed UDP PID={} process=\"{}\" exe=\"{}\" -> {}:{} (domain={:?}) via {} [rule=\"{}\"]",
-                                pid,
-                                proc_basename,
-                                proc_path_str,
-                                raw_host,
-                                target_port,
-                                eval.effective_domain,
-                                route_label,
-                                eval.matched_rule_name
-                            ),
-                        );
-                        self.telemetry.record_connection(
-                            TrackedConnection {
-                                id: Uuid::new_v4().to_string(),
-                                pid,
-                                process_name: proc_basename,
-                                process_path: proc_path_str,
-                                target_host: raw_host,
-                                resolved_domain: eval.effective_domain,
-                                target_port,
-                                protocol: TransportProtocol::Udp,
-                                matched_rule: eval.matched_rule_name,
-                                route_label,
-                                latency_ms: measured_latency_ms,
-                                rx_bytes: reply.payload.len() as u64,
-                                tx_bytes: payload.len() as u64,
-                                status: ConnectionStatus::Active,
-                                started_at: Utc::now(),
-                                error_detail: None,
-                            },
-                            true,
-                        );
+                        self.record_udp_datagram_flow(UdpDatagramRecord {
+                            client_addr,
+                            pid,
+                            process_name: proc_basename,
+                            process_path: proc_path_str,
+                            target_host: raw_host,
+                            resolved_domain: eval.effective_domain,
+                            target_port,
+                            matched_rule: eval.matched_rule_name,
+                            route_label,
+                            real_ip: None,
+                            latency_ms: measured_latency_ms,
+                            rx_bytes: reply.payload.len() as u64,
+                            tx_bytes: payload.len() as u64,
+                            is_proxied: true,
+                        });
                         Ok(reply.payload)
                     }
                     Err(err) => {
@@ -506,27 +563,22 @@ impl RouteWardController {
                     Ok(reply) => {
                         let measured_latency_ms =
                             exchange_start.elapsed().as_millis().max(1) as u64;
-                        self.telemetry.record_connection(
-                            TrackedConnection {
-                                id: Uuid::new_v4().to_string(),
-                                pid,
-                                process_name: proc_basename,
-                                process_path: proc_path_str,
-                                target_host: raw_host,
-                                resolved_domain: eval.effective_domain,
-                                target_port,
-                                protocol: TransportProtocol::Udp,
-                                matched_rule: eval.matched_rule_name,
-                                route_label: format!("Group -> {} (SOCKS5 UDP)", reply.proxy_name),
-                                latency_ms: measured_latency_ms,
-                                rx_bytes: reply.payload.len() as u64,
-                                tx_bytes: payload.len() as u64,
-                                status: ConnectionStatus::Active,
-                                started_at: Utc::now(),
-                                error_detail: None,
-                            },
-                            true,
-                        );
+                        self.record_udp_datagram_flow(UdpDatagramRecord {
+                            client_addr,
+                            pid,
+                            process_name: proc_basename,
+                            process_path: proc_path_str,
+                            target_host: raw_host,
+                            resolved_domain: eval.effective_domain,
+                            target_port,
+                            matched_rule: eval.matched_rule_name,
+                            route_label: format!("Group -> {} (SOCKS5 UDP)", reply.proxy_name),
+                            real_ip: None,
+                            latency_ms: measured_latency_ms,
+                            rx_bytes: reply.payload.len() as u64,
+                            tx_bytes: payload.len() as u64,
+                            is_proxied: true,
+                        });
                         Ok(reply.payload)
                     }
                     Err(err) => {
@@ -582,8 +634,13 @@ impl RouteWardController {
         let mdns_port = self.constants.network.mdns_standard_port;
         let fwmark = self.constants.network.linux_fwmark;
 
-        let resolved_orig_dst = orig_dst_opt
-            .or_else(|| self.lookup_udp_conntrack_orig_dst(peer_addr, &[llmnr_port, mdns_port]));
+        let resolved_orig_dst = match orig_dst_opt {
+            Some(dst) => Some(dst),
+            None => {
+                self.lookup_udp_conntrack_orig_dst(peer_addr, &[llmnr_port, mdns_port])
+                    .await
+            }
+        };
 
         let Some(orig_dst) = resolved_orig_dst else {
             return;
@@ -661,7 +718,10 @@ impl RouteWardController {
                             .query_dns_udp_direct_protected(
                                 payload,
                                 orig_dst,
-                                Duration::from_millis(300),
+                                Duration::from_millis(
+                                    self.constants.network.local_name_query_timeout_ms,
+                                ),
+                                DnsReplyCheck::IdOnly,
                             )
                             .await
                         {
@@ -694,7 +754,8 @@ impl RouteWardController {
         let target_port = orig_dst.port();
         let attribution = self
             .process_resolver
-            .resolve_udp_port_attribution(peer_addr.port());
+            .resolve_udp_port_attribution_async(peer_addr.port())
+            .await;
         let (
             pid,
             proc_name,
@@ -775,5 +836,72 @@ impl RouteWardController {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ProfileConfig, SystemConstants};
+
+    #[tokio::test]
+    async fn direct_udp_datagrams_share_one_flow_record_and_count_as_direct() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.expect("bind echo");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let _echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.default_action = RuleAction::Direct;
+        profile.rules.clear();
+        let controller = RouteWardController::new(constants, profile, "en");
+
+        let client = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 15)), 50123);
+        let target = Socks5UdpTarget::Ipv4(std::net::Ipv4Addr::LOCALHOST, echo_addr.port());
+        for _ in 0..5 {
+            let reply = controller
+                .forward_udp_datagram(
+                    client,
+                    "game.exe",
+                    Some("C:\\game.exe"),
+                    77,
+                    &target,
+                    b"abcd",
+                    false,
+                )
+                .await
+                .expect("direct datagram");
+            assert_eq!(reply, b"abcd");
+        }
+
+        let udp_records: Vec<_> = controller
+            .telemetry
+            .list_connections()
+            .into_iter()
+            .filter(|c| c.protocol == TransportProtocol::Udp)
+            .collect();
+        assert_eq!(
+            udp_records.len(),
+            1,
+            "one record per flow, got {udp_records:?}"
+        );
+        assert_eq!(udp_records[0].status, ConnectionStatus::Active);
+        let flow_logs = controller
+            .telemetry
+            .list_logs()
+            .into_iter()
+            .filter(|l| l.level == LogLevel::Info && l.message.contains("Routed UDP PID=77"))
+            .count();
+        assert_eq!(flow_logs, 1, "exactly one INFO line per new flow");
+
+        let snapshot = controller.telemetry.snapshot();
+        assert_eq!(snapshot.direct_count, 1);
+        assert_eq!(snapshot.proxied_count, 0, "Direct flows are never proxied");
     }
 }

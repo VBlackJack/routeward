@@ -40,7 +40,9 @@ export const HelpTooltip: React.FC<HelpTooltipProps> = ({ text }) => {
         onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
         onKeyDown={(e) => {
-          if (e.key === 'Escape') {
+          if (e.key === 'Escape' && open) {
+            // Close only the tooltip, not the surrounding modal.
+            e.stopPropagation();
             setOpen(false);
           }
         }}

@@ -1,10 +1,7 @@
 {
   "app": {
     "titlebar": {
-      "minimize": "Minimize",
-      "maximize": "Maximize / Restore",
-      "close": "Close",
-      "native_badge": "Native Desktop"
+      "close": "Close"
     },
     "launcher": {
       "button": "Run App via Proxy",
@@ -65,21 +62,12 @@
         "relay": "User-Space Local Relay"
       },
       "language": {
-        "switch": "Switch Language",
         "en": "English",
         "fr": "Français"
       },
       "profile": {
         "import": "Import Profile",
-        "export": "Export Profile",
-        "save": "Save Profile"
-      },
-      "theme": {
-        "button": "ThemeForge"
-      },
-      "command_palette": {
-        "button": "Command Palette",
-        "shortcut": "Ctrl+K"
+        "export": "Export Profile"
       }
     },
     "nav": {
@@ -98,24 +86,6 @@
       },
       "settings": {
         "tab": "Settings"
-      },
-      "dashboard": {
-        "tab": "Dashboard"
-      },
-      "connections": {
-        "tab": "Live Connections"
-      },
-      "proxies": {
-        "tab": "Proxies & Chains"
-      },
-      "rules": {
-        "tab": "Routing Rules"
-      },
-      "dns": {
-        "tab": "Fake-IP DNS"
-      },
-      "logs": {
-        "tab": "Event Logs"
       }
     },
     "statusbar": {
@@ -207,7 +177,11 @@
         "not_elevated": "Elevated daemon did not receive administrator privileges",
         "config_invalid": "Daemon could not load configuration profile",
         "daemon_exited": "Elevated daemon exited unexpectedly during startup"
-      }
+      },
+      "error": {
+        "generic": "The operation failed"
+      },
+      "dismiss": "Dismiss notification"
     }
   },
   "command_palette": {
@@ -216,7 +190,8 @@
       "empty": "No matching command or resource found.",
       "group_navigation": "Navigation",
       "group_actions": "Quick Engine Actions",
-      "group_themes": "ThemeForge Palettes"
+      "group_themes": "ThemeForge Palettes",
+      "title": "Command palette"
     },
     "actions": {
       "toggle_engine": "Toggle Interceptor Engine Start / Stop",
@@ -244,7 +219,6 @@
       "metric_leaks_blocked": "Leaks & Blocks Stopped",
       "metric_protected_traffic": "Total Traffic Handled",
       "proxy_summary_label": "Active Proxy Server",
-      "no_proxy_configured": "No proxy server configured yet",
       "direct_filter_mode_title": "Direct Filter Mode (No External Proxy)",
       "direct_filter_mode_desc": "Active filtering, tracker blocking, and LAN rules apply directly using your normal Internet connection.",
       "configure_proxy_cta": "Set up a Proxy",
@@ -363,9 +337,6 @@
         "blocked": "Blocked",
         "closed": "Closed"
       },
-      "simulate": {
-        "button": "Simulate Connection"
-      },
       "scan_os": {
         "button": "Scan Real OS Sockets"
       },
@@ -418,9 +389,7 @@
         "destination_section": "Destination & Anti-Leak DNS",
         "remote_endpoint": "Remote Endpoint",
         "resolved_domain": "Fake-IP Original Domain",
-        "routing_section": "Applied Routing & Telemetry",
         "matched_rule": "Matched Rule",
-        "upstream_route": "Upstream Tunnel",
         "error_detail": "Block / Failure Reason",
         "quick_actions_title": "1-Click Rule Creation & Socket Control",
         "route_process_proxy": "Route Process via Proxy",
@@ -475,8 +444,7 @@
         "testing": "Testing...",
         "copy_uri": "Copy URI",
         "edit": "Edit / Password",
-        "delete": "Remove",
-        "toggle": "Toggle Enable"
+        "delete": "Remove"
       },
       "badge": {
         "udp_ready": "UDP Ready",
@@ -485,8 +453,6 @@
         "tls_insecure": "TLS Unverified",
         "password_set": "Password Set",
         "untested": "Untested",
-        "online": "Online",
-        "offline": "Unreachable",
         "exit_ip": "Exit IP"
       }
     },
@@ -809,8 +775,12 @@
       "not_elevated": "Administrator or root privileges are required to run routeward daemon",
       "ipc_error": "Daemon IPC communication error",
       "disconnected": "Privileged RouteWard daemon is not connected",
+      "io_timeout": "Timed out while communicating with the RouteWard daemon",
       "insecure_profile": "Refusing to start: profile directory or file has insecure ownership or write permissions",
       "cleanup_refused_active": "Refusing to run cleanup while a RouteWard daemon is active (stop the daemon first or pass --force)"
+    },
+    "service": {
+      "insecure_binary_location": "Refusing to register the Windows service: the RouteWard executable or its folder is writable by non-administrators. Install it under Program Files."
     },
     "desktop": {
       "ui_init": "RouteWard could not initialize its desktop WebView window. Ensure Microsoft Edge WebView2 Runtime is installed and your user data folder is writable."
@@ -820,7 +790,6 @@
     "modal": {
       "title": "ThemeForge Studio - Palette & Accent",
       "subtitle": "Select one of the canonical ThemeForge Oklab palettes or High Contrast, and apply an optional accent tint.",
-      "palette_label": "Theme Palette",
       "accent_label": "Accent Tint",
       "preview_label": "Semantic Token Preview",
       "import_palette": "Load External ThemeForge v1 JSON",
@@ -905,7 +874,7 @@
         "simple": "Your custom traffic laws: e.g., 'Firefox goes through Proxy', 'Steam connects Directly', and 'Windows Telemetry is Blocked'.",
         "expert": "Deterministic ascending-priority evaluator matching process globs, domain wildcards, IPv4/IPv6 CIDR subnets, and port ranges."
       },
-        "system_proxy": {
+      "system_proxy": {
         "term": "System Proxy vs App Launcher",
         "simple": "'System Proxy' configures all of Windows in 1 click. 'Run App via Proxy' launches a single chosen program inside the proxy tunnel.",
         "expert": "Toggles HKCU Internet Settings registry keys or spawns a child process with injected ALL_PROXY / HTTP_PROXY / HTTPS_PROXY environment variables."
@@ -972,6 +941,19 @@
       "subtab_overview": "Overview",
       "subtab_dns": "Fake-IP DNS Cache",
       "subtab_logs": "Event Logs"
+    }
+  },
+  "tray": {
+    "status": {
+      "offline": "RouteWard - Service Offline",
+      "protected": "RouteWard - Protected",
+      "paused": "RouteWard - Paused"
+    },
+    "menu": {
+      "pause": "Pause Protection",
+      "enable": "Enable Protection",
+      "open": "Open RouteWard",
+      "quit": "Exit"
     }
   }
 }

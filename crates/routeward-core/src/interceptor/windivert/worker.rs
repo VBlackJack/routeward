@@ -14,10 +14,80 @@
  * limitations under the License.
  */
 
+use super::fragments::decide_first_udp_fragment;
 use super::*;
+use crate::interceptor::ROUTE_DIRECT_LABEL;
+use crate::process::ProcessIdentity;
+use crate::telemetry::udp_flow_key;
+
+/// One outbound datagram routed DIRECT, as recorded in telemetry.
+struct DirectUdpDatagram<'a> {
+    proc_id: &'a ProcessIdentity,
+    res_source: PidResolutionSource,
+    src: SocketAddr,
+    dst: SocketAddr,
+    domain: Option<&'a str>,
+    rule_name: &'a str,
+    payload_len: u64,
+}
 
 #[cfg(windows)]
 impl WinDivertInterceptor {
+    /// Records a DIRECT UDP datagram on its aggregated flow: the first datagram creates the
+    /// telemetry record and an INFO log, later datagrams only update the byte counters.
+    fn record_direct_udp_datagram(ctrl: &RouteWardController, dgram: &DirectUdpDatagram<'_>) {
+        let flow_key = udp_flow_key(dgram.src, dgram.dst, ROUTE_DIRECT_LABEL);
+        let started = ctrl.telemetry.record_udp_datagram(
+            &flow_key,
+            || TrackedConnection {
+                id: Uuid::new_v4().to_string(),
+                pid: dgram.proc_id.pid,
+                process_name: dgram.proc_id.name.clone(),
+                process_path: dgram.proc_id.executable_path.clone(),
+                target_host: dgram.dst.ip().to_string(),
+                resolved_domain: dgram.domain.map(str::to_string),
+                target_port: dgram.dst.port(),
+                protocol: TransportProtocol::Udp,
+                matched_rule: dgram.rule_name.to_string(),
+                route_label: ROUTE_DIRECT_LABEL.to_string(),
+                latency_ms: 0,
+                rx_bytes: 0,
+                tx_bytes: 0,
+                status: ConnectionStatus::Active,
+                started_at: Utc::now(),
+                error_detail: None,
+            },
+            false,
+            0,
+            dgram.payload_len,
+        );
+        if started {
+            ctrl.telemetry.push_log(
+                LogLevel::Info,
+                COMPONENT_WINDIVERT,
+                format!(
+                    "Routed UDP flow PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {} -> {} (domain={:?}) via DIRECT [rule=\"{}\"]",
+                    dgram.proc_id.pid,
+                    dgram.proc_id.name,
+                    dgram.proc_id.executable_path,
+                    dgram.res_source.as_str(),
+                    dgram.src,
+                    dgram.dst,
+                    dgram.domain,
+                    dgram.rule_name
+                ),
+            );
+        } else {
+            tracing::debug!(
+                component = COMPONENT_WINDIVERT,
+                "UDP datagram {} -> {} ({} bytes) on existing DIRECT flow",
+                dgram.src,
+                dgram.dst,
+                dgram.payload_len
+            );
+        }
+    }
+
     #[cfg(windows)]
     fn inject_inbound_packet(
         api: &WinDivertApi,
@@ -390,44 +460,17 @@ impl WinDivertInterceptor {
         let is_fake_ip = ctrl.dns.is_in_fake_subnet(&meta.dst_ip);
         if matches!(eval.action, RuleAction::Direct) && !is_fake_ip {
             if !is_fragmented {
-                ctrl.telemetry.push_log(
-                    LogLevel::Info,
-                    COMPONENT_WINDIVERT,
-                    format!(
-                        "Routed UDP PID={} process=\"{}\" exe=\"{}\" resolvedVia={} {}:{} -> {}:{} (domain={:?}, realIp={}) via DIRECT [rule=\"{}\"]",
-                        proc_id.pid,
-                        proc_id.name,
-                        proc_id.executable_path,
-                        res_source.as_str(),
-                        meta.src_ip,
-                        meta.src_port,
-                        meta.dst_ip,
-                        meta.dst_port,
-                        eval.effective_domain,
-                        meta.dst_ip,
-                        eval.matched_rule_name
-                    ),
-                );
-                ctrl.telemetry.record_connection(
-                    TrackedConnection {
-                        id: Uuid::new_v4().to_string(),
-                        pid: proc_id.pid,
-                        process_name: proc_id.name,
-                        process_path: proc_id.executable_path,
-                        target_host: dst_ip_str,
-                        resolved_domain: eval.effective_domain,
-                        target_port: meta.dst_port,
-                        protocol: TransportProtocol::Udp,
-                        matched_rule: eval.matched_rule_name,
-                        route_label: "DIRECT".to_string(),
-                        latency_ms: 0,
-                        rx_bytes: 0,
-                        tx_bytes: meta.payload_len as u64,
-                        status: ConnectionStatus::Active,
-                        started_at: Utc::now(),
-                        error_detail: None,
+                Self::record_direct_udp_datagram(
+                    ctrl,
+                    &DirectUdpDatagram {
+                        proc_id: &proc_id,
+                        res_source,
+                        src: SocketAddr::new(IpAddr::V4(meta.src_ip), meta.src_port),
+                        dst: SocketAddr::new(IpAddr::V4(meta.dst_ip), meta.dst_port),
+                        domain: eval.effective_domain.as_deref(),
+                        rule_name: &eval.matched_rule_name,
+                        payload_len: meta.payload_len as u64,
                     },
-                    true,
                 );
             }
             Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
@@ -790,42 +833,17 @@ impl WinDivertInterceptor {
         };
 
         if matches!(eval.action, RuleAction::Direct) {
-            ctrl.telemetry.push_log(
-                LogLevel::Info,
-                COMPONENT_WINDIVERT,
-                format!(
-                    "Routed IPv6 UDP PID={} process=\"{}\" exe=\"{}\" resolvedVia={} [{}]:{} -> [{}]:{} via DIRECT [rule=\"{}\"]",
-                    proc_id.pid,
-                    proc_id.name,
-                    proc_id.executable_path,
-                    res_source.as_str(),
-                    meta.src_ip,
-                    meta.src_port,
-                    meta.dst_ip,
-                    meta.dst_port,
-                    eval.matched_rule_name
-                ),
-            );
-            ctrl.telemetry.record_connection(
-                TrackedConnection {
-                    id: Uuid::new_v4().to_string(),
-                    pid: proc_id.pid,
-                    process_name: proc_id.name,
-                    process_path: proc_id.executable_path,
-                    target_host: dst_ip_str,
-                    resolved_domain: eval.effective_domain,
-                    target_port: meta.dst_port,
-                    protocol: TransportProtocol::Udp,
-                    matched_rule: eval.matched_rule_name,
-                    route_label: "DIRECT".to_string(),
-                    latency_ms: 0,
-                    rx_bytes: 0,
-                    tx_bytes: meta.payload_len as u64,
-                    status: ConnectionStatus::Active,
-                    started_at: Utc::now(),
-                    error_detail: None,
+            Self::record_direct_udp_datagram(
+                ctrl,
+                &DirectUdpDatagram {
+                    proc_id: &proc_id,
+                    res_source,
+                    src: SocketAddr::new(IpAddr::V6(meta.src_ip), meta.src_port),
+                    dst: SocketAddr::new(IpAddr::V6(meta.dst_ip), meta.dst_port),
+                    domain: eval.effective_domain.as_deref(),
+                    rule_name: &eval.matched_rule_name,
+                    payload_len: meta.payload_len as u64,
                 },
-                true,
             );
             Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
             return;
@@ -894,6 +912,100 @@ impl WinDivertInterceptor {
 }
 
 impl WinDivertInterceptor {
+    /// Reports (rate limited) that the pending SYN queue was full and its oldest SYN was dropped;
+    /// the client retransmits it, so the connection is delayed, never mis-routed.
+    fn warn_pending_syn_overflow(ctrl: &RouteWardController, oldest_wait_ms: u64) {
+        ctrl.push_rate_limited_warn(
+            "pending_syn_overflow",
+            COMPONENT_WINDIVERT,
+            format!(
+                "Pending SYN queue full (maxPendingSynPackets={}); dropped the oldest SYN after {oldest_wait_ms}ms (awaiting client retransmission)",
+                ctrl.constants.network.max_pending_syn_packets
+            ),
+        );
+    }
+
+    /// Handles one fragment of a fragmented outbound UDP datagram.
+    ///
+    /// The first fragment (which carries the ports) is attributed, evaluated against the rules and
+    /// given a verdict, remembered for the remaining fragments; a later fragment replays the
+    /// remembered verdict and, when none exists, is released unchanged because it cannot be
+    /// attributed on its own.
+    fn handle_udp_fragment(
+        ctrl: &RouteWardController,
+        api: &WinDivertApi,
+        net_handle: *mut c_void,
+        packet: &[u8],
+        addr: &WinDivertAddress,
+        frag: &UdpFragmentMeta,
+    ) {
+        let verdict = match frag.kind {
+            UdpFragmentKind::NonFirst => ctrl
+                .nat_table
+                .lookup_udp_fragment_verdict(&frag.key())
+                .unwrap_or(UdpFragmentVerdict::Reinject),
+            UdpFragmentKind::First => {
+                let verdict = Self::first_udp_fragment_verdict(ctrl, frag);
+                ctrl.nat_table
+                    .record_udp_fragment_verdict(frag.key(), verdict);
+                verdict
+            }
+        };
+        if verdict == UdpFragmentVerdict::Reinject {
+            Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
+        }
+    }
+
+    fn first_udp_fragment_verdict(
+        ctrl: &RouteWardController,
+        frag: &UdpFragmentMeta,
+    ) -> UdpFragmentVerdict {
+        let ipv6 = frag.src_ip.is_ipv6();
+        let resolved = ctrl.nat_table.try_resolve_pid_nonblocking(
+            SocketKey::new(IPPROTO_UDP, ipv6, frag.src_port),
+            ProcessResolver::find_pid_for_udp_port,
+        );
+        let pid_opt = resolved.map(|(pid, _)| pid);
+        if ctrl.nat_table.is_self_udp_port(frag.src_port)
+            || ctrl.nat_table.is_loop_or_excluded(
+                pid_opt,
+                frag.src_ip,
+                frag.src_port,
+                frag.dst_ip,
+                frag.dst_port,
+            )
+        {
+            return UdpFragmentVerdict::Reinject;
+        }
+
+        let (block_dot, block_quic) = {
+            let prof = ctrl.profile.read();
+            (
+                prof.security_policy.block_encrypted_dns_bypass,
+                prof.security_policy.block_quic_udp_443,
+            )
+        };
+        if (block_dot && frag.dst_port == ctrl.constants.dns.dns_over_tls_port)
+            || (block_quic && frag.dst_port == ctrl.constants.network.quic_default_port)
+        {
+            return UdpFragmentVerdict::Drop;
+        }
+
+        let process = pid_opt.map(|pid| ctrl.process_resolver.resolve_by_pid(pid));
+        let decision = decide_first_udp_fragment(ctrl, process.as_ref(), frag);
+        if decision.verdict == UdpFragmentVerdict::Drop {
+            ctrl.push_rate_limited_warn(
+                "udp_fragment_dropped",
+                COMPONENT_WINDIVERT,
+                format!(
+                    "Dropped fragmented UDP datagram {}:{} -> {}:{} [rule=\"{}\"]",
+                    frag.src_ip, frag.src_port, frag.dst_ip, frag.dst_port, decision.rule_name
+                ),
+            );
+        }
+        decision.verdict
+    }
+
     fn record_quic_udp_443_blocked(
         ctrl_net: &RouteWardController,
         quic_port: u16,
@@ -1026,11 +1138,38 @@ impl WinDivertInterceptor {
                     )
                 };
                 if ok == 0 {
+                    // A closed handle is expected on shutdown and when a live reload replaced this
+                    // handle; any other failure leaves the interceptor blind, so report it and
+                    // clear the active flag so the rest of the engine sees the interceptor stop.
+                    let replaced = shared_net_handle.load(Ordering::Acquire) != recv_handle_usize;
+                    if active_net.load(Ordering::Relaxed) && !replaced {
+                        ctrl_net.telemetry.push_log(
+                            LogLevel::Error,
+                            COMPONENT_WINDIVERT,
+                            "WinDivertRecv failed on the network handle; packet interception has stopped".to_string(),
+                        );
+                        active_net.store(false, Ordering::SeqCst);
+                    }
                     break;
                 }
 
                 let pkt_len = recv_len as usize;
                 let packet = &mut packet_buf[..pkt_len];
+
+                // Fragmented UDP is detected before any UDP parsing: a first fragment whose UDP
+                // length exceeds the fragment would otherwise fail to parse and be reinjected
+                // without ever meeting the rules or the kill switch.
+                if let Some(frag) = parse_udp_fragment_meta(packet) {
+                    Self::handle_udp_fragment(
+                        &ctrl_net,
+                        &api,
+                        handle,
+                        &packet[..pkt_len],
+                        &addr,
+                        &frag,
+                    );
+                    continue;
+                }
 
                 // Case 0: Outbound IPv6 DNS (port 53), DoT (port 853), QUIC (port 443), or mDNS/LLMNR
                 if let Some(v6_meta) = parse_ipv6_transport_meta(packet) {
@@ -1187,7 +1326,7 @@ impl WinDivertInterceptor {
                             )
                         {
                             let resolved = ctrl_net.nat_table.try_resolve_pid_nonblocking(
-                                v6_meta.src_port,
+                                SocketKey::new(IPPROTO_UDP, true, v6_meta.src_port),
                                 ProcessResolver::find_pid_for_udp_port,
                             );
                             if resolved.is_some() {
@@ -1267,7 +1406,7 @@ impl WinDivertInterceptor {
                             }
                         } else if v6_meta.is_syn_only() {
                             let resolved = ctrl_net.nat_table.try_resolve_pid_nonblocking(
-                                v6_meta.src_port,
+                                SocketKey::new(IPPROTO_TCP, true, v6_meta.src_port),
                                 ProcessResolver::find_pid_for_tcp_port,
                             );
                             if resolved.is_some()
@@ -1278,7 +1417,14 @@ impl WinDivertInterceptor {
                                     &ctrl_net, &api, handle, packet, &mut addr, v6_meta, resolved,
                                 );
                             } else {
-                                syn_v6_queue_producer.enqueue((packet.to_vec(), addr), v6_meta);
+                                if let Some(evicted) =
+                                    syn_v6_queue_producer.enqueue((packet.to_vec(), addr), v6_meta)
+                                {
+                                    Self::warn_pending_syn_overflow(
+                                        &ctrl_net,
+                                        evicted.enqueued_at.elapsed().as_millis() as u64,
+                                    );
+                                }
                             }
                             continue;
                         }
@@ -1590,7 +1736,7 @@ impl WinDivertInterceptor {
                         {
                             let is_frag = is_ipv4_packet_fragmented(packet);
                             let resolved = ctrl_net.nat_table.try_resolve_pid_nonblocking(
-                                udp_meta.src_port,
+                                SocketKey::new(IPPROTO_UDP, false, udp_meta.src_port),
                                 ProcessResolver::find_pid_for_udp_port,
                             );
                             if resolved.is_some() {
@@ -1683,7 +1829,7 @@ impl WinDivertInterceptor {
                     } else if meta.is_syn_only() {
                         // Case C: New outbound TCP SYN -> try immediate non-blocking PID lookup
                         let resolved = ctrl_net.nat_table.try_resolve_pid_nonblocking(
-                            meta.src_port,
+                            SocketKey::new(IPPROTO_TCP, false, meta.src_port),
                             ProcessResolver::find_pid_for_tcp_port,
                         );
                         if resolved.is_some()
@@ -1696,7 +1842,14 @@ impl WinDivertInterceptor {
                             continue;
                         } else {
                             // Enqueue into non-blocking PendingSynQueue so the receive loop never stalls
-                            syn_queue_producer.enqueue((packet.to_vec(), addr), meta);
+                            if let Some(evicted) =
+                                syn_queue_producer.enqueue((packet.to_vec(), addr), meta)
+                            {
+                                Self::warn_pending_syn_overflow(
+                                    &ctrl_net,
+                                    evicted.enqueued_at.elapsed().as_millis() as u64,
+                                );
+                            }
                             continue;
                         }
                     }

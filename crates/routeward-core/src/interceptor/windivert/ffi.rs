@@ -35,6 +35,47 @@ impl Default for WinDivertAddress {
     }
 }
 
+/// Offset of the IP protocol byte inside the `Socket` variant of the address union.
+const SOCKET_PROTOCOL_OFFSET: usize = 56;
+/// The `Event` field occupies bits 8..16 of the first flags word.
+const EVENT_SHIFT: u32 = 8;
+const EVENT_MASK: u64 = 0xFF;
+
+/// `WINDIVERT_EVENT_SOCKET_BIND`: a socket was bound to a local address.
+#[cfg(test)]
+pub const WINDIVERT_EVENT_SOCKET_BIND: u8 = 3;
+/// `WINDIVERT_EVENT_SOCKET_CONNECT`: a socket connect was initiated (the owner is still alive).
+#[cfg(test)]
+pub const WINDIVERT_EVENT_SOCKET_CONNECT: u8 = 4;
+/// `WINDIVERT_EVENT_SOCKET_LISTEN`: a socket started listening.
+#[cfg(test)]
+pub const WINDIVERT_EVENT_SOCKET_LISTEN: u8 = 5;
+/// `WINDIVERT_EVENT_SOCKET_ACCEPT`: a socket accepted a connection.
+#[cfg(test)]
+pub const WINDIVERT_EVENT_SOCKET_ACCEPT: u8 = 6;
+/// `WINDIVERT_EVENT_SOCKET_CLOSE`: the socket described by an event was closed.
+pub const WINDIVERT_EVENT_SOCKET_CLOSE: u8 = 7;
+
+/// Decoded `WINDIVERT_LAYER_SOCKET` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketEvent {
+    pub pid: u32,
+    pub local_port: u16,
+    /// IP protocol number (6 = TCP, 17 = UDP).
+    pub protocol: u8,
+    pub ipv6: bool,
+    /// `WINDIVERT_EVENT_SOCKET_*` value.
+    pub kind: u8,
+}
+
+impl SocketEvent {
+    /// Returns `true` when the event reports the socket being closed, so its previous owner must
+    /// be forgotten (the port may be reused by another process).
+    pub fn is_close(&self) -> bool {
+        self.kind == WINDIVERT_EVENT_SOCKET_CLOSE
+    }
+}
+
 impl WinDivertAddress {
     /// Sets or clears the `Outbound` bit (bit 17) in `WINDIVERT_ADDRESS`.
     pub fn set_outbound(&mut self, outbound: bool) {
@@ -53,6 +94,19 @@ impl WinDivertAddress {
     /// Clears the `Impostor` bit (bit 19).
     pub fn clear_impostor(&mut self) {
         self.flags_bitfield &= !BIT_IMPOSTOR;
+    }
+
+    /// Decodes a `WINDIVERT_LAYER_SOCKET` event: owner, local port, protocol, address family and
+    /// event kind (`WINDIVERT_EVENT_SOCKET_BIND`=3, `CONNECT`=4, `LISTEN`=5, `ACCEPT`=6, `CLOSE`=7; 0..2 are the network and flow events).
+    pub fn socket_event(&self) -> SocketEvent {
+        let (pid, local_port) = self.socket_pid_and_local_port();
+        SocketEvent {
+            pid,
+            local_port,
+            protocol: self.union_data[SOCKET_PROTOCOL_OFFSET],
+            ipv6: (self.flags_bitfield & BIT_IPV6) != 0,
+            kind: ((self.flags_bitfield >> EVENT_SHIFT) & EVENT_MASK) as u8,
+        }
     }
 
     /// Extracts `(process_id, local_port)` from a `WINDIVERT_LAYER_SOCKET` event.
@@ -120,6 +174,7 @@ pub(super) struct WinDivertApi {
     pub(super) calc_checksums: FnWinDivertHelperCalcChecksums,
 }
 
+#[cfg(windows)]
 fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
     let raw = path.to_string_lossy();
     if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
@@ -131,6 +186,7 @@ fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
     }
 }
 
+#[cfg(windows)]
 fn push_unique_candidate(candidates: &mut Vec<String>, path: &Path) {
     let normalized = strip_verbatim_prefix(path).to_string_lossy().into_owned();
     if normalized.is_empty() {
@@ -148,6 +204,7 @@ fn push_unique_candidate(candidates: &mut Vec<String>, path: &Path) {
     }
 }
 
+#[cfg(windows)]
 fn collect_windivert_candidates(
     search_paths: &[String],
     exe_dir: Option<&Path>,
@@ -160,19 +217,34 @@ fn collect_windivert_candidates(
             push_unique_candidate(&mut candidates, Path::new(trimmed));
         }
     }
+    // Only absolute paths under the executable directory are trusted: a bare or CWD-relative
+    // "WinDivert.dll" would let a planted DLL run with administrator rights.
+    let Some(exe_dir) = exe_dir else {
+        return candidates;
+    };
+    let exe_dir = strip_verbatim_prefix(exe_dir);
     for raw in search_paths {
         let rel_or_abs = Path::new(raw);
-        if rel_or_abs.is_absolute() {
-            push_unique_candidate(&mut candidates, rel_or_abs);
-            continue;
+        let candidate = if rel_or_abs.is_absolute() {
+            rel_or_abs.to_path_buf()
+        } else {
+            exe_dir.join(rel_or_abs)
+        };
+        if is_trusted_dll_path(&candidate, &exe_dir) {
+            push_unique_candidate(&mut candidates, &candidate);
         }
-        // Check executable directory before CWD so elevated processes resolve bundled DLLs safely.
-        if let Some(dir) = exe_dir {
-            push_unique_candidate(&mut candidates, &dir.join(rel_or_abs));
-        }
-        push_unique_candidate(&mut candidates, rel_or_abs);
     }
     candidates
+}
+
+#[cfg(windows)]
+/// Returns `true` when `path` is absolute, free of `..` components and located under `exe_dir`.
+fn is_trusted_dll_path(path: &Path, exe_dir: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && path.starts_with(exe_dir)
 }
 
 #[cfg(windows)]
@@ -183,7 +255,12 @@ impl WinDivertInterceptor {
             GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH,
         };
 
+        // The override variable can be inherited from a lower-privileged user environment, so
+        // release builds (which run elevated) ignore it entirely.
+        #[cfg(debug_assertions)]
         let env_override = std::env::var(ENV_WINDIVERT_DLL_PATH).ok();
+        #[cfg(not(debug_assertions))]
+        let env_override: Option<String> = None;
         let exe_path = std::env::current_exe().ok();
         let exe_dir = exe_path.as_deref().and_then(|p| p.parent());
         let candidates =
@@ -284,12 +361,12 @@ impl WinDivertInterceptor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
     #[test]
-    fn resolves_windivert_candidates_with_exe_dir_before_cwd_and_strips_verbatim_prefix() {
+    fn resolves_windivert_candidates_under_exe_dir_only_and_strips_verbatim_prefix() {
         let search_paths = vec![
             "WinDivert.dll".to_string(),
             "third_party/windivert/bin/WinDivert.dll".to_string(),
@@ -305,12 +382,27 @@ mod tests {
             Path::new(&candidates[1]),
             Path::new(r"C:\Program Files\RouteWard").join("WinDivert.dll")
         );
-        assert_eq!(candidates[2], "WinDivert.dll");
         assert_eq!(
-            Path::new(&candidates[3]),
+            Path::new(&candidates[2]),
             Path::new(r"C:\Program Files\RouteWard")
                 .join("third_party/windivert/bin/WinDivert.dll")
         );
-        assert_eq!(candidates[4], "third_party/windivert/bin/WinDivert.dll");
+        // The bare CWD-relative names are no longer candidates (intentional behaviour change).
+        assert_eq!(candidates.len(), 3);
+    }
+
+    #[test]
+    fn rejects_escaping_and_foreign_absolute_candidates() {
+        let exe_dir = Path::new(r"C:\Program Files\RouteWard");
+        let search_paths = vec![
+            "WinDivert.dll".to_string(),
+            r"..\Evil\WinDivert.dll".to_string(),
+            r"D:\Other\WinDivert.dll".to_string(),
+        ];
+        let candidates = collect_windivert_candidates(&search_paths, Some(exe_dir), None);
+        assert_eq!(candidates.len(), 1);
+        assert!(Path::new(&candidates[0]).starts_with(exe_dir));
+        // Without a known executable directory nothing may be loaded at all.
+        assert!(collect_windivert_candidates(&search_paths, None, None).is_empty());
     }
 }

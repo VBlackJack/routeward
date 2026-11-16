@@ -136,7 +136,19 @@ fn spawn_embedded_ui_server(
         bridge.log_info(format!(
             "Loopback UI server listening on http://127.0.0.1:{bound_port}"
         ));
-        let listener = TcpListener::from_std(std_listener).expect("Async listener");
+        let listener = match TcpListener::from_std(std_listener) {
+            Ok(listener) => listener,
+            Err(err) => {
+                // Without its loopback listener the UI can never load: report it and stop serving.
+                let bridge_for_report = Arc::clone(&bridge);
+                let detail = format!("Loopback listener error: {err}");
+                let _ = tokio::task::spawn_blocking(move || {
+                    report_fatal_ui_error(&bridge_for_report, &detail);
+                })
+                .await;
+                return;
+            }
+        };
         let token_arc = Arc::new(ephemeral_token);
 
         while let Ok((stream, _)) = listener.accept().await {
@@ -318,7 +330,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Theme::Dark
     };
 
-    let mut window_builder = WindowBuilder::new()
+    let window_builder = WindowBuilder::new()
         .with_title(WINDOW_TITLE)
         .with_window_icon(load_window_icon_32())
         .with_inner_size(LogicalSize::new(
@@ -329,10 +341,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_theme(Some(initial_tao_theme));
 
     #[cfg(target_os = "windows")]
-    {
+    let window_builder = {
         use tao::platform::windows::WindowBuilderExtWindows;
-        window_builder = window_builder.with_taskbar_icon(load_taskbar_icon_256());
-    }
+        window_builder.with_taskbar_icon(load_taskbar_icon_256())
+    };
     #[cfg(not(target_os = "windows"))]
     {
         let _ = load_taskbar_icon_256();

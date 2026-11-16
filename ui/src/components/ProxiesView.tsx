@@ -86,6 +86,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const importTitleId = useId();
   const proxyTitleId = useId();
   const chainTitleId = useId();
+  const formId = useId();
   const [testingId, setTestingId] = useState<string | null>(null);
   const [showAddProxy, setShowAddProxy] = useState(false);
   const [showImportUri, setShowImportUri] = useState(false);
@@ -169,6 +170,12 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         : null;
 
     const effectiveTls = protocol === 'https' ? true : tls;
+    const existing = editingProxyId
+      ? proxies.find((p) => p.id === editingProxyId)
+      : undefined;
+    // Keep an explicit (imported) SNI that differs from the previous host; otherwise follow the host.
+    const preservedSni =
+      existing?.sni && existing.sni !== existing.host ? existing.sni : null;
     onAddProxy({
       id: editingProxyId || generateClientId('proxy'),
       name: name.trim(),
@@ -179,8 +186,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       udpEnabled: protocol === 'socks5' ? udpEnabled : false,
       tls: effectiveTls,
       tlsSkipVerify: effectiveTls ? tlsSkipVerify : false,
-      sni: effectiveTls ? host.trim() : null,
-      enabled: true,
+      sni: effectiveTls ? (preservedSni ?? host.trim()) : null,
+      enabled: existing?.enabled ?? true,
       lastLatencyMs: null,
       exitIp: null
     });
@@ -215,10 +222,14 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
 
   const handleCopyNodeUri = (node: ProxyNode) => {
     const uri = routewardClient.formatProxyUri(node);
-    if (navigator.clipboard) {
-      navigator.clipboard.writeText(uri).catch(() => {});
+    if (!navigator.clipboard) {
+      return;
     }
-    onCopyUri(uri);
+    // Confirm only once the clipboard write has actually succeeded.
+    navigator.clipboard
+      .writeText(uri)
+      .then(() => onCopyUri(uri))
+      .catch(() => {});
   };
 
   return (
@@ -559,10 +570,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 : t('proxies.modal.add_proxy.title')}
             </h3>
             <div>
-              <label className="block text-xs text-tf-secondary">
+              <label htmlFor={`${formId}-f1`} className="block text-xs text-tf-secondary">
                 {t('proxies.modal.add_proxy.name_label')}
               </label>
-              <input
+              <input id={`${formId}-f1`}
                 type="text"
                 required
                 value={name}
@@ -572,10 +583,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             </div>
             <div className="grid grid-cols-3 gap-3">
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f2`} className="block text-xs text-tf-secondary">
                   {t('proxies.modal.add_proxy.protocol_label')}
                 </label>
-                <select
+                <select id={`${formId}-f2`}
                   value={protocol}
                   onChange={(e) => setProtocol(e.target.value as ProxyProtocol)}
                   className="tf-input mt-1 w-full px-2 py-1.5 text-sm uppercase"
@@ -588,10 +599,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 </select>
               </div>
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f3`} className="block text-xs text-tf-secondary">
                   {t('proxies.modal.add_proxy.host_label')}
                 </label>
-                <input
+                <input id={`${formId}-f3`}
                   type="text"
                   required
                   value={host}
@@ -601,10 +612,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 />
               </div>
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f4`} className="block text-xs text-tf-secondary">
                   {t('proxies.modal.add_proxy.port_label')}
                 </label>
-                <input
+                <input id={`${formId}-f4`}
                   type="number"
                   required
                   value={port}
@@ -615,10 +626,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs text-tf-secondary">
+                <label htmlFor={`${formId}-f5`} className="block text-xs text-tf-secondary">
                   {t('proxies.modal.add_proxy.username_label')}
                 </label>
-                <input
+                <input id={`${formId}-f5`}
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
@@ -627,7 +638,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               </div>
               <div>
                 <div className="flex items-center justify-between">
-                  <label className="block text-xs text-tf-secondary">
+                  <label
+                    htmlFor={`${formId}-password`}
+                    className="block text-xs text-tf-secondary"
+                  >
                     {t('proxies.modal.add_proxy.password_label')}
                   </label>
                   {existingHasPassword && (
@@ -638,6 +652,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   )}
                 </div>
                 <input
+                  id={`${formId}-password`}
                   type="password"
                   value={password}
                   disabled={!replacingPassword}
@@ -748,10 +763,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               {t('proxies.modal.add_chain.title')}
             </h3>
             <div>
-              <label className="block text-xs text-tf-secondary">
+              <label htmlFor={`${formId}-f6`} className="block text-xs text-tf-secondary">
                 {t('proxies.modal.add_chain.name_label')}
               </label>
-              <input
+              <input id={`${formId}-f6`}
                 type="text"
                 required
                 value={chainName}
@@ -760,10 +775,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               />
             </div>
             <div>
-              <label className="block text-xs text-tf-secondary">
+              <label htmlFor={`${formId}-f7`} className="block text-xs text-tf-secondary">
                 {t('proxies.modal.add_chain.strategy_label')}
               </label>
-              <select
+              <select id={`${formId}-f7`}
                 value={chainStrategy}
                 onChange={(e) =>
                   setChainStrategy(e.target.value as ChainStrategy)

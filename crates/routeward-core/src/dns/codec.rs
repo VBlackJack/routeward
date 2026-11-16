@@ -26,6 +26,10 @@ const MAX_DOMAIN_NAME_BYTES: usize = 255;
 const MAX_LABEL_LEN: usize = 63;
 const MAX_COMPRESSION_JUMPS: usize = 16;
 const POINTER_MASK: u8 = 0xC0;
+/// Highest ASCII byte value that is a control character or space.
+const ASCII_SPACE: u8 = 0x20;
+/// ASCII DEL control character.
+const ASCII_DEL: u8 = 0x7F;
 
 pub const QTYPE_A: u16 = 1;
 pub const QTYPE_CNAME: u16 = 5;
@@ -59,6 +63,7 @@ pub enum DnsCodecError {
     CompressionPointerLoop,
     DomainNameTooLong,
     InvalidUtf8Label,
+    InvalidLabelCharacter,
     TruncatedResourceRecord,
     InvalidRdataLength,
 }
@@ -78,6 +83,12 @@ impl fmt::Display for DnsCodecError {
             }
             Self::DomainNameTooLong => write!(f, "DNS domain name exceeds 255 bytes"),
             Self::InvalidUtf8Label => write!(f, "DNS label is not valid ASCII/UTF-8"),
+            Self::InvalidLabelCharacter => {
+                write!(
+                    f,
+                    "DNS label contains control, whitespace or non-printable bytes"
+                )
+            }
             Self::TruncatedResourceRecord => write!(f, "truncated DNS resource record"),
             Self::InvalidRdataLength => write!(f, "invalid RDATA length for record type"),
         }
@@ -212,6 +223,14 @@ pub fn decode_domain_name(
 
         let label_str =
             std::str::from_utf8(label_slice).map_err(|_| DnsCodecError::InvalidUtf8Label)?;
+        // Names flow into text protocols (HTTP CONNECT): refuse CR/LF, spaces and other
+        // control bytes. Underscores and other printable bytes stay accepted.
+        if label_slice
+            .iter()
+            .any(|b| *b <= ASCII_SPACE || *b == ASCII_DEL)
+        {
+            return Err(DnsCodecError::InvalidLabelCharacter);
+        }
         labels.push(label_str.to_ascii_lowercase());
         pos = label_end;
     }
@@ -823,5 +842,56 @@ mod tests {
         assert!(msg.is_truncated());
         assert_eq!(msg.questions.len(), 1);
         assert!(msg.answers.is_empty());
+    }
+
+    fn query_with_raw_label(label: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label);
+        pkt.push(0);
+        pkt.extend_from_slice(&QTYPE_A.to_be_bytes());
+        pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn rejects_control_whitespace_and_del_in_qname_labels() {
+        for bad in [
+            &b"a\r\nb"[..],
+            &b"a b"[..],
+            &b"a\tb"[..],
+            &b"a\x00b"[..],
+            &b"a\x7fb"[..],
+        ] {
+            let pkt = query_with_raw_label(bad);
+            assert_eq!(
+                parse_dns_query(&pkt).unwrap_err(),
+                DnsCodecError::InvalidLabelCharacter
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_underscore_labels_and_enforces_length_limits() {
+        let pkt = query_with_raw_label(b"_dmarc");
+        assert_eq!(parse_dns_query(&pkt).unwrap().question.qname, "_dmarc");
+
+        let mut long = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for _ in 0..4 {
+            long.push(63);
+            long.extend_from_slice(&[b'a'; 63]);
+        }
+        long.push(0);
+        long.extend_from_slice(&[0, 1, 0, 1]);
+        assert_eq!(
+            parse_dns_query(&long).unwrap_err(),
+            DnsCodecError::DomainNameTooLong
+        );
+
+        let over_label = query_with_raw_label(&[b'a'; 64]);
+        assert_eq!(
+            parse_dns_query(&over_label).unwrap_err(),
+            DnsCodecError::InvalidLabelLength
+        );
     }
 }

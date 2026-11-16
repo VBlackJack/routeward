@@ -18,13 +18,15 @@ use crate::config::{TelemetryConstants, TransportProtocol};
 use crate::logger::FileLogger;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
@@ -198,9 +200,37 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TelemetryCountingStream<'_, S> {
     }
 }
 
+/// A tracked connection together with the bookkeeping that throttles its `ConnectionUpdated` events.
+struct ConnectionSlot {
+    conn: TrackedConnection,
+    /// When a `ConnectionUpdated` event was last broadcast for this connection.
+    last_emit: Instant,
+    /// Counters changed since the last broadcast.
+    dirty: bool,
+}
+
+/// Non-active connection ids ordered by start time, oldest first.
+type EvictionIndex = BTreeSet<(DateTime<Utc>, String)>;
+
+/// One aggregated UDP flow: all datagrams of a (protocol, 5-tuple, route) share one record.
+struct UdpFlow {
+    conn_id: String,
+    last_seen: Instant,
+}
+
+/// Builds the aggregation key of a UDP flow: transport, client endpoint, target endpoint and route.
+pub fn udp_flow_key(client: SocketAddr, target: SocketAddr, route_label: &str) -> String {
+    format!("udp|{client}|{target}|{route_label}")
+}
+
 #[derive(Clone)]
 pub struct TelemetryHub {
-    connections: Arc<DashMap<String, TrackedConnection>>,
+    connections: Arc<DashMap<String, ConnectionSlot>>,
+    udp_flows: Arc<DashMap<String, UdpFlow>>,
+    /// Non-active connections ordered oldest first: the only records eligible for eviction.
+    evictable: Arc<Mutex<EvictionIndex>>,
+    udp_flow_idle_timeout: Duration,
+    update_interval: Duration,
     active_cancellers: Arc<DashMap<String, watch::Sender<bool>>>,
     logs: Arc<RwLock<VecDeque<LogEntry>>>,
     bandwidth_history: Arc<RwLock<VecDeque<BandwidthSample>>>,
@@ -236,7 +266,12 @@ impl TelemetryHub {
         log_dir: impl Into<std::path::PathBuf>,
         enable_logging: bool,
     ) -> Self {
-        let file_logger = FileLogger::new(log_dir, &constants.log_app_name, enable_logging);
+        let file_logger = FileLogger::with_flush_interval(
+            log_dir,
+            &constants.log_app_name,
+            enable_logging,
+            constants.log_flush_interval_ms,
+        );
         let broadcast_cap = constants
             .event_broadcast_capacity
             .max(MIN_BROADCAST_CAPACITY);
@@ -244,6 +279,10 @@ impl TelemetryHub {
 
         Self {
             connections: Arc::new(DashMap::new()),
+            udp_flows: Arc::new(DashMap::new()),
+            evictable: Arc::new(Mutex::new(BTreeSet::new())),
+            udp_flow_idle_timeout: Duration::from_millis(constants.udp_flow_idle_timeout_ms),
+            update_interval: Duration::from_millis(constants.telemetry_update_interval_ms),
             active_cancellers: Arc::new(DashMap::new()),
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(
                 constants.max_log_ring_buffer_entries,
@@ -293,57 +332,181 @@ impl TelemetryHub {
             }
         }
         self.add_traffic(conn.rx_bytes, conn.tx_bytes);
-        self.connections.insert(conn.id.clone(), conn.clone());
+        let evictable_key =
+            (conn.status != ConnectionStatus::Active).then(|| (conn.started_at, conn.id.clone()));
+        self.connections.insert(
+            conn.id.clone(),
+            ConnectionSlot {
+                conn: conn.clone(),
+                last_emit: Instant::now(),
+                dirty: false,
+            },
+        );
+        if let Some(key) = evictable_key {
+            self.evictable.lock().insert(key);
+        }
         self.evict_excess_connections();
         let _ = self.event_tx.send(TelemetryEvent::ConnectionUpdated(conn));
     }
 
+    /// Evicts the oldest non-active records (closed, blocked, idle UDP flows) while over capacity.
+    /// Cost is proportional to the number of evicted records: no scan and no sort per insert.
     fn evict_excess_connections(&self) {
-        let len = self.connections.len();
-        if len <= self.max_connections {
+        if self.connections.len() <= self.max_connections {
             return;
         }
-        let excess = len - self.max_connections;
-        let mut candidates: Vec<(chrono::DateTime<Utc>, String)> = self
-            .connections
-            .iter()
-            .filter(|entry| entry.value().status != ConnectionStatus::Active)
-            .map(|entry| (entry.value().started_at, entry.key().clone()))
-            .collect();
-        if candidates.is_empty() {
-            return;
-        }
-        candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        for (_, id) in candidates.into_iter().take(excess) {
+        let mut evictable = self.evictable.lock();
+        while self.connections.len() > self.max_connections {
+            let Some((_, id)) = evictable.pop_first() else {
+                break;
+            };
             self.connections.remove(&id);
         }
     }
 
+    /// Adds `delta_rx` / `delta_tx` to a connection. The global counters move immediately; the
+    /// `ConnectionUpdated` event is throttled to once per `telemetryUpdateIntervalMs` per
+    /// connection (pending changes are flushed by [`Self::tick_bandwidth_sample`] and on close).
     pub fn update_connection_traffic(&self, id: &str, delta_rx: u64, delta_tx: u64) {
         self.add_traffic(delta_rx, delta_tx);
-        let updated = if let Some(mut entry) = self.connections.get_mut(id) {
-            entry.rx_bytes += delta_rx;
-            entry.tx_bytes += delta_tx;
-            Some(entry.clone())
+        let updated = if let Some(mut slot) = self.connections.get_mut(id) {
+            slot.conn.rx_bytes += delta_rx;
+            slot.conn.tx_bytes += delta_tx;
+            slot.dirty = true;
+            if slot.last_emit.elapsed() >= self.update_interval {
+                slot.last_emit = Instant::now();
+                slot.dirty = false;
+                Some(slot.conn.clone())
+            } else {
+                None
+            }
         } else {
             None
         };
         if let Some(conn) = updated {
+            let _ = self.event_tx.send(TelemetryEvent::ConnectionUpdated(conn));
+        }
+    }
+
+    /// Broadcasts the connections whose counters changed since their last event and whose
+    /// throttle interval has elapsed.
+    fn flush_pending_connection_updates(&self) {
+        let mut pending = Vec::new();
+        for mut slot in self.connections.iter_mut() {
+            if slot.dirty && slot.last_emit.elapsed() >= self.update_interval {
+                slot.dirty = false;
+                slot.last_emit = Instant::now();
+                pending.push(slot.conn.clone());
+            }
+        }
+        for conn in pending {
             let _ = self.event_tx.send(TelemetryEvent::ConnectionUpdated(conn));
         }
     }
 
     pub fn mark_connection_closed(&self, id: &str) {
         self.active_cancellers.remove(id);
-        let updated = if let Some(mut entry) = self.connections.get_mut(id) {
-            entry.status = ConnectionStatus::Closed;
-            Some(entry.clone())
+        let updated = if let Some(mut slot) = self.connections.get_mut(id) {
+            slot.conn.status = ConnectionStatus::Closed;
+            slot.dirty = false;
+            slot.last_emit = Instant::now();
+            Some(slot.conn.clone())
         } else {
             None
         };
         if let Some(conn) = updated {
+            self.evictable
+                .lock()
+                .insert((conn.started_at, conn.id.clone()));
             let _ = self.event_tx.send(TelemetryEvent::ConnectionUpdated(conn));
+            self.evict_excess_connections();
         }
+    }
+
+    /// Records one UDP datagram of an aggregated flow. The first datagram of `flow_key` creates a
+    /// single `Active` record from `template` (counters taken from `rx_bytes` / `tx_bytes`);
+    /// later datagrams only update that record's traffic. Idle flows are closed by
+    /// [`Self::sweep_idle_udp_flows`]. Returns `true` when this datagram started a new flow, so
+    /// the caller logs the flow start once and the individual datagrams at debug level.
+    ///
+    /// `make_template` is only invoked for a new flow, so the hot per-datagram path allocates nothing.
+    pub fn record_udp_datagram<F>(
+        &self,
+        flow_key: &str,
+        make_template: F,
+        is_proxied: bool,
+        rx_bytes: u64,
+        tx_bytes: u64,
+    ) -> bool
+    where
+        F: FnOnce() -> TrackedConnection,
+    {
+        if let Some(mut flow) = self.udp_flows.get_mut(flow_key) {
+            flow.last_seen = Instant::now();
+            let id = flow.conn_id.clone();
+            drop(flow);
+            let still_active = self
+                .connections
+                .get(&id)
+                .is_some_and(|slot| slot.conn.status == ConnectionStatus::Active);
+            if still_active {
+                self.update_connection_traffic(&id, rx_bytes, tx_bytes);
+                return false;
+            }
+            // The record was evicted, cleared or terminated: start a fresh one below.
+            self.udp_flows
+                .remove_if(flow_key, |_, flow| flow.conn_id == id);
+        }
+        if self.udp_flows.len() >= self.max_connections {
+            self.sweep_idle_udp_flows();
+            if self.udp_flows.len() >= self.max_connections {
+                // Flow table saturated: keep the global byte counters honest but do not track
+                // another record, so a port scan cannot grow telemetry without bound.
+                self.add_traffic(rx_bytes, tx_bytes);
+                return false;
+            }
+        }
+        // The entry API makes check-and-insert atomic: two threads racing on the same new flow
+        // cannot both create an Active record. The vacant entry is held while the record is
+        // stored, so a concurrent datagram of the same flow only sees it once it is complete;
+        // `record_connection` never touches `udp_flows`, so this cannot deadlock.
+        match self.udp_flows.entry(flow_key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                occupied.get_mut().last_seen = Instant::now();
+                let id = occupied.get().conn_id.clone();
+                drop(occupied);
+                self.update_connection_traffic(&id, rx_bytes, tx_bytes);
+                false
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let mut template = make_template();
+                template.status = ConnectionStatus::Active;
+                template.rx_bytes = rx_bytes;
+                template.tx_bytes = tx_bytes;
+                let _guard = vacant.insert(UdpFlow {
+                    conn_id: template.id.clone(),
+                    last_seen: Instant::now(),
+                });
+                self.record_connection(template, is_proxied);
+                true
+            }
+        }
+    }
+
+    /// Marks every UDP flow idle for longer than `udpFlowIdleTimeoutMs` as closed and forgets its
+    /// flow key, so the record becomes evictable. Returns the number of closed flows.
+    pub fn sweep_idle_udp_flows(&self) -> usize {
+        let idle: Vec<(String, String)> = self
+            .udp_flows
+            .iter()
+            .filter(|f| f.value().last_seen.elapsed() >= self.udp_flow_idle_timeout)
+            .map(|f| (f.key().clone(), f.value().conn_id.clone()))
+            .collect();
+        for (flow_key, conn_id) in &idle {
+            self.udp_flows.remove(flow_key);
+            self.mark_connection_closed(conn_id);
+        }
+        idle.len()
     }
 
     /// Registers a cancellation watch channel for an active relayed connection.
@@ -362,10 +525,12 @@ impl TelemetryHub {
             false
         };
 
-        let updated = if let Some(mut entry) = self.connections.get_mut(id) {
-            if entry.status == ConnectionStatus::Active {
-                entry.status = ConnectionStatus::Closed;
-                Some(entry.clone())
+        let updated = if let Some(mut slot) = self.connections.get_mut(id) {
+            if slot.conn.status == ConnectionStatus::Active {
+                slot.conn.status = ConnectionStatus::Closed;
+                slot.dirty = false;
+                slot.last_emit = Instant::now();
+                Some(slot.conn.clone())
             } else {
                 None
             }
@@ -374,7 +539,11 @@ impl TelemetryHub {
         };
 
         if let Some(conn) = updated {
+            self.evictable
+                .lock()
+                .insert((conn.started_at, conn.id.clone()));
             let _ = self.event_tx.send(TelemetryEvent::ConnectionUpdated(conn));
+            self.evict_excess_connections();
             return true;
         }
 
@@ -416,18 +585,22 @@ impl TelemetryHub {
         let closed_ids: Vec<String> = self
             .connections
             .iter()
-            .filter(|c| c.value().status != ConnectionStatus::Active)
+            .filter(|c| c.value().conn.status != ConnectionStatus::Active)
             .map(|c| c.key().clone())
             .collect();
         for id in closed_ids {
             self.connections.remove(&id);
         }
+        self.evictable.lock().clear();
         let _ = self.event_tx.send(TelemetryEvent::ConnectionsCleared);
     }
 
     pub fn list_connections(&self) -> Vec<TrackedConnection> {
-        let mut list: Vec<TrackedConnection> =
-            self.connections.iter().map(|c| c.value().clone()).collect();
+        let mut list: Vec<TrackedConnection> = self
+            .connections
+            .iter()
+            .map(|c| c.value().conn.clone())
+            .collect();
         list.sort_by_key(|b| std::cmp::Reverse(b.started_at));
         list
     }
@@ -460,6 +633,8 @@ impl TelemetryHub {
             });
         }
 
+        self.sweep_idle_udp_flows();
+        self.flush_pending_connection_updates();
         let snap = self.snapshot();
         let _ = self.event_tx.send(TelemetryEvent::Telemetry(snap));
     }
@@ -468,7 +643,7 @@ impl TelemetryHub {
         let active_connections = self
             .connections
             .iter()
-            .filter(|c| c.value().status == ConnectionStatus::Active)
+            .filter(|c| c.value().conn.status == ConnectionStatus::Active)
             .count();
 
         let hist = self.bandwidth_history.read();
@@ -494,7 +669,7 @@ impl TelemetryHub {
         use std::collections::HashMap;
         let mut map: HashMap<String, ProcessTrafficSummary> = HashMap::new();
         for item in self.connections.iter() {
-            let conn = item.value();
+            let conn = &item.value().conn;
             let entry =
                 map.entry(conn.process_name.clone())
                     .or_insert_with(|| ProcessTrafficSummary {
@@ -699,6 +874,8 @@ mod tests {
             log_app_name: "RouteWard".to_string(),
             log_flush_interval_ms: 500,
             event_broadcast_capacity: 16,
+            udp_flow_idle_timeout_ms: 30000,
+            telemetry_update_interval_ms: 250,
         };
         let hub = TelemetryHub::new_with_logging(&constants, false);
         let base_time = Utc::now();
@@ -733,5 +910,206 @@ mod tests {
         assert!(!ids.contains(&"closed-1".to_string()));
         assert!(ids.contains(&"blocked-2".to_string()));
         assert!(ids.contains(&"closed-3".to_string()));
+    }
+
+    fn udp_template(id: &str) -> TrackedConnection {
+        TrackedConnection {
+            id: id.to_string(),
+            pid: 7,
+            process_name: "voip.exe".to_string(),
+            process_path: String::new(),
+            target_host: "203.0.113.9".to_string(),
+            resolved_domain: None,
+            target_port: 3478,
+            protocol: TransportProtocol::Udp,
+            matched_rule: "rule".to_string(),
+            route_label: "DIRECT".to_string(),
+            latency_ms: 0,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            status: ConnectionStatus::Active,
+            started_at: Utc::now(),
+            error_detail: None,
+        }
+    }
+
+    fn udp_test_hub(max_connections: usize, idle_ms: u64, update_ms: u64) -> TelemetryHub {
+        let mut constants = SystemConstants::load_embedded()
+            .expect("SystemConstants")
+            .telemetry;
+        constants.max_connection_history_entries = max_connections;
+        constants.udp_flow_idle_timeout_ms = idle_ms;
+        constants.telemetry_update_interval_ms = update_ms;
+        TelemetryHub::new_with_logging(&constants, false)
+    }
+
+    fn udp_key(port: u16) -> String {
+        udp_flow_key(
+            format!("192.168.1.2:{port}").parse().unwrap(),
+            "203.0.113.9:3478".parse().unwrap(),
+            "DIRECT",
+        )
+    }
+
+    #[test]
+    fn udp_datagrams_of_one_flow_share_a_single_record() {
+        let hub = udp_test_hub(500, 30_000, 250);
+        let key = udp_key(50000);
+        let mut started = 0;
+        for i in 0..1000 {
+            if hub.record_udp_datagram(&key, || udp_template(&format!("id-{i}")), false, 0, 100) {
+                started += 1;
+            }
+        }
+        assert_eq!(started, 1, "only the first datagram starts a flow");
+        let conns = hub.list_connections();
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].tx_bytes, 100_000);
+        assert_eq!(conns[0].status, ConnectionStatus::Active);
+        let snap = hub.snapshot();
+        assert_eq!(snap.total_tx_bytes, 100_000);
+        assert_eq!(snap.direct_count, 1);
+    }
+
+    #[test]
+    fn concurrent_datagrams_of_one_new_flow_create_a_single_active_record() {
+        let hub = std::sync::Arc::new(udp_test_hub(1000, 20, 60_000));
+        let created = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|n| {
+                let hub = hub.clone();
+                let created = created.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if hub.record_udp_datagram(
+                        &udp_key(51000),
+                        || udp_template(&format!("race{n}")),
+                        false,
+                        0,
+                        10,
+                    ) {
+                        created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hub.snapshot().active_connections, 1);
+        assert_eq!(hub.list_connections().len(), 1);
+    }
+
+    #[test]
+    fn idle_udp_flows_are_closed_and_become_evictable() {
+        let hub = udp_test_hub(3, 20, 250);
+        for port in 0..3u16 {
+            hub.record_udp_datagram(
+                &udp_key(50000 + port),
+                || udp_template(&format!("f{port}")),
+                false,
+                0,
+                10,
+            );
+        }
+        assert_eq!(hub.snapshot().active_connections, 3);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(hub.sweep_idle_udp_flows(), 3);
+        assert_eq!(hub.snapshot().active_connections, 0);
+
+        // New flows push the closed (idle) records out instead of growing without bound.
+        for port in 10..20u16 {
+            hub.record_udp_datagram(
+                &udp_key(50000 + port),
+                || udp_template(&format!("g{port}")),
+                false,
+                0,
+                10,
+            );
+        }
+        assert!(hub.list_connections().len() <= 10);
+        let ids: Vec<String> = hub.list_connections().into_iter().map(|c| c.id).collect();
+        assert!(
+            !ids.contains(&"f0".to_string()),
+            "idle flow records were evicted"
+        );
+
+        // A datagram after the idle close starts a new flow record.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(hub.record_udp_datagram(&udp_key(50000), || udp_template("again"), false, 0, 10));
+    }
+
+    #[test]
+    fn udp_flow_table_is_bounded_when_every_flow_is_still_active() {
+        let hub = udp_test_hub(4, 60_000, 250);
+        for port in 0..50u16 {
+            hub.record_udp_datagram(
+                &udp_key(40000 + port),
+                || udp_template(&format!("h{port}")),
+                false,
+                0,
+                10,
+            );
+        }
+        assert!(hub.list_connections().len() <= 4);
+        // Untracked flows still count towards the global byte totals.
+        assert_eq!(hub.snapshot().total_tx_bytes, 500);
+    }
+
+    #[tokio::test]
+    async fn connection_updates_are_throttled_and_flushed_on_tick_and_close() {
+        let hub = udp_test_hub(500, 30_000, 10_000);
+        let mut events = hub.subscribe();
+        let mut conn = udp_template("t1");
+        conn.protocol = TransportProtocol::Tcp;
+        hub.record_connection(conn, true);
+        for _ in 0..500 {
+            hub.update_connection_traffic("t1", 10, 20);
+        }
+        // Only the record_connection event was emitted; 500 chunks did not broadcast 500 clones.
+        let mut updates = 0;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, TelemetryEvent::ConnectionUpdated(_)) {
+                updates += 1;
+            }
+        }
+        assert_eq!(updates, 1);
+        // Counters are exact regardless of the throttle.
+        let live = hub.list_connections().remove(0);
+        assert_eq!((live.rx_bytes, live.tx_bytes), (5000, 10_000));
+
+        // Closing always emits a final update carrying the final counters.
+        hub.mark_connection_closed("t1");
+        match events.try_recv().expect("final update on close") {
+            TelemetryEvent::ConnectionUpdated(c) => {
+                assert_eq!(c.status, ConnectionStatus::Closed);
+                assert_eq!(c.rx_bytes, 5000);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_connection_updates_are_flushed_by_the_periodic_tick() {
+        let hub = udp_test_hub(500, 30_000, 20);
+        let mut events = hub.subscribe();
+        hub.record_connection(udp_template("t2"), false);
+        while events.try_recv().is_ok() {}
+        // A burst right after creation is throttled (interval not elapsed yet).
+        hub.update_connection_traffic("t2", 1, 1);
+        assert!(events.try_recv().is_err());
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        hub.tick_bandwidth_sample();
+        let mut saw_update = false;
+        while let Ok(ev) = events.try_recv() {
+            if let TelemetryEvent::ConnectionUpdated(c) = ev {
+                assert_eq!((c.rx_bytes, c.tx_bytes), (1, 1));
+                saw_update = true;
+            }
+        }
+        assert!(saw_update, "tick must flush the pending counter update");
     }
 }

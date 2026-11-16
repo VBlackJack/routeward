@@ -201,6 +201,49 @@ pub struct NetworkConstants {
     pub pending_udp_timeout_ms: u64,
     #[serde(default = "default_max_pending_udp_packets")]
     pub max_pending_udp_packets: usize,
+    /// Capacity of the pending outbound SYN queue; the oldest SYN is dropped when it is full.
+    #[serde(default = "default_max_pending_syn_packets")]
+    pub max_pending_syn_packets: usize,
+    /// Lifetime of a socket-to-PID cache entry (protocol, family, local port) in milliseconds.
+    #[serde(default = "default_socket_pid_cache_ttl_ms")]
+    pub socket_pid_cache_ttl_ms: u64,
+    /// Age after which a NAT session never accepted by the local relay is removed.
+    #[serde(default = "default_nat_half_open_session_ttl_secs")]
+    pub nat_half_open_session_ttl_secs: u64,
+    /// Interval between sweeps of expired NAT sessions and cache entries, in milliseconds.
+    #[serde(default = "default_nat_session_sweep_interval_ms")]
+    pub nat_session_sweep_interval_ms: u64,
+    /// How long the verdict of a fragmented UDP datagram is remembered for its later fragments.
+    #[serde(default = "default_udp_fragment_verdict_ttl_ms")]
+    pub udp_fragment_verdict_ttl_ms: u64,
+    /// Maximum number of remembered fragmented UDP datagram verdicts.
+    #[serde(default = "default_max_udp_fragment_verdicts")]
+    pub max_udp_fragment_verdicts: usize,
+    /// How long a finished transparent TCP relay session stays in the NAT table, so the final
+    /// FIN/RST and the client's trailing ACK/FIN are still reflected, in milliseconds.
+    #[serde(default = "default_session_close_grace_ms")]
+    pub session_close_grace_ms: u64,
+    /// Polling interval while peeking the first bytes of a TCP stream for SNI / Host, in milliseconds.
+    #[serde(default = "default_peek_poll_interval_ms")]
+    pub peek_poll_interval_ms: u64,
+    /// Maximum number of idle direct-UDP sockets kept for reuse, per address family.
+    #[serde(default = "default_direct_udp_socket_pool_size")]
+    pub direct_udp_socket_pool_size: usize,
+    /// Lower bound of the receive timeout of a direct UDP datagram exchange, in milliseconds.
+    #[serde(default = "default_udp_direct_timeout_min_ms")]
+    pub udp_direct_timeout_min_ms: u64,
+    /// Upper bound of the receive timeout of a direct UDP datagram exchange, in milliseconds.
+    #[serde(default = "default_udp_direct_timeout_max_ms")]
+    pub udp_direct_timeout_max_ms: u64,
+    /// Timeout of a direct LLMNR / mDNS query fallback, in milliseconds.
+    #[serde(default = "default_local_name_query_timeout_ms")]
+    pub local_name_query_timeout_ms: u64,
+    /// How long a parsed conntrack table snapshot is served without re-reading the kernel table.
+    #[serde(default = "default_conntrack_cache_ttl_ms")]
+    pub conntrack_cache_ttl_ms: u64,
+    /// Minimum age of the conntrack snapshot before a lookup miss may trigger a refresh.
+    #[serde(default = "default_conntrack_min_refresh_interval_ms")]
+    pub conntrack_min_refresh_interval_ms: u64,
     pub windivert_priority: i16,
     pub windivert_dll_paths: Vec<String>,
     #[serde(default = "default_linux_fwmark")]
@@ -309,6 +352,62 @@ fn default_max_pending_udp_packets() -> usize {
     256
 }
 
+fn default_max_pending_syn_packets() -> usize {
+    1024
+}
+
+fn default_socket_pid_cache_ttl_ms() -> u64 {
+    5000
+}
+
+fn default_nat_half_open_session_ttl_secs() -> u64 {
+    60
+}
+
+fn default_nat_session_sweep_interval_ms() -> u64 {
+    5000
+}
+
+fn default_udp_fragment_verdict_ttl_ms() -> u64 {
+    10000
+}
+
+fn default_max_udp_fragment_verdicts() -> usize {
+    4096
+}
+
+fn default_session_close_grace_ms() -> u64 {
+    250
+}
+
+fn default_peek_poll_interval_ms() -> u64 {
+    5
+}
+
+fn default_direct_udp_socket_pool_size() -> usize {
+    16
+}
+
+fn default_udp_direct_timeout_min_ms() -> u64 {
+    300
+}
+
+fn default_udp_direct_timeout_max_ms() -> u64 {
+    1500
+}
+
+fn default_local_name_query_timeout_ms() -> u64 {
+    300
+}
+
+fn default_conntrack_cache_ttl_ms() -> u64 {
+    1000
+}
+
+fn default_conntrack_min_refresh_interval_ms() -> u64 {
+    100
+}
+
 fn default_linux_ip_binary() -> String {
     "ip".to_string()
 }
@@ -362,6 +461,48 @@ pub struct DnsConstants {
     pub default_bypass_suffixes: Vec<String>,
     #[serde(default = "default_private_reverse_zones")]
     pub default_private_reverse_zones: Vec<String>,
+    /// Lower bound of the timeout of a direct DNS query to a resolver, in milliseconds.
+    #[serde(default = "default_direct_query_timeout_min_ms")]
+    pub direct_query_timeout_min_ms: u64,
+    /// Upper bound of the timeout of a direct DNS query to a resolver, in milliseconds.
+    #[serde(default = "default_direct_query_timeout_max_ms")]
+    pub direct_query_timeout_max_ms: u64,
+    /// Size of the receive buffer of a direct UDP DNS reply, in bytes.
+    #[serde(default = "default_udp_response_buffer_bytes")]
+    pub udp_response_buffer_bytes: usize,
+    /// How long a domain-to-real-IPv4 resolution done for Direct UDP traffic is reused, in seconds.
+    #[serde(default = "default_fake_ip_real_resolution_ttl_secs")]
+    pub fake_ip_real_resolution_ttl_secs: u64,
+    /// Maximum number of cached domain-to-real-IPv4 resolutions.
+    #[serde(default = "default_fake_ip_real_resolution_max_entries")]
+    pub fake_ip_real_resolution_max_entries: usize,
+    /// How long the detected system DNS resolver list is reused, in milliseconds.
+    #[serde(default = "default_system_resolvers_cache_ttl_ms")]
+    pub system_resolvers_cache_ttl_ms: u64,
+}
+
+fn default_direct_query_timeout_min_ms() -> u64 {
+    500
+}
+
+fn default_direct_query_timeout_max_ms() -> u64 {
+    2500
+}
+
+fn default_udp_response_buffer_bytes() -> usize {
+    4096
+}
+
+fn default_fake_ip_real_resolution_ttl_secs() -> u64 {
+    30
+}
+
+fn default_fake_ip_real_resolution_max_entries() -> usize {
+    1024
+}
+
+fn default_system_resolvers_cache_ttl_ms() -> u64 {
+    5000
 }
 
 fn default_os_response_ttl_seconds() -> u32 {
@@ -459,6 +600,21 @@ pub struct TelemetryConstants {
     pub log_flush_interval_ms: u64,
     #[serde(default = "default_event_broadcast_capacity")]
     pub event_broadcast_capacity: usize,
+    /// A UDP flow with no datagram for this long is marked closed in telemetry.
+    #[serde(default = "default_udp_flow_idle_timeout_ms")]
+    pub udp_flow_idle_timeout_ms: u64,
+    /// Minimum delay between two `ConnectionUpdated` events for the same connection while its
+    /// traffic counters grow; a final update is always emitted when the connection closes.
+    #[serde(default = "default_telemetry_update_interval_ms")]
+    pub telemetry_update_interval_ms: u64,
+}
+
+fn default_udp_flow_idle_timeout_ms() -> u64 {
+    30000
+}
+
+fn default_telemetry_update_interval_ms() -> u64 {
+    250
 }
 
 fn default_max_connection_history_entries() -> usize {
@@ -1275,7 +1431,7 @@ mod tests {
         let junction_link = temp_root.join("JunctionLink");
         assert!(!security::is_symlink_or_reparse_point(&junction_target)
             .expect("check non-reparse dir"));
-        let mklink = std::process::Command::new("cmd")
+        let mklink = std::process::Command::new(crate::system::windows_system_tool_path("cmd.exe"))
             .args([
                 "/C",
                 "mklink",

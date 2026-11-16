@@ -1,3 +1,17 @@
+# Copyright 2026 Julien Bombled
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 name: Release
 
 on:
@@ -11,18 +25,19 @@ on:
         required: false
         default: ""
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
-  ui-build:
+  linux-deb:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -33,25 +48,6 @@ jobs:
         run: |
           npm ci
           npm run build
-
-      - name: Upload built UI bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: ui-dist
-          path: ui/dist
-
-  linux-deb:
-    needs: ui-build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download built UI bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: ui-dist
-          path: ui/dist
 
       - name: Install Linux desktop dependencies
         run: |
@@ -64,16 +60,21 @@ jobs:
             pkg-config
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
 
       - name: Build Linux release binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
 
       - name: Build Debian package
         run: bash packaging/linux/build-deb.sh --target-dir target/release --out-dir dist
 
       - name: Upload Debian package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-linux-deb
           path: |
@@ -81,23 +82,36 @@ jobs:
             dist/*.deb.sha256
 
   windows-zip:
-    needs: ui-build
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Download built UI bundle
-        uses: actions/download-artifact@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          name: ui-dist
-          path: ui/dist
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build UI bundle
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
 
       - name: Build Windows release binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
 
       - name: Setup WiX Toolset CLI
         run: dotnet tool install --global wix --version 6.0.2
@@ -109,7 +123,7 @@ jobs:
           ./packaging/windows/build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64
 
       - name: Upload Windows ZIP and MSI artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-windows-zip
           path: |
@@ -122,9 +136,11 @@ jobs:
     needs: [linux-deb, windows-zip]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     steps:
       - name: Download all release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
 
@@ -138,7 +154,7 @@ jobs:
           )
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             release-files/*.deb

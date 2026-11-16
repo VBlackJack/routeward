@@ -18,9 +18,10 @@ use crate::config::RuleAction;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,7 +47,27 @@ const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_RST: u8 = 0x04;
 const TCP_FLAG_ACK: u8 = 0x10;
-const SOCKET_CACHE_TTL_SECS: u64 = 30;
+const IPV6_EXT_HEADER_FRAGMENT: u8 = 44;
+const IPV6_FRAGMENT_HEADER_LEN: usize = 8;
+const IPV6_FRAG_OFFSET_MASK: u16 = 0xFFF8;
+const IPV6_FRAG_MORE_FLAG: u16 = 0x0001;
+const IPV4_FRAG_OFFSET_MASK: u16 = 0x1FFF;
+/// Maximum number of IPv6 extension headers walked while looking for a fragment header.
+const IPV6_MAX_EXT_HEADERS: usize = 8;
+/// Bytes of the UDP header needed to read the source and destination ports.
+const UDP_PORTS_LEN: usize = 4;
+
+/// Fallback `socket_pid_cache` TTL used until the daemon applies `socketPidCacheTtlMs` through
+/// [`TransparentNatTable::configure`]. Mirrors the `system_constants.json` default.
+const DEFAULT_SOCKET_PID_CACHE_TTL_MS: u64 = 5_000;
+/// Fallback half-open NAT session TTL (mirrors `natHalfOpenSessionTtlSecs`).
+const DEFAULT_NAT_HALF_OPEN_SESSION_TTL_SECS: u64 = 60;
+/// Fallback UDP fragment verdict TTL (mirrors `udpFragmentVerdictTtlMs`).
+const DEFAULT_UDP_FRAGMENT_VERDICT_TTL_MS: u64 = 10_000;
+/// Fallback UDP fragment verdict capacity (mirrors `maxUdpFragmentVerdicts`).
+const DEFAULT_MAX_UDP_FRAGMENT_VERDICTS: usize = 4_096;
+/// Default bound of a [`PendingSynQueue`] built with [`PendingSynQueue::new`].
+const DEFAULT_PENDING_SYN_QUEUE_CAPACITY: usize = 1_024;
 
 /// Indicates which mechanism resolved the owning PID for an outbound TCP SYN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +96,28 @@ pub struct OutboundFlowKey {
     pub local_port: u16,
     pub remote_ip: IpAddr,
     pub remote_port: u16,
+}
+
+/// Key of the socket-to-PID cache: a local port only identifies one socket within a transport
+/// protocol and an address family, so TCP/UDP and IPv4/IPv6 sockets sharing a port number never
+/// inherit each other's owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SocketKey {
+    /// IP protocol number (`IPPROTO_TCP` or `IPPROTO_UDP`).
+    pub protocol: u8,
+    /// `true` for an IPv6 socket, `false` for IPv4.
+    pub ipv6: bool,
+    pub local_port: u16,
+}
+
+impl SocketKey {
+    pub fn new(protocol: u8, ipv6: bool, local_port: u16) -> Self {
+        Self {
+            protocol,
+            ipv6,
+            local_port,
+        }
+    }
 }
 
 /// Active NAT redirection entry keyed by the outbound 4-tuple and indexed by the reflected relay peer tuple.
@@ -117,6 +160,9 @@ pub trait PacketSourcePort {
 
     /// Returns `(src_ip, src_port, dst_ip, dst_port)` for logging and flow inspection.
     fn flow_endpoints(&self) -> (IpAddr, u16, IpAddr, u16);
+
+    /// Returns the protocol, address family and source port identifying the sending socket.
+    fn socket_key(&self) -> SocketKey;
 }
 
 /// Parsed IPv4 + TCP packet header metadata.
@@ -143,6 +189,10 @@ impl PacketSourcePort for Ipv4TcpPacketMeta {
             IpAddr::V4(self.dst_ip),
             self.dst_port,
         )
+    }
+
+    fn socket_key(&self) -> SocketKey {
+        SocketKey::new(IPPROTO_TCP, false, self.src_port)
     }
 }
 
@@ -194,6 +244,10 @@ impl PacketSourcePort for Ipv4UdpPacketMeta {
             self.dst_port,
         )
     }
+
+    fn socket_key(&self) -> SocketKey {
+        SocketKey::new(IPPROTO_UDP, false, self.src_port)
+    }
 }
 
 /// Parsed IPv6 + TCP/UDP packet header and payload slice metadata.
@@ -223,6 +277,10 @@ impl PacketSourcePort for Ipv6TransportPacketMeta {
             IpAddr::V6(self.dst_ip),
             self.dst_port,
         )
+    }
+
+    fn socket_key(&self) -> SocketKey {
+        SocketKey::new(self.next_header, true, self.src_port)
     }
 }
 
@@ -300,6 +358,7 @@ pub enum PendingSynOutcome<T, M = Ipv4TcpPacketMeta> {
 #[derive(Clone)]
 pub struct PendingSynQueue<T, M = Ipv4TcpPacketMeta> {
     inner: Arc<Mutex<VecDeque<PendingSynEntry<T, M>>>>,
+    max_capacity: usize,
 }
 
 impl<T, M> Default for PendingSynQueue<T, M> {
@@ -309,20 +368,36 @@ impl<T, M> Default for PendingSynQueue<T, M> {
 }
 
 impl<T, M> PendingSynQueue<T, M> {
-    /// Creates an empty `PendingSynQueue`.
+    /// Creates an empty `PendingSynQueue` bounded to the default capacity.
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_PENDING_SYN_QUEUE_CAPACITY)
+    }
+
+    /// Creates an empty `PendingSynQueue` bounded to `max_capacity` entries (at least one).
+    pub fn with_capacity(max_capacity: usize) -> Self {
+        let cap = max_capacity.max(1);
         Self {
-            inner: Arc::new(Mutex::new(VecDeque::new())),
+            inner: Arc::new(Mutex::new(VecDeque::with_capacity(cap.min(256)))),
+            max_capacity: cap,
         }
     }
 
-    /// Enqueues an unresolved SYN packet with the current timestamp.
-    pub fn enqueue(&self, payload: T, meta: M) {
-        self.inner.lock().push_back(PendingSynEntry {
+    /// Enqueues an unresolved SYN packet with the current timestamp. When the queue is full the
+    /// oldest entry is evicted and returned so the caller can log it: the client retransmits the
+    /// SYN, so dropping the oldest never lets a connection bypass attribution.
+    pub fn enqueue(&self, payload: T, meta: M) -> Option<PendingSynEntry<T, M>> {
+        let mut queue = self.inner.lock();
+        let evicted = if queue.len() >= self.max_capacity {
+            queue.pop_front()
+        } else {
+            None
+        };
+        queue.push_back(PendingSynEntry {
             payload,
             meta,
             enqueued_at: Instant::now(),
         });
+        evicted
     }
 
     /// Returns the number of currently queued SYN packets.
@@ -349,16 +424,16 @@ impl<T, M: PacketSourcePort> PendingSynQueue<T, M> {
     where
         F: Fn(u16) -> Option<u32>,
     {
-        let mut queue = self.inner.lock();
-        let count = queue.len();
+        // Take the snapshot under the lock and resolve outside it: the PID fallback walks the OS
+        // socket table, which must never block the receive loop enqueueing new SYNs.
+        let snapshot: VecDeque<PendingSynEntry<T, M>> = std::mem::take(&mut *self.inner.lock());
         let mut outcomes = Vec::new();
+        let mut still_pending = VecDeque::new();
+        let memo = memoize_fallback(fallback_fn);
 
-        for _ in 0..count {
-            let Some(entry) = queue.pop_front() else {
-                break;
-            };
+        for entry in snapshot {
             if let Some((pid, source)) =
-                nat.try_resolve_pid_nonblocking(entry.meta.src_port(), &fallback_fn)
+                nat.try_resolve_pid_nonblocking(entry.meta.socket_key(), &memo)
             {
                 outcomes.push(PendingSynOutcome::Resolved {
                     payload: entry.payload,
@@ -387,12 +462,34 @@ impl<T, M: PacketSourcePort> PendingSynQueue<T, M> {
                         });
                     }
                 } else {
-                    queue.push_back(entry);
+                    still_pending.push_back(entry);
                 }
             }
         }
 
+        if !still_pending.is_empty() {
+            // Entries enqueued while resolving are newer: keep the pending ones in front.
+            let mut queue = self.inner.lock();
+            while let Some(entry) = still_pending.pop_back() {
+                queue.push_front(entry);
+            }
+        }
+
         outcomes
+    }
+}
+
+/// Wraps a PID fallback lookup so each distinct local port is resolved at most once per poll cycle.
+fn memoize_fallback<F: Fn(u16) -> Option<u32>>(fallback_fn: F) -> impl Fn(u16) -> Option<u32> {
+    let cache: std::cell::RefCell<HashMap<u16, Option<u32>>> =
+        std::cell::RefCell::new(HashMap::new());
+    move |port| {
+        if let Some(hit) = cache.borrow().get(&port) {
+            return *hit;
+        }
+        let resolved = fallback_fn(port);
+        cache.borrow_mut().insert(port, resolved);
+        resolved
     }
 }
 
@@ -522,16 +619,15 @@ impl<T, M: PacketSourcePort> PendingUdpQueue<T, M> {
     where
         F: Fn(u16) -> Option<u32>,
     {
-        let mut queue = self.inner.lock();
-        let count = queue.len();
+        // Snapshot under the lock, resolve outside it (see `PendingSynQueue::poll_ready`).
+        let snapshot: VecDeque<PendingUdpEntry<T, M>> = std::mem::take(&mut *self.inner.lock());
         let mut outcomes = Vec::new();
+        let mut still_pending = VecDeque::new();
+        let memo = memoize_fallback(fallback_fn);
 
-        for _ in 0..count {
-            let Some(entry) = queue.pop_front() else {
-                break;
-            };
+        for entry in snapshot {
             if let Some((pid, source)) =
-                nat.try_resolve_pid_nonblocking(entry.meta.src_port(), &fallback_fn)
+                nat.try_resolve_pid_nonblocking(entry.meta.socket_key(), &memo)
             {
                 outcomes.push(PendingUdpOutcome::Resolved {
                     payload: entry.payload,
@@ -561,8 +657,15 @@ impl<T, M: PacketSourcePort> PendingUdpQueue<T, M> {
                         });
                     }
                 } else {
-                    queue.push_back(entry);
+                    still_pending.push_back(entry);
                 }
+            }
+        }
+
+        if !still_pending.is_empty() {
+            let mut queue = self.inner.lock();
+            while let Some(entry) = still_pending.pop_back() {
+                queue.push_front(entry);
             }
         }
 
@@ -573,7 +676,14 @@ impl<T, M: PacketSourcePort> PendingUdpQueue<T, M> {
 /// Thread-safe NAT state table and loop-prevention registry for transparent TCP redirection.
 #[derive(Clone)]
 pub struct TransparentNatTable {
-    socket_pid_cache: Arc<DashMap<u16, (u32, Instant)>>,
+    socket_pid_cache: Arc<DashMap<SocketKey, (u32, Instant)>>,
+    socket_cache_ttl_ms: Arc<AtomicU64>,
+    half_open_session_ttl_secs: Arc<AtomicU64>,
+    fragment_verdict_ttl_ms: Arc<AtomicU64>,
+    fragment_verdict_capacity: Arc<AtomicUsize>,
+    udp_fragment_verdicts: Arc<DashMap<UdpFragmentKey, (UdpFragmentVerdict, Instant)>>,
+    /// Flows whose reflected SYN has been accepted by the local relay; the sweep never expires them.
+    adopted_flows: Arc<DashMap<OutboundFlowKey, ()>>,
     self_udp_ports: Arc<DashMap<u16, Instant>>,
     self_tcp_ports: Arc<DashMap<u16, Instant>>,
     sessions_by_flow: Arc<DashMap<OutboundFlowKey, NatSessionEntry>>,
@@ -599,6 +709,16 @@ impl TransparentNatTable {
     ) -> Self {
         Self {
             socket_pid_cache: Arc::new(DashMap::new()),
+            socket_cache_ttl_ms: Arc::new(AtomicU64::new(DEFAULT_SOCKET_PID_CACHE_TTL_MS)),
+            half_open_session_ttl_secs: Arc::new(AtomicU64::new(
+                DEFAULT_NAT_HALF_OPEN_SESSION_TTL_SECS,
+            )),
+            fragment_verdict_ttl_ms: Arc::new(AtomicU64::new(DEFAULT_UDP_FRAGMENT_VERDICT_TTL_MS)),
+            fragment_verdict_capacity: Arc::new(AtomicUsize::new(
+                DEFAULT_MAX_UDP_FRAGMENT_VERDICTS,
+            )),
+            udp_fragment_verdicts: Arc::new(DashMap::new()),
+            adopted_flows: Arc::new(DashMap::new()),
             self_udp_ports: Arc::new(DashMap::new()),
             self_tcp_ports: Arc::new(DashMap::new()),
             sessions_by_flow: Arc::new(DashMap::new()),
@@ -615,11 +735,123 @@ impl TransparentNatTable {
         }
     }
 
+    /// Applies the tunable lifetimes of the socket-to-PID cache, half-open NAT sessions and UDP
+    /// fragment verdicts (`socketPidCacheTtlMs`, `natHalfOpenSessionTtlSecs`,
+    /// `udpFragmentVerdictTtlMs`, `maxUdpFragmentVerdicts`). Clones of the table share the values.
+    pub fn configure(
+        &self,
+        socket_cache_ttl: Duration,
+        half_open_session_ttl: Duration,
+        fragment_verdict_ttl: Duration,
+        fragment_verdict_capacity: usize,
+    ) {
+        self.socket_cache_ttl_ms
+            .store(socket_cache_ttl.as_millis() as u64, Ordering::Relaxed);
+        self.half_open_session_ttl_secs
+            .store(half_open_session_ttl.as_secs(), Ordering::Relaxed);
+        self.fragment_verdict_ttl_ms
+            .store(fragment_verdict_ttl.as_millis() as u64, Ordering::Relaxed);
+        self.fragment_verdict_capacity
+            .store(fragment_verdict_capacity.max(1), Ordering::Relaxed);
+    }
+
+    fn socket_cache_ttl(&self) -> Duration {
+        Duration::from_millis(self.socket_cache_ttl_ms.load(Ordering::Relaxed))
+    }
+
+    /// Returns the configured half-open NAT session TTL.
+    pub fn half_open_session_ttl(&self) -> Duration {
+        Duration::from_secs(self.half_open_session_ttl_secs.load(Ordering::Relaxed))
+    }
+
+    /// Records the verdict applied to the first fragment of a UDP datagram so later fragments of
+    /// the same datagram (same addresses, protocol and identification) receive the same verdict.
+    pub fn record_udp_fragment_verdict(&self, key: UdpFragmentKey, verdict: UdpFragmentVerdict) {
+        let capacity = self.fragment_verdict_capacity.load(Ordering::Relaxed);
+        if self.udp_fragment_verdicts.len() >= capacity {
+            let ttl = Duration::from_millis(self.fragment_verdict_ttl_ms.load(Ordering::Relaxed));
+            self.udp_fragment_verdicts
+                .retain(|_, (_, at)| at.elapsed() < ttl);
+            if self.udp_fragment_verdicts.len() >= capacity {
+                let victim = self.udp_fragment_verdicts.iter().next().map(|e| *e.key());
+                if let Some(victim) = victim {
+                    self.udp_fragment_verdicts.remove(&victim);
+                }
+            }
+        }
+        self.udp_fragment_verdicts
+            .insert(key, (verdict, Instant::now()));
+    }
+
+    /// Returns the cached verdict for a fragment's datagram, if one was recorded within the TTL.
+    pub fn lookup_udp_fragment_verdict(&self, key: &UdpFragmentKey) -> Option<UdpFragmentVerdict> {
+        let ttl = Duration::from_millis(self.fragment_verdict_ttl_ms.load(Ordering::Relaxed));
+        let entry = self.udp_fragment_verdicts.get(key)?;
+        let (verdict, at) = *entry.value();
+        drop(entry);
+        if at.elapsed() < ttl {
+            Some(verdict)
+        } else {
+            self.udp_fragment_verdicts.remove(key);
+            None
+        }
+    }
+
+    /// Removes expired socket-to-PID cache entries, half-open NAT sessions that never reached the
+    /// local relay and expired UDP fragment verdicts. Returns the number of removed NAT sessions.
+    pub fn sweep_expired(&self) -> usize {
+        let socket_ttl = self.socket_cache_ttl();
+        self.socket_pid_cache
+            .retain(|_, (_, at)| at.elapsed() < socket_ttl);
+        let verdict_ttl =
+            Duration::from_millis(self.fragment_verdict_ttl_ms.load(Ordering::Relaxed));
+        self.udp_fragment_verdicts
+            .retain(|_, (_, at)| at.elapsed() < verdict_ttl);
+        self.sweep_expired_sessions(self.half_open_session_ttl())
+    }
+
+    /// Removes NAT sessions older than `ttl` whose reflected SYN was never accepted by the local
+    /// relay (half-open). Sessions adopted by a live relay connection are removed by the relay on
+    /// close and are never expired here, so long-lived connections keep working.
+    pub fn sweep_expired_sessions(&self, ttl: Duration) -> usize {
+        let expired: Vec<OutboundFlowKey> = self
+            .sessions_by_flow
+            .iter()
+            .filter(|e| {
+                e.value().created_at.elapsed() >= ttl && !self.adopted_flows.contains_key(e.key())
+            })
+            .map(|e| *e.key())
+            .collect();
+        let mut removed = 0;
+        for flow_key in expired {
+            if let Some((_, entry)) = self.sessions_by_flow.remove(&flow_key) {
+                let peer_key = entry.relay_peer_key();
+                // Only unlink the peer index when it still points at this flow.
+                self.peer_to_flow
+                    .remove_if(&peer_key, |_, mapped| *mapped == flow_key);
+                removed += 1;
+            }
+        }
+        self.adopted_flows
+            .retain(|flow, _| self.sessions_by_flow.contains_key(flow));
+        removed
+    }
+
+    /// Returns the number of tracked NAT sessions.
+    pub fn session_count(&self) -> usize {
+        self.sessions_by_flow.len()
+    }
+
     /// Registers a local UDP port bound by RouteWard itself so `WinDivert` passes its packets through without interception.
     pub fn register_self_udp_port(&self, port: u16) -> SelfPortGuard {
         let now = Instant::now();
         self.self_udp_ports.insert(port, now);
-        self.socket_pid_cache.insert(port, (self.self_pid, now));
+        for ipv6 in [false, true] {
+            self.socket_pid_cache.insert(
+                SocketKey::new(IPPROTO_UDP, ipv6, port),
+                (self.self_pid, now),
+            );
+        }
         SelfPortGuard {
             map: Arc::clone(&self.self_udp_ports),
             port,
@@ -635,7 +867,12 @@ impl TransparentNatTable {
     pub fn register_self_tcp_port(&self, port: u16) -> SelfPortGuard {
         let now = Instant::now();
         self.self_tcp_ports.insert(port, now);
-        self.socket_pid_cache.insert(port, (self.self_pid, now));
+        for ipv6 in [false, true] {
+            self.socket_pid_cache.insert(
+                SocketKey::new(IPPROTO_TCP, ipv6, port),
+                (self.self_pid, now),
+            );
+        }
         SelfPortGuard {
             map: Arc::clone(&self.self_tcp_ports),
             port,
@@ -707,34 +944,40 @@ impl TransparentNatTable {
         self.upstream_endpoints.read().clone()
     }
 
-    /// Records a `(local_port -> pid)` mapping observed on `WINDIVERT_LAYER_SOCKET`.
-    pub fn record_socket_event(&self, local_port: u16, pid: u32) {
-        if local_port != 0 && pid != 0 {
-            self.socket_pid_cache
-                .insert(local_port, (pid, Instant::now()));
+    /// Records a `(protocol, family, local_port) -> pid` mapping observed on `WINDIVERT_LAYER_SOCKET`.
+    pub fn record_socket_event(&self, key: SocketKey, pid: u32) {
+        if key.local_port != 0 && pid != 0 {
+            self.socket_pid_cache.insert(key, (pid, Instant::now()));
         }
     }
 
-    /// Attempts to resolve the owning PID for `local_port` immediately without sleeping.
+    /// Forgets the owner of a socket that has been closed so a process reusing the port number
+    /// never inherits the previous owner's rule. Only an entry recorded for the closing `pid` is removed.
+    pub fn record_socket_close(&self, key: SocketKey, pid: u32) {
+        self.socket_pid_cache
+            .remove_if(&key, |_, (cached_pid, _)| pid == 0 || *cached_pid == pid);
+    }
+
+    /// Attempts to resolve the owning PID for a socket immediately without sleeping.
     ///
     /// First checks the `SOCKET` layer cache; if absent, performs a single non-blocking call to `fallback_fn`.
     pub fn try_resolve_pid_nonblocking<F>(
         &self,
-        local_port: u16,
+        key: SocketKey,
         fallback_fn: F,
     ) -> Option<(u32, PidResolutionSource)>
     where
         F: Fn(u16) -> Option<u32>,
     {
-        if let Some(entry) = self.socket_pid_cache.get(&local_port) {
-            if entry.value().1.elapsed() <= Duration::from_secs(SOCKET_CACHE_TTL_SECS) {
+        if let Some(entry) = self.socket_pid_cache.get(&key) {
+            if entry.value().1.elapsed() <= self.socket_cache_ttl() {
                 return Some((entry.value().0, PidResolutionSource::SocketLayer));
             }
         }
 
-        if let Some(pid) = fallback_fn(local_port) {
+        if let Some(pid) = fallback_fn(key.local_port) {
             if pid != 0 {
-                self.record_socket_event(local_port, pid);
+                self.record_socket_event(key, pid);
                 return Some((pid, PidResolutionSource::TcpTableFallback));
             }
         }
@@ -797,6 +1040,8 @@ impl TransparentNatTable {
         let flow_key = entry.outbound_flow_key();
         let peer_key = entry.relay_peer_key();
         self.peer_to_flow.insert(peer_key, flow_key);
+        // A re-inserted flow (new SYN on a reused 4-tuple) starts half-open again.
+        self.adopted_flows.remove(&flow_key);
         self.sessions_by_flow.insert(flow_key, entry);
     }
 
@@ -818,8 +1063,13 @@ impl TransparentNatTable {
     }
 
     /// Validates a peer `SocketAddr` accepted by the transparent TCP relay against live NAT sessions.
+    ///
+    /// A validated peer has reached the local relay, so its session is marked as adopted and is no
+    /// longer subject to the half-open expiry sweep.
     pub fn validate_relay_peer_addr(&self, peer_addr: SocketAddr) -> Option<NatSessionEntry> {
-        self.get_session_by_relay_peer(peer_addr.ip(), peer_addr.port())
+        let session = self.get_session_by_relay_peer(peer_addr.ip(), peer_addr.port())?;
+        self.adopted_flows.insert(session.outbound_flow_key(), ());
+        Some(session)
     }
 
     /// Removes the NAT session entry associated with the reflected relay peer `(peer_ip, peer_port)`.
@@ -829,6 +1079,7 @@ impl TransparentNatTable {
         peer_port: u16,
     ) -> Option<NatSessionEntry> {
         let (_, flow_key) = self.peer_to_flow.remove(&(peer_ip.into(), peer_port))?;
+        self.adopted_flows.remove(&flow_key);
         self.sessions_by_flow.remove(&flow_key).map(|(_, v)| v)
     }
 
@@ -1033,6 +1284,275 @@ pub fn parse_ipv6_tcp_meta(packet: &[u8]) -> Option<Ipv6TransportPacketMeta> {
 pub fn parse_ipv6_udp_meta(packet: &[u8]) -> Option<Ipv6TransportPacketMeta> {
     let meta = parse_ipv6_transport_meta(packet)?;
     (meta.next_header == IPPROTO_UDP).then_some(meta)
+}
+
+/// Position of a packet inside a fragmented UDP datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpFragmentKind {
+    /// Fragment offset 0: carries the UDP header, so ports are known.
+    First,
+    /// Fragment offset > 0: carries no UDP header; ports are unknown (reported as 0).
+    NonFirst,
+}
+
+/// Identifies one fragmented datagram: addresses, IP protocol and the IPv4 identification
+/// (zero-extended) or IPv6 fragment identification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UdpFragmentKey {
+    pub src_ip: IpAddr,
+    pub dst_ip: IpAddr,
+    pub protocol: u8,
+    pub fragment_id: u32,
+}
+
+/// Metadata of a fragmented IPv4 or IPv6 UDP packet, parsed without requiring the UDP length to
+/// fit inside this fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpFragmentMeta {
+    pub kind: UdpFragmentKind,
+    pub src_ip: IpAddr,
+    pub dst_ip: IpAddr,
+    /// Source port; 0 for [`UdpFragmentKind::NonFirst`].
+    pub src_port: u16,
+    /// Destination port; 0 for [`UdpFragmentKind::NonFirst`].
+    pub dst_port: u16,
+    pub fragment_id: u32,
+}
+
+impl UdpFragmentMeta {
+    /// Returns the datagram key shared by every fragment of this datagram.
+    pub fn key(&self) -> UdpFragmentKey {
+        UdpFragmentKey {
+            src_ip: self.src_ip,
+            dst_ip: self.dst_ip,
+            protocol: IPPROTO_UDP,
+            fragment_id: self.fragment_id,
+        }
+    }
+}
+
+/// Action applied to every fragment of a UDP datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpFragmentVerdict {
+    /// Reinject the fragment unmodified (the datagram leaves directly).
+    Reinject,
+    /// Discard the fragment.
+    Drop,
+}
+
+/// Decides what happens to a fragmented UDP datagram whose rule evaluated to `action`.
+///
+/// Fragments cannot be reassembled for relaying, so a proxied or chained flow is dropped when the
+/// kill switch is on (never leaked in clear) and released directly when it is off; `Direct` rules
+/// pass and `Block` rules are dropped.
+pub fn decide_udp_fragment_verdict(
+    action: &RuleAction,
+    kill_switch_enabled: bool,
+) -> UdpFragmentVerdict {
+    match action {
+        RuleAction::Direct => UdpFragmentVerdict::Reinject,
+        RuleAction::Block => UdpFragmentVerdict::Drop,
+        RuleAction::Proxy { .. } | RuleAction::Chain { .. } => {
+            if kill_switch_enabled {
+                UdpFragmentVerdict::Drop
+            } else {
+                UdpFragmentVerdict::Reinject
+            }
+        }
+    }
+}
+
+/// Detects a fragmented UDP packet (IPv4 `MF` flag or non-zero offset, IPv6 fragment header with
+/// `M` flag or non-zero offset) and returns its metadata, or `None` for unfragmented or non-UDP
+/// packets. Unlike [`parse_ipv4_udp_meta`], a first fragment whose UDP length exceeds the
+/// fragment size is accepted: only the four port bytes of the UDP header are required.
+pub fn parse_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
+    match packet.first()? >> 4 {
+        IPV4_VERSION => parse_ipv4_udp_fragment_meta(packet),
+        IPV6_VERSION => parse_ipv6_udp_fragment_meta(packet),
+        _ => None,
+    }
+}
+
+fn read_udp_ports(packet: &[u8], offset: usize) -> Option<(u16, u16)> {
+    let ports = packet.get(offset..offset.checked_add(UDP_PORTS_LEN)?)?;
+    Some((
+        u16::from_be_bytes([ports[0], ports[1]]),
+        u16::from_be_bytes([ports[2], ports[3]]),
+    ))
+}
+
+fn parse_ipv4_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
+    if packet.len() < IPV4_MIN_HEADER_LEN || packet[9] != IPPROTO_UDP {
+        return None;
+    }
+    let frag_field = u16::from_be_bytes([packet[6], packet[7]]);
+    if (frag_field & IPV4_FRAG_MORE_OR_OFFSET_MASK) == 0 {
+        return None;
+    }
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if ihl < IPV4_MIN_HEADER_LEN || packet.len() < ihl {
+        return None;
+    }
+    let src_ip = IpAddr::V4(Ipv4Addr::new(
+        packet[12], packet[13], packet[14], packet[15],
+    ));
+    let dst_ip = IpAddr::V4(Ipv4Addr::new(
+        packet[16], packet[17], packet[18], packet[19],
+    ));
+    let fragment_id = u16::from_be_bytes([packet[4], packet[5]]) as u32;
+    if (frag_field & IPV4_FRAG_OFFSET_MASK) != 0 {
+        return Some(UdpFragmentMeta {
+            kind: UdpFragmentKind::NonFirst,
+            src_ip,
+            dst_ip,
+            src_port: 0,
+            dst_port: 0,
+            fragment_id,
+        });
+    }
+    let (src_port, dst_port) = read_udp_ports(packet, ihl)?;
+    Some(UdpFragmentMeta {
+        kind: UdpFragmentKind::First,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        fragment_id,
+    })
+}
+
+/// Where the UDP header sits inside the first fragment of an IPv6 datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ipv6FragmentPayload {
+    /// The UDP header starts at this packet offset.
+    Udp(usize),
+    /// The datagram carries another transport protocol.
+    NotUdp,
+    /// The datagram may be UDP but its header cannot be located (further extension headers that
+    /// are truncated or too numerous).
+    Unparseable,
+}
+
+/// Returns true for extension headers that share the generic `next header, length` layout.
+fn is_ipv6_walkable_ext_header(next_header: u8) -> bool {
+    matches!(next_header, 0 | 43 | 60)
+}
+
+/// Walks the extension headers that follow an IPv6 fragment header (starting at `offset` with
+/// `next_header`) to find the UDP header of a first fragment.
+fn locate_ipv6_fragment_udp_header(
+    packet: &[u8],
+    mut offset: usize,
+    mut next_header: u8,
+    total_len: usize,
+) -> Ipv6FragmentPayload {
+    for _ in 0..IPV6_MAX_EXT_HEADERS {
+        if next_header == IPPROTO_UDP {
+            return Ipv6FragmentPayload::Udp(offset);
+        }
+        if !is_ipv6_walkable_ext_header(next_header) {
+            return Ipv6FragmentPayload::NotUdp;
+        }
+        let Some(hdr) = packet.get(offset..offset.saturating_add(2)) else {
+            return Ipv6FragmentPayload::Unparseable;
+        };
+        next_header = hdr[0];
+        offset = offset.saturating_add(((hdr[1] as usize) + 1) * 8);
+        if offset > total_len {
+            return Ipv6FragmentPayload::Unparseable;
+        }
+    }
+    if next_header == IPPROTO_UDP {
+        Ipv6FragmentPayload::Udp(offset)
+    } else {
+        Ipv6FragmentPayload::Unparseable
+    }
+}
+
+fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
+    if packet.len() < IPV6_HEADER_LEN {
+        return None;
+    }
+    let total_len =
+        IPV6_HEADER_LEN.checked_add(u16::from_be_bytes([packet[4], packet[5]]) as usize)?;
+    if packet.len() < total_len {
+        return None;
+    }
+    let mut src_octets = [0u8; 16];
+    src_octets.copy_from_slice(&packet[8..24]);
+    let mut dst_octets = [0u8; 16];
+    dst_octets.copy_from_slice(&packet[24..40]);
+
+    let mut next_header = packet[6];
+    let mut offset = IPV6_HEADER_LEN;
+    for _ in 0..IPV6_MAX_EXT_HEADERS {
+        match next_header {
+            0 | 43 | 60 => {
+                let hdr = packet.get(offset..offset.checked_add(2)?)?;
+                next_header = hdr[0];
+                offset = offset.checked_add(((hdr[1] as usize) + 1) * 8)?;
+                if offset > total_len {
+                    return None;
+                }
+            }
+            IPV6_EXT_HEADER_FRAGMENT => {
+                let hdr = packet.get(offset..offset.checked_add(IPV6_FRAGMENT_HEADER_LEN)?)?;
+                let frag_field = u16::from_be_bytes([hdr[2], hdr[3]]);
+                let frag_offset = frag_field & IPV6_FRAG_OFFSET_MASK;
+                let more = (frag_field & IPV6_FRAG_MORE_FLAG) != 0;
+                if frag_offset == 0 && !more {
+                    // An atomic fragment that the regular parser handles.
+                    return None;
+                }
+                let payload_start = offset.checked_add(IPV6_FRAGMENT_HEADER_LEN)?;
+                let payload = if frag_offset == 0 {
+                    locate_ipv6_fragment_udp_header(packet, payload_start, hdr[0], total_len)
+                } else if hdr[0] == IPPROTO_UDP || is_ipv6_walkable_ext_header(hdr[0]) {
+                    // Later fragments carry no transport header: the next-header value of the
+                    // fragment header is all that identifies the datagram.
+                    Ipv6FragmentPayload::Unparseable
+                } else {
+                    Ipv6FragmentPayload::NotUdp
+                };
+                if matches!(payload, Ipv6FragmentPayload::NotUdp) {
+                    return None;
+                }
+                let fragment_id = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+                let src_ip = IpAddr::V6(Ipv6Addr::from(src_octets));
+                let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_octets));
+                if frag_offset != 0 {
+                    return Some(UdpFragmentMeta {
+                        kind: UdpFragmentKind::NonFirst,
+                        src_ip,
+                        dst_ip,
+                        src_port: 0,
+                        dst_port: 0,
+                        fragment_id,
+                    });
+                }
+                // A first fragment that is detected but whose UDP header cannot be located is
+                // reported with ports 0, so it is treated as unattributed (unknown-process policy
+                // and kill switch apply) instead of being reinjected unevaluated.
+                let (src_port, dst_port) = match payload {
+                    Ipv6FragmentPayload::Udp(udp_offset) => {
+                        read_udp_ports(packet, udp_offset).unwrap_or((0, 0))
+                    }
+                    _ => (0, 0),
+                };
+                return Some(UdpFragmentMeta {
+                    kind: UdpFragmentKind::First,
+                    src_ip,
+                    dst_ip,
+                    src_port,
+                    dst_port,
+                    fragment_id,
+                });
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Builds a complete IPv4 + UDP reply packet (`src_ip:src_port -> dst_ip:dst_port`) with valid
@@ -1509,7 +2029,9 @@ mod tests {
         let meta_timeout = parse_ipv4_tcp_meta(&pkt_timeout).unwrap();
 
         // Both SYNs arrive before SOCKET event or TCP table entry exists
-        assert!(nat.try_resolve_pid_nonblocking(51001, |_| None).is_none());
+        assert!(nat
+            .try_resolve_pid_nonblocking(SocketKey::new(IPPROTO_TCP, false, 51001), |_| None)
+            .is_none());
         queue.enqueue(pkt_resolved.clone(), meta_resolved);
         queue.enqueue(pkt_timeout.clone(), meta_timeout);
         assert_eq!(queue.len(), 2);
@@ -1520,7 +2042,7 @@ mod tests {
         assert_eq!(queue.len(), 2);
 
         // Late SOCKET event arrives for port 51001
-        nat.record_socket_event(51001, 4632);
+        nat.record_socket_event(SocketKey::new(IPPROTO_TCP, false, 51001), 4632);
         let outcomes_2 = queue.poll_ready(&nat, Duration::from_millis(50), true, |_| None);
         assert_eq!(outcomes_2.len(), 1);
         assert_eq!(
@@ -1876,7 +2398,7 @@ mod tests {
         assert_eq!(queue.len(), 2);
 
         // Late SOCKET event resolves 52002
-        nat.record_socket_event(52002, 7744);
+        nat.record_socket_event(SocketKey::new(IPPROTO_UDP, false, 52002), 7744);
         let outcomes = queue.poll_ready(&nat, Duration::from_millis(50), true, |_| None);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(
@@ -2008,5 +2530,333 @@ mod tests {
         let sa6 = parse_ipv6_origdstaddr_bytes(&raw_sa6).expect("parse IPV6_ORIGDSTADDR");
         assert_eq!(*sa6.ip(), server_ip);
         assert_eq!(sa6.port(), 8853);
+    }
+
+    /// Builds a first IPv4 UDP fragment: 20-byte IP header + 1480 bytes of a 3000-byte datagram.
+    fn build_ipv4_first_udp_fragment(src_port: u16, dst_port: u16, ident: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 20 + 1480];
+        pkt[0] = 0x45;
+        let total_len = pkt.len() as u16;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+        pkt[4..6].copy_from_slice(&ident.to_be_bytes());
+        pkt[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = IPPROTO_UDP;
+        pkt[12..16].copy_from_slice(&[192, 168, 1, 25]);
+        pkt[16..20].copy_from_slice(&[93, 184, 215, 14]);
+        pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        pkt[24..26].copy_from_slice(&3000u16.to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn first_ipv4_udp_fragment_is_detected_and_gets_the_kill_switch_decision() {
+        let first = build_ipv4_first_udp_fragment(50123, 9999, 0xBEEF);
+        // The regular parser rejects it (UDP length exceeds the fragment): this was the leak.
+        assert!(parse_ipv4_udp_meta(&first).is_none());
+
+        let meta = parse_udp_fragment_meta(&first).expect("first fragment detected");
+        assert_eq!(meta.kind, UdpFragmentKind::First);
+        assert_eq!(meta.src_port, 50123);
+        assert_eq!(meta.dst_port, 9999);
+        assert_eq!(meta.fragment_id, 0xBEEF);
+
+        let proxy = RuleAction::Proxy {
+            target_id: "p".to_string(),
+        };
+        let chain = RuleAction::Chain {
+            target_id: "c".to_string(),
+        };
+        assert_eq!(
+            decide_udp_fragment_verdict(&proxy, true),
+            UdpFragmentVerdict::Drop
+        );
+        assert_eq!(
+            decide_udp_fragment_verdict(&chain, true),
+            UdpFragmentVerdict::Drop
+        );
+        assert_eq!(
+            decide_udp_fragment_verdict(&proxy, false),
+            UdpFragmentVerdict::Reinject
+        );
+        assert_eq!(
+            decide_udp_fragment_verdict(&RuleAction::Direct, true),
+            UdpFragmentVerdict::Reinject
+        );
+        assert_eq!(
+            decide_udp_fragment_verdict(&RuleAction::Block, false),
+            UdpFragmentVerdict::Drop
+        );
+
+        // A later fragment of the same datagram has no ports but shares the cached verdict.
+        let mut second = first.clone();
+        second[6..8].copy_from_slice(&0x00B9u16.to_be_bytes());
+        let later = parse_udp_fragment_meta(&second).expect("non-first fragment detected");
+        assert_eq!(later.kind, UdpFragmentKind::NonFirst);
+        assert_eq!(later.key(), meta.key());
+
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        assert!(nat.lookup_udp_fragment_verdict(&later.key()).is_none());
+        nat.record_udp_fragment_verdict(meta.key(), UdpFragmentVerdict::Drop);
+        assert_eq!(
+            nat.lookup_udp_fragment_verdict(&later.key()),
+            Some(UdpFragmentVerdict::Drop)
+        );
+        // A different identification is a different datagram.
+        let other = parse_udp_fragment_meta(&build_ipv4_first_udp_fragment(50123, 9999, 0xBEF0))
+            .expect("other datagram");
+        assert!(nat.lookup_udp_fragment_verdict(&other.key()).is_none());
+    }
+
+    #[test]
+    fn unfragmented_and_non_udp_packets_are_not_fragments() {
+        let whole = build_forged_ipv4_udp_reply(
+            Ipv4Addr::new(10, 0, 0, 1),
+            1000,
+            Ipv4Addr::new(10, 0, 0, 2),
+            2000,
+            b"x",
+        )
+        .unwrap();
+        assert!(parse_udp_fragment_meta(&whole).is_none());
+        let mut tcp_frag = build_ipv4_first_udp_fragment(1, 2, 3);
+        tcp_frag[9] = IPPROTO_TCP;
+        assert!(parse_udp_fragment_meta(&tcp_frag).is_none());
+        assert!(parse_udp_fragment_meta(&[]).is_none());
+    }
+
+    #[test]
+    fn ipv6_first_and_later_udp_fragments_are_detected() {
+        let mut pkt = vec![0u8; 40 + 8 + 8];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&16u16.to_be_bytes());
+        pkt[6] = IPV6_EXT_HEADER_FRAGMENT;
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
+        pkt[24..40].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets());
+        pkt[40] = IPPROTO_UDP;
+        pkt[42..44].copy_from_slice(&0x0001u16.to_be_bytes()); // offset 0, M=1
+        pkt[44..48].copy_from_slice(&0xCAFEBABEu32.to_be_bytes());
+        pkt[48..50].copy_from_slice(&40000u16.to_be_bytes());
+        pkt[50..52].copy_from_slice(&5000u16.to_be_bytes());
+        pkt[52..54].copy_from_slice(&4000u16.to_be_bytes()); // UDP length > fragment
+                                                             // The regular IPv6 parser rejects the truncated first fragment.
+        assert!(parse_ipv6_udp_meta(&pkt).is_none());
+
+        let first = parse_udp_fragment_meta(&pkt).expect("IPv6 first fragment");
+        assert_eq!(first.kind, UdpFragmentKind::First);
+        assert_eq!((first.src_port, first.dst_port), (40000, 5000));
+        assert_eq!(first.fragment_id, 0xCAFEBABE);
+
+        pkt[42..44].copy_from_slice(&0x00B9u16.to_be_bytes()); // offset 184, M=1
+        let later = parse_udp_fragment_meta(&pkt).expect("IPv6 later fragment");
+        assert_eq!(later.kind, UdpFragmentKind::NonFirst);
+        assert_eq!(later.key(), first.key());
+
+        // Atomic fragment (offset 0, M=0) is left to the regular parser.
+        pkt[42..44].copy_from_slice(&0u16.to_be_bytes());
+        assert!(parse_udp_fragment_meta(&pkt).is_none());
+    }
+
+    #[test]
+    fn ipv6_first_fragment_followed_by_extension_header_is_never_reinjected_unevaluated() {
+        // IPv6 header, fragment header (next = destination options), destination options
+        // (next = UDP), UDP ports.
+        let mut pkt = vec![0u8; 40 + 8 + 8 + 8];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&24u16.to_be_bytes());
+        pkt[6] = IPV6_EXT_HEADER_FRAGMENT;
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
+        pkt[24..40].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets());
+        pkt[40] = 60;
+        pkt[42..44].copy_from_slice(&0x0001u16.to_be_bytes()); // offset 0, M=1
+        pkt[44..48].copy_from_slice(&0x0BADF00Du32.to_be_bytes());
+        pkt[48] = IPPROTO_UDP; // destination options: next header
+        pkt[49] = 0; // 8 bytes long
+        pkt[56..58].copy_from_slice(&40000u16.to_be_bytes());
+        pkt[58..60].copy_from_slice(&5000u16.to_be_bytes());
+
+        let first = parse_udp_fragment_meta(&pkt).expect("first fragment with extension header");
+        assert_eq!(first.kind, UdpFragmentKind::First);
+        assert_eq!((first.src_port, first.dst_port), (40000, 5000));
+
+        // Extension header running past the packet: still detected, reported unattributed.
+        pkt[49] = 100;
+        let unparsed = parse_udp_fragment_meta(&pkt).expect("detected but unparseable");
+        assert_eq!(unparsed.kind, UdpFragmentKind::First);
+        assert_eq!((unparsed.src_port, unparsed.dst_port), (0, 0));
+        assert_eq!(unparsed.fragment_id, 0x0BADF00D);
+
+        // Later fragment of the same datagram shares the key.
+        pkt[42..44].copy_from_slice(&0x00B9u16.to_be_bytes());
+        let later = parse_udp_fragment_meta(&pkt).expect("later fragment");
+        assert_eq!(later.kind, UdpFragmentKind::NonFirst);
+        assert_eq!(later.key(), unparsed.key());
+
+        // A non-UDP payload behind the extension header is not a UDP fragment.
+        pkt[42..44].copy_from_slice(&0x0001u16.to_be_bytes());
+        pkt[49] = 0;
+        pkt[48] = IPPROTO_TCP;
+        assert!(parse_udp_fragment_meta(&pkt).is_none());
+    }
+
+    #[test]
+    fn fragment_verdicts_expire_and_stay_bounded() {
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        nat.configure(
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            Duration::from_millis(30),
+            2,
+        );
+        let key = |id: u32| UdpFragmentKey {
+            src_ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
+            protocol: IPPROTO_UDP,
+            fragment_id: id,
+        };
+        nat.record_udp_fragment_verdict(key(1), UdpFragmentVerdict::Drop);
+        assert_eq!(
+            nat.lookup_udp_fragment_verdict(&key(1)),
+            Some(UdpFragmentVerdict::Drop)
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(nat.lookup_udp_fragment_verdict(&key(1)).is_none());
+
+        for id in 10..20 {
+            nat.record_udp_fragment_verdict(key(id), UdpFragmentVerdict::Reinject);
+        }
+        assert!(nat.udp_fragment_verdicts.len() <= 2);
+    }
+
+    #[test]
+    fn socket_pid_cache_is_keyed_by_protocol_family_and_port_and_forgets_closed_sockets() {
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        let tcp4 = SocketKey::new(IPPROTO_TCP, false, 40000);
+        let udp4 = SocketKey::new(IPPROTO_UDP, false, 40000);
+        let tcp6 = SocketKey::new(IPPROTO_TCP, true, 40000);
+        nat.record_socket_event(tcp4, 111);
+
+        assert_eq!(
+            nat.try_resolve_pid_nonblocking(tcp4, |_| None),
+            Some((111, PidResolutionSource::SocketLayer))
+        );
+        // Same port number, other protocol or address family: no inherited owner.
+        assert!(nat.try_resolve_pid_nonblocking(udp4, |_| None).is_none());
+        assert!(nat.try_resolve_pid_nonblocking(tcp6, |_| None).is_none());
+
+        // A Close event of another PID must not evict the owner; the owner's Close does.
+        nat.record_socket_close(tcp4, 222);
+        assert!(nat.try_resolve_pid_nonblocking(tcp4, |_| None).is_some());
+        nat.record_socket_close(tcp4, 111);
+        assert!(nat.try_resolve_pid_nonblocking(tcp4, |_| None).is_none());
+    }
+
+    #[test]
+    fn socket_pid_cache_entries_expire_after_the_configured_ttl() {
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        nat.configure(
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            16,
+        );
+        let key = SocketKey::new(IPPROTO_UDP, false, 41000);
+        nat.record_socket_event(key, 77);
+        assert!(nat.try_resolve_pid_nonblocking(key, |_| None).is_some());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(nat.try_resolve_pid_nonblocking(key, |_| None).is_none());
+        nat.sweep_expired();
+        assert!(nat.socket_pid_cache.is_empty());
+    }
+
+    fn sample_session(client_port: u16, created_at: Instant) -> NatSessionEntry {
+        NatSessionEntry {
+            client_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 25)),
+            client_port,
+            orig_dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)),
+            orig_dst_port: 443,
+            pid: 1,
+            process_name: "x.exe".to_string(),
+            process_path: "x.exe".to_string(),
+            resolution_source: PidResolutionSource::SocketLayer,
+            action: RuleAction::Direct,
+            matched_rule_name: "r".to_string(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn half_open_sessions_expire_but_sessions_adopted_by_the_relay_survive() {
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        let old = Instant::now() - Duration::from_secs(120);
+        nat.insert_session(sample_session(50001, old));
+        nat.insert_session(sample_session(50002, old));
+        nat.insert_session(sample_session(50003, Instant::now()));
+        assert_eq!(nat.session_count(), 3);
+
+        // The relay accepted 50002: it is a live connection, however old.
+        let peer = (IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)), 50002);
+        assert!(nat
+            .validate_relay_peer_addr(SocketAddr::new(peer.0, peer.1))
+            .is_some());
+
+        assert_eq!(nat.sweep_expired(), 1);
+        assert_eq!(nat.session_count(), 2);
+        assert!(nat
+            .get_session_by_relay_peer(IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)), 50001)
+            .is_none());
+        assert!(nat
+            .get_session_by_relay_peer(IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)), 50002)
+            .is_some());
+
+        // Closing the adopted session removes it for good.
+        assert!(nat.remove_session_by_relay_peer(peer.0, peer.1).is_some());
+        assert_eq!(nat.session_count(), 1);
+    }
+
+    #[test]
+    fn pending_syn_queue_is_bounded_and_evicts_the_oldest_entry() {
+        let queue: PendingSynQueue<Vec<u8>> = PendingSynQueue::with_capacity(2);
+        let client_ip = Ipv4Addr::new(192, 168, 31, 136);
+        let dst_ip = Ipv4Addr::new(93, 184, 215, 14);
+        let mut metas = Vec::new();
+        for port in [51101u16, 51102, 51103] {
+            let pkt = build_sample_ipv4_tcp_syn(client_ip, dst_ip, port, 80);
+            metas.push((pkt.clone(), parse_ipv4_tcp_meta(&pkt).unwrap()));
+        }
+        assert!(queue.enqueue(metas[0].0.clone(), metas[0].1).is_none());
+        assert!(queue.enqueue(metas[1].0.clone(), metas[1].1).is_none());
+        let evicted = queue
+            .enqueue(metas[2].0.clone(), metas[2].1)
+            .expect("oldest SYN evicted at capacity");
+        assert_eq!(evicted.meta.src_port, 51101);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn poll_ready_resolves_outside_the_lock_and_memoizes_the_fallback_per_port() {
+        use std::sync::atomic::AtomicUsize;
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        let queue: PendingSynQueue<Vec<u8>> = PendingSynQueue::new();
+        let client_ip = Ipv4Addr::new(192, 168, 31, 136);
+        let dst_ip = Ipv4Addr::new(93, 184, 215, 14);
+        // Three SYNs from the same local port (retransmissions) and one from another.
+        for port in [51201u16, 51201, 51201, 51202] {
+            let pkt = build_sample_ipv4_tcp_syn(client_ip, dst_ip, port, 80);
+            queue.enqueue(pkt.clone(), parse_ipv4_tcp_meta(&pkt).unwrap());
+        }
+        let calls = AtomicUsize::new(0);
+        let outcomes = queue.poll_ready(&nat, Duration::from_secs(5), true, |port| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            (port == 51201).then_some(4321)
+        });
+        assert_eq!(outcomes.len(), 3);
+        // One table lookup per distinct port, never one per queued entry.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // The unresolved SYN stays queued, and enqueueing remains possible afterwards.
+        assert_eq!(queue.len(), 1);
     }
 }

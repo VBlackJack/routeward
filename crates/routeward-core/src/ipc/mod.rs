@@ -225,6 +225,12 @@ pub async fn handle_client_stream(stream: IpcStream, controller: RouteWardContro
     }
 }
 
+/// Builds a failed response that carries the error's i18n key, so the desktop bridge can classify
+/// it (for example a failed profile save is a server-side fault, not a validation failure).
+fn keyed_error_response(id: String, err: &RouteWardError) -> IpcResponse {
+    IpcResponse::error_with_key(Some(id), Some(err.i18n_key().to_string()), err.to_string())
+}
+
 async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> IpcResponse {
     let id = req.id;
     match req.command {
@@ -243,16 +249,14 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
         IpcCommand::GetTelemetry => IpcResponse::success(id, &controller.telemetry.snapshot()),
         IpcCommand::ToggleEngine { start } => {
             if start {
-                controller.start_engine();
+                if let Err(err) = controller.start_engine() {
+                    return keyed_error_response(id, &err);
+                }
                 let mode = controller.profile.read().interception_mode;
                 if mode != InterceptionMode::Relay {
                     if let Err(err) = controller.start_transparent_interceptor() {
                         controller.stop_engine();
-                        return IpcResponse::error_with_key(
-                            Some(id),
-                            Some(err.i18n_key().to_string()),
-                            err.to_string(),
-                        );
+                        return keyed_error_response(id, &err);
                     }
                 }
             } else {
@@ -262,12 +266,16 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
         }
         IpcCommand::SetInterceptionMode { mode } => {
             controller.set_interception_mode(mode);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return keyed_error_response(id, &err);
+            }
             IpcResponse::success(id, &controller.diagnostics())
         }
         IpcCommand::SetTheme { theme, accent } => {
             controller.set_theme_config(theme, accent);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return keyed_error_response(id, &err);
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::GetProfile => {
@@ -277,39 +285,51 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
         IpcCommand::ReplaceProfile { profile } => {
             controller.replace_profile(profile);
             if let Err(err) = controller.save_profile_default() {
-                return IpcResponse::error(Some(id), err.to_string());
+                return keyed_error_response(id, &err);
             }
             let prof = controller.profile.read().redacted_for_ipc();
             IpcResponse::success(id, &prof)
         }
         IpcCommand::UpsertRule { rule } => {
             controller.upsert_rule(rule);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return keyed_error_response(id, &err);
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::RemoveRule { rule_id } => {
             controller.remove_rule(&rule_id);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return keyed_error_response(id, &err);
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::UpsertProxy { node } => {
             controller.upsert_proxy(node);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return keyed_error_response(id, &err);
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::RemoveProxy { proxy_id } => {
             controller.remove_proxy(&proxy_id);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return keyed_error_response(id, &err);
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::UpsertChain { chain } => {
             controller.upsert_chain(chain);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return keyed_error_response(id, &err);
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::RemoveChain { chain_id } => {
             controller.remove_chain(&chain_id);
-            let _ = controller.save_profile_default();
+            if let Err(err) = controller.save_profile_default() {
+                return keyed_error_response(id, &err);
+            }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
         IpcCommand::EvaluateRule { request } => {
@@ -326,7 +346,7 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
         }
         IpcCommand::TestProxy { proxy_id } => match controller.test_proxy(&proxy_id).await {
             Ok(report) => IpcResponse::success(id, &report),
-            Err(err) => IpcResponse::error(Some(id), err.to_string()),
+            Err(err) => keyed_error_response(id, &err),
         },
         IpcCommand::TestAllProxies => {
             let reports = controller.test_all_proxies().await;
@@ -386,7 +406,7 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
                         controller.upsert_rule(rule.clone());
                     }
                     if let Err(err) = controller.save_profile_default() {
-                        return IpcResponse::error(Some(id), err.to_string());
+                        return keyed_error_response(id, &err);
                     }
                     imported.proxies = imported
                         .proxies
@@ -395,29 +415,29 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
                         .collect();
                     IpcResponse::success(id, &imported)
                 }
-                Err(err) => IpcResponse::error(Some(id), err.to_string()),
+                Err(err) => keyed_error_response(id, &err),
             }
         }
         IpcCommand::ListProfiles => match controller.list_named_profiles() {
             Ok(list) => IpcResponse::success(id, &list),
-            Err(err) => IpcResponse::error(Some(id), err.to_string()),
+            Err(err) => keyed_error_response(id, &err),
         },
         IpcCommand::SaveNamedProfile { profile_id, name } => {
             match controller.save_named_profile(profile_id.as_deref(), name.as_deref()) {
                 Ok(list) => IpcResponse::success(id, &list),
-                Err(err) => IpcResponse::error(Some(id), err.to_string()),
+                Err(err) => keyed_error_response(id, &err),
             }
         }
         IpcCommand::SwitchProfile { profile_id } => {
             match controller.switch_named_profile(&profile_id) {
                 Ok(prof) => IpcResponse::success(id, &prof),
-                Err(err) => IpcResponse::error(Some(id), err.to_string()),
+                Err(err) => keyed_error_response(id, &err),
             }
         }
         IpcCommand::DeleteProfile { profile_id } => {
             match controller.delete_named_profile(&profile_id) {
                 Ok(list) => IpcResponse::success(id, &list),
-                Err(err) => IpcResponse::error(Some(id), err.to_string()),
+                Err(err) => keyed_error_response(id, &err),
             }
         }
         IpcCommand::Subscribe => {

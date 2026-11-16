@@ -34,6 +34,7 @@ use crate::process::ProcessResolver;
 use crate::proxy::udp::UdpAssociationManager;
 use crate::telemetry::TelemetryHub;
 use dashmap::DashMap;
+use dns_handler::RelayCaches;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
@@ -50,9 +51,6 @@ pub(super) const COMPONENT_PROXY: &str = "ProxyConnector";
 pub(super) const COMPONENT_DNS: &str = "FakeIpDNS";
 pub(super) const ROUTE_DIRECT_LABEL: &str = "DIRECT";
 pub(super) const ROUTE_BLOCK_LABEL: &str = "BLOCKED";
-pub(super) const SIMULATED_DEFAULT_RX_BYTES: u64 = 18432;
-pub(super) const SIMULATED_DEFAULT_TX_BYTES: u64 = 4096;
-pub(super) const SIMULATED_DEFAULT_LATENCY_MS: u64 = 18;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +88,11 @@ pub enum DnsResolverMode {
     RemoteViaProxy,
 }
 
+/// Upper bound on distinct categories tracked by [`WarnRateLimiter`] before pruning kicks in.
+const WARN_RATE_LIMITER_MAX_KEYS: usize = 2_048;
+/// A category idle for this many rate-limit intervals is dropped when the limiter is pruned.
+const WARN_RATE_LIMITER_IDLE_INTERVALS: u32 = 4;
+
 /// Rate limiter for repetitive UDP/QUIC/LLMNR/mDNS/NetBIOS-NS `WARN` logs with per-category hit counters.
 #[derive(Clone)]
 pub struct WarnRateLimiter {
@@ -108,6 +111,9 @@ impl WarnRateLimiter {
     /// Increments the hit counter for `category_key` and returns `(should_emit_warn_now, total_count)`.
     pub fn should_log(&self, category_key: &str) -> (bool, u64) {
         let now = Instant::now();
+        if self.entries.len() >= WARN_RATE_LIMITER_MAX_KEYS {
+            self.prune(now);
+        }
         if let Some(mut entry) = self.entries.get_mut(category_key) {
             let (last_logged, count) = *entry.value();
             let next_count = count + 1;
@@ -120,6 +126,34 @@ impl WarnRateLimiter {
         }
         self.entries.insert(category_key.to_string(), (now, 1));
         (true, 1)
+    }
+
+    /// Bounds memory: keys built from network data (domain names, addresses) would otherwise
+    /// accumulate forever. Entries idle for several intervals are dropped first; if the map is
+    /// still full the oldest half is evicted.
+    fn prune(&self, now: Instant) {
+        let max_idle = self
+            .interval
+            .saturating_mul(WARN_RATE_LIMITER_IDLE_INTERVALS);
+        self.entries
+            .retain(|_, (last_logged, _)| now.duration_since(*last_logged) < max_idle);
+        if self.entries.len() < WARN_RATE_LIMITER_MAX_KEYS {
+            return;
+        }
+        let mut by_age: Vec<(Instant, String)> = self
+            .entries
+            .iter()
+            .map(|e| (e.value().0, e.key().clone()))
+            .collect();
+        by_age.sort_by_key(|(at, _)| *at);
+        for (_, key) in by_age.into_iter().take(WARN_RATE_LIMITER_MAX_KEYS / 2) {
+            self.entries.remove(&key);
+        }
+    }
+
+    /// Returns the number of tracked categories.
+    pub fn tracked_keys(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -140,8 +174,34 @@ pub struct RouteWardController {
     pub(super) bootstrapped_proxy_endpoints: Arc<DashMap<String, Vec<(IpAddr, u16)>>>,
     pub(super) direct_udp_pool: Arc<parking_lot::Mutex<Vec<(UdpSocket, SelfPortGuard)>>>,
     pub(super) direct_udp_v6_pool: Arc<parking_lot::Mutex<Vec<(UdpSocket, SelfPortGuard)>>>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(super) conntrack_cache: Arc<parking_lot::Mutex<Option<(Instant, String)>>>,
+    pub(super) relay_caches: Arc<RelayCaches>,
     pub(super) interceptor_backend: Arc<dyn Interceptor>,
     pub(super) running: Arc<AtomicBool>,
+    /// Serialises `start_engine` and `stop_engine`; listener tasks never take it.
+    pub(super) engine_lifecycle: Arc<parking_lot::Mutex<()>>,
+    /// Shutdown signal and task handles of the current engine start, `None` while stopped.
+    pub(super) engine_runtime: Arc<parking_lot::Mutex<Option<controller::EngineRuntime>>>,
+}
+
+#[cfg(test)]
+mod warn_rate_limiter_tests {
+    use super::*;
+
+    #[test]
+    fn warn_rate_limiter_stays_bounded_under_unique_keys() {
+        let limiter = WarnRateLimiter::new(Duration::from_secs(60));
+        for i in 0..(WARN_RATE_LIMITER_MAX_KEYS * 3) {
+            let (emit, count) = limiter.should_log(&format!("mdns:host-{i}.example"));
+            assert!(emit);
+            assert_eq!(count, 1);
+        }
+        assert!(limiter.tracked_keys() <= WARN_RATE_LIMITER_MAX_KEYS);
+    }
+
+    #[test]
+    fn warn_rate_limiter_still_rate_limits_repeated_keys() {
+        let limiter = WarnRateLimiter::new(Duration::from_secs(60));
+        assert_eq!(limiter.should_log("k"), (true, 1));
+        assert_eq!(limiter.should_log("k"), (false, 2));
+    }
 }
