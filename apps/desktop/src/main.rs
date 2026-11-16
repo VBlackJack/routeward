@@ -330,7 +330,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Theme::Dark
     };
 
-    let mut window_builder = WindowBuilder::new()
+    let window_builder = WindowBuilder::new()
         .with_title(WINDOW_TITLE)
         .with_window_icon(load_window_icon_32())
         .with_inner_size(LogicalSize::new(
@@ -341,10 +341,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_theme(Some(initial_tao_theme));
 
     #[cfg(target_os = "windows")]
-    {
+    let window_builder = {
         use tao::platform::windows::WindowBuilderExtWindows;
-        window_builder = window_builder.with_taskbar_icon(load_taskbar_icon_256());
-    }
+        window_builder.with_taskbar_icon(load_taskbar_icon_256())
+    };
     #[cfg(not(target_os = "windows"))]
     {
         let _ = load_taskbar_icon_256();
