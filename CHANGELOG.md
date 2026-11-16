@@ -3,7 +3,7 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
-## [Unreleased]
+## [v2026.1116.01] - 2026-11-16
 
 ### Security
 - Stop sending HTTP proxy `Basic` credentials pre-emptively over plaintext: they are now sent only after a `407` that offers `Basic` (Negotiate and NTLM preferred), and remain pre-emptive only when the hop to the proxy is TLS.
