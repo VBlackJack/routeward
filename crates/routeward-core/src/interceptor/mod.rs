@@ -34,6 +34,7 @@ use crate::process::ProcessResolver;
 use crate::proxy::udp::UdpAssociationManager;
 use crate::telemetry::TelemetryHub;
 use dashmap::DashMap;
+use dns_handler::RelayCaches;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
@@ -50,9 +51,6 @@ pub(super) const COMPONENT_PROXY: &str = "ProxyConnector";
 pub(super) const COMPONENT_DNS: &str = "FakeIpDNS";
 pub(super) const ROUTE_DIRECT_LABEL: &str = "DIRECT";
 pub(super) const ROUTE_BLOCK_LABEL: &str = "BLOCKED";
-pub(super) const SIMULATED_DEFAULT_RX_BYTES: u64 = 18432;
-pub(super) const SIMULATED_DEFAULT_TX_BYTES: u64 = 4096;
-pub(super) const SIMULATED_DEFAULT_LATENCY_MS: u64 = 18;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -176,8 +174,7 @@ pub struct RouteWardController {
     pub(super) bootstrapped_proxy_endpoints: Arc<DashMap<String, Vec<(IpAddr, u16)>>>,
     pub(super) direct_udp_pool: Arc<parking_lot::Mutex<Vec<(UdpSocket, SelfPortGuard)>>>,
     pub(super) direct_udp_v6_pool: Arc<parking_lot::Mutex<Vec<(UdpSocket, SelfPortGuard)>>>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(super) conntrack_cache: Arc<parking_lot::Mutex<Option<(Instant, String)>>>,
+    pub(super) relay_caches: Arc<RelayCaches>,
     pub(super) interceptor_backend: Arc<dyn Interceptor>,
     pub(super) running: Arc<AtomicBool>,
 }

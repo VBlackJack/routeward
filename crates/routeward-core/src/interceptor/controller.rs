@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
+use super::dns_handler::{RelayCaches, MAX_UDP_DATAGRAM_BYTES};
 use super::{
     RouteWardController, SystemDiagnostics, WarnRateLimiter, COMPONENT_DNS, COMPONENT_ENGINE,
     COMPONENT_PROXY, COMPONENT_RULE, COMPONENT_TRANSPARENT, COMPONENT_WINDIVERT, ROUTE_BLOCK_LABEL,
-    SIMULATED_DEFAULT_LATENCY_MS, SIMULATED_DEFAULT_RX_BYTES, SIMULATED_DEFAULT_TX_BYTES,
 };
 use crate::checker::{ProxyChecker, ProxyHealthReport};
 use crate::config::security::{
@@ -30,7 +30,7 @@ use crate::config::{
 use crate::dns::FakeIpEngine;
 use crate::error::{
     RouteWardError, RouteWardResult, ERR_KEY_CONFIG_LOAD, ERR_KEY_DAEMON_INSECURE_PROFILE,
-    ERR_KEY_PROXY_NOT_FOUND, ERR_KEY_RULE_BLOCKED,
+    ERR_KEY_DAEMON_IPC_ERROR, ERR_KEY_PROXY_NOT_FOUND, ERR_KEY_RULE_BLOCKED,
 };
 use crate::i18n::I18nRegistry;
 use crate::interceptor::backend::Interceptor;
@@ -59,6 +59,15 @@ use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use uuid::Uuid;
 
+/// Listeners of the engine, bound before any task is spawned.
+struct EngineListeners {
+    relay: TcpListener,
+    transparent: TcpListener,
+    dns_udp: Arc<UdpSocket>,
+    dns_tcp: TcpListener,
+    local_name: Arc<UdpSocket>,
+}
+
 impl RouteWardController {
     pub fn new(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
         let log_dir = constants.telemetry.resolve_process_log_dir();
@@ -81,6 +90,8 @@ impl RouteWardController {
         locale: &str,
         log_dir: std::path::PathBuf,
     ) -> Self {
+        let mut profile = profile;
+        RuleEngine::sort_rules(&mut profile.rules);
         let i18n = I18nRegistry::new(locale);
         let dns = FakeIpEngine::new(&profile.dns_config, &constants.dns);
         let process_resolver = ProcessResolver::new(constants.telemetry.process_cache_ttl_ms);
@@ -126,7 +137,7 @@ impl RouteWardController {
             bootstrapped_proxy_endpoints: Arc::new(DashMap::new()),
             direct_udp_pool: Arc::new(parking_lot::Mutex::new(Vec::new())),
             direct_udp_v6_pool: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            conntrack_cache: Arc::new(parking_lot::Mutex::new(None)),
+            relay_caches: Arc::new(RelayCaches::new()),
             interceptor_backend,
             running: Arc::new(AtomicBool::new(false)),
         };
@@ -144,6 +155,120 @@ impl RouteWardController {
         self.running.load(Ordering::Relaxed)
     }
 
+    /// Binds a TCP listener synchronously (so a failure is reported before anything is spawned).
+    fn bind_tcp_listener_now(addr: &str) -> std::io::Result<TcpListener> {
+        let std_listener = std::net::TcpListener::bind(addr)?;
+        std_listener.set_nonblocking(true)?;
+        TcpListener::from_std(std_listener)
+    }
+
+    /// Binds a UDP socket synchronously (so a failure is reported before anything is spawned).
+    fn bind_udp_socket_now(addr: &str) -> std::io::Result<UdpSocket> {
+        let std_socket = std::net::UdpSocket::bind(addr)?;
+        std_socket.set_nonblocking(true)?;
+        UdpSocket::from_std(std_socket)
+    }
+
+    /// Logs a listener bind failure at error level and converts it into the startup error.
+    fn listener_bind_failure(
+        &self,
+        label: &str,
+        addr: &str,
+        err: std::io::Error,
+    ) -> RouteWardError {
+        let detail = format!("Failed to bind the {label} listener on {addr}: {err}");
+        self.telemetry
+            .push_log(LogLevel::Error, COMPONENT_ENGINE, detail.clone());
+        RouteWardError::DaemonError {
+            key: ERR_KEY_DAEMON_IPC_ERROR,
+            detail,
+        }
+    }
+
+    /// Binds every mandatory IPv4 listener of the engine. Nothing is spawned before all of them
+    /// are bound, so a failure leaves no half-started engine behind.
+    fn bind_engine_listeners(&self) -> RouteWardResult<EngineListeners> {
+        let net = &self.constants.network;
+        let relay_addr = format!("{}:{}", net.local_bind_host, net.default_relay_tcp_port);
+        let transparent_addr = format!(
+            "{}:{}",
+            net.transparent_bind_host, net.default_transparent_tcp_port
+        );
+        let dns_addr = format!(
+            "{}:{}",
+            net.transparent_bind_host, net.default_dns_listen_port
+        );
+        let local_name_addr = format!(
+            "{}:{}",
+            net.transparent_bind_host, net.default_local_name_inspect_port
+        );
+
+        let relay = Self::bind_tcp_listener_now(&relay_addr)
+            .map_err(|e| self.listener_bind_failure("SOCKS5 relay", &relay_addr, e))?;
+        let transparent = Self::bind_tcp_listener_now(&transparent_addr)
+            .map_err(|e| self.listener_bind_failure("transparent TCP", &transparent_addr, e))?;
+        let dns_udp = Self::bind_udp_socket_now(&dns_addr)
+            .map_err(|e| self.listener_bind_failure("UDP DNS", &dns_addr, e))?;
+        let dns_tcp = Self::bind_tcp_listener_now(&dns_addr)
+            .map_err(|e| self.listener_bind_failure("TCP DNS", &dns_addr, e))?;
+        let local_name = Self::bind_udp_socket_now(&local_name_addr)
+            .map_err(|e| self.listener_bind_failure("TPROXY UDP", &local_name_addr, e))?;
+
+        ProxyConnector::apply_platform_mark_udp(&dns_udp, net.linux_fwmark);
+        NftablesInterceptor::enable_udp_pktinfo(&dns_udp);
+        ProxyConnector::apply_platform_mark_udp(&local_name, net.linux_fwmark);
+        if let Err(err) = NftablesInterceptor::enable_udp_tproxy_options(&local_name) {
+            self.telemetry.push_log(
+                LogLevel::Warn,
+                COMPONENT_ENGINE,
+                format!(
+                    "Could not enable IP_TRANSPARENT/IP_RECVORIGDSTADDR on {local_name_addr}: {err}"
+                ),
+            );
+        }
+        NftablesInterceptor::enable_udp_pktinfo(&local_name);
+
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_ENGINE,
+            format!(
+                "{}: {relay_addr}",
+                self.i18n.t("cli.engine.startup.listening_socks")
+            ),
+        );
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_TRANSPARENT,
+            format!(
+                "{}: {transparent_addr}",
+                self.i18n.t("cli.engine.startup.listening_transparent")
+            ),
+        );
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_ENGINE,
+            format!("Listening for local/redirected UDP DNS queries on {dns_addr}"),
+        );
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_ENGINE,
+            format!("Listening for local/redirected TCP DNS queries on {dns_addr}"),
+        );
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_ENGINE,
+            format!("Listening for TPROXY UDP and LLMNR/mDNS inspection on {local_name_addr}"),
+        );
+
+        Ok(EngineListeners {
+            relay,
+            transparent,
+            dns_udp: Arc::new(dns_udp),
+            dns_tcp,
+            local_name: Arc::new(local_name),
+        })
+    }
+
     pub fn start_engine(&self) {
         if self
             .running
@@ -158,6 +283,22 @@ impl RouteWardController {
             COMPONENT_ENGINE,
             self.i18n.t("cli.engine.startup.banner"),
         );
+
+        // Bind first, spawn after: a listener that cannot be bound would otherwise leave the
+        // interceptor reflecting traffic toward a dead port.
+        let listeners = match self.bind_engine_listeners() {
+            Ok(listeners) => listeners,
+            Err(err) => {
+                self.telemetry.push_log(
+                    LogLevel::Error,
+                    COMPONENT_ENGINE,
+                    format!("Engine startup aborted, no listener was started: {err}"),
+                );
+                self.running.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
         self.flush_os_dns_cache("startup");
 
         let ticker_ctrl = self.clone();
@@ -171,162 +312,108 @@ impl RouteWardController {
         });
 
         let relay_ctrl = self.clone();
+        let relay_listener = listeners.relay;
         tokio::spawn(async move {
-            let bind_addr = format!(
-                "{}:{}",
-                relay_ctrl.constants.network.local_bind_host,
-                relay_ctrl.constants.network.default_relay_tcp_port
-            );
-            if let Ok(listener) = TcpListener::bind(&bind_addr).await {
-                relay_ctrl.telemetry.push_log(
-                    LogLevel::Info,
-                    COMPONENT_ENGINE,
-                    format!(
-                        "{}: {}",
-                        relay_ctrl.i18n.t("cli.engine.startup.listening_socks"),
-                        bind_addr
-                    ),
-                );
-
-                while relay_ctrl.is_running() {
-                    if let Ok((client_stream, peer_addr)) = listener.accept().await {
-                        let conn_ctrl = relay_ctrl.clone();
-                        tokio::spawn(async move {
-                            let _ = conn_ctrl
-                                .handle_local_socks5_client(client_stream, peer_addr.port())
-                                .await;
-                        });
-                    }
+            while relay_ctrl.is_running() {
+                if let Ok((client_stream, peer_addr)) = relay_listener.accept().await {
+                    let conn_ctrl = relay_ctrl.clone();
+                    tokio::spawn(async move {
+                        let _ = conn_ctrl
+                            .handle_local_socks5_client(client_stream, peer_addr.port())
+                            .await;
+                    });
                 }
             }
         });
 
         let trans_ctrl = self.clone();
+        let trans_listener = listeners.transparent;
         tokio::spawn(async move {
-            let bind_addr = format!(
-                "{}:{}",
-                trans_ctrl.constants.network.transparent_bind_host,
-                trans_ctrl.constants.network.default_transparent_tcp_port
-            );
-            if let Ok(listener) = TcpListener::bind(&bind_addr).await {
-                trans_ctrl.telemetry.push_log(
-                    LogLevel::Info,
-                    COMPONENT_TRANSPARENT,
-                    format!(
-                        "{}: {}",
-                        trans_ctrl
-                            .i18n
-                            .t("cli.engine.startup.listening_transparent"),
-                        bind_addr
-                    ),
-                );
-                RouteWardController::accept_transparent_tcp_loop(trans_ctrl.clone(), listener)
-                    .await;
-            }
+            RouteWardController::accept_transparent_tcp_loop(trans_ctrl, trans_listener).await;
         });
 
         if let Some(v6_ip) = Self::ipv6_counterpart(&self.constants.network.transparent_bind_host) {
-            let trans_v6_ctrl = self.clone();
-            tokio::spawn(async move {
-                let port = trans_v6_ctrl.constants.network.default_transparent_tcp_port;
-                match Self::bind_tcp_v6_only(v6_ip, port) {
-                    Ok(listener) => {
-                        trans_v6_ctrl.telemetry.push_log(
-                            LogLevel::Info,
-                            COMPONENT_TRANSPARENT,
-                            format!(
-                                "{}: [{}]:{}",
-                                trans_v6_ctrl
-                                    .i18n
-                                    .t("cli.engine.startup.listening_transparent"),
-                                v6_ip,
-                                port
-                            ),
-                        );
-                        RouteWardController::accept_transparent_tcp_loop(
-                            trans_v6_ctrl.clone(),
-                            listener,
-                        )
-                        .await;
-                    }
-                    Err(err) => {
-                        trans_v6_ctrl.telemetry.push_log(
-                            LogLevel::Warn,
-                            COMPONENT_TRANSPARENT,
-                            format!(
-                                "IPv6 transparent TCP listener disabled on [{v6_ip}]:{port}: {err}"
-                            ),
-                        );
-                    }
+            let port = self.constants.network.default_transparent_tcp_port;
+            match Self::bind_tcp_v6_only(v6_ip, port) {
+                Ok(listener) => {
+                    self.telemetry.push_log(
+                        LogLevel::Info,
+                        COMPONENT_TRANSPARENT,
+                        format!(
+                            "{}: [{}]:{}",
+                            self.i18n.t("cli.engine.startup.listening_transparent"),
+                            v6_ip,
+                            port
+                        ),
+                    );
+                    let trans_v6_ctrl = self.clone();
+                    tokio::spawn(async move {
+                        RouteWardController::accept_transparent_tcp_loop(trans_v6_ctrl, listener)
+                            .await;
+                    });
                 }
-            });
+                Err(err) => {
+                    self.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_TRANSPARENT,
+                        format!(
+                            "IPv6 transparent TCP listener disabled on [{v6_ip}]:{port}: {err}"
+                        ),
+                    );
+                }
+            }
         }
 
         let dns_udp_ctrl = self.clone();
+        let dns_udp_socket = listeners.dns_udp;
         tokio::spawn(async move {
-            let bind_addr = format!(
-                "{}:{}",
-                dns_udp_ctrl.constants.network.transparent_bind_host,
-                dns_udp_ctrl.constants.network.default_dns_listen_port
-            );
-            if let Ok(socket) = UdpSocket::bind(&bind_addr).await {
-                ProxyConnector::apply_platform_mark_udp(
-                    &socket,
-                    dns_udp_ctrl.constants.network.linux_fwmark,
-                );
-                NftablesInterceptor::enable_udp_pktinfo(&socket);
-                let socket = Arc::new(socket);
-                dns_udp_ctrl.telemetry.push_log(
-                    LogLevel::Info,
-                    COMPONENT_ENGINE,
-                    format!("Listening for local/redirected UDP DNS queries on {bind_addr}"),
-                );
-                let mut buf = vec![0u8; 4096];
-                while dns_udp_ctrl.is_running() {
-                    if let Ok((len, peer_addr, local_dst_ip)) =
-                        NftablesInterceptor::recv_udp_with_local_ip(&socket, &mut buf).await
-                    {
-                        let query_bytes = buf[..len].to_vec();
-                        let sock_reply = Arc::clone(&socket);
-                        let ctrl_query = dns_udp_ctrl.clone();
-                        tokio::spawn(async move {
-                            let orig_resolver = ctrl_query.lookup_udp_orig_dns_resolver(peer_addr);
-                            let resp = ctrl_query
-                                .resolve_dns_query_async(&query_bytes, orig_resolver, true)
-                                .await;
-                            if !resp.is_empty() {
-                                let _ = NftablesInterceptor::send_udp_from_local_ip(
-                                    &sock_reply,
-                                    &resp,
-                                    peer_addr,
-                                    local_dst_ip,
-                                )
-                                .await;
-                            }
-                        });
-                    }
+            let mut buf = vec![0u8; dns_udp_ctrl.constants.dns.udp_response_buffer_bytes];
+            while dns_udp_ctrl.is_running() {
+                if let Ok((len, peer_addr, local_dst_ip)) =
+                    NftablesInterceptor::recv_udp_with_local_ip(&dns_udp_socket, &mut buf).await
+                {
+                    let query_bytes = buf[..len].to_vec();
+                    let sock_reply = Arc::clone(&dns_udp_socket);
+                    let ctrl_query = dns_udp_ctrl.clone();
+                    tokio::spawn(async move {
+                        let orig_resolver =
+                            ctrl_query.lookup_udp_orig_dns_resolver(peer_addr).await;
+                        let resp = ctrl_query
+                            .resolve_dns_query_async(&query_bytes, orig_resolver, true)
+                            .await;
+                        if !resp.is_empty() {
+                            let _ = NftablesInterceptor::send_udp_from_local_ip(
+                                &sock_reply,
+                                &resp,
+                                peer_addr,
+                                local_dst_ip,
+                            )
+                            .await;
+                        }
+                    });
                 }
             }
         });
 
         if let Some(v6_ip) = Self::ipv6_counterpart(&self.constants.network.transparent_bind_host) {
-            let dns_udp_v6_ctrl = self.clone();
-            tokio::spawn(async move {
-                let port = dns_udp_v6_ctrl.constants.network.default_dns_listen_port;
-                match Self::bind_udp_v6_only(v6_ip, port) {
-                    Ok(socket) => {
-                        ProxyConnector::apply_platform_mark_udp(
-                            &socket,
-                            dns_udp_v6_ctrl.constants.network.linux_fwmark,
-                        );
-                        NftablesInterceptor::enable_ipv6_udp_pktinfo(&socket);
-                        let socket = Arc::new(socket);
-                        dns_udp_v6_ctrl.telemetry.push_log(
-                            LogLevel::Info,
-                            COMPONENT_ENGINE,
-                            format!("Listening for IPv6 UDP DNS queries on [{v6_ip}]:{port}"),
-                        );
-                        let mut buf = vec![0u8; 4096];
+            let port = self.constants.network.default_dns_listen_port;
+            match Self::bind_udp_v6_only(v6_ip, port) {
+                Ok(socket) => {
+                    ProxyConnector::apply_platform_mark_udp(
+                        &socket,
+                        self.constants.network.linux_fwmark,
+                    );
+                    NftablesInterceptor::enable_ipv6_udp_pktinfo(&socket);
+                    let socket = Arc::new(socket);
+                    self.telemetry.push_log(
+                        LogLevel::Info,
+                        COMPONENT_ENGINE,
+                        format!("Listening for IPv6 UDP DNS queries on [{v6_ip}]:{port}"),
+                    );
+                    let dns_udp_v6_ctrl = self.clone();
+                    tokio::spawn(async move {
+                        let mut buf =
+                            vec![0u8; dns_udp_v6_ctrl.constants.dns.udp_response_buffer_bytes];
                         while dns_udp_v6_ctrl.is_running() {
                             if let Ok((len, peer_addr, local_dst_ip)) =
                                 NftablesInterceptor::recv_udp_v6_with_local_ip(&socket, &mut buf)
@@ -337,7 +424,7 @@ impl RouteWardController {
                                 let ctrl_query = dns_udp_v6_ctrl.clone();
                                 tokio::spawn(async move {
                                     let orig_resolver =
-                                        ctrl_query.lookup_udp_orig_dns_resolver(peer_addr);
+                                        ctrl_query.lookup_udp_orig_dns_resolver(peer_addr).await;
                                     let resp = ctrl_query
                                         .resolve_dns_query_async(&query_bytes, orig_resolver, true)
                                         .await;
@@ -353,149 +440,107 @@ impl RouteWardController {
                                 });
                             }
                         }
-                    }
-                    Err(err) => {
-                        dns_udp_v6_ctrl.telemetry.push_log(
-                            LogLevel::Warn,
-                            COMPONENT_ENGINE,
-                            format!("IPv6 UDP DNS listener disabled on [{v6_ip}]:{port}: {err}"),
-                        );
-                    }
+                    });
                 }
-            });
+                Err(err) => {
+                    self.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_ENGINE,
+                        format!("IPv6 UDP DNS listener disabled on [{v6_ip}]:{port}: {err}"),
+                    );
+                }
+            }
         }
 
         let dns_tcp_ctrl = self.clone();
+        let dns_tcp_listener = listeners.dns_tcp;
         tokio::spawn(async move {
             let dns_port = dns_tcp_ctrl.constants.network.default_dns_listen_port;
-            let bind_addr = format!(
-                "{}:{}",
-                dns_tcp_ctrl.constants.network.transparent_bind_host, dns_port
-            );
-            if let Ok(listener) = TcpListener::bind(&bind_addr).await {
-                dns_tcp_ctrl.telemetry.push_log(
-                    LogLevel::Info,
-                    COMPONENT_ENGINE,
-                    format!("Listening for local/redirected TCP DNS queries on {bind_addr}"),
-                );
-                RouteWardController::accept_dns_tcp_loop(dns_tcp_ctrl.clone(), listener, dns_port)
-                    .await;
-            }
+            RouteWardController::accept_dns_tcp_loop(dns_tcp_ctrl, dns_tcp_listener, dns_port)
+                .await;
         });
 
         if let Some(v6_ip) = Self::ipv6_counterpart(&self.constants.network.transparent_bind_host) {
-            let dns_tcp_v6_ctrl = self.clone();
-            tokio::spawn(async move {
-                let dns_port = dns_tcp_v6_ctrl.constants.network.default_dns_listen_port;
-                match Self::bind_tcp_v6_only(v6_ip, dns_port) {
-                    Ok(listener) => {
-                        dns_tcp_v6_ctrl.telemetry.push_log(
-                            LogLevel::Info,
-                            COMPONENT_ENGINE,
-                            format!("Listening for IPv6 TCP DNS queries on [{v6_ip}]:{dns_port}"),
-                        );
+            let dns_port = self.constants.network.default_dns_listen_port;
+            match Self::bind_tcp_v6_only(v6_ip, dns_port) {
+                Ok(listener) => {
+                    self.telemetry.push_log(
+                        LogLevel::Info,
+                        COMPONENT_ENGINE,
+                        format!("Listening for IPv6 TCP DNS queries on [{v6_ip}]:{dns_port}"),
+                    );
+                    let dns_tcp_v6_ctrl = self.clone();
+                    tokio::spawn(async move {
                         RouteWardController::accept_dns_tcp_loop(
-                            dns_tcp_v6_ctrl.clone(),
+                            dns_tcp_v6_ctrl,
                             listener,
                             dns_port,
                         )
                         .await;
-                    }
-                    Err(err) => {
-                        dns_tcp_v6_ctrl.telemetry.push_log(
-                            LogLevel::Warn,
-                            COMPONENT_ENGINE,
-                            format!(
-                                "IPv6 TCP DNS listener disabled on [{v6_ip}]:{dns_port}: {err}"
-                            ),
-                        );
-                    }
+                    });
                 }
-            });
+                Err(err) => {
+                    self.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_ENGINE,
+                        format!("IPv6 TCP DNS listener disabled on [{v6_ip}]:{dns_port}: {err}"),
+                    );
+                }
+            }
         }
 
         let local_name_ctrl = self.clone();
+        let local_name_socket = listeners.local_name;
         tokio::spawn(async move {
-            let inspect_port = local_name_ctrl
-                .constants
-                .network
-                .default_local_name_inspect_port;
-            let bind_addr = format!(
-                "{}:{}",
-                local_name_ctrl.constants.network.transparent_bind_host, inspect_port
-            );
-            if let Ok(socket) = UdpSocket::bind(&bind_addr).await {
-                ProxyConnector::apply_platform_mark_udp(
-                    &socket,
-                    local_name_ctrl.constants.network.linux_fwmark,
-                );
-                if let Err(err) = NftablesInterceptor::enable_udp_tproxy_options(&socket) {
-                    local_name_ctrl.telemetry.push_log(
-                        LogLevel::Warn,
-                        COMPONENT_ENGINE,
-                        format!("Could not enable IP_TRANSPARENT/IP_RECVORIGDSTADDR on {bind_addr}: {err}"),
-                    );
-                }
-                NftablesInterceptor::enable_udp_pktinfo(&socket);
-                let socket = Arc::new(socket);
-                local_name_ctrl.telemetry.push_log(
-                    LogLevel::Info,
-                    COMPONENT_ENGINE,
-                    format!("Listening for TPROXY UDP and LLMNR/mDNS inspection on {bind_addr}"),
-                );
-                let mut buf = vec![0u8; 65535];
-                while local_name_ctrl.is_running() {
-                    if let Ok((len, client_addr, orig_dst)) =
-                        NftablesInterceptor::recv_udp_tproxy_orig_dst(&socket, &mut buf).await
-                    {
-                        let pkt_bytes = buf[..len].to_vec();
-                        let sock_reply = Arc::clone(&socket);
-                        let ctrl_inspect = local_name_ctrl.clone();
-                        tokio::spawn(async move {
-                            ctrl_inspect
-                                .handle_tproxy_udp_datagram(
-                                    &pkt_bytes,
-                                    SocketAddr::V4(client_addr),
-                                    orig_dst.map(SocketAddr::V4),
-                                    &sock_reply,
-                                )
-                                .await;
-                        });
-                    }
+            let mut buf = vec![0u8; MAX_UDP_DATAGRAM_BYTES];
+            while local_name_ctrl.is_running() {
+                if let Ok((len, client_addr, orig_dst)) =
+                    NftablesInterceptor::recv_udp_tproxy_orig_dst(&local_name_socket, &mut buf)
+                        .await
+                {
+                    let pkt_bytes = buf[..len].to_vec();
+                    let sock_reply = Arc::clone(&local_name_socket);
+                    let ctrl_inspect = local_name_ctrl.clone();
+                    tokio::spawn(async move {
+                        ctrl_inspect
+                            .handle_tproxy_udp_datagram(
+                                &pkt_bytes,
+                                SocketAddr::V4(client_addr),
+                                orig_dst.map(SocketAddr::V4),
+                                &sock_reply,
+                            )
+                            .await;
+                    });
                 }
             }
         });
 
         if let Some(v6_ip) = Self::ipv6_counterpart(&self.constants.network.transparent_bind_host) {
-            let local_name_v6_ctrl = self.clone();
-            tokio::spawn(async move {
-                let inspect_port = local_name_v6_ctrl
-                    .constants
-                    .network
-                    .default_local_name_inspect_port;
-                match Self::bind_udp_v6_only(v6_ip, inspect_port) {
-                    Ok(socket) => {
-                        ProxyConnector::apply_platform_mark_udp(
-                            &socket,
-                            local_name_v6_ctrl.constants.network.linux_fwmark,
-                        );
-                        if let Err(err) = NftablesInterceptor::enable_udp_tproxy_v6_options(&socket)
-                        {
-                            local_name_v6_ctrl.telemetry.push_log(
-                                LogLevel::Warn,
-                                COMPONENT_ENGINE,
-                                format!("Could not enable IPv6 TPROXY/IPV6_RECVORIGDSTADDR on [{v6_ip}]:{inspect_port}: {err}"),
-                            );
-                        }
-                        let socket = Arc::new(socket);
-                        local_name_v6_ctrl.telemetry.push_log(
-                            LogLevel::Info,
+            let inspect_port = self.constants.network.default_local_name_inspect_port;
+            match Self::bind_udp_v6_only(v6_ip, inspect_port) {
+                Ok(socket) => {
+                    ProxyConnector::apply_platform_mark_udp(
+                        &socket,
+                        self.constants.network.linux_fwmark,
+                    );
+                    if let Err(err) = NftablesInterceptor::enable_udp_tproxy_v6_options(&socket) {
+                        self.telemetry.push_log(
+                            LogLevel::Warn,
                             COMPONENT_ENGINE,
-                            format!(
-                                "Listening for IPv6 TPROXY UDP inspection on [{v6_ip}]:{inspect_port}"
-                            ),
+                            format!("Could not enable IPv6 TPROXY/IPV6_RECVORIGDSTADDR on [{v6_ip}]:{inspect_port}: {err}"),
                         );
-                        let mut buf = vec![0u8; 65535];
+                    }
+                    let socket = Arc::new(socket);
+                    self.telemetry.push_log(
+                        LogLevel::Info,
+                        COMPONENT_ENGINE,
+                        format!(
+                            "Listening for IPv6 TPROXY UDP inspection on [{v6_ip}]:{inspect_port}"
+                        ),
+                    );
+                    let local_name_v6_ctrl = self.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; MAX_UDP_DATAGRAM_BYTES];
                         while local_name_v6_ctrl.is_running() {
                             if let Ok((len, client_addr, orig_dst)) =
                                 NftablesInterceptor::recv_udp_tproxy_v6_orig_dst(&socket, &mut buf)
@@ -516,16 +561,18 @@ impl RouteWardController {
                                 });
                             }
                         }
-                    }
-                    Err(err) => {
-                        local_name_v6_ctrl.telemetry.push_log(
-                            LogLevel::Warn,
-                            COMPONENT_ENGINE,
-                            format!("IPv6 TPROXY UDP listener disabled on [{v6_ip}]:{inspect_port}: {err}"),
-                        );
-                    }
+                    });
                 }
-            });
+                Err(err) => {
+                    self.telemetry.push_log(
+                        LogLevel::Warn,
+                        COMPONENT_ENGINE,
+                        format!(
+                            "IPv6 TPROXY UDP listener disabled on [{v6_ip}]:{inspect_port}: {err}"
+                        ),
+                    );
+                }
+            }
         }
 
         let bootstrap_ctrl = self.clone();
@@ -768,9 +815,33 @@ impl RouteWardController {
     }
 
     /// Starts the OS-level transparent packet interceptor (`Interceptor` trait backend).
+    ///
+    /// Refuses to start when the engine is not running: its listeners are what the interceptor
+    /// reflects traffic to, so a failed listener bind must never end with an active interceptor
+    /// (and a kill switch) pointing at a dead port. A backend that fails halfway is stopped so
+    /// no driver handle or firewall rule stays applied.
     pub fn start_transparent_interceptor(&self) -> RouteWardResult<&'static str> {
         let backend_name = self.interceptor_backend.name();
-        self.interceptor_backend.start(self.clone())?;
+        if !self.is_running() {
+            let detail = format!(
+                "Refusing to start the {backend_name} interceptor: the engine listeners are not bound"
+            );
+            self.telemetry
+                .push_log(LogLevel::Error, COMPONENT_ENGINE, detail.clone());
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_IPC_ERROR,
+                detail,
+            });
+        }
+        if let Err(err) = self.interceptor_backend.start(self.clone()) {
+            self.telemetry.push_log(
+                LogLevel::Error,
+                COMPONENT_ENGINE,
+                format!("Failed to start the {backend_name} interceptor: {err}"),
+            );
+            self.interceptor_backend.stop();
+            return Err(err);
+        }
         self.telemetry.push_log(
             LogLevel::Info,
             COMPONENT_ENGINE,
@@ -984,9 +1055,8 @@ impl RouteWardController {
 
         #[cfg(windows)]
         {
-            let rule_name = format!(
-                "RouteWard_TransparentRelay_{}",
-                self.constants.network.default_transparent_tcp_port
+            let rule_name = crate::interceptor::windivert::scoped_firewall_rule_name(
+                self.constants.network.default_transparent_tcp_port,
             );
             WinDivertInterceptor::remove_scoped_firewall_rule(&rule_name, &self.telemetry);
         }
@@ -1412,12 +1482,6 @@ impl RouteWardController {
             ConnectionStatus::Active
         };
 
-        let (rx_bytes, tx_bytes) = if status == ConnectionStatus::Blocked {
-            (0, 0)
-        } else {
-            (SIMULATED_DEFAULT_RX_BYTES, SIMULATED_DEFAULT_TX_BYTES)
-        };
-
         let resolved_domain = eval.effective_domain.clone().or_else(|| {
             if req.target_host.parse::<IpAddr>().is_err() {
                 let _ = self.dns.allocate_or_get(&req.target_host);
@@ -1429,7 +1493,7 @@ impl RouteWardController {
 
         let tracked = TrackedConnection {
             id: Uuid::new_v4().to_string(),
-            pid: 4210,
+            pid: 0,
             process_name: ProcessResolver::extract_basename(&req.process_name),
             process_path: req.process_path.unwrap_or_else(|| req.process_name.clone()),
             target_host: req.target_host.clone(),
@@ -1438,9 +1502,9 @@ impl RouteWardController {
             protocol: req.protocol,
             matched_rule: eval.matched_rule_name.clone(),
             route_label: route_label.clone(),
-            latency_ms: SIMULATED_DEFAULT_LATENCY_MS,
-            rx_bytes,
-            tx_bytes,
+            latency_ms: 0,
+            rx_bytes: 0,
+            tx_bytes: 0,
             status,
             started_at: Utc::now(),
             error_detail: None,
@@ -1512,8 +1576,8 @@ impl RouteWardController {
                 matched_rule: eval.matched_rule_name,
                 route_label,
                 latency_ms: 0,
-                rx_bytes: SIMULATED_DEFAULT_RX_BYTES,
-                tx_bytes: SIMULATED_DEFAULT_TX_BYTES,
+                rx_bytes: 0,
+                tx_bytes: 0,
                 status,
                 started_at: Utc::now(),
                 error_detail: None,
@@ -1651,6 +1715,8 @@ impl RouteWardController {
                 }
             }
         }
+        // Same lock as `register_self_proxy_connect_hint`: neither update may be lost.
+        let _guard = self.relay_caches.upstream_endpoints.lock();
         self.nat_table.set_upstream_endpoints(upstream_endpoints);
     }
 
@@ -1682,6 +1748,7 @@ impl RouteWardController {
             let sec_diff = prof.security_policy != new_profile.security_policy;
             let dns_diff = prof.dns_config != new_profile.dns_config;
             let prx_diff = prof.proxies != new_profile.proxies;
+            RuleEngine::sort_rules(&mut new_profile.rules);
             *prof = new_profile;
             (sec_diff, dns_diff, prx_diff)
         };
@@ -2022,7 +2089,7 @@ impl RouteWardController {
         } else {
             prof.rules.push(rule);
         }
-        prof.rules.sort_by_key(|r| r.priority);
+        RuleEngine::sort_rules(&mut prof.rules);
     }
 
     pub fn remove_rule(&self, rule_id: &str) {
@@ -2073,5 +2140,123 @@ impl RouteWardController {
     /// Returns the total number of fragmented UDP datagrams dropped by the proxy fragmentation guard.
     pub fn fragmented_udp_drop_count(&self) -> u64 {
         self.fragmented_udp_drop_count.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PortRange;
+
+    fn test_constants() -> SystemConstants {
+        let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+        constants.network.default_relay_tcp_port = 0;
+        constants.network.default_transparent_tcp_port = 0;
+        constants.network.default_dns_listen_port = 0;
+        constants.network.default_local_name_inspect_port = 0;
+        constants
+    }
+
+    fn test_profile() -> ProfileConfig {
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile
+    }
+
+    fn rule(id: &str, priority: i32) -> RoutingRule {
+        RoutingRule {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            priority,
+            process_patterns: Vec::new(),
+            domain_patterns: Vec::new(),
+            ip_cidrs: Vec::new(),
+            port_ranges: Vec::<PortRange>::new(),
+            protocol: TransportProtocol::Any,
+            action: RuleAction::Direct,
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_start_fails_and_interceptor_is_refused_when_a_listener_port_is_taken() {
+        let mut constants = test_constants();
+        let blocker =
+            std::net::TcpListener::bind(format!("{}:0", constants.network.transparent_bind_host))
+                .expect("bind blocker");
+        constants.network.default_transparent_tcp_port =
+            blocker.local_addr().expect("blocker addr").port();
+        let controller = RouteWardController::new(constants, test_profile(), "en");
+
+        controller.start_engine();
+
+        assert!(
+            !controller.is_running(),
+            "a failed listener bind must leave the engine stopped"
+        );
+        let logs = controller.telemetry.list_logs();
+        assert!(
+            logs.iter().any(|l| l.level == LogLevel::Error
+                && l.component == COMPONENT_ENGINE
+                && l.message
+                    .contains("Failed to bind the transparent TCP listener")),
+            "expected a bind error log, got: {logs:?}"
+        );
+        let result = controller.start_transparent_interceptor();
+        assert!(
+            result.is_err(),
+            "the interceptor must never start without bound listeners"
+        );
+        assert!(!controller.interceptor_backend.is_active());
+        drop(blocker);
+    }
+
+    #[tokio::test]
+    async fn engine_start_succeeds_when_every_port_is_free() {
+        let controller = RouteWardController::new(test_constants(), test_profile(), "en");
+        controller.start_engine();
+        assert!(controller.is_running());
+        controller.stop_engine();
+        assert!(!controller.is_running());
+    }
+
+    #[test]
+    fn upsert_rule_and_profile_replacement_keep_rules_sorted_by_priority() {
+        let mut profile = test_profile();
+        profile.rules = vec![rule("late", 30), rule("early", 10)];
+        let controller = RouteWardController::new(test_constants(), profile.clone(), "en");
+        let ids = |c: &RouteWardController| -> Vec<String> {
+            c.profile
+                .read()
+                .rules
+                .iter()
+                .map(|r| r.id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&controller), ["early", "late"]);
+
+        controller.upsert_rule(rule("middle", 20));
+        assert_eq!(ids(&controller), ["early", "middle", "late"]);
+
+        profile.rules = vec![rule("c", 3), rule("a", 1), rule("b", 2)];
+        controller.replace_profile(profile);
+        assert_eq!(ids(&controller), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn simulated_connection_carries_no_fabricated_measurements() {
+        let controller = RouteWardController::new(test_constants(), test_profile(), "en");
+        let tracked = controller.simulate_connection(ConnectionRequest {
+            process_name: "demo.exe".to_string(),
+            process_path: None,
+            target_host: "example.test".to_string(),
+            target_ip: None,
+            target_port: 443,
+            protocol: TransportProtocol::Tcp,
+        });
+        assert_eq!(tracked.pid, 0);
+        assert_eq!(tracked.latency_ms, 0);
+        assert_eq!(tracked.rx_bytes, 0);
+        assert_eq!(tracked.tx_bytes, 0);
     }
 }
