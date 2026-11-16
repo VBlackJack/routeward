@@ -92,9 +92,12 @@ impl ProxyUriCodec {
 
         let auth = userinfo_opt.map(|raw_user_info| {
             if let Some((u, p)) = raw_user_info.split_once(':') {
-                ProxyCredentials::new(Self::percent_decode(u), Self::percent_decode(p))
+                ProxyCredentials::new(
+                    Self::percent_decode_userinfo(u),
+                    Self::percent_decode_userinfo(p),
+                )
             } else {
-                ProxyCredentials::new(Self::percent_decode(raw_user_info), String::new())
+                ProxyCredentials::new(Self::percent_decode_userinfo(raw_user_info), String::new())
             }
         });
 
@@ -234,7 +237,16 @@ impl ProxyUriCodec {
         encoded
     }
 
+    /// Decodes `%XX` escapes only: in userinfo a literal `+` is a plus sign, never a space.
+    fn percent_decode_userinfo(input: &str) -> String {
+        Self::percent_decode_with(input, false)
+    }
+
     fn percent_decode(input: &str) -> String {
+        Self::percent_decode_with(input, true)
+    }
+
+    fn percent_decode_with(input: &str, plus_as_space: bool) -> String {
         let bytes = input.as_bytes();
         let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
         let mut idx = 0;
@@ -248,7 +260,7 @@ impl ProxyUriCodec {
                     }
                 }
             }
-            if bytes[idx] == b'+' {
+            if plus_as_space && bytes[idx] == b'+' {
                 decoded.push(b' ');
             } else {
                 decoded.push(bytes[idx]);
@@ -318,5 +330,14 @@ mod tests {
         let recreds = reparsed.auth.expect("re-parsed auth");
         assert_eq!(recreds.username, "alice:dev");
         assert_eq!(recreds.password_str(), "p@ss:w%ord");
+    }
+
+    #[test]
+    fn userinfo_keeps_literal_plus_and_decodes_percent_2b() {
+        let node = ProxyUriCodec::parse_uri("http://us+er:pa+ss%2Bx@10.0.0.1:8080")
+            .expect("URI with plus signs in userinfo");
+        let creds = node.auth.as_ref().expect("auth present");
+        assert_eq!(creds.username, "us+er");
+        assert_eq!(creds.password_str(), "pa+ss+x");
     }
 }

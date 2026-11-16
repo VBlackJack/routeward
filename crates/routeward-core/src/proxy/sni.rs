@@ -95,7 +95,12 @@ impl TlsSniExtractor {
                     if pos + name_len <= list_end && name_type == TLS_SNI_HOST_NAME_TYPE {
                         let host_bytes = &sni_data[pos..pos + name_len];
                         if let Ok(hostname) = std::str::from_utf8(host_bytes) {
-                            return Some(hostname.to_lowercase());
+                            // A hostname that is unsafe to embed in a text protocol is dropped
+                            // here so it never reaches an upstream CONNECT request line.
+                            if super::is_safe_hostname(hostname) {
+                                return Some(hostname.to_lowercase());
+                            }
+                            return None;
                         }
                     }
                     pos += name_len;
@@ -149,5 +154,69 @@ mod tests {
 
         let extracted = TlsSniExtractor::extract_sni(&packet).expect("Extracted SNI hostname");
         assert_eq!(extracted, "stealth.torproject.org");
+    }
+
+    fn client_hello_with_sni(host: &[u8]) -> Vec<u8> {
+        let host_len = host.len() as u16;
+        let sni_list_len = host_len + 3;
+        let sni_ext_len = sni_list_len + 2;
+        let extensions_total_len = sni_ext_len + 4;
+        let mut hello_body = Vec::new();
+        hello_body.extend_from_slice(&[0x03, 0x03]);
+        hello_body.extend_from_slice(&[0u8; 32]);
+        hello_body.push(0);
+        hello_body.extend_from_slice(&2u16.to_be_bytes());
+        hello_body.extend_from_slice(&[0x13, 0x01]);
+        hello_body.push(1);
+        hello_body.push(0);
+        hello_body.extend_from_slice(&extensions_total_len.to_be_bytes());
+        hello_body.extend_from_slice(&0u16.to_be_bytes());
+        hello_body.extend_from_slice(&sni_ext_len.to_be_bytes());
+        hello_body.extend_from_slice(&sni_list_len.to_be_bytes());
+        hello_body.push(0);
+        hello_body.extend_from_slice(&host_len.to_be_bytes());
+        hello_body.extend_from_slice(host);
+        let handshake_len = hello_body.len() as u32;
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&handshake_len.to_be_bytes()[1..4]);
+        handshake.extend_from_slice(&hello_body);
+        let record_len = handshake.len() as u16;
+        let mut packet = vec![0x16, 0x03, 0x01];
+        packet.extend_from_slice(&record_len.to_be_bytes());
+        packet.extend_from_slice(&handshake);
+        packet
+    }
+
+    #[test]
+    fn rejects_sni_with_crlf_space_or_control_bytes() {
+        for bad in [
+            &b"a.com\r\nX-Evil: 1"[..],
+            &b"a.com x"[..],
+            &b"a.com\x00"[..],
+            &b"a\tb.com"[..],
+        ] {
+            assert_eq!(
+                TlsSniExtractor::extract_sni(&client_hello_with_sni(bad)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_overlong_sni_and_labels_but_keeps_underscores() {
+        let long_label = vec![b'a'; 64];
+        assert_eq!(
+            TlsSniExtractor::extract_sni(&client_hello_with_sni(&long_label)),
+            None
+        );
+        let long_name = format!("{0}.{0}.{0}.{0}", "a".repeat(63));
+        assert_eq!(
+            TlsSniExtractor::extract_sni(&client_hello_with_sni(long_name.as_bytes())),
+            None
+        );
+        assert_eq!(
+            TlsSniExtractor::extract_sni(&client_hello_with_sni(b"_srv.Example.com")),
+            Some("_srv.example.com".to_string())
+        );
     }
 }

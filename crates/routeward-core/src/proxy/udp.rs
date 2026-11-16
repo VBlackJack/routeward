@@ -217,6 +217,13 @@ pub fn decode_socks5_udp_datagram<'a>(
     }
 }
 
+/// Returns true when `from` is the SOCKS5 UDP relay endpoint (`BND.ADDR:BND.PORT`, already
+/// normalized to the control peer IP when the server returned an unspecified address). IPv4-mapped
+/// IPv6 forms are compared in canonical form.
+pub(crate) fn is_expected_relay_source(from: SocketAddr, relay: SocketAddr) -> bool {
+    from.port() == relay.port() && from.ip().to_canonical() == relay.ip().to_canonical()
+}
+
 #[derive(Debug, Clone)]
 struct UnsupportedNodeEntry {
     expires_at: Instant,
@@ -297,7 +304,8 @@ pub struct UdpAssociationSession {
     pub proxy_name: String,
     pub relay_udp_addr: SocketAddr,
     pub udp_socket: Arc<UdpSocket>,
-    recv_lock: tokio::sync::Mutex<()>,
+    /// Serializes receives and owns the reusable receive buffer (allocated once per session).
+    recv_state: tokio::sync::Mutex<Vec<u8>>,
     control_alive: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     last_activity_ms: AtomicU64,
@@ -536,27 +544,19 @@ impl UdpAssociationManager {
             return Ok(existing);
         }
 
-        let connect_timeout = Duration::from_millis(constants.network.tcp_connect_timeout_ms);
         let handshake_timeout = Duration::from_millis(constants.network.proxy_handshake_timeout_ms);
         let fwmark = constants.network.linux_fwmark;
 
-        let proxy_addr = format!("{}:{}", node.host, node.port);
-        let mut control_stream = timeout(
-            connect_timeout,
-            ProxyConnector::connect_tcp_marked(&proxy_addr, fwmark),
-        )
-        .await
-        .map_err(|_| RouteWardError::ConnectionTimeout {
-            key: ERR_KEY_CONNECTION_TIMEOUT,
-        })?
-        .map_err(RouteWardError::Io)?;
+        let proxy_addr = ProxyConnector::format_host_port(&node.host, node.port);
+        // Same transport opener as the TCP paths: TLS-wrapped for TLS nodes, IPv6-safe address.
+        let (mut control_stream, control_local, control_peer) =
+            ProxyConnector::open_transport_with_addrs(node, &proxy_addr, None, constants).await?;
 
-        let tcp_port_guard = match (nat_table, control_stream.local_addr()) {
-            (Some(nat), Ok(local_sa)) => Some(nat.register_self_tcp_port(local_sa.port())),
+        let tcp_port_guard = match (nat_table, control_local) {
+            (Some(nat), Some(local_sa)) => Some(nat.register_self_tcp_port(local_sa.port())),
             _ => None,
         };
-        let control_peer_ip = control_stream
-            .peer_addr()
+        let control_peer_ip = control_peer
             .map(|sa| sa.ip())
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
 
@@ -632,7 +632,7 @@ impl UdpAssociationManager {
             proxy_name: node.name.clone(),
             relay_udp_addr,
             udp_socket: Arc::new(udp_socket),
-            recv_lock: tokio::sync::Mutex::new(()),
+            recv_state: tokio::sync::Mutex::new(vec![0u8; MAX_UDP_DATAGRAM_BYTES]),
             control_alive,
             shutdown_notify,
             last_activity_ms: AtomicU64::new(self.now_ms()),
@@ -676,7 +676,7 @@ impl UdpAssociationManager {
             .map_err(RouteWardError::Io)?;
 
         // Serialize only the recv_from wait so concurrent outbound sends never stall on a prior read timeout.
-        let _recv_guard = session.recv_lock.lock().await;
+        let mut recv_buf = session.recv_state.lock().await;
         if !session.is_control_alive() {
             self.sessions.remove(&session.key);
             return Err(RouteWardError::ProtocolHandshake {
@@ -685,13 +685,25 @@ impl UdpAssociationManager {
             });
         }
 
-        let mut recv_buf = vec![0u8; MAX_UDP_DATAGRAM_BYTES];
-        let (n, _from_addr) = timeout(read_timeout, session.udp_socket.recv_from(&mut recv_buf))
-            .await
-            .map_err(|_| RouteWardError::ConnectionTimeout {
-                key: ERR_KEY_CONNECTION_TIMEOUT,
-            })?
-            .map_err(RouteWardError::Io)?;
+        // Datagrams from any source other than the relay endpoint (forged or stray traffic)
+        // are dropped; the read timeout bounds the whole wait, not each datagram.
+        let deadline = Instant::now() + read_timeout;
+        let n = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (n, from_addr) = timeout(remaining, session.udp_socket.recv_from(&mut recv_buf))
+                .await
+                .map_err(|_| RouteWardError::ConnectionTimeout {
+                    key: ERR_KEY_CONNECTION_TIMEOUT,
+                })?
+                .map_err(RouteWardError::Io)?;
+            if is_expected_relay_source(from_addr, session.relay_udp_addr) {
+                break n;
+            }
+            tracing::debug!(
+                target: "routeward::proxy::udp",
+                "dropping UDP datagram from unexpected source {from_addr}"
+            );
+        };
 
         if !session.is_control_alive() {
             self.sessions.remove(&session.key);
@@ -1050,7 +1062,7 @@ mod tests {
                 last_activity_ms: AtomicU64::new(now_ms),
                 _udp_port_guard: None,
                 _tcp_port_guard: None,
-                recv_lock: tokio::sync::Mutex::new(()),
+                recv_state: tokio::sync::Mutex::new(vec![0u8; MAX_UDP_DATAGRAM_BYTES]),
             })
         };
 
@@ -1088,5 +1100,21 @@ mod tests {
         // Wait past the 60ms idle timeout -> all associations expire
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(manager.active_count(), 0);
+    }
+
+    #[test]
+    fn relay_source_filter_accepts_only_the_relay_endpoint() {
+        let relay: SocketAddr = "10.0.0.5:4000".parse().unwrap();
+        assert!(is_expected_relay_source(relay, relay));
+        assert!(!is_expected_relay_source(
+            "10.0.0.6:4000".parse().unwrap(),
+            relay
+        ));
+        assert!(!is_expected_relay_source(
+            "10.0.0.5:4001".parse().unwrap(),
+            relay
+        ));
+        let mapped: SocketAddr = "[::ffff:10.0.0.5]:4000".parse().unwrap();
+        assert!(is_expected_relay_source(mapped, relay));
     }
 }
