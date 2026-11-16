@@ -935,7 +935,7 @@ async fn engine_toggle_route_validates_payload_and_surfaces_transport_errors() {
 
     let ctrl =
         routeward_core::interceptor::RouteWardController::new(custom_consts.clone(), profile, "en");
-    let svc = DaemonIpcService::bind(ctrl).expect("bind test ipc");
+    let svc = DaemonIpcService::bind_for_test(ctrl).expect("bind test ipc");
     let svc_task = tokio::spawn(async move {
         let _ = svc.run_accept_loop().await;
     });
