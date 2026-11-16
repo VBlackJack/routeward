@@ -26,6 +26,10 @@ if [ "${1:-}" = "configure" ]; then
 
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload || true
+        # $2 is the previously configured version: set only on upgrade, empty on fresh install.
+        if [ -n "${2:-}" ]; then
+            systemctl try-restart routeward.service || true
+        fi
     fi
 fi
 
