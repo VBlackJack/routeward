@@ -41,6 +41,13 @@ ConfigurationDirectoryMode=0700
 LogsDirectory=routeward
 LogsDirectoryMode=0750
 Environment=RUST_LOG=info
+# Capabilities: NET_ADMIN (nftables, ip rule/route, IP_TRANSPARENT, SO_MARK), NET_RAW (raw UDP
+# reply sockets), CHOWN (hands the IPC socket to group routeward), SYS_PTRACE and DAC_READ_SEARCH
+# (process attribution walks /proc/<pid>/fd and reads /proc/<pid>/exe of OTHER uids; the bounding
+# set has no CAP_DAC_OVERRIDE, so root has no blanket file access).
+# CAP_SYS_PTRACE MUST stay: without it every user process is unattributed and its traffic is
+# blocked. Its attack surface (ptrace attach, process_vm_readv/writev) is closed at the syscall
+# level instead: SystemCallFilter below filters the @debug group.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHOWN
 AmbientCapabilities=
 NoNewPrivileges=yes
@@ -50,6 +57,31 @@ ReadWritePaths=/run/routeward /etc/routeward /var/log/routeward
 ProtectHome=read-only
 LockPersonality=yes
 RestrictRealtime=yes
+# Allow only the regular service syscall set. This drops @debug (ptrace, process_vm_readv/writev,
+# perf_event_open), @mount, @module, @raw-io, @reboot, @swap, @cpu-emulation and @obsolete.
+SystemCallFilter=@system-service
+# Fail the syscall with EPERM instead of killing the daemon with SIGSYS (fail-closed teardown
+# paths must keep running).
+SystemCallErrorNumber=EPERM
+# Block the 32-bit compat ABI, a classic way around a syscall filter.
+SystemCallArchitectures=native
+# The daemon never changes kernel tunables itself; read-only /proc/sys, /sys and friends.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# AF_INET/AF_INET6: proxy sockets and raw sockets (SOCK_RAW with IP_HDRINCL). AF_NETLINK: sock_diag
+# for process attribution and the nft/ip children. AF_UNIX: IPC socket and resolvectl/D-Bus.
+# AF_PACKET is deliberately absent.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+# Neither the daemon nor its children create setuid/setgid files.
+RestrictSUIDSGID=yes
+# Do NOT add ProtectProc=invisible or ProcSubset=pid: they hide other uids' /proc/<pid> (breaks
+# process attribution) and /proc/net, /proc/net/nf_conntrack (breaks TCP/UDP lookups and UDP
+# original-destination recovery).
 
 [Install]
 WantedBy=multi-user.target
