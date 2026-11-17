@@ -839,7 +839,6 @@ impl ProxyConnector {
                     effective_spn,
                     target_host,
                     target_port,
-                    proto,
                 )
                 .await
             }
@@ -1082,11 +1081,9 @@ impl ProxyConnector {
         node: &ProxyNode,
         target_host: &str,
         target_port: u16,
-        _proto: &ProtocolConstants,
     ) -> RouteWardResult<()> {
         let spn = node.sni.as_deref().unwrap_or(&node.host);
-        Self::negotiate_http_connect_with_spn(stream, node, spn, target_host, target_port, _proto)
-            .await
+        Self::negotiate_http_connect_with_spn(stream, node, spn, target_host, target_port).await
     }
 
     pub async fn negotiate_http_connect_with_spn<S: AsyncTunnelStream>(
@@ -1095,7 +1092,6 @@ impl ProxyConnector {
         effective_spn: &str,
         target_host: &str,
         target_port: u16,
-        _proto: &ProtocolConstants,
     ) -> RouteWardResult<()> {
         let mut sspi_session: Option<SspiClientSession> = None;
         let mut pending_auth_header = initial_basic_auth_header(node);
@@ -1326,7 +1322,6 @@ mod tests {
 
     #[tokio::test]
     async fn http_connect_rejects_oversized_unterminated_header() {
-        let proto = SystemConstants::load_embedded().unwrap().protocols;
         let node = ProxyNode {
             id: "test-http".to_string(),
             name: "HTTP".to_string(),
@@ -1350,10 +1345,9 @@ mod tests {
             let _ = server.write_all(&payload).await;
         });
 
-        let err =
-            ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
-                .await
-                .expect_err("unterminated header exceeding limit must error");
+        let err = ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443)
+            .await
+            .expect_err("unterminated header exceeding limit must error");
         assert!(err.to_string().contains("exceeded maximum allowed size"));
     }
 
@@ -1369,7 +1363,6 @@ mod tests {
             "127.0.0.1:1080"
         );
 
-        let proto = SystemConstants::load_embedded().unwrap().protocols;
         let node = ProxyNode {
             id: "test-http-v6".to_string(),
             name: "HTTPv6".to_string(),
@@ -1399,7 +1392,7 @@ mod tests {
             req
         });
 
-        ProxyConnector::negotiate_http_connect(&mut client, &node, "2001:db8::1", 443, &proto)
+        ProxyConnector::negotiate_http_connect(&mut client, &node, "2001:db8::1", 443)
             .await
             .expect("HTTP CONNECT over IPv6 target literal should succeed");
         let sent_req = server_task.await.unwrap();
@@ -1510,7 +1503,6 @@ mod tests {
 
     #[tokio::test]
     async fn plaintext_proxy_receives_no_authorization_on_first_request() {
-        let proto = SystemConstants::load_embedded().unwrap().protocols;
         let node = http_test_node("plain-first-request", false, true);
         let (mut client, mut server) = duplex(2048);
         let server_task = tokio::spawn(async move {
@@ -1522,7 +1514,7 @@ mod tests {
             head
         });
 
-        ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
+        ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443)
             .await
             .expect("CONNECT without challenge succeeds");
         let head = server_task.await.unwrap();
@@ -1535,7 +1527,6 @@ mod tests {
 
     #[tokio::test]
     async fn basic_only_407_is_answered_with_basic_and_succeeds() {
-        let proto = SystemConstants::load_embedded().unwrap().protocols;
         let node = http_test_node("basic-only-reactive", false, true);
         let (mut client, mut server) = duplex(4096);
         let server_task = tokio::spawn(async move {
@@ -1554,7 +1545,7 @@ mod tests {
             (first, second)
         });
 
-        ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
+        ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443)
             .await
             .expect("Basic-only proxy must be served after the 407");
         let (first, second) = server_task.await.unwrap();
@@ -1568,7 +1559,6 @@ mod tests {
 
     #[tokio::test]
     async fn basic_rejected_after_basic_does_not_loop() {
-        let proto = SystemConstants::load_embedded().unwrap().protocols;
         let node = http_test_node("basic-rejected", false, true);
         let (mut client, mut server) = duplex(4096);
         let server_task = tokio::spawn(async move {
@@ -1583,17 +1573,15 @@ mod tests {
             }
         });
 
-        let err =
-            ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
-                .await
-                .expect_err("wrong Basic credentials must be rejected");
+        let err = ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443)
+            .await
+            .expect_err("wrong Basic credentials must be rejected");
         assert!(matches!(err, RouteWardError::AuthenticationRejected { .. }));
         server_task.await.unwrap();
     }
 
     #[tokio::test]
     async fn ntlm_challenge_never_triggers_basic() {
-        let proto = SystemConstants::load_embedded().unwrap().protocols;
         let node = http_test_node("ntlm-never-basic", false, true);
         let (mut client, mut server) = duplex(4096);
         let server_task = tokio::spawn(async move {
@@ -1614,8 +1602,7 @@ mod tests {
         });
 
         let _ =
-            ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
-                .await;
+            ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443).await;
         drop(client);
         let seen = server_task.await.unwrap();
         assert!(
@@ -1669,7 +1656,6 @@ mod tests {
 
     #[tokio::test]
     async fn known_basic_proxy_skips_the_extra_round_trip() {
-        let proto = SystemConstants::load_embedded().unwrap().protocols;
         let node = http_test_node("basic-cache-hit", false, true);
         remember_basic_accepted(&node);
         let (mut client, mut server) = duplex(2048);
@@ -1681,7 +1667,7 @@ mod tests {
                 .unwrap();
             head
         });
-        ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443, &proto)
+        ProxyConnector::negotiate_http_connect(&mut client, &node, "example.com", 443)
             .await
             .expect("cached Basic proxy succeeds first try");
         let head = server_task.await.unwrap();
@@ -1710,7 +1696,6 @@ mod tests {
 
     #[tokio::test]
     async fn http_connect_refuses_target_with_crlf_injection() {
-        let proto = SystemConstants::load_embedded().unwrap().protocols;
         let node = http_test_node("crlf-target", false, false);
         let (mut client, _server) = duplex(1024);
         let err = ProxyConnector::negotiate_http_connect(
@@ -1718,7 +1703,6 @@ mod tests {
             &node,
             "a.com HTTP/1.1\r\nX-Injected: 1\r\n\r\nGET /",
             443,
-            &proto,
         )
         .await
         .expect_err("CRLF in target host must be refused");
