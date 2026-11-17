@@ -66,6 +66,15 @@ impl WatchdogMode {
     }
 }
 
+/// DHCPv4 client UDP port (source port of requests the fail-closed table still lets out).
+pub const DHCP_V4_CLIENT_PORT: u16 = 68;
+/// DHCPv4 server UDP port.
+pub const DHCP_V4_SERVER_PORT: u16 = 67;
+/// DHCPv6 client UDP port.
+pub const DHCP_V6_CLIENT_PORT: u16 = 546;
+/// DHCPv6 server UDP port.
+pub const DHCP_V6_SERVER_PORT: u16 = 547;
+
 /// Action `routeward cleanup --fail-closed-on-crash` takes after the service stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashCleanupAction {
@@ -79,14 +88,21 @@ pub enum CrashCleanupAction {
 pub const SERVICE_RESULT_SUCCESS: &str = "success";
 
 /// Pure decision for the systemd `ExecStopPost` hook: fail closed only when the service did not
-/// stop cleanly (crash, timeout, ...) and the persisted profile has the kill switch enabled.
-/// A missing `service_result` (not run by systemd) always removes everything.
+/// stop cleanly (crash, timeout, ...), the persisted profile has the kill switch enabled, and
+/// RouteWard interception was active (its tables were installed). An idle daemon or a startup
+/// failure never installs the block. A missing `service_result` (not run by systemd) always
+/// removes everything.
 pub fn decide_crash_cleanup_action(
     service_result: Option<&str>,
     kill_switch_enabled: bool,
+    interception_was_active: bool,
 ) -> CrashCleanupAction {
     match service_result {
-        Some(result) if result != SERVICE_RESULT_SUCCESS && kill_switch_enabled => {
+        Some(result)
+            if result != SERVICE_RESULT_SUCCESS
+                && kill_switch_enabled
+                && interception_was_active =>
+        {
             CrashCleanupAction::InstallFailClosed
         }
         _ => CrashCleanupAction::RemoveAll,
@@ -114,8 +130,8 @@ table inet {ks} {{\n\
     type filter hook output priority 0; policy drop;\n\
     oif \"lo\" accept\n\
     ct state established,related accept\n\
-    udp sport 68 udp dport 67 accept\n\
-    udp sport 546 udp dport 547 accept\n\
+    udp sport {DHCP_V4_CLIENT_PORT} udp dport {DHCP_V4_SERVER_PORT} accept\n\
+    udp sport {DHCP_V6_CLIENT_PORT} udp dport {DHCP_V6_SERVER_PORT} accept\n\
     icmpv6 type {{ nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert }} accept\n\
     icmpv6 type {{ mld-listener-query, mld-listener-report, mld-listener-done, mld2-listener-report }} accept\n\
   }}\n\
@@ -266,7 +282,7 @@ open_cleanup",
     /// Locale-independent: it relies on the exit status and the table inventory, never on the
     /// wording of an error message. If the inventory cannot be read, the table is assumed present
     /// so that a failed deletion is reported rather than masked.
-    fn nft_table_is_listed(nft_binary: &str, family: &str, table_name: &str) -> bool {
+    pub fn nft_table_is_listed(nft_binary: &str, family: &str, table_name: &str) -> bool {
         match Command::new(nft_binary)
             .args(["list", "tables"])
             .stdout(Stdio::piped())
@@ -280,6 +296,16 @@ open_cleanup",
             ),
             _ => true,
         }
+    }
+
+    /// Returns `true` when RouteWard interception was active: `ip <table>`, `ip6 <table>` or the
+    /// block table `inet <table>_ks` is listed. An unreadable inventory counts as active (fail
+    /// closed), like `nft_table_is_listed`.
+    pub fn interception_was_active(nft_binary: &str, table_name: &str) -> bool {
+        let ks = fail_closed_table_name(table_name);
+        Self::nft_table_is_listed(nft_binary, "ip", table_name)
+            || Self::nft_table_is_listed(nft_binary, "ip6", table_name)
+            || Self::nft_table_is_listed(nft_binary, "inet", &ks)
     }
 
     /// Returns `true` if `nft list tables` output contains a `table <family> <table_name>` line.
