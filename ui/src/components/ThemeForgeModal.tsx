@@ -118,7 +118,7 @@ export const ThemeForgeModal: React.FC<ThemeForgeModalProps> = ({ onClose }) => 
                 <Upload className="h-3.5 w-3.5 text-tf-accent" />
                 {t('themeforge.modal.import_palette')}
               </button>
-              <input
+              <input name="themeforge-import-file"
                 ref={fileInputRef}
                 type="file"
                 accept=".json"

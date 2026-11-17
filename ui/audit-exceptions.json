@@ -1,0 +1,12 @@
+{
+  "minimumSeverity": "high",
+  "exceptions": [
+    {
+      "advisory": "GHSA-fc5q-39xc-vjpf",
+      "package": "picomatch",
+      "reason": "ReDoS in picomatch <=4.0.7 with no fixed release yet; picomatch is only pulled in by build and test tooling (vite, vitest, tailwindcss) and is not part of the shipped UI bundle.",
+      "addedOn": "2026-11-17",
+      "reviewBy": "2026-12-17"
+    }
+  ]
+}

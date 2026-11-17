@@ -32,7 +32,8 @@ use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::{Icon, Theme, Window, WindowBuilder};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use wry::{WebContext, WebViewBuilder};
 
 const EMBEDDED_INDEX_HTML: &[u8] = include_bytes!("../../../ui/dist/index.html");
@@ -50,6 +51,17 @@ const WINDOW_DEFAULT_HEIGHT: f64 = 900.0;
 const WINDOW_MIN_WIDTH: f64 = 980.0;
 const WINDOW_MIN_HEIGHT: f64 = 660.0;
 const LOOPBACK_EPHEMERAL_ADDR: &str = "127.0.0.1:0";
+/// Connections the loopback UI server holds while they are still sending their request. Each is
+/// cut off by the request deadline; anything beyond this is closed before it is read.
+const LOOPBACK_MAX_PRE_AUTH_CONNECTIONS: usize = 256;
+/// How long a connection that finds the pre-auth pool full waits for a slot before it is closed.
+const LOOPBACK_PRE_AUTH_SLOT_WAIT_MS: u64 = 250;
+/// Connections allowed to wait for a pre-auth slot at the same time; beyond this they are closed
+/// at once, so the waiting itself cannot pile up tasks.
+const LOOPBACK_MAX_WAITING_CONNECTIONS: usize = 64;
+/// Validated requests served at once (page, assets, the realtime stream, API calls). Taken only
+/// after the token check, so slow or unauthenticated connections never consume these.
+const LOOPBACK_MAX_SERVING_REQUESTS: usize = 64;
 const ICON_WINDOW_DIMENSION: u32 = 32;
 const ICON_TASKBAR_DIMENSION: u32 = 256;
 
@@ -126,6 +138,75 @@ fn apply_window_theme(window: &Window, appearance: WindowThemeAppearance) {
     }
 }
 
+/// Identifier of the session-end window subclass (unique among this window's subclasses).
+#[cfg(target_os = "windows")]
+const SESSION_END_SUBCLASS_ID: usize = 1;
+
+/// Window subclass procedure: when Windows confirms the session is ending (logoff or shutdown),
+/// gives the proxy settings back before the process is terminated. The event loop never sees
+/// `WM_ENDSESSION`, so the usual exit path is not reached in that case.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn session_end_subclass_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+    _subclass_id: usize,
+    bridge_ptr: usize,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_ENDSESSION, WM_NCDESTROY};
+
+    // A non-zero wParam means the session really ends (zero: the end was cancelled).
+    if msg == WM_ENDSESSION && wparam != 0 {
+        // SAFETY: `bridge_ptr` comes from `Arc::into_raw` in `restore_settings_on_session_end`
+        // and that reference is intentionally never released, so it is valid for the whole run.
+        let bridge = unsafe { &*(bridge_ptr as *const DesktopCommandBridge) };
+        bridge.restore_system_settings_on_exit();
+    }
+    if msg == WM_NCDESTROY {
+        // The window is going away: detach the hook as the documentation asks. The bridge
+        // reference handed over in `restore_settings_on_session_end` is deliberately never
+        // released: the desktop process ends with its window, and other threads may still use
+        // the bridge it points to.
+        // SAFETY: removes this procedure from the window being destroyed.
+        unsafe {
+            RemoveWindowSubclass(
+                hwnd,
+                Some(session_end_subclass_proc),
+                SESSION_END_SUBCLASS_ID,
+            )
+        };
+    }
+    // SAFETY: forwards the unmodified message of this window procedure call.
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+/// Hooks `WM_ENDSESSION` on the main window so a logoff or shutdown restores the proxy settings.
+/// tao 0.30 exposes no event for it, so the window is subclassed; no new dependency is needed.
+#[cfg(target_os = "windows")]
+fn restore_settings_on_session_end(window: &Window, bridge: &Arc<DesktopCommandBridge>) {
+    use tao::platform::windows::WindowExtWindows;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::Shell::SetWindowSubclass;
+
+    let bridge_ptr = Arc::into_raw(Arc::clone(bridge)) as usize;
+    // SAFETY: called on the thread that owns the window; the reference data outlives the window.
+    let installed = unsafe {
+        SetWindowSubclass(
+            window.hwnd() as HWND,
+            Some(session_end_subclass_proc),
+            SESSION_END_SUBCLASS_ID,
+            bridge_ptr,
+        )
+    };
+    if installed == 0 {
+        bridge.log_warn(
+            "Could not hook the Windows session end; proxy settings are not restored on logoff",
+        );
+    }
+}
+
 fn spawn_embedded_ui_server(
     runtime: &tokio::runtime::Handle,
     bridge: Arc<DesktopCommandBridge>,
@@ -151,41 +232,113 @@ fn spawn_embedded_ui_server(
                 return;
             }
         };
-        let token_arc = Arc::new(ephemeral_token);
-
-        while let Ok((stream, _)) = listener.accept().await {
-            let bridge_ref = Arc::clone(&bridge);
-            let proxy_ref = event_proxy.clone();
-            let token_ref = Arc::clone(&token_arc);
-
-            tokio::spawn(async move {
-                let win_cb = |cmd: DesktopWindowCommand| {
-                    let _ = proxy_ref.send_event(cmd);
-                };
-                serve_loopback_http_connection(
-                    stream,
-                    bound_port,
-                    &token_ref,
-                    &bridge_ref,
-                    Some(&win_cb),
-                    Some(|path: &str| {
-                        if path.starts_with("/assets/app.js") {
-                            ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
-                        } else if path.starts_with("/assets/app.css") {
-                            ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
-                        } else if path.starts_with("/routeward-glyph.svg") {
-                            ("image/svg+xml", EMBEDDED_GLYPH_SVG)
-                        } else if path.starts_with("/routeward-icon.svg") {
-                            ("image/svg+xml", EMBEDDED_ICON_SVG)
-                        } else {
-                            ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
-                        }
-                    }),
-                )
-                .await;
-            });
-        }
+        let on_window_cmd: Arc<dyn Fn(DesktopWindowCommand) + Send + Sync> = Arc::new(move |cmd| {
+            let _ = event_proxy.send_event(cmd);
+        });
+        serve_loopback_listener(
+            listener,
+            bound_port,
+            Arc::new(ephemeral_token),
+            bridge,
+            on_window_cmd,
+        )
+        .await;
     });
+}
+
+/// Serves the loopback UI on `listener` until it fails.
+///
+/// Two separate bounds apply. `LOOPBACK_MAX_PRE_AUTH_CONNECTIONS` limits the connections still
+/// reading their request (each is cut off after the request deadline). The much smaller
+/// `LOOPBACK_MAX_SERVING_REQUESTS` limits validated requests and is only taken after the token
+/// check, so unauthenticated or slow-drip connections cannot starve authenticated ones.
+async fn serve_loopback_listener(
+    listener: TcpListener,
+    bound_port: u16,
+    token: Arc<String>,
+    bridge: Arc<DesktopCommandBridge>,
+    on_window_cmd: Arc<dyn Fn(DesktopWindowCommand) + Send + Sync>,
+) {
+    let serving_slots = Arc::new(Semaphore::new(LOOPBACK_MAX_SERVING_REQUESTS));
+    accept_bounded(listener, LOOPBACK_MAX_PRE_AUTH_CONNECTIONS, move |stream| {
+        let bridge_ref = Arc::clone(&bridge);
+        let token_ref = Arc::clone(&token);
+        let cmd_ref = Arc::clone(&on_window_cmd);
+        let slots_ref = Arc::clone(&serving_slots);
+        async move {
+            let win_cb = |cmd: DesktopWindowCommand| cmd_ref(cmd);
+            serve_loopback_http_connection(
+                stream,
+                bound_port,
+                &token_ref,
+                &bridge_ref,
+                Some(&win_cb),
+                Some(|path: &str| {
+                    if path.starts_with("/assets/app.js") {
+                        ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
+                    } else if path.starts_with("/assets/app.css") {
+                        ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
+                    } else if path.starts_with("/routeward-glyph.svg") {
+                        ("image/svg+xml", EMBEDDED_GLYPH_SVG)
+                    } else if path.starts_with("/routeward-icon.svg") {
+                        ("image/svg+xml", EMBEDDED_ICON_SVG)
+                    } else {
+                        ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
+                    }
+                }),
+                Some(&slots_ref),
+            )
+            .await;
+        }
+    })
+    .await;
+}
+
+/// Accepts connections until the listener fails and serves each one with `handler`, at most
+/// `limit` at a time. A connection that arrives while every slot is taken waits briefly
+/// (`LOOPBACK_PRE_AUTH_SLOT_WAIT_MS`) for one and is closed if none frees up, instead of being
+/// queued without bound.
+///
+/// Out of scope: a local process that deliberately holds many sockets open can still crowd
+/// others out for the length of the request deadline. The listener is bound to loopback, so the
+/// attacker already runs on the same machine, and the token check keeps it from doing anything
+/// but wasting slots.
+async fn accept_bounded<H, Fut>(listener: TcpListener, limit: usize, handler: H)
+where
+    H: Fn(TcpStream) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let slots = Arc::new(Semaphore::new(limit));
+    let waiting = Arc::new(Semaphore::new(LOOPBACK_MAX_WAITING_CONNECTIONS));
+    while let Ok((stream, _)) = listener.accept().await {
+        let serving = handler(stream);
+        match Arc::clone(&slots).try_acquire_owned() {
+            Ok(permit) => {
+                tokio::spawn(async move {
+                    serving.await;
+                    drop(permit);
+                });
+            }
+            Err(_) => {
+                let Ok(waiting_place) = Arc::clone(&waiting).try_acquire_owned() else {
+                    // Too many connections already wait: close this one at once.
+                    continue;
+                };
+                let waiting_slots = Arc::clone(&slots);
+                tokio::spawn(async move {
+                    let wait = std::time::Duration::from_millis(LOOPBACK_PRE_AUTH_SLOT_WAIT_MS);
+                    // On timeout `serving` is dropped unpolled, which closes the connection.
+                    if let Ok(Ok(permit)) =
+                        tokio::time::timeout(wait, waiting_slots.acquire_owned()).await
+                    {
+                        drop(waiting_place);
+                        serving.await;
+                        drop(permit);
+                    }
+                });
+            }
+        }
+    }
 }
 
 /// Lets the UI origin trigger several exports in a row on WebView2.
@@ -417,6 +570,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     apply_window_theme(&window, initial_appearance);
+    #[cfg(target_os = "windows")]
+    restore_settings_on_session_end(&window, &bridge);
 
     let webview_data_dir = bridge.webview_data_dir();
     if let Err(err) = std::fs::create_dir_all(&webview_data_dir) {
@@ -492,6 +647,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     #[cfg(target_os = "windows")]
                     tray_handle.lock().shutdown();
+                    bridge_for_loop.restore_system_settings_on_exit();
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -508,6 +664,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         #[cfg(target_os = "windows")]
                         tray_handle.lock().shutdown();
+                        bridge_for_loop.restore_system_settings_on_exit();
                         *control_flow = ControlFlow::Exit;
                     }
                 }
@@ -540,6 +697,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 DesktopWindowCommand::Quit => {
                     #[cfg(target_os = "windows")]
                     tray_handle.lock().shutdown();
+                    bridge_for_loop.restore_system_settings_on_exit();
                     *control_flow = ControlFlow::Exit;
                 }
             },
@@ -578,5 +736,110 @@ mod tests {
         assert!(is_smoke_ipc_arg_list(["--foo", "--smoke-ipc"]));
         assert!(!is_smoke_ipc_arg_list::<[&str; 0], &str>([]));
         assert!(!is_smoke_ipc_arg_list(["--help"]));
+    }
+
+    /// Reads one byte from the stream: `Some(byte)` when the server sent one, `None` on a close.
+    async fn first_byte(stream: &mut TcpStream) -> Option<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await {
+            Ok(Ok(1)) => Some(buf[0]),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_bounded_closes_excess_connections_and_reuses_freed_slots() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SERVED_MARKER: u8 = b'K';
+        const LIMIT: usize = 2;
+        const RETRY_ATTEMPTS: usize = 40;
+        const RETRY_DELAY_MS: u64 = 50;
+
+        let listener = TcpListener::bind(LOOPBACK_EPHEMERAL_ADDR).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The handler marks the connection as served, then holds its slot until the peer closes.
+        let server = tokio::spawn(accept_bounded(listener, LIMIT, |mut stream| async move {
+            let _ = stream.write_all(&[SERVED_MARKER]).await;
+            let mut sink = [0u8; 1];
+            let _ = stream.read(&mut sink).await;
+        }));
+
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(first_byte(&mut first).await, Some(SERVED_MARKER));
+        assert_eq!(first_byte(&mut second).await, Some(SERVED_MARKER));
+
+        let mut excess = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(
+            first_byte(&mut excess).await,
+            None,
+            "a connection beyond the limit must be closed without being served"
+        );
+
+        drop(first);
+        let mut served_again = false;
+        for _ in 0..RETRY_ATTEMPTS {
+            let mut retry = TcpStream::connect(addr).await.unwrap();
+            if first_byte(&mut retry).await == Some(SERVED_MARKER) {
+                served_again = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+        assert!(served_again, "a freed slot must serve new connections");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_unauthenticated_connections_cannot_starve_an_authenticated_request() {
+        use routeward_core::config::{ProfileConfig, SystemConstants};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        profile.enable_logging = false;
+        let bridge = Arc::new(DesktopCommandBridge::new(constants, profile, "en"));
+
+        let listener = TcpListener::bind(LOOPBACK_EPHEMERAL_ADDR).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = generate_ephemeral_token();
+        let server = tokio::spawn(serve_loopback_listener(
+            listener,
+            port,
+            Arc::new(token.clone()),
+            bridge,
+            Arc::new(|_cmd: DesktopWindowCommand| {}),
+        ));
+
+        // As many half-sent requests as the serving limit: they never finish and never authenticate.
+        let mut dripping = Vec::new();
+        for _ in 0..LOOPBACK_MAX_SERVING_REQUESTS {
+            let mut slow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            slow.write_all(b"GET /api/state HTTP/1.1\r\n")
+                .await
+                .unwrap();
+            dripping.push(slow);
+        }
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let request = format!(
+            "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-RouteWard-Token: {token}\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("the authenticated request must be answered while slow connections hang")
+        .unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
+
+        drop(dripping);
+        server.abort();
     }
 }

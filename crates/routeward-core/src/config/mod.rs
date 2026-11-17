@@ -1174,15 +1174,12 @@ impl ProfileConfig {
         #[cfg(windows)]
         if crate::interceptor::RouteWardController::detect_elevated_privileges() {
             if let Err(err) = security::apply_secure_profile_file_permissions(&tmp_path, false) {
-                let _ = security::apply_windows_sddl_dacl(&tmp_path, "D:(A;;FA;;;WD)");
                 let _ = fs::remove_file(&tmp_path);
                 return Err(err);
             }
         }
 
         if let Err(err) = fs::rename(&tmp_path, target_path) {
-            #[cfg(windows)]
-            let _ = security::apply_windows_sddl_dacl(&tmp_path, "D:(A;;FA;;;WD)");
             let _ = fs::remove_file(&tmp_path);
             return Err(RouteWardError::ConfigError {
                 key: ERR_KEY_CONFIG_SAVE,
@@ -1518,5 +1515,189 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn failed_rename_removes_temp_profile_without_widening_access() {
+        let profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        let temp_dir =
+            std::env::temp_dir().join(format!("routeward_rename_fail_{}", Uuid::new_v4()));
+        // A directory at the destination makes the final rename fail on every platform.
+        let blocking_target = temp_dir.join("active_profile.json");
+        fs::create_dir_all(&blocking_target).expect("create blocking directory");
+
+        let result = profile.save_to_path(&blocking_target);
+        assert!(result.is_err(), "rename over a directory must fail");
+
+        let leftovers: Vec<_> = fs::read_dir(&temp_dir)
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary profile must be removed after a failed save: {leftovers:?}"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn production_code_never_applies_an_everyone_full_access_dacl() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+        assert!(
+            !production.contains("D:(A;;FA;;;WD)"),
+            "production code must never apply an Everyone full-access DACL"
+        );
+    }
+
+    /// Converts a `snake_case` field name to the `camelCase` key used in the JSON files.
+    fn snake_to_camel(name: &str) -> String {
+        let mut out = String::new();
+        let mut upper_next = false;
+        for ch in name.chars() {
+            if ch == '_' {
+                upper_next = true;
+            } else if upper_next {
+                out.push(ch.to_ascii_uppercase());
+                upper_next = false;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Returns `(struct name, camelCase field key)` for every field of the production section of
+    /// this file carrying a serde default function.
+    fn defaulted_fields_in_source() -> Vec<(String, String)> {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+        let mut current_struct = String::new();
+        let mut pending_default = false;
+        let mut found = Vec::new();
+        for line in production.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("pub struct ") {
+                current_struct = rest
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                pending_default = false;
+            } else if trimmed.starts_with("#[serde(default = \"") {
+                pending_default = true;
+            } else if pending_default {
+                if let Some(rest) = trimmed.strip_prefix("pub ") {
+                    let field = rest.split(':').next().unwrap_or_default().trim();
+                    found.push((current_struct.clone(), snake_to_camel(field)));
+                    pending_default = false;
+                } else if !trimmed.starts_with("///") && !trimmed.starts_with("#[") {
+                    pending_default = false;
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn serde_defaults_match_embedded_system_constants() {
+        let full: serde_json::Value =
+            serde_json::from_str(EMBEDDED_SYSTEM_CONSTANTS).expect("embedded constants json");
+        let expected = serde_json::to_value(SystemConstants::load_embedded().expect("constants"))
+            .expect("serialize constants");
+
+        let section_of = |struct_name: &str| -> Option<&'static str> {
+            match struct_name {
+                "NetworkConstants" => Some("network"),
+                "DnsConstants" => Some("dns"),
+                "TelemetryConstants" => Some("telemetry"),
+                "ProtocolConstants" => Some("protocols"),
+                _ => None,
+            }
+        };
+
+        let mut stripped = full.clone();
+        let mut checked = 0usize;
+        for (struct_name, key) in defaulted_fields_in_source() {
+            let Some(section) = section_of(&struct_name) else {
+                continue;
+            };
+            let section_obj = stripped
+                .get_mut(section)
+                .and_then(|v| v.as_object_mut())
+                .expect("section object");
+            assert!(
+                section_obj.remove(&key).is_some(),
+                "{struct_name}.{key} has a serde default but is absent from system_constants.json"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 50,
+            "expected to exercise the serde defaults of the system constants, got {checked}"
+        );
+
+        let from_defaults: SystemConstants =
+            serde_json::from_value(stripped).expect("constants deserialize with defaults");
+        let actual = serde_json::to_value(from_defaults).expect("serialize defaulted constants");
+        let mut drifted = Vec::new();
+        for (section, expected_section) in expected.as_object().expect("constants object") {
+            for (key, expected_value) in expected_section.as_object().expect("section object") {
+                let actual_value = &actual[section][key];
+                // The reverse zones are matched as a set of suffixes: the serde default lists
+                // them in a different order than the JSON file, which has no behavioural effect.
+                let order_free = section == "dns" && key == "defaultPrivateReverseZones";
+                let equal = if order_free {
+                    let sorted = |value: &serde_json::Value| {
+                        let mut items: Vec<String> = value
+                            .as_array()
+                            .expect("array")
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect();
+                        items.sort();
+                        items
+                    };
+                    sorted(actual_value) == sorted(expected_value)
+                } else {
+                    actual_value == expected_value
+                };
+                if !equal {
+                    drifted.push(format!(
+                        "{section}.{key}: serde default {actual_value} vs system_constants.json {expected_value}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            drifted.is_empty(),
+            "serde defaults drifted from configs/system_constants.json: {drifted:#?}"
+        );
+    }
+
+    #[test]
+    fn security_policy_serde_defaults_match_default_impl() {
+        let mut value =
+            serde_json::to_value(SecurityPolicyConfig::default()).expect("serialize policy");
+        let object = value.as_object_mut().expect("policy object");
+        let mut removed = 0usize;
+        for (struct_name, key) in defaulted_fields_in_source() {
+            if struct_name == "SecurityPolicyConfig" {
+                assert!(object.remove(&key).is_some(), "missing key {key}");
+                removed += 1;
+            }
+        }
+        assert_eq!(removed, 3, "SecurityPolicyConfig serde defaults changed");
+        let parsed: SecurityPolicyConfig =
+            serde_json::from_value(value).expect("policy deserializes with defaults");
+        assert_eq!(parsed, SecurityPolicyConfig::default());
     }
 }

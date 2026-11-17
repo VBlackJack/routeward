@@ -1326,12 +1326,4 @@ export class RouteWardClientService {
 
 export const routewardClient = new RouteWardClientService();
 
-export function formatBytes(bytes: number): string {
-  if (bytes <= 0) return `0 ${UI_CONFIG.BYTE_UNITS[0]}`;
-  const i = Math.min(
-    UI_CONFIG.BYTE_UNITS.length - 1,
-    Math.floor(Math.log(bytes) / Math.log(UI_CONFIG.BYTE_STEP))
-  );
-  const value = bytes / Math.pow(UI_CONFIG.BYTE_STEP, i);
-  return `${value.toFixed(i === 0 ? 0 : 1)} ${UI_CONFIG.BYTE_UNITS[i]}`;
-}
+export { formatBytes } from './format';

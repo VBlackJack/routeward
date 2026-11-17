@@ -35,7 +35,8 @@ use tokio::sync::watch;
 
 const MAX_PAC_HTTP_REQUEST_BYTES: usize = 4096;
 const PAC_HTTP_READ_TIMEOUT_MS: u64 = 2000;
-const PAC_SOCKS_RETRY_LIMIT: usize = 1;
+/// Pause after a failed `accept()` on the PAC listener before retrying, to avoid a busy loop.
+const PAC_ACCEPT_ERROR_BACKOFF_MS: u64 = 25;
 const BROWSER_PROCESS_CANDIDATES: &[&str] = &[
     "msedge.exe",
     "chrome.exe",
@@ -265,7 +266,7 @@ impl PacGenerator {
                                 });
                             }
                             Err(_) => {
-                                tokio::time::sleep(Duration::from_millis(25 * PAC_SOCKS_RETRY_LIMIT as u64)).await;
+                                tokio::time::sleep(Duration::from_millis(PAC_ACCEPT_ERROR_BACKOFF_MS)).await;
                             }
                         }
                     }

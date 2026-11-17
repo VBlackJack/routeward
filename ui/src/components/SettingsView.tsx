@@ -295,7 +295,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               </div>
             </div>
-            <input
+            <input name="settings-shield-all"
               type="checkbox"
               aria-label={t('settings.security.simple_shield_title')}
               checked={allShieldsActive}
@@ -318,7 +318,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </div>
                 </div>
               </div>
-              <input
+              <input name="settings-killswitch"
                 type="checkbox"
                 aria-label={t('dashboard.security_shield.panel.killswitch_aria')}
                 checked={securityPolicy.killSwitchEnabled}
@@ -344,7 +344,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </div>
                 </div>
               </div>
-              <input
+              <input name="settings-udp-guard"
                 type="checkbox"
                 aria-label={t('dashboard.security_shield.panel.udp_guard_aria')}
                 checked={securityPolicy.blockUdpOnTcpOnlyProxy}
@@ -370,7 +370,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </div>
                 </div>
               </div>
-              <input
+              <input name="settings-dns-guard"
                 type="checkbox"
                 aria-label={t('dashboard.security_shield.panel.dns_guard_aria')}
                 checked={securityPolicy.strictDnsNoLocalFallback}
@@ -395,7 +395,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </div>
                 </div>
               </div>
-              <input
+              <input name="settings-block-quic"
                 type="checkbox"
                 aria-label={t('settings.security.block_quic_title')}
                 checked={Boolean(securityPolicy.blockQuicUdp443 ?? true)}
@@ -420,7 +420,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </div>
                 </div>
               </div>
-              <input
+              <input name="settings-block-dot"
                 type="checkbox"
                 aria-label={t('settings.security.block_dot_title')}
                 checked={Boolean(securityPolicy.blockEncryptedDnsBypass ?? true)}
@@ -606,7 +606,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 }}
                 className="flex items-center gap-2"
               >
-                <input
+                <input name="settings-profile-name"
                   type="text"
                   value={newProfileName}
                   onChange={(e) => setNewProfileName(e.target.value)}
@@ -645,8 +645,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         )}
                       </div>
                       <div className="text-[10px] text-tf-secondary">
-                        {prof.proxyCount} {t('settings.profiles.proxies_unit')} •{' '}
-                        {prof.ruleCount} {t('settings.profiles.rules_unit')}
+                        {t('settings.profiles.proxies_count', {
+                          count: prof.proxyCount
+                        })}{' '}
+                        •{' '}
+                        {t('settings.profiles.rules_count', {
+                          count: prof.ruleCount
+                        })}
                       </div>
                     </div>
                     <div className="flex shrink-0 items-center gap-1.5">
@@ -723,7 +728,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <input
+              <input name="settings-profile-import-file"
                 ref={fileInputRef}
                 type="file"
                 accept="application/json,.json"

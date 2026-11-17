@@ -894,4 +894,280 @@ mod tests {
             DnsCodecError::InvalidLabelLength
         );
     }
+
+    mod properties {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        /// Cases per property: bounded so the whole suite stays well under a second in CI.
+        const PROPTEST_CASES: u32 = 256;
+        /// Upper bound for arbitrary packets (a little above the classic 512 byte UDP limit).
+        const MAX_ARBITRARY_PACKET_BYTES: usize = 600;
+        /// Label count bound: 4 labels of at most 40 bytes stay below the 255 byte name limit.
+        const MAX_LABELS: usize = 4;
+        const MAX_LABEL_CHARS: usize = 40;
+        /// Number of random byte edits applied to a valid packet by the mutation property.
+        const MAX_MUTATIONS: usize = 8;
+
+        fn config() -> ProptestConfig {
+            ProptestConfig::with_cases(PROPTEST_CASES)
+        }
+
+        fn label_strategy() -> impl Strategy<Value = String> {
+            proptest::string::string_regex(&format!("[A-Za-z0-9_-]{{1,{MAX_LABEL_CHARS}}}"))
+                .expect("valid label regex")
+        }
+
+        fn domain_strategy() -> impl Strategy<Value = String> {
+            proptest::collection::vec(label_strategy(), 1..=MAX_LABELS)
+                .prop_map(|labels| labels.join("."))
+        }
+
+        fn ipv6_strategy() -> impl Strategy<Value = Ipv6Addr> {
+            any::<[u8; 16]>().prop_map(Ipv6Addr::from)
+        }
+
+        fn ipv4_strategy() -> impl Strategy<Value = Ipv4Addr> {
+            any::<[u8; 4]>().prop_map(Ipv4Addr::from)
+        }
+
+        /// Runs every public parsing entry point on `bytes`; the only requirement is no panic.
+        fn exercise_all_decoders(bytes: &[u8]) {
+            let _ = parse_dns_query(bytes);
+            let _ = parse_dns_message(bytes);
+            let _ = extract_ipv4_answers(bytes);
+            let _ = build_rcode_response_from_raw(bytes, RCODE_FORMERR);
+            for offset in [
+                0,
+                1,
+                DNS_HEADER_LEN,
+                bytes.len().saturating_sub(1),
+                bytes.len(),
+            ] {
+                let _ = decode_domain_name(bytes, offset);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(config())]
+
+            #[test]
+            fn decode_never_panics_on_arbitrary_bytes(
+                bytes in proptest::collection::vec(any::<u8>(), 0..MAX_ARBITRARY_PACKET_BYTES)
+            ) {
+                exercise_all_decoders(&bytes);
+            }
+
+            #[test]
+            fn decode_never_panics_on_header_prefixed_bytes(
+                header in any::<[u8; DNS_HEADER_LEN]>(),
+                body in proptest::collection::vec(any::<u8>(), 0..MAX_ARBITRARY_PACKET_BYTES)
+            ) {
+                let mut packet = header.to_vec();
+                packet.extend_from_slice(&body);
+                exercise_all_decoders(&packet);
+            }
+
+            #[test]
+            fn decode_never_panics_on_mutated_valid_packets(
+                id in any::<u16>(),
+                domain in domain_strategy(),
+                ip in ipv4_strategy(),
+                ttl in any::<u32>(),
+                edits in proptest::collection::vec((any::<usize>(), any::<u8>()), 0..MAX_MUTATIONS),
+                cut in any::<usize>(),
+            ) {
+                let query = parse_dns_query(&build_a_query(id, &domain).unwrap()).unwrap();
+                let mut wire = build_a_response(&query, ip, ttl);
+                for (index, value) in edits {
+                    let slot = index % wire.len();
+                    wire[slot] = value;
+                }
+                wire.truncate(cut % (wire.len() + 1));
+                exercise_all_decoders(&wire);
+            }
+
+            #[test]
+            fn decode_domain_name_never_panics_at_any_offset(
+                bytes in proptest::collection::vec(any::<u8>(), 0..MAX_ARBITRARY_PACKET_BYTES),
+                offset in 0usize..MAX_ARBITRARY_PACKET_BYTES + 8,
+            ) {
+                if let Ok((_, end)) = decode_domain_name(&bytes, offset) {
+                    prop_assert!(end <= bytes.len());
+                }
+            }
+
+            #[test]
+            fn ptr_qname_parser_never_panics(text in ".{0,80}") {
+                let _ = parse_ipv4_ptr_qname(&text);
+            }
+
+            #[test]
+            fn query_round_trips(
+                id in any::<u16>(),
+                domain in domain_strategy(),
+                qtype in prop_oneof![
+                    Just(QTYPE_A), Just(QTYPE_AAAA), Just(QTYPE_PTR),
+                    Just(QTYPE_CNAME), Just(QTYPE_TXT), any::<u16>()
+                ],
+            ) {
+                let wire = build_query(id, &domain, qtype).unwrap();
+                let parsed = parse_dns_query(&wire).unwrap();
+                prop_assert_eq!(parsed.id, id);
+                prop_assert_eq!(parsed.question.qname, domain.to_ascii_lowercase());
+                prop_assert_eq!(parsed.question.qtype, qtype);
+                prop_assert_eq!(parsed.question.qclass, QCLASS_IN);
+                prop_assert_eq!(parsed.max_udp_payload_bytes, DNS_DEFAULT_UDP_MAX_BYTES);
+
+                let message = parse_dns_message(&wire).unwrap();
+                prop_assert_eq!(message.id, id);
+                prop_assert_eq!(message.questions.len(), 1);
+                prop_assert!(message.answers.is_empty());
+            }
+
+            #[test]
+            fn domain_name_round_trips(domain in domain_strategy()) {
+                let mut wire = Vec::new();
+                encode_domain_name(&domain, &mut wire).unwrap();
+                let (decoded, end) = decode_domain_name(&wire, 0).unwrap();
+                prop_assert_eq!(decoded, domain.to_ascii_lowercase());
+                prop_assert_eq!(end, wire.len());
+            }
+
+            #[test]
+            fn a_response_round_trips(
+                id in any::<u16>(),
+                domain in domain_strategy(),
+                ip in ipv4_strategy(),
+                ttl in any::<u32>(),
+            ) {
+                let query = parse_dns_query(&build_a_query(id, &domain).unwrap()).unwrap();
+                let wire = build_a_response(&query, ip, ttl);
+                let message = parse_dns_message(&wire).unwrap();
+                prop_assert_eq!(message.id, id);
+                prop_assert_eq!(message.rcode(), RCODE_NOERROR);
+                prop_assert_eq!(message.answers.len(), 1);
+                let answer = &message.answers[0];
+                prop_assert_eq!(&answer.name, &domain.to_ascii_lowercase());
+                prop_assert_eq!(answer.rtype, QTYPE_A);
+                prop_assert_eq!(answer.rclass, QCLASS_IN);
+                prop_assert_eq!(answer.ttl, ttl);
+                prop_assert_eq!(&answer.rdata, &DnsRdata::A(ip));
+                prop_assert_eq!(extract_ipv4_answers(&wire).unwrap(), vec![ip]);
+            }
+
+            #[test]
+            fn aaaa_response_round_trips(
+                id in any::<u16>(),
+                domain in domain_strategy(),
+                ip in ipv6_strategy(),
+                ttl in any::<u32>(),
+            ) {
+                let query = parse_dns_query(&build_query(id, &domain, QTYPE_AAAA).unwrap()).unwrap();
+                let wire = build_aaaa_response(&query, ip, ttl);
+                let message = parse_dns_message(&wire).unwrap();
+                prop_assert_eq!(message.id, id);
+                prop_assert_eq!(message.answers.len(), 1);
+                let answer = &message.answers[0];
+                prop_assert_eq!(answer.rtype, QTYPE_AAAA);
+                prop_assert_eq!(answer.ttl, ttl);
+                prop_assert_eq!(&answer.rdata, &DnsRdata::AAAA(ip));
+                prop_assert!(extract_ipv4_answers(&wire).unwrap().is_empty());
+            }
+
+            #[test]
+            fn ptr_response_round_trips(
+                id in any::<u16>(),
+                domain in domain_strategy(),
+                target in domain_strategy(),
+                ttl in any::<u32>(),
+            ) {
+                let query = parse_dns_query(&build_query(id, &domain, QTYPE_PTR).unwrap()).unwrap();
+                let wire = build_ptr_response(&query, &target, ttl).unwrap();
+                let message = parse_dns_message(&wire).unwrap();
+                prop_assert_eq!(message.answers.len(), 1);
+                let answer = &message.answers[0];
+                prop_assert_eq!(answer.rtype, QTYPE_PTR);
+                prop_assert_eq!(answer.ttl, ttl);
+                prop_assert_eq!(&answer.rdata, &DnsRdata::Ptr(target.to_ascii_lowercase()));
+            }
+
+            #[test]
+            fn rcode_response_round_trips(
+                id in any::<u16>(),
+                domain in domain_strategy(),
+                rcode in 0u8..=RCODE_REFUSED,
+            ) {
+                let query = parse_dns_query(&build_a_query(id, &domain).unwrap()).unwrap();
+                let wire = build_rcode_response(&query, rcode);
+                let message = parse_dns_message(&wire).unwrap();
+                prop_assert_eq!(message.id, id);
+                prop_assert_eq!(message.rcode(), rcode);
+                prop_assert!(message.answers.is_empty());
+                prop_assert_eq!(message.questions.len(), 1);
+                prop_assert_eq!(
+                    &message.questions[0].qname,
+                    &domain.to_ascii_lowercase()
+                );
+                prop_assert_eq!(
+                    build_rcode_response_from_raw(&build_a_query(id, &domain).unwrap(), rcode),
+                    Some(wire)
+                );
+            }
+
+            #[test]
+            fn truncated_responses_stay_parseable(
+                id in any::<u16>(),
+                domain in domain_strategy(),
+                ip in ipv4_strategy(),
+            ) {
+                let query = parse_dns_query(&build_a_query(id, &domain).unwrap()).unwrap();
+                let wire = build_a_response(&query, ip, 30);
+                // A limit below the default floor is raised to it, so force overflow with padding.
+                let mut padded = wire.clone();
+                padded.resize(DNS_DEFAULT_UDP_MAX_BYTES + 1, 0);
+                let truncated = enforce_udp_truncation(&padded, &query, DNS_DEFAULT_UDP_MAX_BYTES);
+                let message = parse_dns_message(&truncated).unwrap();
+                prop_assert!(message.is_truncated());
+                prop_assert!(message.answers.is_empty());
+                prop_assert_eq!(message.id, id);
+                prop_assert_eq!(enforce_udp_truncation(&wire, &query, DNS_DEFAULT_UDP_MAX_BYTES), wire);
+            }
+
+            #[test]
+            fn tcp_frame_prefix_matches_payload_length(
+                payload in proptest::collection::vec(any::<u8>(), 0..MAX_ARBITRARY_PACKET_BYTES)
+            ) {
+                let framed = encode_tcp_dns_frame(&payload);
+                prop_assert_eq!(framed.len(), payload.len() + 2);
+                prop_assert_eq!(
+                    u16::from_be_bytes([framed[0], framed[1]]) as usize,
+                    payload.len()
+                );
+                prop_assert_eq!(&framed[2..], payload.as_slice());
+            }
+
+            #[test]
+            fn ptr_qname_round_trips_for_every_ipv4(ip in ipv4_strategy()) {
+                let [a, b, c, d] = ip.octets();
+                let qname = format!("{d}.{c}.{b}.{a}.in-addr.arpa");
+                prop_assert_eq!(parse_ipv4_ptr_qname(&qname), Some(ip));
+            }
+
+            #[test]
+            fn transaction_id_rewrite_only_touches_the_first_two_bytes(
+                mut wire in proptest::collection::vec(any::<u8>(), 0..MAX_ARBITRARY_PACKET_BYTES),
+                id in any::<u16>(),
+            ) {
+                let original = wire.clone();
+                rewrite_transaction_id(&mut wire, id);
+                if original.len() >= 2 {
+                    prop_assert_eq!(u16::from_be_bytes([wire[0], wire[1]]), id);
+                    prop_assert_eq!(&wire[2..], &original[2..]);
+                } else {
+                    prop_assert_eq!(wire, original);
+                }
+            }
+        }
+    }
 }

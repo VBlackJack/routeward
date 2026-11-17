@@ -1230,4 +1230,19 @@ mod tests {
         drop(stream);
         let _ = accept.await;
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_peer_cred_reports_the_current_process_identity() {
+        let (left, right) = tokio::net::UnixStream::pair().expect("socketpair");
+        // SAFETY: geteuid/getegid/getpid have no preconditions and cannot fail.
+        let (uid, gid, pid) = unsafe { (libc::geteuid(), libc::getegid(), libc::getpid()) };
+
+        for stream in [&left, &right] {
+            let peer = query_unix_peer_cred(stream).expect("SO_PEERCRED on a socketpair");
+            assert_eq!(peer.uid, Some(uid));
+            assert_eq!(peer.gid, Some(gid));
+            assert_eq!(peer.pid, Some(pid as u32));
+        }
+    }
 }

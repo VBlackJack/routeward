@@ -547,7 +547,7 @@ describe('Core UI view components', () => {
 
     expect(screen.getAllByText('firefox.exe')).toHaveLength(1);
     expect(
-      screen.getByText(`2 ${i18n.t('connections.simple.count_connections')}`)
+      screen.getByText(i18n.t('connections.simple.count_connections', { count: 2 }))
     ).toBeInTheDocument();
 
     fireEvent.click(

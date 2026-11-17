@@ -657,7 +657,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
           <span>{t('rules.simulator.title')}</span>
         </div>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
-          <input
+          <input name="simulator-process"
             type="text"
             value={simProc}
             onChange={(e) => setSimProc(e.target.value)}
@@ -665,7 +665,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
             aria-label={t('rules.simulator.process_placeholder')}
             className="tf-input px-3 py-1.5 text-xs"
           />
-          <input
+          <input name="simulator-host"
             type="text"
             value={simHost}
             onChange={(e) => setSimHost(e.target.value)}
@@ -673,7 +673,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
             aria-label={t('rules.simulator.host_placeholder')}
             className="tf-input px-3 py-1.5 text-xs"
           />
-          <input
+          <input name="simulator-port"
             type="number"
             value={simPort}
             onChange={(e) => setSimPort(Number(e.target.value))}
@@ -738,7 +738,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                     }`}
                   >
                     <div className="flex items-center gap-3">
-                      <input
+                      <input name={`rule-enabled-${rule.id}`}
                         type="checkbox"
                         checked={rule.enabled}
                         onChange={() => onToggleRule(rule.id)}
@@ -832,7 +832,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                     }`}
                   >
                     <td className="px-3 py-3">
-                      <input
+                      <input name={`rule-enabled-${rule.id}`}
                         type="checkbox"
                         checked={rule.enabled}
                         onChange={() => onToggleRule(rule.id)}
@@ -1381,8 +1381,11 @@ export const RulesView: React.FC<RulesViewProps> = ({
                       ))
                     : enabledChains.map((c) => (
                         <option key={c.id} value={c.id}>
-                          {c.name} ({c.proxyIds.length}{' '}
-                          {t('proxies.section.chains.hops')})
+                          {c.name} (
+                          {t('proxies.section.chains.hops', {
+                            count: c.proxyIds.length
+                          })}
+                          )
                         </option>
                       ))}
                 </select>
@@ -1435,7 +1438,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                   {t('rules.modal.foxyproxy.subtitle')}
                 </p>
               </div>
-              <input
+              <input name="foxyproxy-file"
                 ref={foxyFileInputRef}
                 type="file"
                 accept="application/json,.json"
@@ -1481,7 +1484,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
               />
             </div>
 
-            <textarea
+            <textarea name="foxyproxy-json"
               rows={6}
               required
               aria-label={t('rules.modal.foxyproxy.title')}

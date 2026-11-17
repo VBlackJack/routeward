@@ -98,7 +98,61 @@
         Impersonate="no"
         Return="ignore" />
 
+    <!--
+      Uninstall cleanup. Both actions run from the still-installed routeward.exe, before RemoveFiles (the
+      service was already stopped by StopServices, which precedes it), and only on a real removal:
+      REMOVE~="ALL" is true for the uninstall session, and UPGRADINGPRODUCTCODE is set in the old product's
+      uninstall session of a MajorUpgrade, so an upgrade never purges data nor restores the user's proxy.
+      "Return=ignore": a failed cleanup must never block the uninstall.
+
+      KEEPDATA (public, Secure): msiexec /x RouteWard.msi KEEPDATA=1 keeps %ProgramData%\RouteWard (the
+      profile and the logs). Any non-empty value keeps them; omit it to delete them.
+
+      PurgeProgramData: deferred, no impersonation (runs as LocalSystem), deletes %ProgramData%\RouteWard.
+      The CLI refuses while a RouteWard daemon is active, refuses a directory that a standard user could
+      write to, and never follows a link out of the directory. Accepted limit: the data is deleted before
+      the rest of the uninstall has finished, so an uninstall that fails or is rolled back AFTER this
+      action leaves the data deleted (KEEPDATA=1 avoids it).
+
+      CleanupUserSettings: deferred, no impersonation (runs as LocalSystem), runs the CLI "cleanup" command with its all-users option:
+      for every user whose registry hive is loaded under HKEY_USERS at that moment (every logged-on
+      user, including the one running the uninstall, whose HKCU is not the installer's own), it restores
+      or removes the RouteWard-owned values (system proxy, PAC URL, autostart entry) from that user's saved
+      backup, only while they are still RouteWard's. Hives of users who are not logged on are NOT loaded
+      (too intrusive), so those users keep their values and must fix them by hand: Settings > Network and
+      Internet > Proxy, or Internet Options > Connections > LAN settings, or run the CLI "cleanup" command with its user option
+      before the uninstall.
+
+      The SYSTEM pass only reads each user's backup file through a verified handle (it must be a regular
+      file at its expected place, owned by the user or by SYSTEM or the Administrators) and never creates,
+      renames or deletes anything inside a user profile. If the check fails, only values equal to
+      RouteWard's own are switched off. Race to know about: a RouteWard desktop still running in another
+      user's session at uninstall time may write its settings again after this pass; the desktop also
+      restores them when it exits or when that user logs off.
+
+      TerminalServerAware is not set on any action: that flag only applies to impersonated deferred
+      actions, and none of these impersonates the user.
+    -->
+    <Property Id="KEEPDATA" Secure="yes" />
+
+    <CustomAction
+        Id="PurgeProgramData"
+        FileRef="RouteWardCliExe"
+        ExeCommand="purge-data"
+        Execute="deferred"
+        Impersonate="no"
+        Return="ignore" />
+    <CustomAction
+        Id="CleanupUserSettings"
+        FileRef="RouteWardCliExe"
+        ExeCommand="cleanup --all-users"
+        Execute="deferred"
+        Impersonate="no"
+        Return="ignore" />
+
     <InstallExecuteSequence>
+      <Custom Action="CleanupUserSettings" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="PurgeProgramData" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT KEEPDATA" />
       <Custom Action="RollbackRestoreServiceAutoStart" Before="RestoreServiceAutoStart" Condition="NOT REMOVE AND (UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND ROUTEWARD_OLD_IMAGEPATH &lt;&gt; &quot;&quot; AND ROUTEWARD_OLD_SVC_START = &quot;#2&quot;" />
       <Custom Action="RollbackRestoreServiceDemandStart" Before="RestoreServiceDemandStart" Condition="NOT REMOVE AND (UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND ROUTEWARD_OLD_IMAGEPATH &lt;&gt; &quot;&quot; AND ROUTEWARD_OLD_SVC_START &lt;&gt; &quot;#2&quot;" />
       <Custom Action="RestoreServiceAutoStart" After="InstallFiles" Condition="NOT REMOVE AND (UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND ROUTEWARD_OLD_IMAGEPATH &lt;&gt; &quot;&quot; AND ROUTEWARD_OLD_SVC_START = &quot;#2&quot;" />

@@ -1227,65 +1227,6 @@ impl NftablesInterceptor {
             )
         })?;
 
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_INET,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                libc::IPPROTO_RAW,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        struct RawFdGuard(libc::c_int);
-        impl Drop for RawFdGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    let _ = libc::close(self.0);
-                }
-            }
-        }
-        let _guard = RawFdGuard(fd);
-
-        let one: libc::c_int = 1;
-        unsafe {
-            let _ = libc::setsockopt(
-                fd,
-                libc::IPPROTO_IP,
-                libc::IP_HDRINCL,
-                &one as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            let _ = libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_BROADCAST,
-                &one as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            if fwmark != 0 {
-                let mark: libc::c_uint = fwmark;
-                let _ = libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_MARK,
-                    &mark as *const libc::c_uint as *const libc::c_void,
-                    std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-                );
-            }
-            if dst.ip().is_multicast() {
-                let zero: libc::c_uchar = 0;
-                let _ = libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_IP,
-                    libc::IP_MULTICAST_LOOP,
-                    &zero as *const libc::c_uchar as *const libc::c_void,
-                    std::mem::size_of::<libc::c_uchar>() as libc::socklen_t,
-                );
-            }
-        }
-
         let mut dst_sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         dst_sin.sin_family = libc::AF_INET as libc::sa_family_t;
         dst_sin.sin_port = dst.port().to_be();
@@ -1293,20 +1234,18 @@ impl NftablesInterceptor {
             s_addr: u32::from(*dst.ip()).to_be(),
         };
 
-        let sent = unsafe {
-            libc::sendto(
-                fd,
-                raw_pkt.as_ptr() as *const libc::c_void,
-                raw_pkt.len(),
-                0,
-                &dst_sin as *const libc::sockaddr_in as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
-        };
-        if sent < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(sent as usize)
+        RAW_UDP_V4_SOCKETS.send_with_retry(
+            fwmark,
+            || create_raw_udp_socket(RawUdpFamily::V4, fwmark),
+            |sock| {
+                raw_sendto(
+                    sock,
+                    &raw_pkt,
+                    &dst_sin as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            },
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1331,7 +1270,6 @@ impl NftablesInterceptor {
         payload: &[u8],
         fwmark: u32,
     ) -> std::io::Result<usize> {
-        const LINUX_IPV6_HDRINCL: libc::c_int = 36;
         let raw_pkt = crate::interceptor::nat::build_forged_ipv6_udp_reply(
             *src.ip(),
             src.port(),
@@ -1346,48 +1284,6 @@ impl NftablesInterceptor {
             )
         })?;
 
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_INET6,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                libc::IPPROTO_RAW,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        struct RawFdGuard(libc::c_int);
-        impl Drop for RawFdGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    let _ = libc::close(self.0);
-                }
-            }
-        }
-        let _guard = RawFdGuard(fd);
-
-        let one: libc::c_int = 1;
-        unsafe {
-            let _ = libc::setsockopt(
-                fd,
-                libc::SOL_IPV6,
-                LINUX_IPV6_HDRINCL,
-                &one as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            if fwmark != 0 {
-                let mark: libc::c_uint = fwmark;
-                let _ = libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_MARK,
-                    &mark as *const libc::c_uint as *const libc::c_void,
-                    std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-                );
-            }
-        }
-
         let mut dst_sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
         dst_sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
         dst_sin6.sin6_port = 0;
@@ -1396,21 +1292,18 @@ impl NftablesInterceptor {
             s6_addr: dst.ip().octets(),
         };
 
-        let sent = unsafe {
-            libc::sendto(
-                fd,
-                raw_pkt.as_ptr() as *const libc::c_void,
-                raw_pkt.len(),
-                0,
-                &dst_sin6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-            )
-        };
-        if sent < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(sent as usize)
-        }
+        RAW_UDP_V6_SOCKETS.send_with_retry(
+            fwmark,
+            || create_raw_udp_socket(RawUdpFamily::V6, fwmark),
+            |sock| {
+                raw_sendto(
+                    sock,
+                    &raw_pkt,
+                    &dst_sin6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            },
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1424,5 +1317,340 @@ impl NftablesInterceptor {
             std::io::ErrorKind::Unsupported,
             "send_raw_ipv6_udp_packet is only supported on Linux",
         ))
+    }
+}
+
+/// Linux `IPV6_HDRINCL` socket option value (not exported by the `libc` crate).
+#[cfg(target_os = "linux")]
+const LINUX_IPV6_HDRINCL: libc::c_int = 36;
+
+/// Maximum number of send attempts for one raw datagram: the first attempt uses the cached socket,
+/// the second runs on a freshly created socket after the cached one proved dead.
+#[cfg(target_os = "linux")]
+const RAW_SEND_MAX_ATTEMPTS: usize = 2;
+
+/// Errno `EBADF` (Linux numbering): the cached descriptor is no longer valid.
+#[cfg(target_os = "linux")]
+const ERRNO_EBADF: i32 = 9;
+/// Errno `ENOTSOCK` (Linux numbering): the cached descriptor is no longer a socket.
+#[cfg(target_os = "linux")]
+const ERRNO_ENOTSOCK: i32 = 88;
+/// Errno `ENETDOWN` (Linux numbering): the socket's network stack went down underneath it.
+#[cfg(target_os = "linux")]
+const ERRNO_ENETDOWN: i32 = 100;
+
+/// Address family of a cached raw UDP socket.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum RawUdpFamily {
+    V4,
+    V6,
+}
+
+/// Owned raw socket descriptor, closed when the last `Arc` holder drops it.
+#[cfg(target_os = "linux")]
+struct RawUdpSocket(std::os::fd::OwnedFd);
+
+/// Lazily created raw sockets, one per `SO_MARK` value, shared by all sending tasks.
+///
+/// `sendto(2)` on a raw socket is safe to call concurrently. Creation happens under the lock so
+/// two tasks never race to create duplicates. A socket is dropped from the cache when a send
+/// reports that it is dead, and in-flight senders keep their `Arc` so the descriptor is never
+/// closed (and reused by the kernel) under them.
+#[cfg(target_os = "linux")]
+struct RawSocketCache<S> {
+    sockets: Mutex<Vec<(u32, Arc<S>)>>,
+}
+
+#[cfg(target_os = "linux")]
+impl<S> RawSocketCache<S> {
+    const fn new() -> Self {
+        Self {
+            sockets: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Returns the cached socket for `fwmark`, creating it with `create` on first use.
+    fn get_or_create<F>(&self, fwmark: u32, create: F) -> std::io::Result<Arc<S>>
+    where
+        F: FnOnce() -> std::io::Result<S>,
+    {
+        let mut guard = self.sockets.lock();
+        if let Some((_, sock)) = guard.iter().find(|(mark, _)| *mark == fwmark) {
+            return Ok(Arc::clone(sock));
+        }
+        let sock = Arc::new(create()?);
+        guard.push((fwmark, Arc::clone(&sock)));
+        Ok(sock)
+    }
+
+    /// Drops the cached entry for `fwmark` only if it is still `stale` (a concurrent task may
+    /// already have replaced it).
+    fn invalidate(&self, fwmark: u32, stale: &Arc<S>) {
+        let mut guard = self.sockets.lock();
+        guard.retain(|(mark, sock)| !(*mark == fwmark && Arc::ptr_eq(sock, stale)));
+    }
+
+    /// Number of cached sockets.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.sockets.lock().len()
+    }
+
+    /// Runs `send` on the cached socket. When it fails with an error that means the socket itself
+    /// is dead, the entry is discarded and the send is retried once on a new socket.
+    fn send_with_retry<T, C, F>(&self, fwmark: u32, create: C, send: F) -> std::io::Result<T>
+    where
+        C: Fn() -> std::io::Result<S>,
+        F: Fn(&S) -> std::io::Result<T>,
+    {
+        let mut attempt = 1;
+        loop {
+            let sock = self.get_or_create(fwmark, &create)?;
+            match send(&sock) {
+                Err(err) if attempt < RAW_SEND_MAX_ATTEMPTS && is_dead_socket_error(&err) => {
+                    self.invalidate(fwmark, &sock);
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+/// Returns `true` when `err` shows the socket descriptor can no longer be used, as opposed to a
+/// per-destination failure (unreachable network, bad address) that a new socket would not fix.
+#[cfg(target_os = "linux")]
+fn is_dead_socket_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(code) if code == ERRNO_EBADF || code == ERRNO_ENOTSOCK || code == ERRNO_ENETDOWN
+    )
+}
+
+#[cfg(target_os = "linux")]
+static RAW_UDP_V4_SOCKETS: RawSocketCache<RawUdpSocket> = RawSocketCache::new();
+#[cfg(target_os = "linux")]
+static RAW_UDP_V6_SOCKETS: RawSocketCache<RawUdpSocket> = RawSocketCache::new();
+
+/// Creates a raw socket with `IP_HDRINCL`/`IPV6_HDRINCL` and, when non-zero, `SO_MARK = fwmark`.
+///
+/// The IPv4 socket also enables `SO_BROADCAST` and disables `IP_MULTICAST_LOOP`; the latter only
+/// affects multicast destinations, so applying it to every IPv4 send is behaviourally identical to
+/// setting it per multicast datagram.
+#[cfg(target_os = "linux")]
+fn create_raw_udp_socket(family: RawUdpFamily, fwmark: u32) -> std::io::Result<RawUdpSocket> {
+    use std::os::fd::FromRawFd;
+
+    let domain = match family {
+        RawUdpFamily::V4 => libc::AF_INET,
+        RawUdpFamily::V6 => libc::AF_INET6,
+    };
+    let fd = unsafe {
+        libc::socket(
+            domain,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_RAW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by `socket(2)` and is owned by nothing else.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+
+    let one: libc::c_int = 1;
+    let int_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    unsafe {
+        match family {
+            RawUdpFamily::V4 => {
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IP,
+                    libc::IP_HDRINCL,
+                    &one as *const libc::c_int as *const libc::c_void,
+                    int_len,
+                );
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BROADCAST,
+                    &one as *const libc::c_int as *const libc::c_void,
+                    int_len,
+                );
+                let zero: libc::c_uchar = 0;
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IP,
+                    libc::IP_MULTICAST_LOOP,
+                    &zero as *const libc::c_uchar as *const libc::c_void,
+                    std::mem::size_of::<libc::c_uchar>() as libc::socklen_t,
+                );
+            }
+            RawUdpFamily::V6 => {
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_IPV6,
+                    LINUX_IPV6_HDRINCL,
+                    &one as *const libc::c_int as *const libc::c_void,
+                    int_len,
+                );
+            }
+        }
+        if fwmark != 0 {
+            let mark: libc::c_uint = fwmark;
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_MARK,
+                &mark as *const libc::c_uint as *const libc::c_void,
+                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+            );
+        }
+    }
+    Ok(RawUdpSocket(owned))
+}
+
+/// Sends one fully built IP packet to `addr` through `sock`.
+#[cfg(target_os = "linux")]
+fn raw_sendto(
+    sock: &RawUdpSocket,
+    packet: &[u8],
+    addr: *const libc::sockaddr,
+    addr_len: libc::socklen_t,
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    let sent = unsafe {
+        libc::sendto(
+            sock.0.as_raw_fd(),
+            packet.as_ptr() as *const libc::c_void,
+            packet.len(),
+            0,
+            addr,
+            addr_len,
+        )
+    };
+    if sent < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(sent as usize)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod raw_socket_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn dead_err() -> std::io::Error {
+        std::io::Error::from_raw_os_error(ERRNO_EBADF)
+    }
+
+    #[test]
+    fn creates_once_and_reuses_per_mark() {
+        let cache: RawSocketCache<u32> = RawSocketCache::new();
+        let created = AtomicUsize::new(0);
+        let make = |mark: u32| {
+            created.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(mark)
+        };
+        let a = cache.get_or_create(1, || make(1)).unwrap();
+        let b = cache.get_or_create(1, || make(1)).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(created.load(AtomicOrdering::SeqCst), 1);
+        let c = cache.get_or_create(2, || make(2)).unwrap();
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_eq!(created.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn creation_failure_is_not_cached() {
+        let cache: RawSocketCache<u32> = RawSocketCache::new();
+        let err = cache
+            .get_or_create(0, || Err(std::io::Error::from_raw_os_error(1)))
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(1));
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get_or_create(0, || Ok(7)).is_ok());
+    }
+
+    #[test]
+    fn dead_socket_is_recreated_once_and_send_retried() {
+        let cache: RawSocketCache<u32> = RawSocketCache::new();
+        let created = AtomicUsize::new(0);
+        let result = cache.send_with_retry(
+            0,
+            || Ok(created.fetch_add(1, AtomicOrdering::SeqCst) as u32),
+            |sock| {
+                if *sock == 0 {
+                    Err(dead_err())
+                } else {
+                    Ok(*sock)
+                }
+            },
+        );
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(created.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn persistent_dead_socket_stops_after_max_attempts() {
+        let cache: RawSocketCache<u32> = RawSocketCache::new();
+        let sends = AtomicUsize::new(0);
+        let result: std::io::Result<u32> = cache.send_with_retry(
+            0,
+            || Ok(0),
+            |_| {
+                sends.fetch_add(1, AtomicOrdering::SeqCst);
+                Err(dead_err())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(sends.load(AtomicOrdering::SeqCst), RAW_SEND_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn destination_errors_keep_the_cached_socket() {
+        let cache: RawSocketCache<u32> = RawSocketCache::new();
+        let created = AtomicUsize::new(0);
+        for _ in 0..3 {
+            let result: std::io::Result<u32> = cache.send_with_retry(
+                0,
+                || Ok(created.fetch_add(1, AtomicOrdering::SeqCst) as u32),
+                |_| Err(std::io::Error::from_raw_os_error(101)),
+            );
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(101));
+        }
+        assert_eq!(created.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn invalidate_ignores_a_replaced_socket() {
+        let cache: RawSocketCache<u32> = RawSocketCache::new();
+        let old = cache.get_or_create(0, || Ok(1)).unwrap();
+        cache.invalidate(0, &old);
+        let fresh = cache.get_or_create(0, || Ok(2)).unwrap();
+        cache.invalidate(0, &old);
+        assert_eq!(cache.len(), 1);
+        assert!(Arc::ptr_eq(
+            &fresh,
+            &cache.get_or_create(0, || Ok(3)).unwrap()
+        ));
+    }
+
+    #[test]
+    fn dead_socket_error_classification() {
+        for code in [ERRNO_EBADF, ERRNO_ENOTSOCK, ERRNO_ENETDOWN] {
+            assert!(is_dead_socket_error(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        assert!(!is_dead_socket_error(&std::io::Error::from_raw_os_error(
+            101
+        )));
+        assert!(!is_dead_socket_error(&std::io::Error::other("x")));
     }
 }

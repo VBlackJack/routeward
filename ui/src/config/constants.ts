@@ -37,7 +37,13 @@ export const UI_CONFIG = {
     WIZARD_COMPLETED: 'routeward_wizard_done'
   },
   TELEMETRY_REFRESH_INTERVAL_MS: 1000,
-  BYTE_UNITS: ['B', 'KB', 'MB', 'GB'] as const,
+  /** Locale keys of the byte unit labels, from bytes up to gigabytes. */
+  BYTE_UNIT_KEYS: [
+    'format.bytes.b',
+    'format.bytes.kb',
+    'format.bytes.mb',
+    'format.bytes.gb'
+  ] as const,
   BYTE_STEP: 1024,
   HIGH_CONTRAST_BORDER_PX: '2px',
   STANDARD_BORDER_PX: '1px',
@@ -69,10 +75,10 @@ export const UI_CONFIG = {
   /** Quick-launch presets of the process launcher modal. */
   IP_CHECK_URL,
   QUICK_LAUNCH_PRESETS: [
-    { exe: 'curl.exe', args: IP_CHECK_URL },
-    { exe: 'powershell.exe', args: '-NoExit' },
-    { exe: 'cmd.exe', args: '' }
-  ],
+    { exe: 'curl.exe', args: [IP_CHECK_URL] },
+    { exe: 'powershell.exe', args: ['-NoExit'] },
+    { exe: 'cmd.exe', args: [] }
+  ] as ReadonlyArray<{ exe: string; args: readonly string[] }>,
   API_ENDPOINTS: {
     STATE: '/api/state',
     EVENTS: '/api/events',

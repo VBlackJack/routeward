@@ -241,7 +241,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
         </h2>
         <div className="flex items-center border-b border-tf-border px-4 py-3">
           <Search className="mr-3 h-4 w-4 text-tf-accent" />
-          <input
+          <input name="command-palette-query"
             ref={inputRef}
             type="text"
             value={query}

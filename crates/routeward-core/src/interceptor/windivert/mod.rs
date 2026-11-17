@@ -129,7 +129,6 @@ struct ActiveHandles {
     pending_udp_queue: PendingUdpQueue<(Vec<u8>, WinDivertAddress)>,
     pending_udp_v6_queue: PendingUdpQueue<(Vec<u8>, WinDivertAddress), Ipv6TransportPacketMeta>,
     rt_handle: tokio::runtime::Handle,
-    _fallback_runtime: Option<tokio::runtime::Runtime>,
     firewall_rule_name: String,
     telemetry: TelemetryHub,
 }
@@ -379,23 +378,14 @@ impl Interceptor for WinDivertInterceptor {
         let firewall_rule_name =
             Self::create_scoped_firewall_rule(relay_port, &controller.telemetry);
 
-        let (rt_handle, fallback_runtime) = match tokio::runtime::Handle::try_current() {
-            Ok(h) => (h, None),
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build()
-                    .map_err(|err| RouteWardError::InterceptorError {
-                        key: ERR_KEY_INTERCEPTOR_OPEN,
-                        detail: format!(
-                            "Failed to create Tokio runtime for WinDivert workers: {err}"
-                        ),
-                    })?;
-                let h = rt.handle().clone();
-                (h, Some(rt))
+        // The engine listeners (required before this point) are tokio tasks, so a runtime is
+        // always present; every caller (CLI, daemon IPC dispatch) runs inside one.
+        let rt_handle = tokio::runtime::Handle::try_current().map_err(|err| {
+            RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_OPEN,
+                detail: format!("No Tokio runtime available for WinDivert workers: {err}"),
             }
-        };
+        })?;
 
         self.active.store(true, Ordering::SeqCst);
         let sock_handle_usize = socket_handle as usize;
@@ -429,7 +419,6 @@ impl Interceptor for WinDivertInterceptor {
             pending_udp_queue: pending_udp_queue.clone(),
             pending_udp_v6_queue: pending_udp_v6_queue.clone(),
             rt_handle: rt_handle.clone(),
-            _fallback_runtime: fallback_runtime,
             firewall_rule_name,
             telemetry: controller.telemetry.clone(),
         });

@@ -14,11 +14,26 @@
  * limitations under the License.
  */
 
+pub mod purge;
+pub mod user_state;
 pub mod windows_service;
 
-use crate::error::RouteWardResult;
+#[cfg(windows)]
+use crate::error::ERR_KEY_SYSTEM_REGISTRY_WRITE;
+use crate::error::{
+    RouteWardError, RouteWardResult, ERR_KEY_SYSTEM_LAUNCH_FAILED, ERR_KEY_SYSTEM_PAC_URL_INVALID,
+    ERR_KEY_SYSTEM_PATH_EMPTY,
+};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+#[cfg(windows)]
+use user_state::{FileBackupStore, Win32RegistryStore};
+use user_state::{RegValue, UserCleanupReport, PROXY_SERVER_PREFIX};
+
+/// Serializes every read-modify-write of the saved previous settings: the desktop bridge runs the
+/// proxy, PAC and exit handlers on separate blocking threads.
+#[cfg(windows)]
+static USER_STATE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(windows)]
 const WINDOWS_SYSTEM_DIR_FALLBACK: &str = r"C:\Windows\System32";
@@ -33,19 +48,12 @@ const ENV_NO_PROXY: &str = "NO_PROXY";
 const DEFAULT_NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
 
 #[cfg(windows)]
-const WIN_INET_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-#[cfg(windows)]
 const WIN_RUN_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
-const AUTOSTART_VALUE_NAME: &str = "RouteWardDesktop";
-#[cfg(windows)]
-/// Registry value holding the per-user system proxy switch (REG_DWORD, 1 = enabled).
-const PROXY_ENABLE_VALUE_NAME: &str = "ProxyEnable";
-#[cfg(any(windows, test))]
+const AUTOSTART_VALUE_NAME: &str = user_state::VALUE_AUTOSTART;
 /// Token `reg query` prints for a DWORD value; it is not localized.
 const REG_DWORD_TYPE_TOKEN: &str = "REG_DWORD";
 
-#[cfg(any(windows, test))]
 /// Extracts the numeric data of a `reg query` DWORD value line, locale-independently.
 ///
 /// Only the `REG_DWORD` type token and the `0x` hexadecimal data are inspected; the value name
@@ -91,22 +99,69 @@ pub struct LaunchedProcessReport {
     pub proxy_endpoint: String,
 }
 
+/// Path under which the local PAC server publishes the script.
+const PAC_URL_PATH: &str = "/proxy.pac";
+
+/// URL of the local PAC script served by RouteWard on `host:port`.
+pub fn local_pac_url(host: &str, port: u16) -> String {
+    format!("http://{host}:{port}{PAC_URL_PATH}")
+}
+
+/// True when the proxy switch is on and the server is the one RouteWard writes for
+/// `socks_endpoint`.
+pub fn proxy_is_routeward(
+    enable: Option<&RegValue>,
+    server: Option<&RegValue>,
+    socks_endpoint: &str,
+) -> bool {
+    let written = format!("{PROXY_SERVER_PREFIX}{socks_endpoint}");
+    enable == Some(&RegValue::Dword(1))
+        && server
+            .and_then(RegValue::as_text)
+            .is_some_and(|text| text.trim().eq_ignore_ascii_case(&written))
+}
+
+/// Quotes one argument for display when it is empty or contains whitespace or a double quote,
+/// so that a logged command line is unambiguous. Embedded quotes are escaped with a backslash.
+pub fn quote_display_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || c == '"');
+    if !needs_quotes {
+        return arg.to_string();
+    }
+    format!("\"{}\"", arg.replace('"', "\\\""))
+}
+
+/// Joins an executable and its arguments into a display string, quoting each part that needs it.
+pub fn format_display_command(executable: &str, args: &[String]) -> String {
+    std::iter::once(executable)
+        .chain(args.iter().map(String::as_str))
+        .map(quote_display_arg)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub struct SystemProxyManager;
 
 impl SystemProxyManager {
     #[cfg(windows)]
-    fn run_reg_add(args: &[&str]) -> RouteWardResult<()> {
+    pub(crate) fn run_reg_add(args: &[&str]) -> RouteWardResult<()> {
         let output = Command::new(windows_system_tool_path("reg.exe"))
             .args(args)
-            .output()?;
+            .output()
+            .map_err(|err| RouteWardError::SystemError {
+                key: ERR_KEY_SYSTEM_REGISTRY_WRITE,
+                detail: format!("cannot run reg add: {err}"),
+            })?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(std::io::Error::other(if detail.is_empty() {
-                format!("reg add exited with status {}", output.status)
-            } else {
-                format!("reg add failed: {detail}")
-            })
-            .into());
+            return Err(RouteWardError::SystemError {
+                key: ERR_KEY_SYSTEM_REGISTRY_WRITE,
+                detail: if detail.is_empty() {
+                    format!("reg add exited with status {}", output.status)
+                } else {
+                    format!("reg add failed: {detail}")
+                },
+            });
         }
         Ok(())
     }
@@ -117,7 +172,7 @@ impl SystemProxyManager {
     /// "not found" case is told apart locale-independently: after a failed delete, a `reg query`
     /// of the same value must also fail for the value to count as already absent.
     #[cfg(windows)]
-    fn run_reg_delete_value(key: &str, value_name: &str) {
+    pub(crate) fn run_reg_delete_value(key: &str, value_name: &str) {
         let reg = windows_system_tool_path("reg.exe");
         let deleted = Command::new(&reg)
             .args(["delete", key, "/v", value_name, "/f"])
@@ -146,42 +201,126 @@ impl SystemProxyManager {
         }
     }
 
+    /// Runs `task` with the per-user registry and the saved-settings file, serialized.
+    #[cfg(windows)]
+    fn with_user_state<T>(
+        task: impl FnOnce(&Win32RegistryStore, &FileBackupStore) -> RouteWardResult<T>,
+    ) -> RouteWardResult<T> {
+        let backups = FileBackupStore::for_current_user()?;
+        let _guard = USER_STATE_LOCK.lock();
+        task(&Win32RegistryStore::current_user(), &backups)
+    }
+
+    /// Enables or disables RouteWard's system proxy for the current user.
+    ///
+    /// Enabling first saves the previous proxy settings; disabling restores them, but only while
+    /// the proxy server is still RouteWard's. Returns the state after the call: after a disable
+    /// that left a foreign proxy alone, that is `true`; otherwise it is `false`.
     pub fn set_system_proxy(enable: bool, socks_endpoint: &str) -> RouteWardResult<bool> {
         #[cfg(windows)]
         {
-            let enable_val = if enable { "1" } else { "0" };
-            Self::run_reg_add(&[
-                "add",
-                WIN_INET_REG_PATH,
-                "/v",
-                "ProxyEnable",
-                "/t",
-                "REG_DWORD",
-                "/d",
-                enable_val,
-                "/f",
-            ])?;
-
+            Self::with_user_state(|settings, backups| {
+                if enable {
+                    user_state::enable_proxy(settings, backups, socks_endpoint)
+                } else {
+                    user_state::disable_proxy(settings, backups, socks_endpoint).map(|_| ())
+                }
+            })?;
             if enable {
-                let server_val = format!("socks={socks_endpoint}");
-                Self::run_reg_add(&[
-                    "add",
-                    WIN_INET_REG_PATH,
-                    "/v",
-                    "ProxyServer",
-                    "/t",
-                    "REG_SZ",
-                    "/d",
-                    &server_val,
-                    "/f",
-                ])?;
+                Ok(true)
+            } else {
+                // After a disable, "still on" means RouteWard's own proxy could not be removed. A
+                // foreign proxy the user (or a policy) set is none of RouteWard's business and
+                // must not make the call report failure.
+                Ok(Self::is_routeward_proxy_active(socks_endpoint))
             }
-            Ok(enable)
         }
         #[cfg(not(windows))]
         {
             let _ = socks_endpoint;
             Ok(enable)
+        }
+    }
+
+    /// Restores the proxy and PAC settings RouteWard changed, if they are still RouteWard's.
+    /// Called when the desktop app exits. Idempotent; a no-op outside Windows.
+    pub fn restore_owned_settings(
+        socks_endpoint: &str,
+        pac_url: &str,
+    ) -> RouteWardResult<UserCleanupReport> {
+        #[cfg(windows)]
+        {
+            Self::with_user_state(|settings, backups| {
+                user_state::restore_owned_proxy_settings(settings, backups, socks_endpoint, pac_url)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (socks_endpoint, pac_url);
+            Ok(UserCleanupReport::default())
+        }
+    }
+
+    /// Everything `routeward cleanup --user` does: restores the proxy and PAC settings that are
+    /// still RouteWard's and removes the autostart entry if it starts a RouteWard executable.
+    /// Idempotent; a no-op outside Windows.
+    pub fn cleanup_current_user(
+        socks_endpoint: &str,
+        pac_url: &str,
+    ) -> RouteWardResult<UserCleanupReport> {
+        #[cfg(windows)]
+        {
+            Self::with_user_state(|settings, backups| {
+                user_state::cleanup_user_settings(settings, backups, socks_endpoint, pac_url)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (socks_endpoint, pac_url);
+            Ok(UserCleanupReport::default())
+        }
+    }
+
+    /// Everything `routeward cleanup --all-users` does: for every user hive currently loaded
+    /// under `HKEY_USERS`, restores the proxy and PAC settings that are still RouteWard's and
+    /// removes the autostart entry. Needs an elevated or SYSTEM caller. Users who are not logged
+    /// on have no loaded hive and keep their values. A no-op outside Windows.
+    pub fn cleanup_all_users(
+        socks_endpoint: &str,
+        pac_url: &str,
+    ) -> RouteWardResult<user_state::AllUsersCleanupReport> {
+        #[cfg(windows)]
+        {
+            user_state::cleanup_all_loaded_users(socks_endpoint, pac_url)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (socks_endpoint, pac_url);
+            Ok(user_state::AllUsersCleanupReport::default())
+        }
+    }
+
+    /// True when the system proxy is switched on and points to RouteWard's relay.
+    pub fn is_routeward_proxy_active(socks_endpoint: &str) -> bool {
+        #[cfg(windows)]
+        {
+            use user_state::{RegLocation, UserSettingsStore};
+            let read = |name| {
+                Win32RegistryStore::current_user()
+                    .read(RegLocation::InternetSettings, name)
+                    .ok()
+                    .flatten()
+            };
+            proxy_is_routeward(
+                read(user_state::VALUE_PROXY_ENABLE).as_ref(),
+                read(user_state::VALUE_PROXY_SERVER).as_ref(),
+                socks_endpoint,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = socks_endpoint;
+            false
         }
     }
 
@@ -209,29 +348,21 @@ impl SystemProxyManager {
 
     pub fn set_system_pac(enable: bool, pac_url: &str) -> RouteWardResult<bool> {
         if enable && !Self::is_valid_local_pac_url(pac_url) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "PAC URL must use loopback http://127.0.0.1:<port>/...",
-            )
-            .into());
+            return Err(RouteWardError::SystemError {
+                key: ERR_KEY_SYSTEM_PAC_URL_INVALID,
+                detail: "PAC URL must use loopback http://127.0.0.1:<port>/...".to_string(),
+            });
         }
         #[cfg(windows)]
         {
-            if enable {
-                Self::run_reg_add(&[
-                    "add",
-                    WIN_INET_REG_PATH,
-                    "/v",
-                    "AutoConfigURL",
-                    "/t",
-                    "REG_SZ",
-                    "/d",
-                    pac_url.trim(),
-                    "/f",
-                ])?;
-            } else {
-                Self::run_reg_delete_value(WIN_INET_REG_PATH, "AutoConfigURL");
-            }
+            let pac_url = pac_url.trim();
+            Self::with_user_state(|settings, backups| {
+                if enable {
+                    user_state::enable_pac(settings, backups, pac_url)
+                } else {
+                    user_state::disable_pac(settings, backups, pac_url).map(|_| ())
+                }
+            })?;
             Ok(enable)
         }
         #[cfg(not(windows))]
@@ -246,16 +377,15 @@ impl SystemProxyManager {
     pub fn is_system_proxy_enabled() -> bool {
         #[cfg(windows)]
         {
-            let Ok(output) = Command::new(windows_system_tool_path("reg.exe"))
-                .args(["query", WIN_INET_REG_PATH, "/v", PROXY_ENABLE_VALUE_NAME])
-                .output()
-            else {
-                return false;
-            };
-            if !output.status.success() {
-                return false;
-            }
-            parse_reg_dword_value(&String::from_utf8_lossy(&output.stdout)) == Some(1)
+            use user_state::{RegLocation, UserSettingsStore};
+            Win32RegistryStore::current_user()
+                .read(
+                    RegLocation::InternetSettings,
+                    user_state::VALUE_PROXY_ENABLE,
+                )
+                .ok()
+                .flatten()
+                == Some(RegValue::Dword(1))
         }
         #[cfg(not(windows))]
         {
@@ -266,23 +396,16 @@ impl SystemProxyManager {
     pub fn get_system_pac_url() -> Option<String> {
         #[cfg(windows)]
         {
-            let output = Command::new(windows_system_tool_path("reg.exe"))
-                .args(["query", WIN_INET_REG_PATH, "/v", "AutoConfigURL"])
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some(idx) = line.find("REG_SZ") {
-                    let val = line[idx + "REG_SZ".len()..].trim();
-                    if !val.is_empty() {
-                        return Some(val.to_string());
-                    }
-                }
-            }
-            None
+            use user_state::{RegLocation, UserSettingsStore};
+            Win32RegistryStore::current_user()
+                .read(
+                    RegLocation::InternetSettings,
+                    user_state::VALUE_AUTO_CONFIG_URL,
+                )
+                .ok()
+                .flatten()
+                .and_then(|value| value.as_text().map(str::to_string))
+                .filter(|url| !url.is_empty())
         }
         #[cfg(not(windows))]
         {
@@ -313,11 +436,10 @@ impl SystemProxyManager {
             if enable {
                 let trimmed = exe_path.trim().trim_matches('"');
                 if trimmed.is_empty() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Autostart executable path cannot be empty",
-                    )
-                    .into());
+                    return Err(RouteWardError::SystemError {
+                        key: ERR_KEY_SYSTEM_PATH_EMPTY,
+                        detail: "Autostart executable path cannot be empty".to_string(),
+                    });
                 }
                 let quoted = format!("\"{trimmed}\"");
                 Self::run_reg_add(&[
@@ -351,11 +473,10 @@ impl SystemProxyManager {
     ) -> RouteWardResult<LaunchedProcessReport> {
         let trimmed_exe = executable_path.trim();
         if trimmed_exe.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Executable path cannot be empty",
-            )
-            .into());
+            return Err(RouteWardError::SystemError {
+                key: ERR_KEY_SYSTEM_PATH_EMPTY,
+                detail: "Executable path cannot be empty".to_string(),
+            });
         }
 
         let socks_url = format!("socks5h://{socks_endpoint}");
@@ -367,17 +488,15 @@ impl SystemProxyManager {
             .env(ENV_HTTP_PROXY, &http_url)
             .env(ENV_HTTPS_PROXY, &http_url)
             .env(ENV_NO_PROXY, DEFAULT_NO_PROXY_VALUE)
-            .spawn()?;
-
-        let display_command = if args.is_empty() {
-            trimmed_exe.to_string()
-        } else {
-            format!("{trimmed_exe} {}", args.join(" "))
-        };
+            .spawn()
+            .map_err(|err| RouteWardError::SystemError {
+                key: ERR_KEY_SYSTEM_LAUNCH_FAILED,
+                detail: format!("cannot start {trimmed_exe}: {err}"),
+            })?;
 
         Ok(LaunchedProcessReport {
             pid: child.id(),
-            command: display_command,
+            command: format_display_command(trimmed_exe, args),
             proxy_endpoint: socks_endpoint.to_string(),
         })
     }
@@ -386,6 +505,55 @@ impl SystemProxyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_command_quotes_only_the_arguments_that_need_it() {
+        assert_eq!(format_display_command("tool", &[]), "tool");
+        assert_eq!(
+            format_display_command(
+                r"C:\Program Files\App\app.exe",
+                &[
+                    "--flag".to_string(),
+                    "two words".to_string(),
+                    String::new(),
+                    r#"say "hi""#.to_string(),
+                ]
+            ),
+            r#""C:\Program Files\App\app.exe" --flag "two words" "" "say \"hi\"""#
+        );
+    }
+
+    #[test]
+    fn detects_a_routeward_proxy_only_when_on_and_pointing_to_the_relay() {
+        let on = RegValue::Dword(1);
+        let off = RegValue::Dword(0);
+        let ours = RegValue::Sz("socks=127.0.0.1:10808".to_string());
+        let corp = RegValue::Sz("proxy.corp.example:3128".to_string());
+        assert!(proxy_is_routeward(
+            Some(&on),
+            Some(&ours),
+            "127.0.0.1:10808"
+        ));
+        assert!(!proxy_is_routeward(
+            Some(&off),
+            Some(&ours),
+            "127.0.0.1:10808"
+        ));
+        assert!(!proxy_is_routeward(
+            Some(&on),
+            Some(&corp),
+            "127.0.0.1:10808"
+        ));
+        assert!(!proxy_is_routeward(Some(&on), Some(&ours), "127.0.0.1:1"));
+        assert!(!proxy_is_routeward(None, None, "127.0.0.1:10808"));
+    }
+
+    #[test]
+    fn pac_enable_with_a_foreign_url_is_a_keyed_error() {
+        let err = SystemProxyManager::set_system_pac(true, "https://evil.example/p.pac")
+            .expect_err("foreign PAC URL must be refused");
+        assert_eq!(err.i18n_key(), ERR_KEY_SYSTEM_PAC_URL_INVALID);
+    }
 
     #[test]
     fn parses_reg_dword_enabled_and_disabled() {

@@ -23,7 +23,9 @@ use routeward_core::config::{
     SystemConstants, ThemeForgeCatalog,
 };
 use routeward_core::dns::FakeIpEntry;
-use routeward_core::error::ERR_KEY_DAEMON_DISCONNECTED;
+use routeward_core::error::{
+    RouteWardError, RouteWardResult, ERR_KEY_DAEMON_DISCONNECTED, ERR_KEY_SYSTEM_PATH_EMPTY,
+};
 use routeward_core::i18n::I18nRegistry;
 use routeward_core::interceptor::SystemDiagnostics;
 use routeward_core::ipc::protocol::{
@@ -36,7 +38,7 @@ use routeward_core::logger::FileLogger;
 use routeward_core::pac::FoxyProxyImportResult;
 use routeward_core::process::{ProcessResolver, SystemApplicationEntry};
 use routeward_core::rules::{ConnectionRequest, RuleEvaluationResult};
-use routeward_core::system::{LaunchedProcessReport, SystemProxyManager};
+use routeward_core::system::{local_pac_url, LaunchedProcessReport, SystemProxyManager};
 use routeward_core::telemetry::{
     ConnectionStatus, LogEntry, LogLevel, TelemetryEvent, TelemetrySnapshot, TrackedConnection,
 };
@@ -52,6 +54,49 @@ const DAEMON_START_POLL_ATTEMPTS: usize = 16;
 const DAEMON_START_POLL_INTERVAL_MS: u64 = 250;
 
 type TrayNotifyCallback = Arc<dyn Fn(TrayStatusSnapshot) + Send + Sync>;
+
+/// A failed system operation (registry tools, process spawn): the localized message plus the
+/// stable i18n key the UI uses to translate it again in its own locale.
+///
+/// It derefs to the message and compares equal to a `String`, so callers that only care about
+/// the text keep working.
+#[derive(Debug, Clone)]
+pub struct SystemOpError {
+    key: Option<&'static str>,
+    message: String,
+}
+
+impl SystemOpError {
+    /// The i18n key of the failure; absent when the blocking task itself could not complete.
+    pub fn key(&self) -> Option<&'static str> {
+        self.key
+    }
+
+    /// The message localized in the bridge locale.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for SystemOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::ops::Deref for SystemOpError {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl PartialEq<String> for SystemOpError {
+    fn eq(&self, other: &String) -> bool {
+        &self.message == other
+    }
+}
 
 #[derive(Clone)]
 pub struct DesktopCommandBridge {
@@ -544,34 +589,68 @@ impl DesktopCommandBridge {
     }
 
     /// Runs a blocking system call (registry tools, process spawn) off the async worker.
-    async fn run_blocking<T, F>(task: F) -> Result<T, String>
+    ///
+    /// A failure is logged with its English detail and handed to the UI as the message of its
+    /// i18n key in the active locale, so the user never sees a raw OS error text.
+    async fn run_system_blocking<T, F>(&self, task: F) -> Result<T, SystemOpError>
     where
         T: Send + 'static,
-        F: FnOnce() -> Result<T, String> + Send + 'static,
+        F: FnOnce() -> RouteWardResult<T> + Send + 'static,
     {
-        tokio::task::spawn_blocking(task)
-            .await
-            .map_err(|e| e.to_string())?
+        match tokio::task::spawn_blocking(task).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(err)) => {
+                self.log_warn(format!("System operation failed: {err}"));
+                Err(SystemOpError {
+                    key: Some(err.i18n_key()),
+                    message: self.i18n.t(err.i18n_key()),
+                })
+            }
+            Err(join_err) => Err(SystemOpError {
+                key: None,
+                message: join_err.to_string(),
+            }),
+        }
     }
 
-    pub async fn set_system_proxy(&self, enabled: bool) -> Result<bool, String> {
+    pub async fn set_system_proxy(&self, enabled: bool) -> Result<bool, SystemOpError> {
         let endpoint = self.get_diagnostics().relay_tcp_endpoint;
-        Self::run_blocking(move || {
-            SystemProxyManager::set_system_proxy(enabled, &endpoint).map_err(|e| e.to_string())
+        self.run_system_blocking(move || SystemProxyManager::set_system_proxy(enabled, &endpoint))
+            .await
+    }
+
+    /// True when the system proxy is on and points to RouteWard's relay; a proxy configured by
+    /// someone else does not count.
+    pub async fn get_system_proxy_status(&self) -> bool {
+        let endpoint = self.get_diagnostics().relay_tcp_endpoint;
+        tokio::task::spawn_blocking(move || {
+            SystemProxyManager::is_routeward_proxy_active(&endpoint)
         })
         .await
+        .unwrap_or(false)
     }
 
-    pub async fn get_system_proxy_status(&self) -> bool {
-        tokio::task::spawn_blocking(SystemProxyManager::is_system_proxy_enabled)
-            .await
-            .unwrap_or(false)
+    /// Gives the system proxy and PAC settings back when the app exits, if RouteWard set them
+    /// and they still are RouteWard's. Blocking and best effort: a failure is only logged.
+    pub fn restore_system_settings_on_exit(&self) {
+        let endpoint = self.get_diagnostics().relay_tcp_endpoint;
+        match SystemProxyManager::restore_owned_settings(&endpoint, &self.pac_url()) {
+            Ok(report) if report.proxy_restored || report.pac_restored => {
+                self.log_info("Restored the system proxy settings on exit");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                self.log_warn(format!(
+                    "Could not restore system proxy settings on exit: {err}"
+                ));
+            }
+        }
     }
 
     pub fn pac_url(&self) -> String {
-        format!(
-            "http://{}:{}/proxy.pac",
-            self.constants.network.local_bind_host, self.constants.network.default_pac_port
+        local_pac_url(
+            &self.constants.network.local_bind_host,
+            self.constants.network.default_pac_port,
         )
     }
 
@@ -588,12 +667,11 @@ impl DesktopCommandBridge {
         (active, expected)
     }
 
-    pub async fn set_system_pac(&self, enabled: bool) -> Result<(bool, String), String> {
+    pub async fn set_system_pac(&self, enabled: bool) -> Result<(bool, String), SystemOpError> {
         let expected = self.pac_url();
         let expected_for_task = expected.clone();
-        Self::run_blocking(move || {
+        self.run_system_blocking(move || {
             SystemProxyManager::set_system_pac(enabled, &expected_for_task)
-                .map_err(|e| e.to_string())
         })
         .await
         .map(|res| (res, expected))
@@ -605,13 +683,13 @@ impl DesktopCommandBridge {
             .unwrap_or(false)
     }
 
-    pub async fn set_autostart(&self, enabled: bool) -> Result<bool, String> {
-        let exe_path = std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .to_string_lossy()
-            .into_owned();
-        Self::run_blocking(move || {
-            SystemProxyManager::set_autostart(enabled, &exe_path).map_err(|e| e.to_string())
+    pub async fn set_autostart(&self, enabled: bool) -> Result<bool, SystemOpError> {
+        self.run_system_blocking(move || {
+            let exe_path = std::env::current_exe().map_err(|err| RouteWardError::SystemError {
+                key: ERR_KEY_SYSTEM_PATH_EMPTY,
+                detail: format!("cannot resolve the current executable: {err}"),
+            })?;
+            SystemProxyManager::set_autostart(enabled, &exe_path.to_string_lossy())
         })
         .await
     }
@@ -700,18 +778,17 @@ impl DesktopCommandBridge {
         &self,
         executable_path: &str,
         args: &[String],
-    ) -> Result<LaunchedProcessReport, String> {
+    ) -> Result<LaunchedProcessReport, SystemOpError> {
         let diag = self.get_diagnostics();
         let executable_path = executable_path.to_string();
         let args = args.to_vec();
-        Self::run_blocking(move || {
+        self.run_system_blocking(move || {
             SystemProxyManager::spawn_process_with_proxy(
                 &executable_path,
                 &args,
                 &diag.relay_tcp_endpoint,
                 &diag.relay_http_endpoint,
             )
-            .map_err(|e| e.to_string())
         })
         .await
     }

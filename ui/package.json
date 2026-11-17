@@ -5,6 +5,9 @@
   "license": "Apache-2.0",
   "author": "Julien Bombled",
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

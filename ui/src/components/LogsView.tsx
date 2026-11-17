@@ -17,6 +17,7 @@
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Trash2 } from 'lucide-react';
+import { formatLogTime } from '../services/format';
 import { LogEntry, LogLevel } from '../types/routeward';
 
 interface LogsViewProps {
@@ -89,7 +90,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ logs, onClear }) => {
                   className="transition hover:bg-tf-surface-alt/40"
                 >
                   <td className="whitespace-nowrap px-4 py-2.5 text-[11px] text-tf-secondary">
-                    {new Date(entry.timestamp).toLocaleTimeString()}
+                    {formatLogTime(entry.timestamp)}
                   </td>
                   <td className="px-4 py-2.5">
                     <span
