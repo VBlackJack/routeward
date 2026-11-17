@@ -60,6 +60,7 @@ Loading and opening the WinDivert kernel filter requires **Administrator** privi
 **Symptom**:
 - `routeward run` exits with `errors.interceptor.not_root` or `errors.interceptor.nft_missing`.
 - Or, if both `routeward` and its pipe-linked fail-open watchdog were killed simultaneously, outbound IPv4 TCP traffic remains redirected to `:10810` and fails to connect.
+- Or, with `securityPolicy.killSwitchEnabled = true`, the daemon crashed or was killed and the host failed closed: the nftables table `inet routeward_ks` drops all outgoing traffic except loopback, established connections, DHCP, IPv6 neighbour discovery and MLD. Check with `sudo nft list table inet routeward_ks`; run `sudo routeward cleanup --force` to remove it (or start the daemon again with interception running). On Windows a crash still fails open.
 
 **Resolution**:
 - Ensure `routeward` is executed as `root` (`sudo routeward run`) and that the `nftables` package (`nft` binary) is installed.
@@ -90,7 +91,7 @@ cargo build -p routeward-desktop
 ## 7. `WinDivert.dll` Missing After Installing the Windows `.msi`
 
 **Symptom**:
-The `.msi` installer succeeded, but launching routing fails because `WinDivert.dll` is not present in the installation folder (typical when built without `-IncludeWinDivert`).
+The `.msi` installer succeeded, but launching routing fails because `WinDivert.dll` is not present in the installation folder (release `.msi` packages bundle WinDivert 2.2.2; this happens with a locally built `.msi` made without `-IncludeWinDivert`, or after a manual removal of the files).
 
 **Resolution**:
 Run the bundled `fetch-windivert.ps1` script from an elevated PowerShell prompt to download and verify WinDivert directly into `C:\Program Files\RouteWard\`:

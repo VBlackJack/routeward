@@ -169,6 +169,8 @@ pub struct RouteWardController {
     pub udp_manager: UdpAssociationManager,
     pub(super) warn_rate_limiter: WarnRateLimiter,
     pub(super) fragmented_udp_drop_count: Arc<AtomicU64>,
+    /// Later UDP fragments dropped because no verdict was remembered for their datagram.
+    pub(super) orphan_fragment_drop_count: Arc<AtomicU64>,
     pub(super) last_seen_orig_resolver: Arc<RwLock<Option<SocketAddr>>>,
     pub(super) system_resolvers_override: Arc<RwLock<Option<Vec<SocketAddr>>>>,
     pub(super) bootstrapped_proxy_endpoints: Arc<DashMap<String, Vec<(IpAddr, u16)>>>,

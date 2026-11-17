@@ -31,8 +31,9 @@ use routeward_core::logger::FileLogger;
 use routeward_core::pac::PacGenerator;
 use routeward_core::rules::ConnectionRequest;
 use routeward_core::system::windows_service::{
-    install_windows_service, query_windows_service_status, run_windows_service_dispatcher,
-    start_windows_service, stop_windows_service, uninstall_windows_service,
+    install_windows_service, query_windows_service_status, restore_windows_service,
+    run_windows_service_dispatcher, start_windows_service, stop_windows_service,
+    uninstall_windows_service,
 };
 use routeward_core::telemetry::LogLevel;
 use std::path::PathBuf;
@@ -108,7 +109,87 @@ enum Commands {
         /// Force removal even if a RouteWard daemon instance appears active
         #[arg(long)]
         force: bool,
+        /// Linux service hook: when the service did not stop cleanly ($SERVICE_RESULT is not
+        /// "success") and the persisted profile has the kill switch enabled, install the
+        /// fail-closed block table instead of removing every rule
+        #[arg(long = "fail-closed-on-crash")]
+        fail_closed_on_crash: bool,
     },
+}
+
+/// Reads the persisted daemon profile and returns its kill switch setting; any read or parse
+/// failure counts as "off" so that an unreadable profile never blocks the host.
+#[cfg(not(windows))]
+fn persisted_kill_switch_enabled(controller: &RouteWardController) -> bool {
+    let Ok(path) = controller.constants.ipc.resolve_daemon_profile_path() else {
+        return false;
+    };
+    ProfileConfig::load_from_path(path)
+        .map(|profile| profile.security_policy.kill_switch_enabled)
+        .unwrap_or(false)
+}
+
+/// Runs `routeward cleanup`. With `fail_closed_on_crash` (Linux systemd hook) a crashed service
+/// with the kill switch enabled gets the block table instead of a full removal; otherwise every
+/// RouteWard rule is removed, including a leftover block table.
+fn run_cleanup(
+    controller: &RouteWardController,
+    force: bool,
+    fail_closed_on_crash: bool,
+) -> RouteWardResult<()> {
+    #[cfg(not(windows))]
+    {
+        use routeward_core::interceptor::nftables::TproxyRoutingSpec;
+        use routeward_core::interceptor::nftables::{
+            decide_crash_cleanup_action, CrashCleanupAction, NftablesInterceptor,
+        };
+
+        let net = &controller.constants.network;
+        if fail_closed_on_crash {
+            let service_result = std::env::var("SERVICE_RESULT").ok();
+            let action = decide_crash_cleanup_action(
+                service_result.as_deref(),
+                persisted_kill_switch_enabled(controller),
+                NftablesInterceptor::interception_was_active(
+                    &net.linux_nft_binary,
+                    &net.linux_nft_table_name,
+                ),
+            );
+            if action == CrashCleanupAction::InstallFailClosed {
+                controller.check_cleanup_allowed(force)?;
+                NftablesInterceptor::install_fail_closed_table(
+                    &net.linux_nft_binary,
+                    &net.linux_nft_table_name,
+                    &controller.telemetry,
+                )?;
+                NftablesInterceptor::delete_tproxy_routing(
+                    &net.linux_ip_binary,
+                    TproxyRoutingSpec {
+                        fwmark: net.linux_tproxy_fwmark,
+                        route_table: net.linux_tproxy_route_table,
+                        rule_priority: net.linux_tproxy_rule_priority,
+                        tproxy_port: net.default_local_name_inspect_port,
+                    },
+                    &controller.telemetry,
+                );
+                controller.telemetry.flush_file_logger();
+                return Ok(());
+            }
+        }
+        controller.cleanup_orphaned_rules(force)?;
+        NftablesInterceptor::delete_fail_closed_table(
+            &net.linux_nft_binary,
+            &net.linux_nft_table_name,
+            &controller.telemetry,
+        );
+        controller.telemetry.flush_file_logger();
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let _ = fail_closed_on_crash;
+        controller.cleanup_orphaned_rules(force)
+    }
 }
 
 #[derive(Subcommand)]
@@ -127,6 +208,23 @@ enum ServiceCommands {
         /// Configure manual start instead of automatic start on boot
         #[arg(long)]
         demand_start: bool,
+    },
+    /// Re-register the service after an MSI upgrade from the captured old ImagePath
+    Restore {
+        /// Start the service once it is registered
+        #[arg(long)]
+        start: bool,
+        /// Configure manual start instead of automatic start on boot
+        #[arg(long)]
+        demand_start: bool,
+        /// Captured old service command line (after `--`): executable token, `service run`, allow-sid flags
+        #[arg(
+            last = true,
+            required = true,
+            allow_hyphen_values = true,
+            value_name = "IMAGE_PATH_ARGS"
+        )]
+        image_path: Vec<String>,
     },
     /// Stop and remove the RouteWard Windows Service
     Uninstall,
@@ -557,6 +655,16 @@ fn handle_service_command(
             eprintln!("{}", i18n.t("cli.engine.service.installed"));
             Ok(())
         }
+        ServiceCommands::Restore {
+            start,
+            demand_start,
+            image_path,
+        } => {
+            let status = restore_windows_service(&image_path, demand_start, start)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            eprintln!("{}", i18n.t("cli.engine.service.installed"));
+            Ok(())
+        }
         ServiceCommands::Uninstall => {
             uninstall_windows_service()?;
             let status = query_windows_service_status()?;
@@ -759,8 +867,11 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }))?
             );
         }
-        Commands::Cleanup { force } => {
-            if let Err(err) = controller.cleanup_orphaned_rules(force) {
+        Commands::Cleanup {
+            force,
+            fail_closed_on_crash,
+        } => {
+            if let Err(err) = run_cleanup(&controller, force, fail_closed_on_crash) {
                 let localized = controller.i18n.t(err.i18n_key());
                 eprintln!("{localized}");
                 return Err(err.into());
@@ -778,6 +889,28 @@ mod tests {
     use super::*;
     use routeward_core::error::ERR_KEY_CLEANUP_DAEMON_ACTIVE;
     use routeward_core::ipc::protocol::DaemonFullState;
+
+    #[test]
+    fn cleanup_accepts_fail_closed_on_crash_flag() {
+        let args =
+            CliArgs::try_parse_from(["routeward", "cleanup", "--force", "--fail-closed-on-crash"])
+                .expect("flag parses");
+        match args.command {
+            Commands::Cleanup {
+                force,
+                fail_closed_on_crash,
+            } => assert!(force && fail_closed_on_crash),
+            _ => panic!("expected cleanup"),
+        }
+        let plain = CliArgs::try_parse_from(["routeward", "cleanup"]).expect("plain parses");
+        match plain.command {
+            Commands::Cleanup {
+                force,
+                fail_closed_on_crash,
+            } => assert!(!force && !fail_closed_on_crash),
+            _ => panic!("expected cleanup"),
+        }
+    }
 
     #[tokio::test]
     async fn cleanup_refused_when_test_daemon_listens_and_accepted_with_force() {
@@ -1127,6 +1260,48 @@ mod tests {
             }
             _ => panic!("unexpected parsed command"),
         }
+
+        let restore = CliArgs::try_parse_from([
+            "routeward",
+            "service",
+            "restore",
+            "--start",
+            "--",
+            r"C:\Program Files\RouteWard\routeward.exe",
+            "service",
+            "run",
+            "--allow-sid",
+            "S-1-5-21-1-2-3-1001",
+        ])
+        .expect("parse service restore");
+        match restore.command {
+            Commands::Service {
+                action:
+                    ServiceCommands::Restore {
+                        start,
+                        demand_start,
+                        image_path,
+                    },
+            } => {
+                assert!(start);
+                assert!(!demand_start);
+                assert_eq!(
+                    image_path,
+                    vec![
+                        r"C:\Program Files\RouteWard\routeward.exe".to_string(),
+                        "service".to_string(),
+                        "run".to_string(),
+                        "--allow-sid".to_string(),
+                        "S-1-5-21-1-2-3-1001".to_string(),
+                    ]
+                );
+            }
+            _ => panic!("unexpected parsed command"),
+        }
+        assert!(
+            CliArgs::try_parse_from(["routeward", "service", "restore", "--start"]).is_err(),
+            "restore without image path args must be rejected"
+        );
 
         let daemon = CliArgs::try_parse_from([
             "routeward",

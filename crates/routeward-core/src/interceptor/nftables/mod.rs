@@ -38,6 +38,11 @@ mod tests;
 mod tproxy;
 mod watchdog;
 
+pub use watchdog::{
+    decide_crash_cleanup_action, fail_closed_table_name, CrashCleanupAction, WatchdogMode,
+    FAIL_CLOSED_TABLE_SUFFIX, SERVICE_RESULT_SUCCESS,
+};
+
 pub(super) const BACKEND_NAME: &str = "nftables";
 pub(super) const COMPONENT_NFTABLES: &str = "NftablesInterceptor";
 pub(super) const AF_INET_U16: u16 = 2;
@@ -66,6 +71,9 @@ pub(super) struct NftActiveState {
     pub(super) ipv6_tproxy_active: bool,
     pub(super) watchdog_stdin: Option<ChildStdin>,
     pub(super) watchdog_child: Option<Child>,
+    /// Kill switch setting last communicated to the watchdog (decides its crash behaviour).
+    #[cfg(target_os = "linux")]
+    pub(super) kill_switch_enabled: bool,
     pub(super) telemetry: TelemetryHub,
 }
 
@@ -118,6 +126,38 @@ impl NftablesInterceptor {
         } else {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             Err(format!("exit={:?}: {stderr}", out.status.code()))
+        }
+    }
+}
+
+impl NftablesInterceptor {
+    /// Teardown used by the failure paths of `start`.
+    ///
+    /// Removes RouteWard's own `ip`/`ip6` tables and `TPROXY` routing but never disarms the
+    /// watchdog and never deletes the fail-closed block table `inet <table>_ks`: a start that
+    /// fails after a crash must not reopen the host. With the kill switch on and a block table
+    /// present the watchdog is told `block` (it re-asserts the table when the pipe closes);
+    /// otherwise it is told `open`, so a failed start never installs a block table that was not
+    /// there before.
+    #[cfg(target_os = "linux")]
+    pub(super) fn teardown_failed_start(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        if let Some(mut state) = self.state.lock().take() {
+            let ks = fail_closed_table_name(&state.table_name);
+            let keep_block = state.kill_switch_enabled
+                && Self::nft_table_is_listed(&state.nft_binary, "inet", &ks);
+            let mode = if keep_block {
+                WatchdogMode::Block
+            } else {
+                WatchdogMode::Open
+            };
+            Self::write_watchdog_mode(&mut state.watchdog_stdin, mode, &state.telemetry);
+            drop(state.watchdog_stdin.take());
+            let _ = Self::delete_nft_table(&state.nft_binary, &state.table_name, &state.telemetry);
+            Self::delete_tproxy_routing(&state.ip_binary, state.tproxy_spec, &state.telemetry);
+            if let Some(mut child) = state.watchdog_child.take() {
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -321,6 +361,9 @@ impl Interceptor for NftablesInterceptor {
                                 "Could not install IPv6 fallback guard \"ip6 {table_name}\" with the kill switch enabled: {fb_detail}"
                             ),
                         );
+                        // No watchdog and no active state exist yet: only the routing installed
+                        // so far goes. The fail-closed block table of a previous crash is left
+                        // untouched, like on every other start failure path.
                         Self::delete_tproxy_routing(&ip_bin, tproxy_spec, &controller.telemetry);
                         self.active.store(false, Ordering::SeqCst);
                         return Err(RouteWardError::InterceptorError {
@@ -380,6 +423,13 @@ impl Interceptor for NftablesInterceptor {
             }
         }
 
+        // Tell the watchdog what to do if the daemon dies: fail closed with the kill switch on.
+        Self::write_watchdog_mode(
+            &mut watchdog_stdin,
+            WatchdogMode::from_kill_switch(kill_switch_enabled),
+            &controller.telemetry,
+        );
+
         *self.state.lock() = Some(NftActiveState {
             nft_binary: nft_bin.clone(),
             ip_binary: ip_bin,
@@ -388,6 +438,7 @@ impl Interceptor for NftablesInterceptor {
             ipv6_tproxy_active,
             watchdog_stdin,
             watchdog_child,
+            kill_switch_enabled,
             telemetry: controller.telemetry.clone(),
         });
 
@@ -420,7 +471,7 @@ impl Interceptor for NftablesInterceptor {
         {
             Ok(child) => child,
             Err(err) => {
-                self.stop();
+                self.teardown_failed_start();
                 return Err(RouteWardError::InterceptorError {
                     key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
                     detail: format!("Could not spawn {nft_bin} -f -: {err}"),
@@ -435,7 +486,7 @@ impl Interceptor for NftablesInterceptor {
         let apply_out = match apply_child.wait_with_output() {
             Ok(out) => out,
             Err(err) => {
-                self.stop();
+                self.teardown_failed_start();
                 return Err(RouteWardError::InterceptorError {
                     key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
                     detail: format!("Failed waiting for {nft_bin} -f -: {err}"),
@@ -444,7 +495,7 @@ impl Interceptor for NftablesInterceptor {
         };
 
         if !apply_out.status.success() {
-            self.stop();
+            self.teardown_failed_start();
             let stderr = String::from_utf8_lossy(&apply_out.stderr)
                 .trim()
                 .to_string();
@@ -461,6 +512,10 @@ impl Interceptor for NftablesInterceptor {
                 "Installed nftables table \"ip {table_name}\" (chain=\"{chain_name}\", fwmark={fwmark:#x}, redirect_port={relay_port}, dns_port={dns_listen_port})"
             ),
         );
+
+        // Own tables are installed: a block table left by a previous crash can now go (deleting it
+        // earlier would open a window, keeping it would block the upstream proxy traffic).
+        Self::delete_fail_closed_table(&nft_bin, &table_name, &controller.telemetry);
 
         Ok(())
     }
@@ -654,15 +709,32 @@ impl Interceptor for NftablesInterceptor {
             ),
         );
 
+        // Keep the crash behaviour in sync with the (possibly toggled) kill switch.
+        if let Some(ref mut st) = *self.state.lock() {
+            st.kill_switch_enabled = kill_switch_enabled;
+            Self::write_watchdog_mode(
+                &mut st.watchdog_stdin,
+                WatchdogMode::from_kill_switch(kill_switch_enabled),
+                &st.telemetry,
+            );
+        }
+
         Ok(())
     }
 
     fn stop(&self) {
         self.active.store(false, Ordering::SeqCst);
         if let Some(mut state) = self.state.lock().take() {
-            // Closing the pipe write-end lets the watchdog exit cleanly
+            // A clean stop must never leave the network blocked: disarm, then close the pipe
+            // write-end so the watchdog exits with the plain cleanup.
+            Self::write_watchdog_mode(
+                &mut state.watchdog_stdin,
+                WatchdogMode::Disarm,
+                &state.telemetry,
+            );
             drop(state.watchdog_stdin.take());
             let _ = Self::delete_nft_table(&state.nft_binary, &state.table_name, &state.telemetry);
+            Self::delete_fail_closed_table(&state.nft_binary, &state.table_name, &state.telemetry);
             Self::delete_tproxy_routing(&state.ip_binary, state.tproxy_spec, &state.telemetry);
             if let Some(mut child) = state.watchdog_child.take() {
                 let _ = child.wait();
@@ -676,7 +748,16 @@ impl Interceptor for NftablesInterceptor {
 }
 
 impl Drop for NftablesInterceptor {
+    /// Dropping without an explicit `stop()` (for example a panic unwinding) must never disarm:
+    /// the watchdog keeps its current mode and applies it when the pipe closes, so a daemon that
+    /// dies with the kill switch on still fails closed.
     fn drop(&mut self) {
-        self.stop();
+        self.active.store(false, Ordering::SeqCst);
+        if let Some(mut state) = self.state.lock().take() {
+            drop(state.watchdog_stdin.take());
+            if let Some(mut child) = state.watchdog_child.take() {
+                let _ = child.wait();
+            }
+        }
     }
 }

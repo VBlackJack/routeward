@@ -113,6 +113,32 @@ pub(super) fn decide_first_udp_fragment(
     }
 }
 
+/// Verdict for a later fragment whose first fragment left no remembered verdict (never seen,
+/// expired or evicted). Such a fragment cannot be attributed, so it is dropped when the kill
+/// switch is on (it would otherwise leak a datagram that the rules may have blocked) and released
+/// unchanged when it is off. A fragment that may belong to another protocol is always released.
+pub(super) fn decide_orphan_fragment(
+    ctrl: &RouteWardController,
+    frag: &UdpFragmentMeta,
+) -> UdpFragmentVerdict {
+    if !frag.udp_confirmed || !ctrl.profile.read().security_policy.kill_switch_enabled {
+        return UdpFragmentVerdict::Reinject;
+    }
+    let drop_count = ctrl
+        .orphan_fragment_drop_count
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+    ctrl.push_rate_limited_warn(
+        "udp_orphan_fragment",
+        COMPONENT_WINDIVERT,
+        format!(
+            "Dropped orphan UDP fragment {} -> {} (id={}): no verdict remembered for its datagram and killSwitchEnabled=true (total orphan drops #{drop_count})",
+            frag.src_ip, frag.dst_ip, frag.fragment_id
+        ),
+    );
+    UdpFragmentVerdict::Drop
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,7 +149,7 @@ mod tests {
         build_forged_ipv4_udp_reply, parse_ipv4_udp_meta, parse_udp_fragment_meta, UdpFragmentKind,
         IPPROTO_UDP,
     };
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn controller(kill_switch: bool) -> RouteWardController {
         let constants = SystemConstants::load_embedded().expect("SystemConstants");
@@ -271,5 +297,131 @@ mod tests {
         )
         .expect("whole datagram");
         assert!(parse_udp_fragment_meta(&whole).is_none());
+    }
+
+    /// Later IPv4 fragment (offset 185) of the datagram that `first_fragment_packet` starts.
+    fn later_ipv4_fragment_packet() -> Vec<u8> {
+        let mut pkt = first_fragment_packet(9999);
+        pkt[6..8].copy_from_slice(&0x00B9u16.to_be_bytes());
+        pkt
+    }
+
+    /// Later IPv6 fragment (offset 184) whose fragment header announces `next_header`.
+    fn later_ipv6_fragment_packet(next_header: u8) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40 + 8 + 8];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&16u16.to_be_bytes());
+        pkt[6] = 44;
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
+        pkt[24..40].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets());
+        pkt[40] = next_header;
+        pkt[42..44].copy_from_slice(&0x00B9u16.to_be_bytes());
+        pkt[44..48].copy_from_slice(&0xCAFEBABEu32.to_be_bytes());
+        pkt
+    }
+
+    /// Mirrors the worker: a remembered verdict is replayed, otherwise the orphan rule applies.
+    fn verdict_for_later_fragment(
+        ctrl: &RouteWardController,
+        frag: &UdpFragmentMeta,
+    ) -> UdpFragmentVerdict {
+        ctrl.nat_table
+            .lookup_udp_fragment_verdict(&frag.key())
+            .unwrap_or_else(|| decide_orphan_fragment(ctrl, frag))
+    }
+
+    #[test]
+    fn orphan_ipv4_fragment_is_dropped_under_kill_switch_and_released_without_it() {
+        let frag = parse_udp_fragment_meta(&later_ipv4_fragment_packet()).expect("later fragment");
+        assert_eq!(frag.kind, UdpFragmentKind::NonFirst);
+
+        let on = controller(true);
+        assert_eq!(
+            verdict_for_later_fragment(&on, &frag),
+            UdpFragmentVerdict::Drop
+        );
+        assert_eq!(on.orphan_fragment_drop_count(), 1);
+        assert_eq!(
+            on.fragmented_udp_drop_count(),
+            0,
+            "orphan drops have their own counter"
+        );
+
+        let off = controller(false);
+        assert_eq!(
+            verdict_for_later_fragment(&off, &frag),
+            UdpFragmentVerdict::Reinject
+        );
+        assert_eq!(off.orphan_fragment_drop_count(), 0);
+    }
+
+    #[test]
+    fn orphan_ipv6_fragment_is_dropped_under_kill_switch_and_released_without_it() {
+        let frag = parse_udp_fragment_meta(&later_ipv6_fragment_packet(IPPROTO_UDP))
+            .expect("later fragment");
+        assert_eq!(frag.kind, UdpFragmentKind::NonFirst);
+
+        let on = controller(true);
+        assert_eq!(
+            verdict_for_later_fragment(&on, &frag),
+            UdpFragmentVerdict::Drop
+        );
+        assert_eq!(on.orphan_fragment_drop_count(), 1);
+
+        let off = controller(false);
+        assert_eq!(
+            verdict_for_later_fragment(&off, &frag),
+            UdpFragmentVerdict::Reinject
+        );
+        assert_eq!(off.orphan_fragment_drop_count(), 0);
+    }
+
+    #[test]
+    fn fragments_that_may_not_be_udp_are_never_dropped_as_orphans() {
+        // Next header 60 (destination options): the protocol behind it is unknown.
+        let frag =
+            parse_udp_fragment_meta(&later_ipv6_fragment_packet(60)).expect("later fragment");
+        assert!(!frag.udp_confirmed);
+        let on = controller(true);
+        assert_eq!(
+            verdict_for_later_fragment(&on, &frag),
+            UdpFragmentVerdict::Reinject
+        );
+        assert_eq!(on.orphan_fragment_drop_count(), 0);
+
+        // A TCP fragment is not classified as UDP at all: the worker releases it untouched.
+        assert!(parse_udp_fragment_meta(&later_ipv6_fragment_packet(6)).is_none());
+        let mut tcp_v4 = later_ipv4_fragment_packet();
+        tcp_v4[9] = 6;
+        assert!(parse_udp_fragment_meta(&tcp_v4).is_none());
+    }
+
+    #[test]
+    fn remembered_verdicts_are_still_replayed_to_later_fragments() {
+        let ctrl = controller(true);
+        let first = parse_udp_fragment_meta(&first_fragment_packet(9999)).expect("first");
+        let later = parse_udp_fragment_meta(&later_ipv4_fragment_packet()).expect("later");
+
+        ctrl.nat_table
+            .record_udp_fragment_verdict(first.key(), UdpFragmentVerdict::Reinject);
+        assert_eq!(
+            verdict_for_later_fragment(&ctrl, &later),
+            UdpFragmentVerdict::Reinject,
+            "a remembered Reinject beats the kill-switch orphan rule"
+        );
+        assert_eq!(ctrl.orphan_fragment_drop_count(), 0);
+
+        ctrl.nat_table
+            .record_udp_fragment_verdict(first.key(), UdpFragmentVerdict::Drop);
+        assert_eq!(
+            verdict_for_later_fragment(&ctrl, &later),
+            UdpFragmentVerdict::Drop
+        );
+        assert_eq!(
+            ctrl.orphan_fragment_drop_count(),
+            0,
+            "a replayed Drop is not an orphan drop"
+        );
     }
 }

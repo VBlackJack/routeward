@@ -125,9 +125,11 @@ Pour une exécution persistante sous `LocalSystem`, enregistrez RouteWard comme 
 # Empaqueter les binaires release en ZIP + SHA-256 (sans inclure les pilotes WinDivert) :
 .\packaging\windows\package-windows.ps1
 
-# Générer l'installateur Windows MSI (requiert WiX Toolset v6 `wix.exe`; l'option `-IncludeWinDivert` embarque les pilotes WinDivert présents) :
+# Générer l'installateur Windows MSI (requiert WiX Toolset v6 `wix.exe`; l'option `-IncludeWinDivert` embarque les fichiers WinDivert 2.2.2 présents, comme dans les MSI de release) :
 .\packaging\windows\build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64
 ```
+
+Les paquets `.msi` de release embarquent WinDivert 2.2.2 (`WinDivert.dll` et `WinDivert64.sys`, non modifiés, sous licence LGPLv3 ; mentions dans `THIRD_PARTY_NOTICES.txt`, archive des sources de WinDivert jointe à chaque release). Une mise à jour MSI réenregistre le service RouteWard avec ses arguments `--allow-sid` (`routeward service restore` ; les services en démarrage automatique sont relancés, ceux en démarrage manuel sont enregistrés arrêtés), et la désinstallation supprime le service du pilote WinDivert. Le ZIP portable ne contient pas WinDivert et exige toujours `tools/fetch-windivert.ps1`.
 
 ### Unité `systemd` & Paquet `.deb` sous Linux
 Pour un déploiement système sous Linux, utilisez `packaging/linux/build-deb.sh` (ou installez `packaging/linux/routeward.service` avec le groupe système `routeward`) :

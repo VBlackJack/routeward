@@ -173,6 +173,12 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: read
+    env:
+      # WinDivert 2.2.2 corresponding source (LGPLv3 obligation for the DLL and driver shipped in the MSI).
+      # The binary archive is pinned inside tools/fetch-windivert.ps1.
+      WINDIVERT_SOURCE_URL: https://github.com/basil00/WinDivert/archive/refs/tags/v2.2.2.tar.gz
+      WINDIVERT_SOURCE_SHA256: 300c1b14e08652e0f8647bf06e9b212f924af76cb2459bd0f88da481c9b08336
+      WINDIVERT_SOURCE_NAME: WinDivert-2.2.2-source.tar.gz
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -206,11 +212,32 @@ jobs:
       - name: Setup WiX Toolset CLI
         run: dotnet tool install --global wix --version 6.0.2
 
+      # Pinned SHA-256 of WinDivert-2.2.2-A.zip is enforced by the script. It extracts the unmodified
+      # x64 DLL and driver plus the upstream license texts into third_party/windivert/bin.
+      - name: Fetch WinDivert runtime and license files
+        shell: pwsh
+        run: ./tools/fetch-windivert.ps1
+
       - name: Package Windows bundle and MSI installer
         shell: pwsh
         run: |
           ./packaging/windows/package-windows.ps1 -TargetDir target/release -OutDir dist -Arch x64
-          ./packaging/windows/build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64
+          ./packaging/windows/build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64 -IncludeWinDivert
+
+      - name: Download WinDivert corresponding source archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $target = Join-Path dist $env:WINDIVERT_SOURCE_NAME
+          Invoke-WebRequest -Uri $env:WINDIVERT_SOURCE_URL -OutFile $target -UseBasicParsing
+          $actual = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:WINDIVERT_SOURCE_SHA256) {
+            Remove-Item -LiteralPath $target -Force
+            throw "SHA-256 mismatch for WinDivert source archive. Expected $($env:WINDIVERT_SOURCE_SHA256), actual $actual"
+          }
+          # LF line ending so `sha256sum -c` accepts the sidecar on every platform.
+          [System.IO.File]::WriteAllText("$target.sha256", "$actual  $($env:WINDIVERT_SOURCE_NAME)`n", [System.Text.Encoding]::ASCII)
 
       - name: Upload Windows ZIP and MSI as workflow artifact (manual runs only)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
@@ -223,6 +250,8 @@ jobs:
             dist/*.zip.sha256
             dist/*.msi
             dist/*.msi.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
 
       # Tag runs: hand the files to publish-release through the Actions cache.
       # The key has no run_attempt so a "re-run failed jobs" attempt still finds
@@ -238,6 +267,8 @@ jobs:
             dist/*.zip.sha256
             dist/*.msi
             dist/*.msi.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
           key: release-${{ github.run_id }}-windows
           lookup-only: true
           enableCrossOsArchive: true
@@ -251,6 +282,8 @@ jobs:
             dist/*.zip.sha256
             dist/*.msi
             dist/*.msi.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
           key: release-${{ github.run_id }}-windows
           enableCrossOsArchive: true
 
@@ -281,6 +314,8 @@ jobs:
             dist/*.zip.sha256
             dist/*.msi
             dist/*.msi.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
           key: release-${{ github.run_id }}-windows
           enableCrossOsArchive: true
           fail-on-cache-miss: true
@@ -301,8 +336,13 @@ jobs:
           debs=(*.deb)
           zips=(*.zip)
           msis=(*.msi)
+          sources=(*.tar.gz)
           if [ "${#debs[@]}" -ne 1 ] || [ "${#zips[@]}" -ne 1 ] || [ "${#msis[@]}" -ne 1 ]; then
             echo "Expected exactly one .deb, one .zip and one .msi in dist; found: ${debs[*]} ${zips[*]} ${msis[*]}" >&2
+            exit 1
+          fi
+          if [ "${#sources[@]}" -ne 1 ] || [ "${sources[0]}" != "WinDivert-2.2.2-source.tar.gz" ]; then
+            echo "Expected exactly the WinDivert 2.2.2 source archive among .tar.gz files; found: ${sources[*]}" >&2
             exit 1
           fi
           case "${debs[0]}" in *"_${version}_"*) ;; *) echo "${debs[0]} does not carry version $version" >&2; exit 1 ;; esac
@@ -310,19 +350,19 @@ jobs:
           case "${msis[0]}" in *"-${version}-"*) ;; *) echo "${msis[0]} does not carry version $version" >&2; exit 1 ;; esac
 
           # Sidecars hold "<hash>  <basename>"; verify each against its file.
-          for pkg in "${debs[0]}" "${zips[0]}" "${msis[0]}"; do
+          for pkg in "${debs[0]}" "${zips[0]}" "${msis[0]}" "${sources[0]}"; do
             if grep -q $'\r' "${pkg}.sha256"; then
               echo "${pkg}.sha256 has CRLF line endings; sidecars must use LF." >&2
               exit 1
             fi
             sha256sum -c "${pkg}.sha256"
           done
-          sha256sum "${debs[0]}" "${zips[0]}" "${msis[0]}" > SHA256SUMS.txt
+          sha256sum "${debs[0]}" "${zips[0]}" "${msis[0]}" "${sources[0]}" > SHA256SUMS.txt
 
       - name: Upload files to the draft release
         run: |
           set -euo pipefail
-          gh release upload "$TAG" dist/*.deb dist/*.deb.sha256 dist/*.zip dist/*.zip.sha256 dist/*.msi dist/*.msi.sha256 dist/SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" dist/*.deb dist/*.deb.sha256 dist/*.zip dist/*.zip.sha256 dist/*.msi dist/*.msi.sha256 dist/*.tar.gz dist/*.tar.gz.sha256 dist/SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
 
       - name: Publish the release
         run: |

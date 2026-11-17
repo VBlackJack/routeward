@@ -18,6 +18,8 @@ WinDivert is dual-licensed at the user's election under either:
 RouteWard elects to use WinDivert under the terms of the **GNU Lesser General Public License, Version 3 (LGPLv3)**:
 - RouteWard does **not** statically link WinDivert and does **not** commit WinDivert binary artifacts (`WinDivert.dll`, `WinDivert64.sys`, `WinDivert32.sys`) to the source repository.
 - On Windows, `routeward-core` loads `WinDivert.dll` exclusively at runtime via dynamic linking (`LoadLibraryW` / `GetProcAddress`).
+- The Windows **MSI installer** bundles the unmodified WinDivert 2.2.2 files (`WinDivert.dll` and `WinDivert64.sys`). The notices are reproduced in `THIRD_PARTY_NOTICES.txt`, and the corresponding WinDivert source archive is attached to each RouteWard release.
+- The portable **ZIP** does not contain any WinDivert binary: users fetch it with `tools/fetch-windivert.ps1` (SHA-256 verified).
 - Users are free to inspect, modify, recompile, or replace `WinDivert.dll` on disk with any interface-compatible version, in accordance with Section 4 of the GNU Lesser General Public License v3.
 
 ---

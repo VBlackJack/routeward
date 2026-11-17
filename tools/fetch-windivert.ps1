@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Downloads, verifies (SHA-256), and extracts the official WinDivert 2.2.2-A runtime binaries.
+    Downloads, verifies (SHA-256), and extracts the official WinDivert 2.2.2-A x64 runtime binaries and license texts.
 .DESCRIPTION
     Copyright 2026 Julien Bombled
 
@@ -46,6 +46,12 @@ $resolvedOutputDir = [System.IO.Path]::GetFullPath($OutputDirectory)
 $tempZipPath = Join-Path -Path $resolvedOutputDir -ChildPath 'WinDivert-2.2.2-A.zip'
 $tempExtractDir = Join-Path -Path $resolvedOutputDir -ChildPath '_extract_tmp'
 
+# Archive entry -> file name written next to the binaries.
+$licenseFiles = [ordered]@{
+    'LICENSE' = 'WinDivert-LICENSE.txt'
+    'README'  = 'WinDivert-README.txt'
+}
+
 if ($PSCmdlet.ShouldProcess($resolvedOutputDir, "Download WinDivert 2.2.2-A from $DownloadUrl and extract x64 binaries")) {
     if (-not (Test-Path -LiteralPath $resolvedOutputDir)) {
         New-Item -ItemType Directory -Path $resolvedOutputDir -Force | Out-Null
@@ -84,8 +90,19 @@ if ($PSCmdlet.ShouldProcess($resolvedOutputDir, "Download WinDivert 2.2.2-A from
     Copy-Item -LiteralPath $dllSource -Destination (Join-Path -Path $resolvedOutputDir -ChildPath 'WinDivert.dll') -Force
     Copy-Item -LiteralPath $sysSource -Destination (Join-Path -Path $resolvedOutputDir -ChildPath 'WinDivert64.sys') -Force
 
+    # License texts shipped with the binaries (LGPLv3 / GPLv3 / GPLv2 in one file, plus the README
+    # carrying the copyright and source pointers). Saved under explicit names next to the binaries.
+    $archiveRoot = Join-Path -Path $tempExtractDir -ChildPath 'WinDivert-2.2.2-A'
+    foreach ($entry in $licenseFiles.GetEnumerator()) {
+        $licenseSource = Join-Path -Path $archiveRoot -ChildPath $entry.Key
+        if (-not (Test-Path -LiteralPath $licenseSource)) {
+            throw "Expected license file '$($entry.Key)' was not found in the archive."
+        }
+        Copy-Item -LiteralPath $licenseSource -Destination (Join-Path -Path $resolvedOutputDir -ChildPath $entry.Value) -Force
+    }
+
     Remove-Item -LiteralPath $tempZipPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $tempExtractDir -Recurse -Force -ErrorAction SilentlyContinue
 
-    Write-Output "Extracted WinDivert.dll and WinDivert64.sys to $resolvedOutputDir"
+    Write-Output "Extracted WinDivert.dll, WinDivert64.sys and license files to $resolvedOutputDir"
 }

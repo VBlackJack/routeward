@@ -23,7 +23,13 @@ Type=simple
 User=root
 Group=routeward
 ExecStart=/usr/bin/routeward daemon
-ExecStopPost=/usr/bin/routeward cleanup --force
+# Crash behaviour: when the daemon dies (SERVICE_RESULT is not "success") and the persisted
+# profile has securityPolicy.killSwitchEnabled set, the host fails CLOSED: cleanup installs the
+# nftables table "inet routeward_ks" (drops all output except loopback, established traffic,
+# DHCP, ICMPv6 neighbour discovery and MLD) instead of removing every rule. With the kill switch
+# off, or after a clean stop, every RouteWard rule is removed (fail-open).
+# Recovery while blocked: run "routeward cleanup --force" (or start the daemon again).
+ExecStopPost=/usr/bin/routeward cleanup --force --fail-closed-on-crash
 Restart=on-failure
 RestartSec=3s
 KillMode=mixed

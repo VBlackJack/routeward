@@ -142,6 +142,79 @@ pub fn build_quoted_service_command_line(
     Ok(cmd)
 }
 
+/// Prefix Windows Installer puts in front of a REG_EXPAND_SZ value read by a raw registry search.
+/// `CreateServiceW` stores `ImagePath` as REG_EXPAND_SZ, so the captured value carries it.
+const IMAGE_PATH_EXPAND_SZ_PREFIX: &str = "#%";
+/// Win32 `ERROR_SERVICE_MARKED_FOR_DELETE`: the previous registration is still pending deletion
+/// (a handle is open elsewhere), so `CreateServiceW` cannot reuse the name yet.
+#[cfg(any(windows, test))]
+const ERROR_SERVICE_MARKED_FOR_DELETE_CODE: u32 = 1072;
+/// Maximum number of registration attempts when the service is still marked for deletion.
+#[cfg(any(windows, test))]
+const RESTORE_MAX_ATTEMPTS: u32 = 5;
+/// Delay between registration attempts while the service is still marked for deletion.
+#[cfg(windows)]
+const RESTORE_RETRY_DELAY_MS: u64 = 1000;
+/// Verb tokens that must follow the executable in a RouteWard service command line.
+const SERVICE_COMMAND_VERBS: [&str; 2] = ["service", "run"];
+/// The only flag a RouteWard service command line may carry.
+const SERVICE_ALLOW_SID_FLAG: &str = "--allow-sid";
+
+/// Extracts and re-validates the `--allow-sid` principals from the arguments of a previously
+/// registered service command line (the registry `ImagePath` of the old service, split like a
+/// command line: quotes already consumed).
+///
+/// The expected grammar is strictly `<exe> service run [--allow-sid <SID>]...`, which is exactly
+/// what `build_quoted_service_command_line` writes. Anything else (unknown flags, `--flag=value`
+/// forms, a flag without value, extra positional tokens) is rejected so that a tampered registry
+/// value or installer property can never smuggle extra arguments into the re-registered service.
+/// The executable token is checked for sanity but never returned: the caller must register the
+/// path of the NEW binary, not the one recorded by the old installation.
+pub fn parse_service_image_path_args(args: &[String]) -> RouteWardResult<Vec<String>> {
+    let invalid = |detail: String| RouteWardError::DaemonError {
+        key: ERR_KEY_DAEMON_IPC_ERROR,
+        detail,
+    };
+    let mut tokens = args.iter().map(String::as_str);
+    let exe = tokens
+        .next()
+        .ok_or_else(|| invalid("Captured service ImagePath is empty".to_string()))?;
+    let exe = exe
+        .strip_prefix(IMAGE_PATH_EXPAND_SZ_PREFIX)
+        .unwrap_or(exe)
+        .trim();
+    if exe.is_empty() || exe.contains('"') || exe.chars().any(|c| c.is_control()) {
+        return Err(invalid(format!(
+            "Captured service ImagePath has an invalid executable token '{exe}'"
+        )));
+    }
+    for verb in SERVICE_COMMAND_VERBS {
+        if tokens.next() != Some(verb) {
+            return Err(invalid(format!(
+                "Captured service ImagePath is not a RouteWard 'service run' command line (expected '{verb}')"
+            )));
+        }
+    }
+    let mut sids: Vec<String> = Vec::new();
+    while let Some(flag) = tokens.next() {
+        if flag != SERVICE_ALLOW_SID_FLAG {
+            return Err(invalid(format!(
+                "Captured service ImagePath carries an unexpected argument '{flag}'"
+            )));
+        }
+        let raw_sid = tokens.next().ok_or_else(|| {
+            invalid(format!(
+                "Captured service ImagePath has '{SERVICE_ALLOW_SID_FLAG}' without a value"
+            ))
+        })?;
+        let canon = validate_and_canonicalize_allowed_sid(raw_sid)?;
+        if !sids.contains(&canon) {
+            sids.push(canon);
+        }
+    }
+    Ok(sids)
+}
+
 pub type ServiceMainRunner =
     Box<dyn FnOnce(String, Vec<String>, watch::Receiver<bool>) -> RouteWardResult<()> + Send>;
 
@@ -927,6 +1000,72 @@ pub fn install_windows_service(
     }
 }
 
+/// Returns true when a failed registration attempt should be retried: the failure is
+/// `ERROR_SERVICE_MARKED_FOR_DELETE` (carried in the error detail as `os error 1072`) and fewer
+/// than `max_attempts` attempts have been made so far (`attempts_made` counts the failed one).
+#[cfg(any(windows, test))]
+fn should_retry_restore(detail: &str, attempts_made: u32, max_attempts: u32) -> bool {
+    let marker = format!("(os error {ERROR_SERVICE_MARKED_FOR_DELETE_CODE})");
+    attempts_made < max_attempts && detail.contains(&marker)
+}
+
+/// Re-registers the RouteWard service after an MSI upgrade removed it.
+///
+/// `image_path_args` is the old service `ImagePath` captured before the upgrade, split into
+/// arguments. Only its `--allow-sid` values are reused (re-validated like on a fresh install);
+/// the service binary is always the currently running executable, i.e. the NEW installed binary,
+/// whose location is re-verified before registration. `demand_start` selects manual start type
+/// (automatic otherwise) and `start` starts the service once registered.
+///
+/// A registration that fails with `ERROR_SERVICE_MARKED_FOR_DELETE` (the old service is still
+/// being deleted) is retried a bounded number of times with a short delay, then fails.
+///
+/// The restore API only distinguishes automatic from manual start: a service that was disabled
+/// (`Start = 4`) before the upgrade is restored as demand start, because the installer passes
+/// `--demand-start` for every old start type other than automatic.
+pub fn restore_windows_service(
+    image_path_args: &[String],
+    demand_start: bool,
+    start: bool,
+) -> RouteWardResult<WindowsServiceStatus> {
+    let allowed_sids = parse_service_image_path_args(image_path_args)?;
+    #[cfg(windows)]
+    {
+        let mut attempts_made = 0;
+        let status = loop {
+            match win32_impl::install(None, &allowed_sids, !demand_start) {
+                Ok(status) => break status,
+                Err(err) => {
+                    attempts_made += 1;
+                    let retry = match &err {
+                        RouteWardError::DaemonError { detail, .. } => {
+                            should_retry_restore(detail, attempts_made, RESTORE_MAX_ATTEMPTS)
+                        }
+                        _ => false,
+                    };
+                    if !retry {
+                        return Err(err);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(RESTORE_RETRY_DELAY_MS));
+                }
+            }
+        };
+        if start {
+            win32_impl::start()
+        } else {
+            Ok(status)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (allowed_sids, demand_start, start);
+        Err(RouteWardError::DaemonError {
+            key: ERR_KEY_DAEMON_IPC_ERROR,
+            detail: "Windows Service Control Manager is only available on Windows".to_string(),
+        })
+    }
+}
+
 pub fn uninstall_windows_service() -> RouteWardResult<()> {
     #[cfg(windows)]
     {
@@ -1006,6 +1145,27 @@ pub fn run_windows_service_dispatcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_retries_only_marked_for_delete_within_bound() {
+        let marked = "CreateServiceW failed: The specified service has been marked for deletion. (os error 1072)";
+        assert!(should_retry_restore(marked, 1, RESTORE_MAX_ATTEMPTS));
+        assert!(should_retry_restore(
+            marked,
+            RESTORE_MAX_ATTEMPTS - 1,
+            RESTORE_MAX_ATTEMPTS
+        ));
+        assert!(!should_retry_restore(
+            marked,
+            RESTORE_MAX_ATTEMPTS,
+            RESTORE_MAX_ATTEMPTS
+        ));
+        assert!(!should_retry_restore(
+            "CreateServiceW failed: Access is denied. (os error 5)",
+            1,
+            RESTORE_MAX_ATTEMPTS
+        ));
+    }
 
     #[test]
     fn write_class_access_masks_are_detected() {
@@ -1120,5 +1280,137 @@ mod tests {
             &["WD".to_string()],
         )
         .is_err());
+    }
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn image_path_parsing_extracts_validated_sids() {
+        let sids = parse_service_image_path_args(&args(&[
+            r"C:\Program Files\RouteWard\routeward.exe",
+            "service",
+            "run",
+            "--allow-sid",
+            "S-1-5-21-100-200-300-1001",
+            "--allow-sid",
+            "S-1-5-21-100-200-300-1002",
+            "--allow-sid",
+            "S-1-5-21-100-200-300-1001",
+        ]))
+        .expect("well formed image path");
+        assert_eq!(
+            sids,
+            vec![
+                "S-1-5-21-100-200-300-1001".to_string(),
+                "S-1-5-21-100-200-300-1002".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn image_path_parsing_accepts_expand_sz_prefix_and_no_sid() {
+        let sids = parse_service_image_path_args(&args(&[
+            r"#%C:\Program Files\RouteWard\routeward.exe",
+            "service",
+            "run",
+        ]))
+        .expect("prefixed image path without SID");
+        assert!(sids.is_empty());
+    }
+
+    #[test]
+    fn image_path_parsing_rejects_missing_or_malformed_parts() {
+        assert!(parse_service_image_path_args(&[]).is_err());
+        assert!(parse_service_image_path_args(&args(&[""])).is_err());
+        assert!(parse_service_image_path_args(&args(&["#%", "service", "run"])).is_err());
+        assert!(parse_service_image_path_args(&args(&[r"C:\rw\routeward.exe"])).is_err());
+        assert!(
+            parse_service_image_path_args(&args(&[r"C:\rw\routeward.exe", "service"])).is_err()
+        );
+        assert!(
+            parse_service_image_path_args(&args(&[r"C:\rw\routeward.exe", "daemon", "run"]))
+                .is_err()
+        );
+        // Flag without a value.
+        assert!(parse_service_image_path_args(&args(&[
+            r"C:\rw\routeward.exe",
+            "service",
+            "run",
+            "--allow-sid"
+        ]))
+        .is_err());
+        // Executable path that still carries a quote (unbalanced capture).
+        assert!(parse_service_image_path_args(&args(&[
+            "\"C:\\rw\\routeward.exe",
+            "service",
+            "run"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn image_path_parsing_rejects_injected_arguments() {
+        let base = [r"C:\rw\routeward.exe", "service", "run"];
+        let with = |extra: &[&str]| {
+            let mut v = args(&base);
+            v.extend(args(extra));
+            v
+        };
+        assert!(parse_service_image_path_args(&with(&["--bin-path", r"C:\evil.exe"])).is_err());
+        assert!(parse_service_image_path_args(&with(&["--allow-current-user"])).is_err());
+        assert!(
+            parse_service_image_path_args(&with(&["--allow-sid=S-1-5-21-1-2-3-1000"])).is_err()
+        );
+        assert!(parse_service_image_path_args(&with(&[
+            "--allow-sid",
+            "S-1-5-21-1-2-3-1000",
+            "--locale",
+            "fr"
+        ]))
+        .is_err());
+        assert!(parse_service_image_path_args(&with(&["extra"])).is_err());
+        // A value that is itself a flag is not a valid SID.
+        assert!(parse_service_image_path_args(&with(&["--allow-sid", "--allow-sid"])).is_err());
+    }
+
+    #[test]
+    fn image_path_parsing_rejects_broad_or_injected_sids() {
+        let base = [r"C:\rw\routeward.exe", "service", "run", "--allow-sid"];
+        for sid in [
+            "S-1-1-0",
+            "WD",
+            "S-1-5-11",
+            "S-1-5-21-1-2-3-1000;(A;;GA;;;WD)",
+        ] {
+            let mut v = args(&base);
+            v.push(sid.to_string());
+            assert!(
+                parse_service_image_path_args(&v).is_err(),
+                "SID '{sid}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn image_path_round_trips_the_install_command_line() {
+        let sid = "S-1-5-21-100-200-300-1001".to_string();
+        let cmd = build_quoted_service_command_line(
+            r"C:\Program Files\RouteWard\routeward.exe",
+            std::slice::from_ref(&sid),
+        )
+        .expect("quoted command line");
+        // Split like the C runtime does: the quoted executable path is one token.
+        let (exe, rest) = cmd
+            .strip_prefix('"')
+            .and_then(|c| c.split_once("\" "))
+            .expect("quoted executable");
+        let mut split = vec![exe.to_string()];
+        split.extend(rest.split_whitespace().map(str::to_string));
+        assert_eq!(
+            parse_service_image_path_args(&split).expect("round trip"),
+            vec![sid]
+        );
     }
 }
