@@ -38,6 +38,10 @@ const SOCKS5_UDP_IPV4_HEADER_LEN: usize = 10;
 const SOCKS5_UDP_IPV6_HEADER_LEN: usize = 22;
 const DEFAULT_UDP_DATAGRAM_READ_TIMEOUT_MS: u64 = 3500;
 const MAX_UDP_DATAGRAM_BYTES: usize = 65535;
+/// Minimum delay between two full-table eviction sweeps triggered from the per-datagram lookup
+/// path. A single lookup still rejects its own expired or dead entry immediately; the sweep only
+/// reclaims other stale entries, so bounding its frequency keeps lookups O(1) under packet load.
+const UDP_EVICTION_SWEEP_INTERVAL_MS: u64 = 1000;
 
 /// Target endpoint carried inside an RFC 1928 §7 SOCKS5 UDP request/reply header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +358,8 @@ pub struct UdpAssociationManager {
     epoch: Instant,
     idle_timeout_ms: u64,
     max_associations: usize,
+    /// Manager-relative time (ms) of the last full eviction sweep, shared across clones.
+    last_sweep_ms: Arc<AtomicU64>,
 }
 
 impl UdpAssociationManager {
@@ -378,6 +384,7 @@ impl UdpAssociationManager {
             epoch: Instant::now(),
             idle_timeout_ms: idle_timeout.as_millis().max(1) as u64,
             max_associations: max_associations.max(1),
+            last_sweep_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -422,6 +429,26 @@ impl UdpAssociationManager {
         count
     }
 
+    /// Runs a full eviction sweep unless one ran less than `UDP_EVICTION_SWEEP_INTERVAL_MS` ago.
+    /// Returns `true` when a sweep was performed.
+    fn maybe_evict_expired_and_dead(&self) -> bool {
+        let now_ms = self.now_ms();
+        let last = self.last_sweep_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < UDP_EVICTION_SWEEP_INTERVAL_MS {
+            return false;
+        }
+        // Only the task that wins the exchange sweeps; concurrent lookups skip it.
+        if self
+            .last_sweep_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        self.evict_expired_and_dead();
+        true
+    }
+
     fn evict_oldest_idle(&self) -> bool {
         let oldest_key = self
             .sessions
@@ -456,13 +483,15 @@ impl UdpAssociationManager {
         client_addr: SocketAddr,
         proxy_id: &str,
     ) -> Option<Arc<UdpAssociationSession>> {
-        self.evict_expired_and_dead();
+        self.maybe_evict_expired_and_dead();
         let key = UdpAssociationKey {
             client_addr,
             proxy_id: proxy_id.to_string(),
         };
         let session = self.sessions.get(&key).map(|e| Arc::clone(e.value()))?;
-        if !session.is_control_alive() {
+        let expired =
+            self.now_ms().saturating_sub(session.last_activity_ms()) >= self.idle_timeout_ms;
+        if !session.is_control_alive() || expired {
             self.sessions.remove(&key);
             return None;
         }
@@ -1100,6 +1129,54 @@ mod tests {
         // Wait past the 60ms idle timeout -> all associations expire
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(manager.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn lookup_rejects_its_own_expired_entry_without_a_full_sweep() {
+        let manager = UdpAssociationManager::with_limits(
+            Duration::from_millis(20),
+            8,
+            Duration::from_secs(60),
+        );
+        let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        std_sock.set_nonblocking(true).unwrap();
+        let session = Arc::new(UdpAssociationSession {
+            key: UdpAssociationKey {
+                client_addr: "127.0.0.1:50101".parse().unwrap(),
+                proxy_id: "proxy-1".to_string(),
+            },
+            proxy_name: "Proxy 1".to_string(),
+            relay_udp_addr: "127.0.0.1:1080".parse().unwrap(),
+            udp_socket: Arc::new(UdpSocket::from_std(std_sock).unwrap()),
+            control_alive: Arc::new(AtomicBool::new(true)),
+            shutdown_notify: Arc::new(Notify::new()),
+            last_activity_ms: AtomicU64::new(manager.now_ms()),
+            _udp_port_guard: None,
+            _tcp_port_guard: None,
+            recv_state: tokio::sync::Mutex::new(vec![0u8; MAX_UDP_DATAGRAM_BYTES]),
+        });
+        manager.insert_session(session);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // The sweep interval has not elapsed, so no full sweep runs, yet the expired entry
+        // must still be refused (and removed) by the lookup itself.
+        assert!(!manager.maybe_evict_expired_and_dead());
+        assert!(manager
+            .get_live_session("127.0.0.1:50101".parse().unwrap(), "proxy-1")
+            .is_none());
+        assert_eq!(manager.sessions.len(), 0);
+    }
+
+    #[test]
+    fn sweep_is_time_bounded() {
+        let manager =
+            UdpAssociationManager::with_limits(Duration::from_secs(60), 8, Duration::from_secs(60));
+        // Right after creation the interval has not elapsed: no sweep.
+        assert!(!manager.maybe_evict_expired_and_dead());
+        // Pretend the last sweep happened long ago: exactly one sweep runs, the next is skipped.
+        manager.last_sweep_ms.store(0, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(UDP_EVICTION_SWEEP_INTERVAL_MS + 20));
+        assert!(manager.maybe_evict_expired_and_dead());
+        assert!(!manager.maybe_evict_expired_and_dead());
     }
 
     #[test]
