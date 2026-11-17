@@ -426,3 +426,190 @@ table ip6 other
         "routeward"
     ));
 }
+
+#[test]
+fn watchdog_mode_protocol_is_strict() {
+    assert_eq!(WatchdogMode::Open.as_str(), "open");
+    assert_eq!(WatchdogMode::Block.as_str(), "block");
+    assert_eq!(WatchdogMode::Disarm.as_str(), "disarm");
+    for mode in [
+        WatchdogMode::Open,
+        WatchdogMode::Block,
+        WatchdogMode::Disarm,
+    ] {
+        assert_eq!(WatchdogMode::parse(mode.as_str()), Some(mode));
+    }
+    for bogus in ["", "BLOCK", "block ", "blo", "close", "open;reboot"] {
+        assert_eq!(WatchdogMode::parse(bogus), None, "{bogus:?}");
+    }
+    assert_eq!(WatchdogMode::from_kill_switch(true), WatchdogMode::Block);
+    assert_eq!(WatchdogMode::from_kill_switch(false), WatchdogMode::Open);
+}
+
+#[test]
+fn crash_cleanup_action_fails_closed_only_on_unclean_stop_with_kill_switch() {
+    use CrashCleanupAction::{InstallFailClosed, RemoveAll};
+    assert_eq!(
+        decide_crash_cleanup_action(Some("success"), true),
+        RemoveAll
+    );
+    assert_eq!(
+        decide_crash_cleanup_action(Some("success"), false),
+        RemoveAll
+    );
+    for result in ["signal", "exit-code", "core-dump", "timeout", "watchdog"] {
+        assert_eq!(
+            decide_crash_cleanup_action(Some(result), true),
+            InstallFailClosed,
+            "{result}"
+        );
+        assert_eq!(
+            decide_crash_cleanup_action(Some(result), false),
+            RemoveAll,
+            "{result}"
+        );
+    }
+    assert_eq!(decide_crash_cleanup_action(None, true), RemoveAll);
+    assert_eq!(decide_crash_cleanup_action(None, false), RemoveAll);
+}
+
+#[test]
+fn fail_closed_ruleset_is_one_idempotent_transaction_with_expected_allowances() {
+    let ruleset = NftablesInterceptor::build_fail_closed_ruleset("routeward");
+    assert_eq!(fail_closed_table_name("routeward"), "routeward_ks");
+    for old in ["ip", "ip6"] {
+        let declare = ruleset
+            .find(&format!("table {old} routeward {{}}"))
+            .expect("declare");
+        let delete = ruleset
+            .find(&format!("delete table {old} routeward\n"))
+            .expect("delete");
+        assert!(declare < delete);
+    }
+    assert!(ruleset.contains("table inet routeward_ks {}\ndelete table inet routeward_ks\n"));
+    assert!(ruleset.contains("table inet routeward_ks {\n"));
+    assert!(ruleset.contains("type filter hook output priority 0; policy drop;"));
+    assert!(ruleset.contains("oif \"lo\" accept"));
+    assert!(ruleset.contains("ct state established,related accept"));
+    assert!(ruleset.contains("udp sport 68 udp dport 67 accept"));
+    assert!(ruleset.contains("udp sport 546 udp dport 547 accept"));
+    assert!(ruleset.contains(
+        "icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept"
+    ));
+    assert!(ruleset.contains("mld-listener-query"));
+    assert!(ruleset.contains("mld2-listener-report"));
+    assert!(!ruleset.contains('\''));
+}
+
+#[test]
+fn watchdog_script_embeds_mode_protocol_and_block_transaction() {
+    let spec = TproxyRoutingSpec {
+        fwmark: 21080,
+        route_table: 100,
+        rule_priority: 10810,
+        tproxy_port: 10854,
+    };
+    let wd = NftablesInterceptor::build_watchdog_cleanup_script("nft", "ip", "routeward", spec);
+    assert!(
+        wd.contains("mode=open; while read -r m; do case \"$m\" in open|block|disarm) mode=$m;;")
+    );
+    assert!(wd.contains("nft -f -"));
+    assert!(wd.contains("policy drop"));
+    assert!(wd.contains("nft delete table inet routeward_ks"));
+    assert!(!wd.contains("cat >/dev/null"));
+}
+
+#[cfg(unix)]
+mod watchdog_script_execution {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicU32;
+
+    static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
+
+    /// Runs the real watchdog script against recording stub binaries, feeding it `lines` on
+    /// stdin and then closing the pipe. Returns everything the stubs recorded.
+    fn run_watchdog(lines: &[&str]) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "routeward-wd-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("log.txt");
+        for name in ["nft", "ip"] {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"{name} $*\" >> '{}'\nif [ \"$1\" = \"-f\" ]; then cat >> '{}'; fi\n",
+                    log.display(),
+                    log.display()
+                ),
+            )
+            .expect("stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let spec = TproxyRoutingSpec {
+            fwmark: 21080,
+            route_table: 100,
+            rule_priority: 10810,
+            tproxy_port: 10854,
+        };
+        let script = NftablesInterceptor::build_watchdog_cleanup_script(
+            &dir.join("nft").to_string_lossy(),
+            &dir.join("ip").to_string_lossy(),
+            "routeward",
+            spec,
+        );
+        let mut child = Command::new("sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn watchdog");
+        {
+            let mut stdin = child.stdin.take().expect("stdin");
+            for line in lines {
+                stdin.write_all(line.as_bytes()).expect("write");
+                stdin.write_all(b"\n").expect("write");
+            }
+        }
+        assert!(child.wait().expect("wait").success());
+        let recorded = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        recorded
+    }
+
+    #[test]
+    fn block_mode_installs_block_table_and_removes_tproxy_routing() {
+        let rec = run_watchdog(&["open", "block"]);
+        assert!(rec.contains("-f -"), "{rec}");
+        assert!(rec.contains("policy drop"), "{rec}");
+        assert!(rec.contains("rule del fwmark 21080"), "{rec}");
+        assert!(
+            rec.contains("route del local 0.0.0.0/0 dev lo table 100"),
+            "{rec}"
+        );
+    }
+
+    #[test]
+    fn last_valid_mode_wins_and_disarm_removes_everything() {
+        let rec = run_watchdog(&["block", "disarm"]);
+        assert!(!rec.contains("-f -"), "{rec}");
+        assert!(rec.contains("delete table ip routeward"), "{rec}");
+        assert!(rec.contains("delete table ip6 routeward"), "{rec}");
+        assert!(rec.contains("delete table inet routeward_ks"), "{rec}");
+    }
+
+    #[test]
+    fn open_mode_and_unknown_lines_fail_open() {
+        let rec = run_watchdog(&["block", "open"]);
+        assert!(!rec.contains("-f -"), "{rec}");
+        assert!(rec.contains("delete table ip routeward"), "{rec}");
+        let rec = run_watchdog(&["bogus", "BLOCK"]);
+        assert!(!rec.contains("-f -"), "{rec}");
+        let rec = run_watchdog(&[]);
+        assert!(rec.contains("delete table inet routeward_ks"), "{rec}");
+    }
+}
