@@ -60,6 +60,7 @@ L'ouverture du filtre WinDivert requiert les droits **Administrateur**. Ouvrir P
 **Symptôme** :
 - `routeward run` s'arrête avec `errors.interceptor.not_root` ou `errors.interceptor.nft_missing`.
 - Ou, si `routeward` et son processus watchdog ont été tués simultanément, le trafic TCP IPv4 sortant reste redirigé vers `:10810` et échoue.
+- Ou, avec `securityPolicy.killSwitchEnabled = true`, le daemon a planté ou a été tué et l'hôte a échoué en mode fermé : la table nftables `inet routeward_ks` bloque tout le trafic sortant sauf le loopback, les connexions établies, DHCP, la découverte de voisins IPv6 et MLD. Vérifier avec `sudo nft list table inet routeward_ks` ; exécuter `sudo routeward cleanup --force` pour la retirer (ou relancer le daemon avec l'interception active). Sous Windows, un crash laisse toujours passer le trafic.
 
 **Solution** :
 - Exécuter `routeward` en tant que `root` (`sudo routeward run`) et vérifier que le paquet `nftables` (binaire `nft`) est installé.
@@ -90,7 +91,7 @@ cargo build -p routeward-desktop
 ## 7. `WinDivert.dll` introuvable après installation via le `.msi` Windows
 
 **Symptôme** :
-L'installateur `.msi` s'est terminé sans erreur, mais l'interception échoue car `WinDivert.dll` est absent du dossier d'installation (cas standard lorsque le `.msi` est compilé sans `-IncludeWinDivert`).
+L'installateur `.msi` s'est terminé sans erreur, mais l'interception échoue car `WinDivert.dll` est absent du dossier d'installation (les `.msi` de release embarquent WinDivert 2.2.2 ; le cas se produit avec un `.msi` compilé localement sans `-IncludeWinDivert`, ou après une suppression manuelle des fichiers).
 
 **Solution** :
 Exécuter le script `fetch-windivert.ps1` fourni dans le dossier d'installation depuis un PowerShell administrateur afin de télécharger et vérifier WinDivert dans `C:\Program Files\RouteWard\` :

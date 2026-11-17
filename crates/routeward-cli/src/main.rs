@@ -31,8 +31,9 @@ use routeward_core::logger::FileLogger;
 use routeward_core::pac::PacGenerator;
 use routeward_core::rules::ConnectionRequest;
 use routeward_core::system::windows_service::{
-    install_windows_service, query_windows_service_status, run_windows_service_dispatcher,
-    start_windows_service, stop_windows_service, uninstall_windows_service,
+    install_windows_service, query_windows_service_status, restore_windows_service,
+    run_windows_service_dispatcher, start_windows_service, stop_windows_service,
+    uninstall_windows_service,
 };
 use routeward_core::telemetry::LogLevel;
 use std::path::PathBuf;
@@ -203,6 +204,23 @@ enum ServiceCommands {
         /// Configure manual start instead of automatic start on boot
         #[arg(long)]
         demand_start: bool,
+    },
+    /// Re-register the service after an MSI upgrade from the captured old ImagePath
+    Restore {
+        /// Start the service once it is registered
+        #[arg(long)]
+        start: bool,
+        /// Configure manual start instead of automatic start on boot
+        #[arg(long)]
+        demand_start: bool,
+        /// Captured old service command line (after `--`): executable token, `service run`, allow-sid flags
+        #[arg(
+            last = true,
+            required = true,
+            allow_hyphen_values = true,
+            value_name = "IMAGE_PATH_ARGS"
+        )]
+        image_path: Vec<String>,
     },
     /// Stop and remove the RouteWard Windows Service
     Uninstall,
@@ -629,6 +647,16 @@ fn handle_service_command(
             }
             let exe_str = bin_path.as_ref().map(|p| p.to_string_lossy().into_owned());
             let status = install_windows_service(exe_str.as_deref(), &allow_sid, !demand_start)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            eprintln!("{}", i18n.t("cli.engine.service.installed"));
+            Ok(())
+        }
+        ServiceCommands::Restore {
+            start,
+            demand_start,
+            image_path,
+        } => {
+            let status = restore_windows_service(&image_path, demand_start, start)?;
             println!("{}", serde_json::to_string_pretty(&status)?);
             eprintln!("{}", i18n.t("cli.engine.service.installed"));
             Ok(())
@@ -1228,6 +1256,48 @@ mod tests {
             }
             _ => panic!("unexpected parsed command"),
         }
+
+        let restore = CliArgs::try_parse_from([
+            "routeward",
+            "service",
+            "restore",
+            "--start",
+            "--",
+            r"C:\Program Files\RouteWard\routeward.exe",
+            "service",
+            "run",
+            "--allow-sid",
+            "S-1-5-21-1-2-3-1001",
+        ])
+        .expect("parse service restore");
+        match restore.command {
+            Commands::Service {
+                action:
+                    ServiceCommands::Restore {
+                        start,
+                        demand_start,
+                        image_path,
+                    },
+            } => {
+                assert!(start);
+                assert!(!demand_start);
+                assert_eq!(
+                    image_path,
+                    vec![
+                        r"C:\Program Files\RouteWard\routeward.exe".to_string(),
+                        "service".to_string(),
+                        "run".to_string(),
+                        "--allow-sid".to_string(),
+                        "S-1-5-21-1-2-3-1001".to_string(),
+                    ]
+                );
+            }
+            _ => panic!("unexpected parsed command"),
+        }
+        assert!(
+            CliArgs::try_parse_from(["routeward", "service", "restore", "--start"]).is_err(),
+            "restore without image path args must be rejected"
+        );
 
         let daemon = CliArgs::try_parse_from([
             "routeward",
