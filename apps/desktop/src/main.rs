@@ -16,6 +16,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod navigation;
+
 use routeward_core::ipc::generate_ephemeral_token;
 use routeward_desktop_lib::commands::DesktopCommandBridge;
 #[cfg(target_os = "windows")]
@@ -373,9 +375,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let init_script = format!("window.__ROUTEWARD_TOKEN__ = {ephemeral_token:?};");
+    let Some(allowed_authority) = navigation::ui_origin_authority(&ui_url) else {
+        report_fatal_ui_error(&bridge, "Invalid loopback UI URL");
+        return Err("Invalid loopback UI URL".into());
+    };
+    let bridge_for_nav = Arc::clone(&bridge);
+    let bridge_for_new_window = Arc::clone(&bridge);
     let mut web_context = WebContext::new(Some(webview_data_dir));
     let _webview = match WebViewBuilder::with_web_context(&mut web_context)
         .with_initialization_script(&init_script)
+        .with_navigation_handler(move |target| {
+            let allowed = navigation::is_navigation_allowed(&target, &allowed_authority);
+            if !allowed {
+                bridge_for_nav.log_warn(format!(
+                    "Blocked WebView navigation to {}",
+                    navigation::redact_url_for_log(&target)
+                ));
+            }
+            allowed
+        })
+        .with_new_window_req_handler(move |target| {
+            bridge_for_new_window.log_warn(format!(
+                "Blocked WebView new window request to {}",
+                navigation::redact_url_for_log(&target)
+            ));
+            false
+        })
         .with_url(&ui_url)
         .build(&window)
     {
