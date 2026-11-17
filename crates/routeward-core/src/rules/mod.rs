@@ -780,4 +780,393 @@ mod tests {
             .map
             .contains_key(&format!("k{}", MAX_CACHED_REGEX_PATTERNS + 4)));
     }
+
+    const TABLE_PROXY_ID: &str = "table-proxy";
+
+    fn table_rule(id: &str, priority: i32) -> crate::config::RoutingRule {
+        crate::config::RoutingRule {
+            id: id.to_string(),
+            name: format!("rule {id}"),
+            enabled: true,
+            priority,
+            process_patterns: vec![],
+            domain_patterns: vec![],
+            ip_cidrs: vec![],
+            port_ranges: vec![],
+            protocol: TransportProtocol::Any,
+            action: RuleAction::Proxy {
+                target_id: TABLE_PROXY_ID.to_string(),
+            },
+        }
+    }
+
+    fn table_request(process: &str, host: &str, ip: Option<&str>, port: u16) -> ConnectionRequest {
+        ConnectionRequest {
+            process_name: process.to_string(),
+            process_path: None,
+            target_host: host.to_string(),
+            target_ip: ip.map(str::to_string),
+            target_port: port,
+            protocol: TransportProtocol::Tcp,
+        }
+    }
+
+    fn matched_id(rules: &[crate::config::RoutingRule], req: &ConnectionRequest) -> String {
+        RuleEngine::evaluate(req, rules, &RuleAction::Direct, None).matched_rule_id
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn process_pattern_table() {
+        let cases = [
+            (vec!["firefox.exe"], "firefox.exe", true),
+            (vec!["firefox.exe"], "FIREFOX.EXE", true),
+            (vec!["FireFox.exe"], "firefox.exe", true),
+            (vec!["firefox.exe"], "C:\\Apps\\Mozilla\\firefox.exe", true),
+            (vec!["firefox.exe"], "/usr/bin/firefox.exe", true),
+            (vec!["fire*.exe"], "firefox.exe", true),
+            (vec!["*.exe"], "notepad.exe", true),
+            (vec!["chrome?.exe"], "chrome1.exe", true),
+            (vec!["chrome?.exe"], "chrome.exe", false),
+            (vec!["firefox.exe"], "firefox.exe.bak", false),
+            (vec!["firefox.exe"], "chrome.exe", false),
+            (vec!["firefox.exe", "chrome.exe"], "chrome.exe", true),
+            (vec!["!chrome.exe"], "chrome.exe", false),
+            (vec!["!chrome.exe"], "firefox.exe", true),
+            (vec!["*.exe", "!chrome.exe"], "chrome.exe", false),
+            (vec!["*.exe", "!chrome.exe"], "firefox.exe", true),
+            (vec!["*"], "anything", true),
+        ];
+        for (patterns, candidate, expected) in cases {
+            let patterns = strings(&patterns);
+            assert_eq!(
+                RuleEngine::matches_process_patterns(&patterns, candidate),
+                expected,
+                "{patterns:?} vs {candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_pattern_can_match_the_full_path() {
+        let mut rule = table_rule("by-path", 10);
+        rule.process_patterns = strings(&["c:\\games\\*"]);
+        let mut req = table_request("game.exe", "example.com", None, 443);
+        assert_ne!(matched_id(&[rule.clone()], &req), "by-path");
+        req.process_path = Some("C:\\Games\\Quake\\game.exe".to_string());
+        assert_eq!(matched_id(&[rule], &req), "by-path");
+    }
+
+    #[test]
+    fn domain_pattern_table() {
+        let cases = [
+            ("example.com", "example.com", true),
+            ("EXAMPLE.com", "example.com", true),
+            ("example.com", "www.example.com", false),
+            ("*.example.com", "www.example.com", true),
+            ("*.example.com", "a.b.example.com", true),
+            ("*.example.com", "example.com", true),
+            ("*.example.com", "badexample.com", false),
+            ("*.example.com", "example.com.evil.org", false),
+            ("api-*.example.com", "api-42.example.com", true),
+            ("api-*.example.com", "web.example.com", false),
+            ("a?.example.com", "ab.example.com", true),
+            ("a?.example.com", "abc.example.com", false),
+            ("*", "anything.example", true),
+            (
+                "regex:^api-[0-9]+\\.example\\.com$",
+                "api-7.example.com",
+                true,
+            ),
+            (
+                "regex:^api-[0-9]+\\.example\\.com$",
+                "api-x.example.com",
+                false,
+            ),
+            (
+                "REGEX:^API-[0-9]+\\.EXAMPLE\\.COM$",
+                "api-7.example.com",
+                true,
+            ),
+            ("Regex:^abc$", "ABC", true),
+            ("regex:", "example.com", true),
+            ("regex:(", "example.com", false),
+            ("regex:^$", "example.com", false),
+        ];
+        for (pattern, domain, expected) in cases {
+            assert_eq!(
+                RuleEngine::domain_match(pattern, domain),
+                expected,
+                "{pattern} vs {domain}"
+            );
+        }
+    }
+
+    #[test]
+    fn regex_prefix_table() {
+        let cases = [
+            ("regex:abc", Some("abc")),
+            ("REGEX:Abc", Some("Abc")),
+            ("Regex:", Some("")),
+            ("regex", None),
+            ("regexabc", None),
+            ("rege", None),
+            ("", None),
+            ("*.regex:x", None),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(RuleEngine::strip_regex_prefix(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn negation_table() {
+        let cases = [
+            ("!a", Some((true, "a"))),
+            ("  ! a  ", Some((true, "a"))),
+            ("a", Some((false, "a"))),
+            ("  a  ", Some((false, "a"))),
+            ("!", None),
+            ("!   ", None),
+            ("", None),
+            ("   ", None),
+            ("!!a", Some((true, "!a"))),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(RuleEngine::strip_negation(raw), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn cidr_table_v4_and_v6() {
+        let cases = [
+            ("10.0.0.0/8", "10.1.2.3", true),
+            ("10.0.0.0/8", "11.0.0.1", false),
+            ("192.168.1.0/24", "192.168.1.255", true),
+            ("192.168.1.0/24", "192.168.2.0", false),
+            ("203.0.113.7", "203.0.113.7", true),
+            ("203.0.113.7", "203.0.113.8", false),
+            ("203.0.113.7/32", "203.0.113.7", true),
+            ("0.0.0.0/0", "8.8.8.8", true),
+            ("2001:db8::/32", "2001:db8:1::1", true),
+            ("2001:db8::/32", "2001:db9::1", false),
+            ("::1", "::1", true),
+            ("::1/128", "::1", true),
+            ("::/0", "2606:4700::1111", true),
+            ("10.0.0.0/8", "2001:db8::1", false),
+            ("2001:db8::/32", "10.0.0.1", false),
+            ("not-a-cidr", "10.0.0.1", false),
+            ("10.0.0.0/33", "10.0.0.1", false),
+        ];
+        for (cidr, ip, expected) in cases {
+            let mut rule = table_rule("cidr", 10);
+            rule.ip_cidrs = strings(&[cidr]);
+            let req = table_request("app.exe", ip, Some(ip), 443);
+            let hit = matched_id(&[rule], &req) == "cidr";
+            assert_eq!(hit, expected, "{cidr} vs {ip}");
+        }
+    }
+
+    #[test]
+    fn cidr_negation_vetoes_and_negative_only_matches_the_rest() {
+        let mut rule = table_rule("not-lan", 10);
+        rule.ip_cidrs = strings(&["!10.0.0.0/8", "!2001:db8::/32"]);
+        let rules = [rule];
+        let cases = [
+            ("10.2.3.4", false),
+            ("2001:db8::5", false),
+            ("8.8.8.8", true),
+            ("2606:4700::1", true),
+        ];
+        for (ip, expected) in cases {
+            let req = table_request("app.exe", ip, Some(ip), 443);
+            assert_eq!(matched_id(&rules, &req) == "not-lan", expected, "{ip}");
+        }
+    }
+
+    #[test]
+    fn domain_or_cidr_positive_criteria_are_alternatives() {
+        let mut rule = table_rule("either", 10);
+        rule.domain_patterns = strings(&["*.corp.example"]);
+        rule.ip_cidrs = strings(&["10.0.0.0/8"]);
+        let rules = [rule];
+        let cases = [
+            ("app.corp.example", Some("203.0.113.9"), true),
+            ("other.example", Some("10.9.9.9"), true),
+            ("other.example", Some("203.0.113.9"), false),
+        ];
+        for (host, ip, expected) in cases {
+            let req = table_request("app.exe", host, ip, 443);
+            assert_eq!(
+                matched_id(&rules, &req) == "either",
+                expected,
+                "{host} {ip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_literal_host_is_matched_by_cidr_without_a_domain() {
+        let mut rule = table_rule("lan", 10);
+        rule.ip_cidrs = strings(&["192.168.0.0/16"]);
+        let req = table_request("app.exe", "192.168.4.5", None, 80);
+        let eval = RuleEngine::evaluate(&req, &[rule], &RuleAction::Direct, None);
+        assert_eq!(eval.matched_rule_id, "lan");
+        assert_eq!(eval.effective_domain, None);
+    }
+
+    #[test]
+    fn port_range_table() {
+        let ranges = |pairs: &[(u16, u16)]| {
+            pairs
+                .iter()
+                .map(|&(start, end)| crate::config::PortRange { start, end })
+                .collect::<Vec<_>>()
+        };
+        let cases = [
+            (ranges(&[(443, 443)]), 443, true),
+            (ranges(&[(443, 443)]), 80, false),
+            (ranges(&[(8000, 8999)]), 8000, true),
+            (ranges(&[(8000, 8999)]), 8999, true),
+            (ranges(&[(8000, 8999)]), 9000, false),
+            (ranges(&[(8000, 8999)]), 7999, false),
+            (ranges(&[(80, 80), (443, 443)]), 443, true),
+            (ranges(&[(80, 80), (443, 443)]), 8080, false),
+            (ranges(&[(1, 65535)]), 65535, true),
+            (ranges(&[]), 12345, true),
+        ];
+        for (port_ranges, port, expected) in cases {
+            let mut rule = table_rule("ports", 10);
+            rule.port_ranges = port_ranges.clone();
+            let req = table_request("app.exe", "example.com", None, port);
+            assert_eq!(
+                matched_id(&[rule], &req) == "ports",
+                expected,
+                "{port_ranges:?} vs {port}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_table() {
+        let cases = [
+            (TransportProtocol::Tcp, TransportProtocol::Tcp, true),
+            (TransportProtocol::Tcp, TransportProtocol::Udp, false),
+            (TransportProtocol::Udp, TransportProtocol::Udp, true),
+            (TransportProtocol::Udp, TransportProtocol::Tcp, false),
+            (TransportProtocol::Any, TransportProtocol::Tcp, true),
+            (TransportProtocol::Any, TransportProtocol::Udp, true),
+        ];
+        for (rule_proto, req_proto, expected) in cases {
+            let mut rule = table_rule("proto", 10);
+            rule.protocol = rule_proto;
+            let mut req = table_request("app.exe", "example.com", None, 443);
+            req.protocol = req_proto;
+            assert_eq!(
+                matched_id(&[rule], &req) == "proto",
+                expected,
+                "{rule_proto:?} vs {req_proto:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lowest_priority_value_wins_regardless_of_slice_order() {
+        let rules = vec![
+            table_rule("late", 30),
+            table_rule("early", 5),
+            table_rule("middle", 10),
+        ];
+        let req = table_request("app.exe", "example.com", None, 443);
+        assert_eq!(matched_id(&rules, &req), "early");
+
+        let mut sorted = rules.clone();
+        RuleEngine::sort_rules(&mut sorted);
+        assert!(RuleEngine::is_priority_ordered(&sorted));
+        assert!(!RuleEngine::is_priority_ordered(&rules));
+        assert_eq!(matched_id(&sorted, &req), "early");
+    }
+
+    #[test]
+    fn negative_priorities_sort_before_zero() {
+        let rules = vec![table_rule("zero", 0), table_rule("negative", -10)];
+        let req = table_request("app.exe", "example.com", None, 443);
+        assert_eq!(matched_id(&rules, &req), "negative");
+    }
+
+    #[test]
+    fn disabled_rules_are_skipped_and_fallback_uses_the_default_action() {
+        let mut disabled = table_rule("disabled", 1);
+        disabled.enabled = false;
+        let mut narrow = table_rule("narrow", 2);
+        narrow.domain_patterns = strings(&["only.example"]);
+        let rules = vec![disabled, narrow];
+
+        let req = table_request("app.exe", "other.example", None, 443);
+        let eval = RuleEngine::evaluate(&req, &rules, &RuleAction::Block, None);
+        assert_eq!(eval.matched_rule_id, DEFAULT_FALLBACK_RULE_ID);
+        assert_eq!(eval.matched_rule_name, DEFAULT_FALLBACK_RULE_NAME);
+        assert_eq!(eval.action, RuleAction::Block);
+
+        let hit = table_request("app.exe", "only.example", None, 443);
+        assert_eq!(matched_id(&rules, &hit), "narrow");
+    }
+
+    #[test]
+    fn empty_rule_list_returns_the_default_action() {
+        let req = table_request("app.exe", "example.com", None, 443);
+        let eval = RuleEngine::evaluate(&req, &[], &RuleAction::Direct, None);
+        assert_eq!(eval.action, RuleAction::Direct);
+        assert_eq!(eval.matched_rule_id, DEFAULT_FALLBACK_RULE_ID);
+    }
+
+    #[test]
+    fn blank_domain_and_cidr_patterns_do_not_constrain_a_rule() {
+        let mut rule = table_rule("blank", 10);
+        rule.domain_patterns = strings(&["", "   "]);
+        rule.ip_cidrs = strings(&["  "]);
+        let req = table_request("app.exe", "example.com", None, 443);
+        assert_eq!(matched_id(&[rule], &req), "blank");
+    }
+
+    #[test]
+    fn domain_match_is_case_and_trailing_dot_insensitive_in_evaluation() {
+        let mut rule = table_rule("dom", 10);
+        rule.domain_patterns = strings(&["*.Example.COM", "!Blocked.example.com"]);
+        let rules = [rule];
+        let cases = [
+            ("WWW.EXAMPLE.COM", true),
+            ("www.example.com.", true),
+            ("blocked.example.com", false),
+            ("BLOCKED.EXAMPLE.COM.", false),
+            ("example.org", false),
+        ];
+        for (host, expected) in cases {
+            let req = table_request("app.exe", host, None, 443);
+            assert_eq!(matched_id(&rules, &req) == "dom", expected, "{host}");
+        }
+    }
+
+    #[test]
+    fn exclusion_in_a_higher_priority_rule_falls_through_to_the_next_rule() {
+        let mut first = table_rule("first", 1);
+        first.domain_patterns = strings(&["*.example.com", "!secret.example.com"]);
+        first.process_patterns = strings(&["!legacy.exe"]);
+        let second = table_rule("second", 2);
+        let rules = [first, second];
+
+        let cases = [
+            ("app.exe", "www.example.com", "first"),
+            ("app.exe", "secret.example.com", "second"),
+            ("legacy.exe", "www.example.com", "second"),
+            ("app.exe", "other.org", "second"),
+        ];
+        for (process, host, expected) in cases {
+            let req = table_request(process, host, None, 443);
+            assert_eq!(matched_id(&rules, &req), expected, "{process} {host}");
+        }
+    }
 }
