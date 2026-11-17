@@ -40,7 +40,8 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
-      - run: npm audit --audit-level=high
+      # Advisories exempted by name, with a review date, live in ui/audit-exceptions.json.
+      - run: node scripts/audit.mjs
 
   rust-linux:
     name: Rust Check, Clippy, and Tests (Linux)
