@@ -27,14 +27,74 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # Creates (or reuses) a draft release. On tag runs no workflow artifact storage
+  # is used: build jobs hand their files to publish-release through the Actions
+  # cache, and only publish-release holds a write token.
+  draft-release:
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Create or refresh the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          notes_file="docs/release-notes/${TAG}.md"
+          notes_args=(--generate-notes)
+          if [ -f "$notes_file" ]; then
+            notes_args=(--notes-file "$notes_file")
+          fi
+
+          status=0
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft 2> "$RUNNER_TEMP/view.err" > "$RUNNER_TEMP/view.json" || status=$?
+          if [ "$status" -eq 0 ]; then
+            if [ "$(jq -r '.isDraft' "$RUNNER_TEMP/view.json")" != "true" ]; then
+              echo "Release $TAG is already published; refusing to modify it." >&2
+              exit 1
+            fi
+            # Reuse of a draft: drop every previous asset so stale files from an
+            # earlier attempt can never be published.
+            while IFS= read -r name; do
+              [ -n "$name" ] || continue
+              gh release delete-asset "$TAG" "$name" --yes --repo "$GITHUB_REPOSITORY"
+            done < <(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            if [ -f "$notes_file" ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "$TAG" --notes-file "$notes_file"
+            else
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "$TAG"
+            fi
+          elif grep -qi 'release not found' "$RUNNER_TEMP/view.err"; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" "${notes_args[@]}"
+          else
+            echo "Unable to look up release $TAG:" >&2
+            cat "$RUNNER_TEMP/view.err" >&2
+            exit 1
+          fi
+
   linux-deb:
+    needs: draft-release
+    if: ${{ !cancelled() && (needs.draft-release.result == 'success' || needs.draft-release.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -73,21 +133,51 @@ jobs:
       - name: Build Debian package
         run: bash packaging/linux/build-deb.sh --target-dir target/release --out-dir dist
 
-      - name: Upload Debian package
+      - name: Upload Debian package as workflow artifact (manual runs only)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-linux-deb
+          retention-days: 3
           path: |
             dist/*.deb
             dist/*.deb.sha256
 
+      # Tag runs: hand the files to publish-release through the Actions cache.
+      # The key has no run_attempt so a "re-run failed jobs" attempt still finds
+      # the files of a build job that succeeded in an earlier attempt. The lookup
+      # makes the save idempotent when a successful build job is rerun.
+      - name: Check for an existing release cache
+        id: existing
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            dist/*.deb
+            dist/*.deb.sha256
+          key: release-${{ github.run_id }}-linux
+          lookup-only: true
+
+      - name: Save release files for the publish job
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && steps.existing.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            dist/*.deb
+            dist/*.deb.sha256
+          key: release-${{ github.run_id }}-linux
+
   windows-zip:
+    needs: draft-release
+    if: ${{ !cancelled() && (needs.draft-release.result == 'success' || needs.draft-release.result == 'skipped') }}
     runs-on: windows-latest
     permissions:
       contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -122,44 +212,115 @@ jobs:
           ./packaging/windows/package-windows.ps1 -TargetDir target/release -OutDir dist -Arch x64
           ./packaging/windows/build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64
 
-      - name: Upload Windows ZIP and MSI artifacts
+      - name: Upload Windows ZIP and MSI as workflow artifact (manual runs only)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-windows-zip
+          retention-days: 3
           path: |
             dist/*.zip
             dist/*.zip.sha256
             dist/*.msi
             dist/*.msi.sha256
 
+      # Tag runs: hand the files to publish-release through the Actions cache.
+      # The key has no run_attempt so a "re-run failed jobs" attempt still finds
+      # the files of a build job that succeeded in an earlier attempt. The lookup
+      # makes the save idempotent when a successful build job is rerun.
+      - name: Check for an existing release cache
+        id: existing
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/*.msi
+            dist/*.msi.sha256
+          key: release-${{ github.run_id }}-windows
+          lookup-only: true
+          enableCrossOsArchive: true
+
+      - name: Save release files for the publish job
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && steps.existing.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/*.msi
+            dist/*.msi.sha256
+          key: release-${{ github.run_id }}-windows
+          enableCrossOsArchive: true
+
   publish-release:
     needs: [linux-deb, windows-zip]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
     steps:
-      - name: Download all release artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - name: Restore Linux release files
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: artifacts
+          path: |
+            dist/*.deb
+            dist/*.deb.sha256
+          key: release-${{ github.run_id }}-linux
+          fail-on-cache-miss: true
 
-      - name: Prepare combined release files and SHA256SUMS
+      - name: Restore Windows release files
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/*.msi
+            dist/*.msi.sha256
+          key: release-${{ github.run_id }}-windows
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Verify release files
+        working-directory: dist
         run: |
-          mkdir -p release-files
-          find artifacts -type f \( -name '*.deb' -o -name '*.zip' -o -name '*.msi' -o -name '*.sha256' \) -exec cp {} release-files/ \;
-          (
-            cd release-files
-            sha256sum *.deb *.zip *.msi > SHA256SUMS.txt
-          )
+          set -euo pipefail
+          # Tag v2026.1116.01 maps to Cargo version 2026.1116.1 (the sequence loses its leading zeros).
+          if ! [[ "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Tag $TAG does not match vYYYY.MMDD.NN" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((10#${BASH_REMATCH[3]}))"
+          echo "Expected package version: $version"
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          files: |
-            release-files/*.deb
-            release-files/*.zip
-            release-files/*.msi
-            release-files/*.sha256
-            release-files/SHA256SUMS.txt
-          generate_release_notes: true
+          shopt -s nullglob
+          debs=(*.deb)
+          zips=(*.zip)
+          msis=(*.msi)
+          if [ "${#debs[@]}" -ne 1 ] || [ "${#zips[@]}" -ne 1 ] || [ "${#msis[@]}" -ne 1 ]; then
+            echo "Expected exactly one .deb, one .zip and one .msi in dist; found: ${debs[*]} ${zips[*]} ${msis[*]}" >&2
+            exit 1
+          fi
+          case "${debs[0]}" in *"_${version}_"*) ;; *) echo "${debs[0]} does not carry version $version" >&2; exit 1 ;; esac
+          case "${zips[0]}" in *"-${version}-"*) ;; *) echo "${zips[0]} does not carry version $version" >&2; exit 1 ;; esac
+          case "${msis[0]}" in *"-${version}-"*) ;; *) echo "${msis[0]} does not carry version $version" >&2; exit 1 ;; esac
+
+          # Sidecars hold "<hash>  <basename>"; verify each against its file.
+          for pkg in "${debs[0]}" "${zips[0]}" "${msis[0]}"; do
+            sha256sum -c "${pkg}.sha256"
+          done
+          sha256sum "${debs[0]}" "${zips[0]}" "${msis[0]}" > SHA256SUMS.txt
+
+      - name: Upload files to the draft release
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/*.deb dist/*.deb.sha256 dist/*.zip dist/*.zip.sha256 dist/*.msi dist/*.msi.sha256 dist/SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"
