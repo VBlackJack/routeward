@@ -155,6 +155,10 @@ const RESTORE_MAX_ATTEMPTS: u32 = 5;
 /// Delay between registration attempts while the service is still marked for deletion.
 #[cfg(windows)]
 const RESTORE_RETRY_DELAY_MS: u64 = 1000;
+
+/// Poll interval while waiting for the service control manager to reach a desired state.
+#[cfg(windows)]
+const SERVICE_STATE_POLL_INTERVAL_MS: u64 = 200;
 /// Verb tokens that must follow the executable in a RouteWard service command line.
 const SERVICE_COMMAND_VERBS: [&str; 2] = ["service", "run"];
 /// The only flag a RouteWard service command line may carry.
@@ -247,11 +251,11 @@ mod win32_impl {
         SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_SHUTDOWN,
         SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION,
         SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
-        SERVICE_DEMAND_START, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE,
-        SERVICE_PAUSED, SERVICE_PAUSE_PENDING, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
-        SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
-        SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS, SERVICE_STOP,
-        SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_DEMAND_START, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_PAUSED,
+        SERVICE_PAUSE_PENDING, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+        SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
+        SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOPPED,
+        SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     };
 
     const SCM_START_WAIT_TIMEOUT_SECS: u64 = 15;
@@ -790,7 +794,6 @@ mod win32_impl {
                 SERVICE_CONFIG_DESCRIPTION,
                 &mut desc as *mut SERVICE_DESCRIPTIONW as *const c_void,
             );
-            let _ = SERVICE_NO_CHANGE;
         }
 
         query_handle_status(svc.0)
@@ -818,7 +821,7 @@ mod win32_impl {
                     ),
                 });
             }
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(SERVICE_STATE_POLL_INTERVAL_MS));
         }
     }
 
