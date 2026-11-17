@@ -189,7 +189,8 @@ try {
     }
 
     $hash = (Get-FileHash -LiteralPath $msiPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    Set-Content -LiteralPath "${msiPath}.sha256" -Value "$hash  $msiName" -Encoding ascii
+    # LF line ending so `sha256sum -c` accepts the sidecar on every platform.
+    [System.IO.File]::WriteAllText("${msiPath}.sha256", "$hash  $msiName`n", [System.Text.Encoding]::ASCII)
     Write-Output "Built $msiPath (MSI ProductVersion $msiVersion)"
 }
 finally {

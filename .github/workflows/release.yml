@@ -311,6 +311,10 @@ jobs:
 
           # Sidecars hold "<hash>  <basename>"; verify each against its file.
           for pkg in "${debs[0]}" "${zips[0]}" "${msis[0]}"; do
+            if grep -q $'\r' "${pkg}.sha256"; then
+              echo "${pkg}.sha256 has CRLF line endings; sidecars must use LF." >&2
+              exit 1
+            fi
             sha256sum -c "${pkg}.sha256"
           done
           sha256sum "${debs[0]}" "${zips[0]}" "${msis[0]}" > SHA256SUMS.txt
