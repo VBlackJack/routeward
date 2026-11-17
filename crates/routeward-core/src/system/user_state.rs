@@ -765,6 +765,26 @@ pub fn check_backup_file_facts(
     Ok(())
 }
 
+/// Longest time spent reading one user's backup file in the SYSTEM pass.
+pub const BACKUP_READ_DEADLINE_MS: u64 = 2000;
+
+/// Runs `work` on a worker thread and returns its result, or `None` when it did not finish within
+/// `deadline` (or the thread could not start). A worker that stays blocked (for example on a file
+/// held by an oplock) is detached, never joined: it cannot keep the process from exiting.
+pub fn run_with_deadline<T: Send + 'static>(
+    deadline: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("routeward-bounded-read".to_string())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .ok()?;
+    receiver.recv_timeout(deadline).ok()
+}
+
 /// [`BackupStore`] for code that runs with more rights than the profile owner (the SYSTEM pass
 /// over other users). It holds a backup read beforehand and never touches the file system:
 /// `save` does nothing, so nothing is created, renamed or deleted inside a user-controlled
@@ -889,6 +909,7 @@ mod win32 {
         RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegOpenKeyExW,
         RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS,
         KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE,
+        REG_OPTION_OPEN_LINK,
     };
 
     const SUBKEY_INTERNET_SETTINGS: &str =
@@ -922,6 +943,94 @@ mod win32 {
             // SAFETY: the handle was opened by this module and is closed exactly once.
             unsafe { RegCloseKey(self.0) };
         }
+    }
+
+    /// Value only a registry symbolic link key has (type `REG_LINK`).
+    const LINK_TARGET_VALUE: &str = "SymbolicLinkValue";
+
+    /// True when this key, opened without following links, is itself a registry symbolic link.
+    fn is_registry_link(key: &OpenKey) -> RouteWardResult<bool> {
+        let wide_name = to_wide(LINK_TARGET_VALUE);
+        let mut reg_type = 0u32;
+        let mut size = 0u32;
+        // SAFETY: a null data pointer asks only for the type and the size.
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                wide_name.as_ptr(),
+                std::ptr::null(),
+                &mut reg_type,
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        match status {
+            ERROR_FILE_NOT_FOUND => Ok(false),
+            ERROR_SUCCESS | ERROR_MORE_DATA => Ok(true),
+            other => Err(registry_error(format!(
+                "cannot tell whether a registry key is a link: error {other}"
+            ))),
+        }
+    }
+
+    /// Opens `hive\subkey` one component at a time without following registry symbolic links and
+    /// fails when any component is a link: in another user's hive, a link planted by that user
+    /// could send a SYSTEM write to a key of the machine. `Ok(None)`: a component does not exist.
+    fn open_key_rejecting_links(
+        hive: HKEY,
+        subkey: &str,
+        access: u32,
+    ) -> RouteWardResult<Option<OpenKey>> {
+        let parts: Vec<&str> = subkey.split('\\').filter(|part| !part.is_empty()).collect();
+        let mut current: Option<OpenKey> = None;
+        let mut parent = hive;
+        for (index, part) in parts.iter().enumerate() {
+            let wanted = if index + 1 == parts.len() {
+                access | KEY_QUERY_VALUE
+            } else {
+                KEY_QUERY_VALUE
+            };
+            let wide = to_wide(part);
+            let mut handle: HKEY = std::ptr::null_mut();
+            // SAFETY: `wide` is NUL-terminated and `handle` is a valid out pointer.
+            let status = unsafe {
+                RegOpenKeyExW(
+                    parent,
+                    wide.as_ptr(),
+                    REG_OPTION_OPEN_LINK,
+                    wanted,
+                    &mut handle,
+                )
+            };
+            match status {
+                ERROR_SUCCESS => {}
+                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => return Ok(None),
+                other => {
+                    return Err(registry_error(format!(
+                        "cannot open registry key {subkey}: error {other}"
+                    )))
+                }
+            }
+            let key = OpenKey(handle);
+            if is_registry_link(&key)? {
+                return Err(registry_error(format!(
+                    "refusing registry key {subkey}: {part} is a symbolic link"
+                )));
+            }
+            parent = key.0;
+            current = Some(key);
+        }
+        Ok(current)
+    }
+
+    /// Test hook: whether the link-safe open finds the key.
+    #[cfg(test)]
+    pub(super) fn open_key_rejecting_links_for_test(
+        hive: HKEY,
+        subkey: &str,
+        access: u32,
+    ) -> RouteWardResult<bool> {
+        Ok(open_key_rejecting_links(hive, subkey, access)?.is_some())
     }
 
     /// Opens `hive\subkey`; `Ok(None)` when it does not exist.
@@ -1011,6 +1120,20 @@ mod win32 {
             }
         }
 
+        /// Opens the key of `location`. Another user's hive is opened link-safe and is never
+        /// created: when the key is absent there is nothing of RouteWard's to restore.
+        fn open_location(
+            &self,
+            location: RegLocation,
+            access: u32,
+        ) -> RouteWardResult<Option<OpenKey>> {
+            let (hive, subkey) = self.hive_and_subkey(location);
+            match self.root {
+                RegistryRoot::CurrentUser => open_key(hive, &subkey, access),
+                RegistryRoot::LoadedUser(_) => open_key_rejecting_links(hive, &subkey, access),
+            }
+        }
+
         fn hive_and_subkey(&self, location: RegLocation) -> (HKEY, String) {
             let relative = match location {
                 RegLocation::InternetSettings => SUBKEY_INTERNET_SETTINGS,
@@ -1025,8 +1148,7 @@ mod win32 {
 
     impl UserSettingsStore for Win32RegistryStore {
         fn read(&self, location: RegLocation, name: &str) -> RouteWardResult<Option<RegValue>> {
-            let (hive, subkey) = self.hive_and_subkey(location);
-            let Some(key) = open_key(hive, &subkey, KEY_QUERY_VALUE)? else {
+            let Some(key) = self.open_location(location, KEY_QUERY_VALUE)? else {
                 return Ok(None);
             };
             Ok(read_raw(&key, name)?.and_then(|(reg_type, data)| decode_reg_data(reg_type, &data)))
@@ -1038,29 +1160,40 @@ mod win32 {
             name: &str,
             value: &RegValue,
         ) -> RouteWardResult<()> {
-            let (hive, subkey) = self.hive_and_subkey(location);
-            let wide_subkey = to_wide(&subkey);
-            let mut handle: HKEY = std::ptr::null_mut();
-            // SAFETY: `wide_subkey` is NUL-terminated; the optional pointers are null.
-            let status = unsafe {
-                RegCreateKeyExW(
-                    hive,
-                    wide_subkey.as_ptr(),
-                    0,
-                    std::ptr::null(),
-                    REG_OPTION_NON_VOLATILE,
-                    KEY_SET_VALUE,
-                    std::ptr::null(),
-                    &mut handle,
-                    std::ptr::null_mut(),
-                )
+            let key = match self.root {
+                RegistryRoot::CurrentUser => {
+                    let (hive, subkey) = self.hive_and_subkey(location);
+                    let wide_subkey = to_wide(&subkey);
+                    let mut handle: HKEY = std::ptr::null_mut();
+                    // SAFETY: `wide_subkey` is NUL-terminated; the optional pointers are null.
+                    let status = unsafe {
+                        RegCreateKeyExW(
+                            hive,
+                            wide_subkey.as_ptr(),
+                            0,
+                            std::ptr::null(),
+                            REG_OPTION_NON_VOLATILE,
+                            KEY_SET_VALUE,
+                            std::ptr::null(),
+                            &mut handle,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if status != ERROR_SUCCESS {
+                        return Err(registry_error(format!(
+                            "cannot open registry key {subkey} for writing: error {status}"
+                        )));
+                    }
+                    OpenKey(handle)
+                }
+                RegistryRoot::LoadedUser(_) => {
+                    let Some(key) = self.open_location(location, KEY_SET_VALUE)? else {
+                        // No key, so none of RouteWard's values to restore: create nothing.
+                        return Ok(());
+                    };
+                    key
+                }
             };
-            if status != ERROR_SUCCESS {
-                return Err(registry_error(format!(
-                    "cannot open registry key {subkey} for writing: error {status}"
-                )));
-            }
-            let key = OpenKey(handle);
             let (reg_type, data) = encode_reg_data(value);
             let wide_name = to_wide(name);
             // SAFETY: `data` is a valid buffer of `data.len()` bytes.
@@ -1083,8 +1216,7 @@ mod win32 {
         }
 
         fn delete(&self, location: RegLocation, name: &str) -> RouteWardResult<()> {
-            let (hive, subkey) = self.hive_and_subkey(location);
-            let Some(key) = open_key(hive, &subkey, KEY_SET_VALUE)? else {
+            let Some(key) = self.open_location(location, KEY_SET_VALUE)? else {
                 return Ok(());
             };
             let wide_name = to_wide(name);
@@ -1157,10 +1289,11 @@ mod win32 {
         };
         use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
         use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+            CreateFileW, GetFileInformationByHandle, GetFileType, GetFinalPathNameByHandleW,
             BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS,
+            FILE_SHARE_WRITE, FILE_TYPE_DISK, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+            SECURITY_SQOS_PRESENT, VOLUME_NAME_DOS,
         };
 
         let wide: Vec<u16> = path
@@ -1176,7 +1309,7 @@ mod win32 {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                 std::ptr::null_mut(),
             )
         };
@@ -1191,6 +1324,13 @@ mod win32 {
         }
         // SAFETY: `handle` is a valid, owned file handle; `File` closes it on drop.
         let file = unsafe { std::fs::File::from_raw_handle(handle) };
+
+        // An object-manager symbolic link could have led to a pipe or a device: refuse anything
+        // that is not a disk file before asking it anything else.
+        // SAFETY: `handle` is a valid open handle.
+        if unsafe { GetFileType(handle) } != FILE_TYPE_DISK {
+            return Err("the path does not lead to a disk file".to_string());
+        }
 
         // SAFETY: `info` is a valid out structure for this handle.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -1229,8 +1369,13 @@ mod win32 {
                 &mut descriptor,
             )
         };
-        if status != ERROR_SUCCESS || owner.is_null() {
+        if status != ERROR_SUCCESS {
             return Err(format!("cannot read the file owner: error {status}"));
+        }
+        if owner.is_null() {
+            // SAFETY: the call succeeded, so the descriptor was allocated by it.
+            unsafe { LocalFree(descriptor) };
+            return Err("the file has no owner".to_string());
         }
         let mut sid_text: *mut u16 = std::ptr::null_mut();
         // SAFETY: `owner` points into `descriptor`, which is still alive.
@@ -1323,12 +1468,20 @@ pub fn cleanup_all_loaded_users(
             Ok(win32::profile_dir(sid)?.map(|dir| {
                 // The profile directory comes from HKLM (trusted); its resolved form is the
                 // location the backup handle must end up at.
-                let trusted_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-                let outcome = win32::read_backup_file_securely(
-                    &backup_path_in_profile(&dir),
-                    &backup_path_in_profile(&trusted_dir),
-                    sid,
-                );
+                let worker_sid = sid.to_string();
+                let outcome = run_with_deadline(
+                    std::time::Duration::from_millis(BACKUP_READ_DEADLINE_MS),
+                    move || {
+                        let trusted_dir =
+                            std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+                        win32::read_backup_file_securely(
+                            &backup_path_in_profile(&dir),
+                            &backup_path_in_profile(&trusted_dir),
+                            &worker_sid,
+                        )
+                    },
+                )
+                .unwrap_or_else(|| Err("reading the backup file timed out".to_string()));
                 (
                     Win32RegistryStore::loaded_user(sid),
                     ReadOnlyBackupStore::from_trusted_read(outcome, sid),
@@ -2157,5 +2310,44 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_read_that_does_not_finish_in_time_is_abandoned_without_blocking() {
+        let started = std::time::Instant::now();
+        let outcome = run_with_deadline(std::time::Duration::from_millis(50), || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            1
+        });
+        assert_eq!(outcome, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the caller must not wait for the blocked worker"
+        );
+        assert_eq!(
+            run_with_deadline(std::time::Duration::from_secs(5), || 7),
+            Some(7)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_link_safe_open_reads_a_normal_key_and_reports_a_missing_one() {
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, KEY_QUERY_VALUE};
+        // Read-only: HKCU\Software\Microsoft\Windows\CurrentVersion exists and is not a link.
+        let found = super::win32::open_key_rejecting_links_for_test(
+            HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion",
+            KEY_QUERY_VALUE,
+        )
+        .unwrap();
+        assert!(found);
+        let missing = super::win32::open_key_rejecting_links_for_test(
+            HKEY_CURRENT_USER,
+            r"Software\RouteWard-test-absent\Nothing",
+            KEY_QUERY_VALUE,
+        )
+        .unwrap();
+        assert!(!missing);
     }
 }

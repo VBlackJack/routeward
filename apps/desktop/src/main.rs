@@ -56,6 +56,9 @@ const LOOPBACK_EPHEMERAL_ADDR: &str = "127.0.0.1:0";
 const LOOPBACK_MAX_PRE_AUTH_CONNECTIONS: usize = 256;
 /// How long a connection that finds the pre-auth pool full waits for a slot before it is closed.
 const LOOPBACK_PRE_AUTH_SLOT_WAIT_MS: u64 = 250;
+/// Connections allowed to wait for a pre-auth slot at the same time; beyond this they are closed
+/// at once, so the waiting itself cannot pile up tasks.
+const LOOPBACK_MAX_WAITING_CONNECTIONS: usize = 64;
 /// Validated requests served at once (page, assets, the realtime stream, API calls). Taken only
 /// after the token check, so slow or unauthenticated connections never consume these.
 const LOOPBACK_MAX_SERVING_REQUESTS: usize = 64;
@@ -306,6 +309,7 @@ where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let slots = Arc::new(Semaphore::new(limit));
+    let waiting = Arc::new(Semaphore::new(LOOPBACK_MAX_WAITING_CONNECTIONS));
     while let Ok((stream, _)) = listener.accept().await {
         let serving = handler(stream);
         match Arc::clone(&slots).try_acquire_owned() {
@@ -316,6 +320,10 @@ where
                 });
             }
             Err(_) => {
+                let Ok(waiting_place) = Arc::clone(&waiting).try_acquire_owned() else {
+                    // Too many connections already wait: close this one at once.
+                    continue;
+                };
                 let waiting_slots = Arc::clone(&slots);
                 tokio::spawn(async move {
                     let wait = std::time::Duration::from_millis(LOOPBACK_PRE_AUTH_SLOT_WAIT_MS);
@@ -323,6 +331,7 @@ where
                     if let Ok(Ok(permit)) =
                         tokio::time::timeout(wait, waiting_slots.acquire_owned()).await
                     {
+                        drop(waiting_place);
                         serving.await;
                         drop(permit);
                     }
