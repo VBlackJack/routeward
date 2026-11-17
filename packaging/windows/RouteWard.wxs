@@ -31,6 +31,58 @@
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/VBlackJack/routeward" />
     <Property Id="ARPNOMODIFY" Value="1" />
 
+    <!--
+      Service restore after an upgrade. MajorUpgrade uninstalls the previous product first
+      (RemoveExistingProducts), and its ServiceControl Remove="uninstall" deletes the RouteWard service
+      together with the allow-sid arguments of its command line. AppSearch runs before that removal,
+      so the old registration is captured here and replayed after InstallFiles by the custom actions below.
+      Type="raw" keeps the value as stored: a REG_EXPAND_SZ ImagePath comes back with a "#%" prefix
+      (stripped by the CLI) and the DWORD Start value as "#2" (automatic) or "#3" (manual).
+    -->
+    <Property Id="ROUTEWARD_OLD_IMAGEPATH" Secure="yes">
+      <RegistrySearch
+          Id="RouteWardOldImagePathSearch"
+          Root="HKLM"
+          Key="SYSTEM\CurrentControlSet\Services\RouteWard"
+          Name="ImagePath"
+          Type="raw" />
+    </Property>
+    <Property Id="ROUTEWARD_OLD_SVC_START" Secure="yes">
+      <RegistrySearch
+          Id="RouteWardOldServiceStartSearch"
+          Root="HKLM"
+          Key="SYSTEM\CurrentControlSet\Services\RouteWard"
+          Name="Start"
+          Type="raw" />
+    </Property>
+
+    <!--
+      Deferred, no impersonation (runs as LocalSystem), run from the freshly installed routeward.exe.
+      The captured ImagePath is passed unquoted after the end-of-options marker: the C runtime parsing of its own quotes
+      yields one argument per token. The CLI re-validates every value (grammar, SIDs) and registers the
+      NEW binary path, never the old one. "Return=ignore": a failed restore must not roll back the upgrade.
+      The service is started again only when it was an automatic-start service (Start = 2).
+    -->
+    <CustomAction
+        Id="RestoreServiceAutoStart"
+        FileRef="RouteWardCliExe"
+        ExeCommand="service restore --start -- [ROUTEWARD_OLD_IMAGEPATH]"
+        Execute="deferred"
+        Impersonate="no"
+        Return="ignore" />
+    <CustomAction
+        Id="RestoreServiceDemandStart"
+        FileRef="RouteWardCliExe"
+        ExeCommand="service restore --demand-start -- [ROUTEWARD_OLD_IMAGEPATH]"
+        Execute="deferred"
+        Impersonate="no"
+        Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RestoreServiceAutoStart" After="InstallFiles" Condition="NOT REMOVE AND (UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND ROUTEWARD_OLD_IMAGEPATH &lt;&gt; &quot;&quot; AND ROUTEWARD_OLD_SVC_START = &quot;#2&quot;" />
+      <Custom Action="RestoreServiceDemandStart" After="InstallFiles" Condition="NOT REMOVE AND (UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND ROUTEWARD_OLD_IMAGEPATH &lt;&gt; &quot;&quot; AND ROUTEWARD_OLD_SVC_START &lt;&gt; &quot;#2&quot;" />
+    </InstallExecuteSequence>
+
     <Feature Id="ProductFeature" Title="RouteWard" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
       <ComponentGroupRef Id="ProgramDataComponents" />
@@ -107,6 +159,20 @@
       <Component Id="WinDivertRuntimeComponent" Guid="5E8A12F0-4C3B-4E19-8D6A-3B7F2C1E9A05">
         <File Id="WinDivertDll" Source="$(var.StageDir)\WinDivert.dll" KeyPath="yes" />
         <File Id="WinDivertSys" Source="$(var.StageDir)\$(var.WinDivertSysName)" />
+        <File Id="WinDivertLicense" Source="$(var.StageDir)\WinDivert-LICENSE.txt" />
+        <File Id="WinDivertReadme" Source="$(var.StageDir)\WinDivert-README.txt" />
+        <File Id="ThirdPartyNotices" Source="$(var.StageDir)\THIRD_PARTY_NOTICES.txt" />
+        <!--
+          The driver service is created by WinDivert.dll at run time, not by this package. Stop and remove it
+          on install and uninstall so the driver file is never locked and no orphan service is left behind.
+          A missing service is ignored by Windows Installer.
+        -->
+        <ServiceControl
+            Id="WinDivertServiceControl"
+            Name="WinDivert"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
       </Component>
     </ComponentGroup>
     <?endif ?>
