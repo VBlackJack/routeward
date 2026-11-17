@@ -70,6 +70,21 @@ pub fn is_navigation_allowed(target: &str, allowed_authority: &str) -> bool {
     authority.eq_ignore_ascii_case(allowed_authority)
 }
 
+/// Decides whether a WebView permission request is auto-allowed.
+///
+/// Only the "multiple automatic downloads" permission is ever granted (so a second export
+/// is not held by the browser engine's download limiter), and only when the requesting
+/// URI is the UI origin (same rule as navigation). Every other request is left to the
+/// engine's default handling: this never denies anything.
+#[cfg(any(windows, test))]
+pub fn should_allow_multiple_downloads(
+    is_multiple_downloads_kind: bool,
+    requesting_uri: &str,
+    allowed_authority: &str,
+) -> bool {
+    is_multiple_downloads_kind && is_navigation_allowed(requesting_uri, allowed_authority)
+}
+
 fn truncated_scheme(scheme: &str) -> String {
     scheme.chars().take(LOG_SCHEME_MAX_CHARS).collect()
 }
@@ -93,6 +108,37 @@ pub fn redact_url_for_log(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiple_downloads_allowed_only_for_ui_origin_and_kind() {
+        let auth = "127.0.0.1:5000";
+        assert!(should_allow_multiple_downloads(
+            true,
+            "http://127.0.0.1:5000/",
+            auth
+        ));
+        assert!(should_allow_multiple_downloads(
+            true,
+            "blob:http://127.0.0.1:5000/abc",
+            auth
+        ));
+        assert!(!should_allow_multiple_downloads(
+            false,
+            "http://127.0.0.1:5000/",
+            auth
+        ));
+        assert!(!should_allow_multiple_downloads(
+            true,
+            "http://evil.example/",
+            auth
+        ));
+        assert!(!should_allow_multiple_downloads(
+            true,
+            "http://127.0.0.1:5001/",
+            auth
+        ));
+        assert!(!should_allow_multiple_downloads(true, "", auth));
+    }
 
     const AUTH: &str = "127.0.0.1:49152";
 
