@@ -287,7 +287,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="relative min-w-[240px] flex-1">
             <Search className="absolute left-3 top-2.5 h-4 w-4 text-tf-secondary" />
-            <input
+            <input name="connections-simple-filter"
               type="text"
               value={filterText}
               onChange={(e) => setFilterText(e.target.value)}
@@ -345,7 +345,8 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                       {group.processName}
                     </span>
                     <span className="rounded bg-tf-surface-alt px-2 py-0.5 text-[11px] font-medium text-tf-secondary">
-                      {group.count} {t('connections.simple.count_connections')}
+                      {/* Plural keys: connections.simple.count_connections_one, connections.simple.count_connections_other */}
+                      {t('connections.simple.count_connections', { count: group.count })}
                     </span>
                     <span className="font-mono text-[11px] text-tf-cyan">
                       {formatBytes(group.totalBytes)}
@@ -429,7 +430,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="relative min-w-[260px] flex-1">
           <Search className="absolute left-3 top-2.5 h-4 w-4 text-tf-secondary" />
-          <input
+          <input name="connections-filter"
             type="text"
             value={filterText}
             onChange={(e) => setFilterText(e.target.value)}
