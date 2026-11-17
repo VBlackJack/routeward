@@ -43,6 +43,10 @@ use uuid::Uuid;
 /// Largest possible UDP payload, used as the receive buffer of relayed datagrams.
 pub(super) const MAX_UDP_DATAGRAM_BYTES: usize = 65535;
 
+/// Scratch buffer size used to discard stale datagrams queued on a pooled UDP socket before
+/// a new exchange (content is thrown away, so only a typical DNS-over-UDP size is needed).
+const UDP_DRAIN_BUFFER_BYTES: usize = 2048;
+
 /// Length in bytes of the DNS transaction ID at the start of a message.
 const DNS_ID_LEN: usize = 2;
 
@@ -1026,7 +1030,7 @@ impl RouteWardController {
 
         let is_ipv6 = target_addr.is_ipv6();
         let (sock, port_guard) = self.acquire_direct_udp_socket(is_ipv6).await?;
-        let mut drain_buf = [0u8; 2048];
+        let mut drain_buf = [0u8; UDP_DRAIN_BUFFER_BYTES];
         while sock.try_recv_from(&mut drain_buf).is_ok() {}
 
         tokio::time::timeout(recv_timeout, sock.send_to(payload, target_addr))
