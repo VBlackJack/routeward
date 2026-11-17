@@ -1,0 +1,39 @@
+RouteWard - third party notices (Windows MSI)
+
+RouteWard itself is licensed under the Apache License 2.0 (see LICENSE).
+
+================================================================================
+WinDivert 2.2.2 (Windows Packet Divert)
+================================================================================
+
+Files shipped in this installer, unmodified, exactly as published upstream:
+
+  WinDivert.dll       user-mode library, loaded by routeward.exe at run time
+  WinDivert64.sys     kernel driver (signed by its author; never re-signed or altered here)
+  WinDivert-LICENSE.txt   upstream license file (LGPLv3, GPLv3 and GPLv2 texts)
+  WinDivert-README.txt    upstream README
+
+Author:    Basil (basil00)
+Project:   https://reqrypt.org/windivert.html
+Source:    https://github.com/basil00/WinDivert (tag v2.2.2)
+
+License election
+----------------
+WinDivert is dual-licensed by its author under your choice of the GNU Lesser
+General Public License version 3 (LGPLv3) or the GNU General Public License
+version 2 (GPLv2). RouteWard elects the LGPLv3 branch. The GPLv2 branch is not
+used because it is incompatible with the Apache License 2.0 under which
+RouteWard is distributed.
+
+Under the LGPLv3 terms:
+  - RouteWard loads WinDivert.dll dynamically (LoadLibraryW / GetProcAddress);
+    it is not statically linked into routeward.exe or routeward-desktop.exe.
+  - You may replace WinDivert.dll (and the matching driver) in the installation
+    folder with a modified or newer interface-compatible build. RouteWard does
+    not pin or check a hash of the DLL at run time for that reason. A replaced
+    driver must be signed so that Windows accepts it.
+  - The complete corresponding source code of the shipped version is published
+    with every RouteWard release as WinDivert-2.2.2-source.tar.gz, next to the
+    installer, and at https://github.com/basil00/WinDivert/tree/v2.2.2
+
+The full license texts are in WinDivert-LICENSE.txt, installed next to this file.

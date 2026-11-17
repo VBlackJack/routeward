@@ -153,13 +153,19 @@ try {
     $includeWinDivertFlag = 'no'
     $winDivertSysName = if ($Arch -eq 'x86') { 'WinDivert32.sys' } else { 'WinDivert64.sys' }
     if ($IncludeWinDivert) {
-        $wdDll = Join-Path $resolvedWinDivertDir 'WinDivert.dll'
-        $wdSys = Join-Path $resolvedWinDivertDir $winDivertSysName
-        if (-not (Test-Path -LiteralPath $wdDll) -or -not (Test-Path -LiteralPath $wdSys)) {
-            throw "WinDivert binaries ($winDivertSysName) not found in: $resolvedWinDivertDir"
+        # tools/fetch-windivert.ps1 only extracts the x64 binaries; there is no x86 or arm64 driver to embed.
+        if ($Arch -ne 'x64') {
+            throw "-IncludeWinDivert is only supported for -Arch x64 (requested: $Arch): tools/fetch-windivert.ps1 extracts the x64 WinDivert binaries only."
         }
-        Copy-Item -LiteralPath $wdDll -Destination (Join-Path $stageDir 'WinDivert.dll')
-        Copy-Item -LiteralPath $wdSys -Destination (Join-Path $stageDir $winDivertSysName)
+        $winDivertFiles = @('WinDivert.dll', $winDivertSysName, 'WinDivert-LICENSE.txt', 'WinDivert-README.txt')
+        foreach ($wdFile in $winDivertFiles) {
+            $wdSource = Join-Path $resolvedWinDivertDir $wdFile
+            if (-not (Test-Path -LiteralPath $wdSource)) {
+                throw "WinDivert file '$wdFile' not found in: $resolvedWinDivertDir (run tools/fetch-windivert.ps1)"
+            }
+            Copy-Item -LiteralPath $wdSource -Destination (Join-Path $stageDir $wdFile)
+        }
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'THIRD_PARTY_NOTICES.txt') -Destination (Join-Path $stageDir 'THIRD_PARTY_NOTICES.txt')
         $includeWinDivertFlag = 'yes'
     }
 
