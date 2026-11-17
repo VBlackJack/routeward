@@ -123,6 +123,13 @@
       Internet > Proxy, or Internet Options > Connections > LAN settings, or run the CLI "cleanup" command with its user option
       before the uninstall.
 
+      The SYSTEM pass only reads each user's backup file through a verified handle (it must be a regular
+      file at its expected place, owned by the user or by SYSTEM or the Administrators) and never creates,
+      renames or deletes anything inside a user profile. If the check fails, only values equal to
+      RouteWard's own are switched off. Race to know about: a RouteWard desktop still running in another
+      user's session at uninstall time may write its settings again after this pass; the desktop also
+      restores them when it exits or when that user logs off.
+
       TerminalServerAware is not set on any action: that flag only applies to impersonated deferred
       actions, and none of these impersonates the user.
     -->

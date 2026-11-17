@@ -1075,14 +1075,7 @@ pub async fn serve_loopback_http_connection<FStatic>(
             Err(_) => {
                 let body = b"{\"error\":\"busy\"}";
                 let resp = format!(
-                    "{}
-Content-Type: application/json; charset=utf-8
-Content-Length: {}
-Cache-Control: no-store, no-cache, must-revalidate
-X-Content-Type-Options: nosniff
-Connection: close
-
-",
+                    "{}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
                     http_status_line(503),
                     body.len()
                 );
@@ -1230,19 +1223,10 @@ mod tests {
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
         client
-            .write_all(
-                b"POST /x HTTP/1.1
-Content-Length: 2
-
-{}",
-            )
+            .write_all(b"POST /x HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
             .await
             .unwrap();
         let text = server.await.unwrap().unwrap();
-        assert!(text.ends_with(
-            "
-
-{}"
-        ));
+        assert!(text.ends_with("\r\n\r\n{}"));
     }
 }

@@ -54,6 +54,8 @@ const LOOPBACK_EPHEMERAL_ADDR: &str = "127.0.0.1:0";
 /// Connections the loopback UI server holds while they are still sending their request. Each is
 /// cut off by the request deadline; anything beyond this is closed before it is read.
 const LOOPBACK_MAX_PRE_AUTH_CONNECTIONS: usize = 256;
+/// How long a connection that finds the pre-auth pool full waits for a slot before it is closed.
+const LOOPBACK_PRE_AUTH_SLOT_WAIT_MS: u64 = 250;
 /// Validated requests served at once (page, assets, the realtime stream, API calls). Taken only
 /// after the token check, so slow or unauthenticated connections never consume these.
 const LOOPBACK_MAX_SERVING_REQUESTS: usize = 64;
@@ -149,8 +151,8 @@ unsafe extern "system" fn session_end_subclass_proc(
     _subclass_id: usize,
     bridge_ptr: usize,
 ) -> windows_sys::Win32::Foundation::LRESULT {
-    use windows_sys::Win32::UI::Shell::DefSubclassProc;
-    use windows_sys::Win32::UI::WindowsAndMessaging::WM_ENDSESSION;
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_ENDSESSION, WM_NCDESTROY};
 
     // A non-zero wParam means the session really ends (zero: the end was cancelled).
     if msg == WM_ENDSESSION && wparam != 0 {
@@ -158,6 +160,20 @@ unsafe extern "system" fn session_end_subclass_proc(
         // and that reference is intentionally never released, so it is valid for the whole run.
         let bridge = unsafe { &*(bridge_ptr as *const DesktopCommandBridge) };
         bridge.restore_system_settings_on_exit();
+    }
+    if msg == WM_NCDESTROY {
+        // The window is going away: detach the hook as the documentation asks. The bridge
+        // reference handed over in `restore_settings_on_session_end` is deliberately never
+        // released: the desktop process ends with its window, and other threads may still use
+        // the bridge it points to.
+        // SAFETY: removes this procedure from the window being destroyed.
+        unsafe {
+            RemoveWindowSubclass(
+                hwnd,
+                Some(session_end_subclass_proc),
+                SESSION_END_SUBCLASS_ID,
+            )
+        };
     }
     // SAFETY: forwards the unmodified message of this window procedure call.
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
@@ -276,8 +292,14 @@ async fn serve_loopback_listener(
 }
 
 /// Accepts connections until the listener fails and serves each one with `handler`, at most
-/// `limit` at a time. A connection that arrives while every slot is taken is closed at once
-/// instead of queued, so a local process cannot pile up unauthenticated tasks and sockets.
+/// `limit` at a time. A connection that arrives while every slot is taken waits briefly
+/// (`LOOPBACK_PRE_AUTH_SLOT_WAIT_MS`) for one and is closed if none frees up, instead of being
+/// queued without bound.
+///
+/// Out of scope: a local process that deliberately holds many sockets open can still crowd
+/// others out for the length of the request deadline. The listener is bound to loopback, so the
+/// attacker already runs on the same machine, and the token check keeps it from doing anything
+/// but wasting slots.
 async fn accept_bounded<H, Fut>(listener: TcpListener, limit: usize, handler: H)
 where
     H: Fn(TcpStream) -> Fut,
@@ -285,15 +307,28 @@ where
 {
     let slots = Arc::new(Semaphore::new(limit));
     while let Ok((stream, _)) = listener.accept().await {
-        let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
-            drop(stream);
-            continue;
-        };
         let serving = handler(stream);
-        tokio::spawn(async move {
-            serving.await;
-            drop(permit);
-        });
+        match Arc::clone(&slots).try_acquire_owned() {
+            Ok(permit) => {
+                tokio::spawn(async move {
+                    serving.await;
+                    drop(permit);
+                });
+            }
+            Err(_) => {
+                let waiting_slots = Arc::clone(&slots);
+                tokio::spawn(async move {
+                    let wait = std::time::Duration::from_millis(LOOPBACK_PRE_AUTH_SLOT_WAIT_MS);
+                    // On timeout `serving` is dropped unpolled, which closes the connection.
+                    if let Ok(Ok(permit)) =
+                        tokio::time::timeout(wait, waiting_slots.acquire_owned()).await
+                    {
+                        serving.await;
+                        drop(permit);
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -773,22 +808,15 @@ mod tests {
         let mut dripping = Vec::new();
         for _ in 0..LOOPBACK_MAX_SERVING_REQUESTS {
             let mut slow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-            slow.write_all(
-                b"GET /api/state HTTP/1.1
-",
-            )
-            .await
-            .unwrap();
+            slow.write_all(b"GET /api/state HTTP/1.1\r\n")
+                .await
+                .unwrap();
             dripping.push(slow);
         }
 
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let request = format!(
-            "GET /api/state HTTP/1.1
-Host: 127.0.0.1:{port}
-X-RouteWard-Token: {token}
-
-"
+            "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-RouteWard-Token: {token}\r\n\r\n"
         );
         client.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();

@@ -674,20 +674,134 @@ pub fn encode_reg_data(value: &RegValue) -> (u32, Vec<u8>) {
     }
 }
 
-/// Prefix of the SIDs of local, domain and Microsoft-account users (the well-known service
-/// accounts such as `S-1-5-18` are not users).
-const USER_SID_PREFIX: &str = "S-1-5-21-";
+/// Prefixes of the SIDs of local, domain and Microsoft-account users (`S-1-5-21-`) and of
+/// Entra ID users (`S-1-12-1-`); the well-known service accounts such as `S-1-5-18` are not users.
+const USER_SID_PREFIXES: [&str; 2] = ["S-1-5-21-", "S-1-12-1-"];
 /// Suffix of the `HKEY_USERS` key that holds a user's file-type classes, not the user's hive.
 const CLASSES_KEY_SUFFIX: &str = "_Classes";
 /// Location of a user's local application data below the profile directory.
 const PROFILE_LOCAL_APP_DATA_RELATIVE: [&str; 2] = ["AppData", "Local"];
 
-/// True for the `HKEY_USERS` key name of a real user's hive: `S-1-5-21-...`, digits and dashes
-/// only, and not the `_Classes` companion key.
+/// True for the `HKEY_USERS` key name of a real user's hive: a `S-1-5-21-` or `S-1-12-1-` SID,
+/// digits and dashes only, and not the `_Classes` companion key.
 pub fn is_user_hive_sid(key_name: &str) -> bool {
-    key_name.strip_prefix(USER_SID_PREFIX).is_some_and(|rest| {
-        !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '-')
-    }) && !key_name.ends_with(CLASSES_KEY_SUFFIX)
+    USER_SID_PREFIXES
+        .iter()
+        .filter_map(|prefix| key_name.strip_prefix(prefix))
+        .any(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '-'))
+        && !key_name.ends_with(CLASSES_KEY_SUFFIX)
+}
+
+/// SID of the LocalSystem account.
+const SID_LOCAL_SYSTEM: &str = "S-1-5-18";
+/// SID of the built-in Administrators group.
+const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
+/// Prefix of a DOS-style extended path as returned by `GetFinalPathNameByHandleW`.
+const EXTENDED_PATH_PREFIX: &str = r"\\?\";
+/// Prefix of an extended UNC path.
+const EXTENDED_UNC_PREFIX: &str = r"\\?\UNC\";
+
+/// Facts about a backup file that was opened by handle, gathered by the Win32 layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupFileFacts {
+    /// Final, normalized path of the open handle.
+    pub final_path: String,
+    pub is_reparse_point: bool,
+    pub is_regular_file: bool,
+    pub size: u64,
+    /// SID (string form) of the file owner.
+    pub owner_sid: String,
+}
+
+/// Normalizes a path for comparison: no extended prefix, backslashes, no trailing separator,
+/// lower case.
+fn normalize_path_for_compare(path: &str) -> String {
+    let stripped = match path.strip_prefix(EXTENDED_UNC_PREFIX) {
+        Some(rest) => format!(r"\\{rest}"),
+        None => path
+            .strip_prefix(EXTENDED_PATH_PREFIX)
+            .unwrap_or(path)
+            .to_string(),
+    };
+    stripped
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+/// Decides whether a backup file opened by SYSTEM inside a user profile can be trusted: not a
+/// link, a regular file, at the exact expected location (a junction, mount point or
+/// object-manager redirect on any parent changes the final path), small, and owned by the user
+/// or by SYSTEM or the Administrators.
+pub fn check_backup_file_facts(
+    facts: &BackupFileFacts,
+    expected_path: &str,
+    user_sid: &str,
+) -> Result<(), String> {
+    if facts.is_reparse_point {
+        return Err("the file is a reparse point".to_string());
+    }
+    if !facts.is_regular_file {
+        return Err("the path is not a regular file".to_string());
+    }
+    if normalize_path_for_compare(&facts.final_path) != normalize_path_for_compare(expected_path) {
+        return Err(format!(
+            "the file resolves to {} instead of the expected location",
+            facts.final_path
+        ));
+    }
+    if facts.size > MAX_BACKUP_FILE_BYTES {
+        return Err(format!(
+            "the file is larger than {MAX_BACKUP_FILE_BYTES} bytes"
+        ));
+    }
+    let owner = facts.owner_sid.as_str();
+    let owner_ok = owner.eq_ignore_ascii_case(user_sid)
+        || owner.eq_ignore_ascii_case(SID_LOCAL_SYSTEM)
+        || owner.eq_ignore_ascii_case(SID_ADMINISTRATORS);
+    if !owner_ok {
+        return Err(format!("the file is owned by {owner}"));
+    }
+    Ok(())
+}
+
+/// [`BackupStore`] for code that runs with more rights than the profile owner (the SYSTEM pass
+/// over other users). It holds a backup read beforehand and never touches the file system:
+/// `save` does nothing, so nothing is created, renamed or deleted inside a user-controlled
+/// profile. Leaving the file in place is harmless because restores are idempotent and gated on
+/// ownership of the current values.
+pub struct ReadOnlyBackupStore {
+    backup: SettingsBackup,
+}
+
+impl ReadOnlyBackupStore {
+    /// Builds the store from the outcome of a trusted read (`Ok(None)`: no file). Anything
+    /// unusable (refused by the trust checks, unreadable, not valid JSON) gives an empty backup:
+    /// the caller then falls back to switching off only values equal to RouteWard's own.
+    pub fn from_trusted_read(outcome: Result<Option<Vec<u8>>, String>, sid: &str) -> Self {
+        let backup = match outcome {
+            Ok(None) => SettingsBackup::default(),
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+                tracing::warn!(sid, error = %err, "ignoring an invalid settings backup");
+                SettingsBackup::default()
+            }),
+            Err(reason) => {
+                tracing::warn!(sid, %reason, "ignoring an untrusted settings backup");
+                SettingsBackup::default()
+            }
+        };
+        Self { backup }
+    }
+}
+
+impl BackupStore for ReadOnlyBackupStore {
+    fn load(&self) -> RouteWardResult<SettingsBackup> {
+        Ok(self.backup.clone())
+    }
+
+    fn save(&self, _backup: &SettingsBackup) -> RouteWardResult<()> {
+        Ok(())
+    }
 }
 
 /// Where a user's saved settings live, given the profile directory (`ProfileImagePath`).
@@ -1024,6 +1138,143 @@ mod win32 {
         Ok(names)
     }
 
+    /// Reads a user's backup file through a handle opened without following a final reparse point,
+    /// then checks what the handle really is (see [`check_backup_file_facts`]). `Ok(None)`: the
+    /// file does not exist. Creates, renames and deletes nothing.
+    pub(super) fn read_backup_file_securely(
+        path: &Path,
+        expected_path: &Path,
+        user_sid: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        use std::io::Read;
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{
+            GetLastError, LocalFree, GENERIC_READ, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS,
+        };
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide` is NUL-terminated; the optional pointers are null.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            // SAFETY: reads the calling thread's last error.
+            let code = unsafe { GetLastError() };
+            return if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND {
+                Ok(None)
+            } else {
+                Err(format!("cannot open the file: error {code}"))
+            };
+        }
+        // SAFETY: `handle` is a valid, owned file handle; `File` closes it on drop.
+        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+
+        // SAFETY: `info` is a valid out structure for this handle.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+            return Err("cannot query the file information".to_string());
+        }
+        let attributes = info.dwFileAttributes;
+
+        let mut path_buffer = vec![0u16; EXPANDED_PATH_CAPACITY];
+        // SAFETY: `path_buffer` holds `len` writable UTF-16 units.
+        let written = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                path_buffer.as_mut_ptr(),
+                path_buffer.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if written == 0 || written >= path_buffer.len() {
+            return Err("cannot resolve the final path of the file".to_string());
+        }
+        let final_path = String::from_utf16_lossy(&path_buffer[..written]);
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: out pointers are valid; the descriptor is freed below.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS || owner.is_null() {
+            return Err(format!("cannot read the file owner: error {status}"));
+        }
+        let mut sid_text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `owner` points into `descriptor`, which is still alive.
+        let converted = unsafe { ConvertSidToStringSidW(owner, &mut sid_text) };
+        let owner_sid = if converted != 0 && !sid_text.is_null() {
+            // SAFETY: `sid_text` is a NUL-terminated string allocated by the call above.
+            let text = unsafe {
+                let mut len = 0;
+                while *sid_text.add(len) != 0 {
+                    len += 1;
+                }
+                String::from_utf16_lossy(std::slice::from_raw_parts(sid_text, len))
+            };
+            // SAFETY: both pointers were allocated with LocalAlloc by the calls above.
+            unsafe { LocalFree(sid_text.cast()) };
+            text
+        } else {
+            String::new()
+        };
+        // SAFETY: allocated by `GetSecurityInfo`.
+        unsafe { LocalFree(descriptor) };
+
+        let facts = BackupFileFacts {
+            final_path,
+            is_reparse_point: attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+            is_regular_file: attributes & FILE_ATTRIBUTE_DIRECTORY == 0,
+            size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+            owner_sid,
+        };
+        check_backup_file_facts(&facts, &expected_path.to_string_lossy(), user_sid)?;
+
+        let mut bytes = Vec::new();
+        (&file)
+            .take(MAX_BACKUP_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| format!("cannot read the file: {err}"))?;
+        if bytes.len() as u64 > MAX_BACKUP_FILE_BYTES {
+            return Err(format!(
+                "the file is larger than {MAX_BACKUP_FILE_BYTES} bytes"
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
     /// Profile directory of the user with this SID, from the ProfileList of the machine.
     pub(super) fn profile_dir(sid: &str) -> RouteWardResult<Option<PathBuf>> {
         let subkey = format!(r"{SUBKEY_PROFILE_LIST}\{sid}");
@@ -1070,9 +1321,17 @@ pub fn cleanup_all_loaded_users(
         &hive_names,
         |sid| {
             Ok(win32::profile_dir(sid)?.map(|dir| {
+                // The profile directory comes from HKLM (trusted); its resolved form is the
+                // location the backup handle must end up at.
+                let trusted_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+                let outcome = win32::read_backup_file_securely(
+                    &backup_path_in_profile(&dir),
+                    &backup_path_in_profile(&trusted_dir),
+                    sid,
+                );
                 (
                     Win32RegistryStore::loaded_user(sid),
-                    FileBackupStore::new(backup_path_in_profile(&dir)),
+                    ReadOnlyBackupStore::from_trusted_read(outcome, sid),
                 )
             }))
         },
@@ -1561,6 +1820,10 @@ mod tests {
         assert!(!is_user_hive_sid(
             "S-1-5-21-1111111111-2222222222-3333333333-1001_Classes"
         ));
+        assert!(is_user_hive_sid("S-1-12-1-111-222-333-444"));
+        assert!(!is_user_hive_sid("S-1-12-1-111-222-333-444_Classes"));
+        assert!(!is_user_hive_sid("S-1-12-1-"));
+        assert!(!is_user_hive_sid("S-1-12-2-111"));
         assert!(!is_user_hive_sid(".DEFAULT"));
         assert!(!is_user_hive_sid("S-1-5-18"));
         assert!(!is_user_hive_sid("S-1-5-19"));
@@ -1735,5 +1998,164 @@ mod tests {
         let backups = FakeBackups::default();
         let err = enable_proxy(&settings, &backups, ENDPOINT).unwrap_err();
         assert_eq!(err.i18n_key(), ERR_KEY_SYSTEM_REGISTRY_WRITE);
+    }
+
+    fn trusted_facts() -> BackupFileFacts {
+        BackupFileFacts {
+            final_path: r"\\?\C:\Users\Alice\AppData\Local\RouteWard\system_settings_backup.json"
+                .to_string(),
+            is_reparse_point: false,
+            is_regular_file: true,
+            size: 300,
+            owner_sid: "S-1-5-21-1-2-3-1001".to_string(),
+        }
+    }
+
+    const EXPECTED_BACKUP: &str =
+        r"C:\users\alice\appdata\local\routeward\system_settings_backup.json";
+
+    #[test]
+    fn a_backup_file_at_the_expected_place_owned_by_the_user_is_trusted() {
+        let user = "S-1-5-21-1-2-3-1001";
+        assert!(check_backup_file_facts(&trusted_facts(), EXPECTED_BACKUP, user).is_ok());
+        for owner in ["S-1-5-18", "S-1-5-32-544"] {
+            let facts = BackupFileFacts {
+                owner_sid: owner.to_string(),
+                ..trusted_facts()
+            };
+            assert!(check_backup_file_facts(&facts, EXPECTED_BACKUP, user).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_redirected_linked_foreign_or_oversized_backup_file_is_refused() {
+        let user = "S-1-5-21-1-2-3-1001";
+        let refused = |facts: BackupFileFacts| {
+            assert!(check_backup_file_facts(&facts, EXPECTED_BACKUP, user).is_err());
+        };
+        // A junction or object-manager redirect on a parent changes the final path.
+        refused(BackupFileFacts {
+            final_path: r"\\?\C:\Windows\System32\system_settings_backup.json".to_string(),
+            ..trusted_facts()
+        });
+        refused(BackupFileFacts {
+            final_path: r"\\?\GLOBALROOT\RPC Control\system_settings_backup.json".to_string(),
+            ..trusted_facts()
+        });
+        refused(BackupFileFacts {
+            is_reparse_point: true,
+            ..trusted_facts()
+        });
+        refused(BackupFileFacts {
+            is_regular_file: false,
+            ..trusted_facts()
+        });
+        refused(BackupFileFacts {
+            size: MAX_BACKUP_FILE_BYTES + 1,
+            ..trusted_facts()
+        });
+        // Owned by another standard user.
+        refused(BackupFileFacts {
+            owner_sid: "S-1-5-21-1-2-3-1002".to_string(),
+            ..trusted_facts()
+        });
+        refused(BackupFileFacts {
+            owner_sid: String::new(),
+            ..trusted_facts()
+        });
+    }
+
+    #[test]
+    fn the_read_only_store_serves_the_backup_and_never_writes() {
+        let backup = SettingsBackup {
+            proxy: Some(ProxyBackup {
+                prev_enable: None,
+                prev_server: None,
+                written_server: SERVER.into(),
+            }),
+            pac: None,
+        };
+        let json = serde_json::to_vec(&backup).unwrap();
+        let store = ReadOnlyBackupStore::from_trusted_read(Ok(Some(json)), "S-1-5-21-1-2-3-1001");
+        assert_eq!(store.load().unwrap(), backup);
+        store.save(&SettingsBackup::default()).unwrap();
+        assert_eq!(
+            store.load().unwrap(),
+            backup,
+            "save must not change what is served"
+        );
+
+        // Missing, refused and garbage input all give the empty (fallback) backup.
+        for outcome in [
+            Ok(None),
+            Err("the file is a reparse point".to_string()),
+            Ok(Some(b"{ not json".to_vec())),
+        ] {
+            let store = ReadOnlyBackupStore::from_trusted_read(outcome, "S-1-5-21-1-2-3-1001");
+            assert!(store.load().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_untrusted_backup_falls_back_to_switching_off_only_routeward_values() {
+        let settings = FakeSettings::default();
+        settings.set(VALUE_PROXY_ENABLE, RegValue::Dword(1));
+        settings.set(VALUE_PROXY_SERVER, RegValue::Sz(SERVER.into()));
+        let store = ReadOnlyBackupStore::from_trusted_read(
+            Err("untrusted".to_string()),
+            "S-1-5-21-1-2-3-1001",
+        );
+        cleanup_user_settings(&settings, &store, ENDPOINT, PAC).unwrap();
+        assert_eq!(settings.get(VALUE_PROXY_ENABLE), Some(RegValue::Dword(0)));
+
+        let foreign = FakeSettings::default();
+        corporate_proxy(&foreign);
+        cleanup_user_settings(&foreign, &store, ENDPOINT, PAC).unwrap();
+        assert_eq!(foreign.get(VALUE_PROXY_ENABLE), Some(RegValue::Dword(1)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_handle_based_reader_refuses_a_redirected_parent_and_reports_a_missing_file() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("routeward-secure-read-{}", uuid::Uuid::new_v4()));
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join(BACKUP_FILE_NAME), "{}").unwrap();
+        let user = "S-1-5-21-1-2-3-1001";
+
+        let expected = real.join(BACKUP_FILE_NAME);
+        // Missing file: not an error.
+        let missing = root.join("nothing").join(BACKUP_FILE_NAME);
+        assert_eq!(
+            super::win32::read_backup_file_securely(&missing, &missing, user),
+            Ok(None)
+        );
+        // Read at the expected place: allowed, unless this host's file owner is not trusted.
+        match super::win32::read_backup_file_securely(&expected, &expected, user) {
+            Ok(bytes) => assert_eq!(bytes, Some(b"{}".to_vec())),
+            Err(reason) => assert!(reason.contains("owned by"), "unexpected refusal: {reason}"),
+        }
+
+        // A junction on the parent: the handle ends up somewhere else than expected.
+        let link = root.join("link");
+        let made = std::process::Command::new(super::super::windows_system_tool_path("cmd.exe"))
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if made {
+            let through_link = link.join(BACKUP_FILE_NAME);
+            let err = super::win32::read_backup_file_securely(&through_link, &through_link, user)
+                .unwrap_err();
+            assert!(
+                err.contains("resolves to") || err.contains("owned by"),
+                "{err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

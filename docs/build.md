@@ -137,6 +137,8 @@ Before the files are removed, an uninstall (not an upgrade) runs two actions:
 - `routeward cleanup --all-users` (as `LocalSystem`): for every user whose registry hive is **currently loaded** (every logged-on user), it gives back the system proxy, the PAC URL and the autostart entry that RouteWard changed, from that user's saved backup, and only while they are still RouteWard's. Hives of users who are not logged on are deliberately **not** loaded, so those users keep their values. To fix one by hand, turn the proxy off in *Settings > Network & Internet > Proxy* (or *Internet Options > Connections > LAN settings*), or run `routeward cleanup --user` as that user before uninstalling.
 - `routeward purge-data`: deletes `%ProgramData%\RouteWard` (profile and logs) unless `KEEPDATA=1` was passed (`msiexec /x RouteWard.msi KEEPDATA=1`). It refuses a directory that a standard user could write to. Accepted limit: the data is deleted before the uninstall has finished, so an uninstall that fails or is rolled back afterwards leaves the data deleted.
 
+The `LocalSystem` pass never writes inside a user profile: it only reads each user's saved settings through a verified handle (regular file at the expected place, owned by the user, SYSTEM or the Administrators) and, if that check fails, only switches off values equal to RouteWard's own. A desktop still running in another user's session at uninstall time may write its settings again after this pass; the desktop also restores them when it exits or when that user logs off.
+
 ### Linux `systemd` Unit & `.deb` Packaging
 For headless Linux installations, use `packaging/linux/build-deb.sh` (or install `packaging/linux/routeward.service` alongside the `routeward` system group):
 
