@@ -2343,6 +2343,7 @@ impl RouteWardController {
 mod tests {
     use super::*;
     use crate::config::PortRange;
+    use std::sync::atomic::AtomicU16;
 
     fn test_constants() -> SystemConstants {
         let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
@@ -2422,18 +2423,37 @@ mod tests {
     /// Time given to the listener tasks to run until they are parked in accept/recv.
     const LISTENER_SETTLE_DELAY: Duration = Duration::from_millis(30);
 
-    /// Reserves `count` distinct ports that are free for both TCP and UDP on the loopback
-    /// interface. The probe sockets stay open until every port is chosen, so none repeats.
+    /// First port handed out to the tests that need fixed engine ports. It sits below every
+    /// default ephemeral range (Linux 32768-60999, Windows and macOS 49152-65535), so the
+    /// listeners and client sockets that other tests bind on port 0 can never be assigned one
+    /// of these ports behind our back.
+    const FIXED_PORT_RANGE_START: u16 = 20_000;
+
+    /// Exclusive end of the range described by `FIXED_PORT_RANGE_START`.
+    const FIXED_PORT_RANGE_END: u16 = 32_000;
+
+    /// Next candidate port. Shared by the whole test process, so two tests running in parallel
+    /// are never handed the same port, which a release-then-reuse reservation cannot guarantee.
+    static NEXT_FIXED_PORT: AtomicU16 = AtomicU16::new(FIXED_PORT_RANGE_START);
+
+    /// Reserves `count` distinct ports that are free for both TCP and UDP on `host`. Ports are
+    /// unique across every test of the process and come from a range the OS never uses for
+    /// ephemeral ports, so a port stays free from this call until the engine binds it.
     fn reserve_free_ports(host: &str, count: usize) -> Vec<u16> {
-        let mut probes = Vec::new();
-        while probes.len() < count {
-            let tcp = std::net::TcpListener::bind(format!("{host}:0")).expect("reserve tcp port");
-            let port = tcp.local_addr().expect("reserved addr").port();
-            if let Ok(udp) = std::net::UdpSocket::bind(format!("{host}:{port}")) {
-                probes.push((port, tcp, udp));
+        let mut ports = Vec::with_capacity(count);
+        while ports.len() < count {
+            let port = NEXT_FIXED_PORT.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                port < FIXED_PORT_RANGE_END,
+                "fixed test port range exhausted"
+            );
+            let tcp_free = std::net::TcpListener::bind(format!("{host}:{port}")).is_ok();
+            let udp_free = std::net::UdpSocket::bind(format!("{host}:{port}")).is_ok();
+            if tcp_free && udp_free {
+                ports.push(port);
             }
         }
-        probes.iter().map(|(port, _, _)| *port).collect()
+        ports
     }
 
     /// Lets every listener task run until it is parked in accept/recv.
@@ -2453,13 +2473,52 @@ mod tests {
         constants
     }
 
-    fn assert_relay_port_bindable(constants: &SystemConstants) {
+    /// Pause between two attempts while waiting for the OS to release a port.
+    const PORT_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    /// Starts the engine, retrying while a fixed port is still transiently held.
+    ///
+    /// Closing a socket does not release its port while a concurrent `fork` (any other test
+    /// spawning a helper process, such as the DNS cache flush) still holds a copy of the
+    /// descriptor until its `exec`. That window lasts well under a millisecond, whereas a leaked
+    /// listener stays bound for good, so the waits in these tests are bounded by
+    /// `ENGINE_SHUTDOWN_JOIN_TIMEOUT` and a real leak still fails the test.
+    async fn start_engine_when_ports_release(controller: &RouteWardController) {
+        let deadline = tokio::time::Instant::now() + ENGINE_SHUTDOWN_JOIN_TIMEOUT;
+        loop {
+            match controller.start_engine() {
+                Ok(()) => return,
+                Err(err) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "engine start kept failing: {err}"
+                    );
+                    tokio::time::sleep(PORT_RELEASE_POLL_INTERVAL).await;
+                }
+            }
+        }
+    }
+
+    /// Asserts the relay port can be bound again once the engine is stopped (see
+    /// `start_engine_when_ports_release` for why the wait is bounded rather than absent).
+    async fn assert_relay_port_bindable(constants: &SystemConstants) {
         let addr = format!(
             "{}:{}",
             constants.network.local_bind_host, constants.network.default_relay_tcp_port
         );
-        std::net::TcpListener::bind(&addr)
-            .unwrap_or_else(|err| panic!("relay port {addr} must be free after stop: {err}"));
+        let deadline = tokio::time::Instant::now() + ENGINE_SHUTDOWN_JOIN_TIMEOUT;
+        loop {
+            match std::net::TcpListener::bind(&addr) {
+                Ok(_) => return,
+                Err(err) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "relay port {addr} must be free after stop: {err}"
+                    );
+                    tokio::time::sleep(PORT_RELEASE_POLL_INTERVAL).await;
+                }
+            }
+        }
     }
 
     /// Polls until every fixed engine port can be bound again, yielding to the runtime between
@@ -2507,15 +2566,15 @@ mod tests {
         let constants = fixed_port_constants();
         let controller = RouteWardController::new(constants.clone(), test_profile(), "en");
 
-        controller.start_engine().expect("first start");
+        start_engine_when_ports_release(&controller).await;
         settle_listener_tasks().await;
         controller.stop_engine();
-        assert_relay_port_bindable(&constants);
+        assert_relay_port_bindable(&constants).await;
 
-        controller.start_engine().expect("restart after stop");
+        start_engine_when_ports_release(&controller).await;
         assert!(controller.is_running());
         controller.stop_engine();
-        assert_relay_port_bindable(&constants);
+        assert_relay_port_bindable(&constants).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2532,7 +2591,7 @@ mod tests {
             start.await.expect("start task");
             stop.await.expect("stop task");
             controller.stop_engine();
-            assert_relay_port_bindable(&constants);
+            assert_relay_port_bindable(&constants).await;
         }
     }
 
@@ -2541,15 +2600,15 @@ mod tests {
         let constants = fixed_port_constants();
         let controller = RouteWardController::new(constants.clone(), test_profile(), "en");
 
-        controller.start_engine().expect("first start");
+        start_engine_when_ports_release(&controller).await;
         settle_listener_tasks().await;
         controller.stop_engine();
         // On a current-thread runtime stop_engine cannot block, so the listener tasks drop their
         // sockets once this task yields; wait (bounded) until every engine port is free again.
         wait_until_engine_ports_bindable(&constants).await;
-        assert_relay_port_bindable(&constants);
+        assert_relay_port_bindable(&constants).await;
 
-        controller.start_engine().expect("restart after stop");
+        start_engine_when_ports_release(&controller).await;
         controller.stop_engine();
     }
 
