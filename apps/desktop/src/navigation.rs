@@ -25,6 +25,8 @@ const AUTHORITY_TERMINATORS: [char; 3] = ['/', '?', '#'];
 const USERINFO_MARKER: char = '@';
 const BACKSLASH: char = '\\';
 const LOG_SCHEME_MAX_CHARS: usize = 16;
+/// Prefix of object URLs created by `URL.createObjectURL` (used by exports).
+const BLOB_PREFIX: &str = "blob:";
 
 /// Returns the authority (`host[:port]`) of an `http://` URL, or `None` when
 /// the URL is not a plain hierarchical http URL.
@@ -48,11 +50,17 @@ pub fn ui_origin_authority(ui_url: &str) -> Option<String> {
 /// allowed (scheme, host and port); path, query and fragment are free.
 /// Anything with userinfo, backslashes, whitespace or control characters is
 /// denied, as are all non-http schemes (`javascript:`, `data:`, `file:`,
-/// `about:blank`).
+/// `about:blank`). The one exception is `blob:http://<allowed authority>/...`
+/// (exact same origin only), which exports need for `<a download>` on
+/// WebKitGTK; foreign blob origins and blob URLs with userinfo stay denied.
 pub fn is_navigation_allowed(target: &str, allowed_authority: &str) -> bool {
     if target.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return false;
     }
+    let target = match target.get(..BLOB_PREFIX.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(BLOB_PREFIX) => &target[BLOB_PREFIX.len()..],
+        _ => target,
+    };
     let Some(authority) = http_authority(target) else {
         return false;
     };
@@ -154,11 +162,38 @@ mod tests {
         assert!(!is_navigation_allowed("data:text/html,<b>x</b>", AUTH));
         assert!(!is_navigation_allowed("file:///C:/Windows/win.ini", AUTH));
         assert!(!is_navigation_allowed("about:blank", AUTH));
-        assert!(!is_navigation_allowed(
-            "blob:http://127.0.0.1:49152/x",
+        assert!(!is_navigation_allowed("", AUTH));
+    }
+
+    #[test]
+    fn allows_same_origin_blob_only() {
+        // Intentional behaviour change: same-origin blob: used to be denied.
+        assert!(is_navigation_allowed(
+            "blob:http://127.0.0.1:49152/0b6e-uuid",
             AUTH
         ));
-        assert!(!is_navigation_allowed("", AUTH));
+        assert!(!is_navigation_allowed("blob:http://evil.com/x", AUTH));
+        assert!(!is_navigation_allowed(
+            "blob:http://127.0.0.1:49153/x",
+            AUTH
+        ));
+        assert!(!is_navigation_allowed(
+            "blob:http://evil.com@127.0.0.1:49152/x",
+            AUTH
+        ));
+        assert!(!is_navigation_allowed(
+            "blob:http://127.0.0.1:49152@evil.com/x",
+            AUTH
+        ));
+        assert!(!is_navigation_allowed(
+            "blob:https://127.0.0.1:49152/x",
+            AUTH
+        ));
+        assert!(!is_navigation_allowed(
+            "blob:blob:http://127.0.0.1:49152/x",
+            AUTH
+        ));
+        assert!(!is_navigation_allowed("blob:", AUTH));
     }
 
     #[test]

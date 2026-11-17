@@ -47,6 +47,12 @@ const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_RST: u8 = 0x04;
 const TCP_FLAG_ACK: u8 = 0x10;
+/// IPv6 Hop-by-Hop Options extension header (next-header value 0).
+const IPV6_EXT_HEADER_HOP_BY_HOP: u8 = 0;
+/// IPv6 Routing extension header (next-header value 43).
+const IPV6_EXT_HEADER_ROUTING: u8 = 43;
+/// IPv6 Destination Options extension header (next-header value 60).
+const IPV6_EXT_HEADER_DESTINATION_OPTIONS: u8 = 60;
 const IPV6_EXT_HEADER_FRAGMENT: u8 = 44;
 const IPV6_FRAGMENT_HEADER_LEN: usize = 8;
 const IPV6_FRAG_OFFSET_MASK: u16 = 0xFFF8;
@@ -773,16 +779,18 @@ impl TransparentNatTable {
             self.udp_fragment_verdicts
                 .retain(|_, (_, at)| at.elapsed() < ttl);
             if self.udp_fragment_verdicts.len() >= capacity {
-                // Evict a Reinject entry first: losing a Drop verdict would turn the remaining
-                // fragments of a blocked datagram into orphans that leak when the kill switch is
-                // off. A Drop entry is evicted only when no Reinject entry exists.
-                let reinject_victim = self
-                    .udp_fragment_verdicts
-                    .iter()
-                    .find(|e| e.value().0 == UdpFragmentVerdict::Reinject)
-                    .map(|e| *e.key());
-                let victim = reinject_victim
-                    .or_else(|| self.udp_fragment_verdicts.iter().next().map(|e| *e.key()));
+                // Evict the OLDEST Reinject entry first: losing a Drop verdict would turn the
+                // remaining fragments of a blocked datagram into orphans that leak when the
+                // kill switch is off. The oldest Drop entry goes only when no Reinject exists.
+                let oldest = |wanted: UdpFragmentVerdict| {
+                    self.udp_fragment_verdicts
+                        .iter()
+                        .filter(|e| e.value().0 == wanted)
+                        .min_by_key(|e| e.value().1)
+                        .map(|e| *e.key())
+                };
+                let victim = oldest(UdpFragmentVerdict::Reinject)
+                    .or_else(|| oldest(UdpFragmentVerdict::Drop));
                 if let Some(victim) = victim {
                     self.udp_fragment_verdicts.remove(&victim);
                 }
@@ -1255,7 +1263,9 @@ pub fn parse_ipv6_transport_meta(packet: &[u8]) -> Option<Ipv6TransportPacketMet
                     tcp_flags: 0,
                 });
             }
-            0 | 43 | 60 => {
+            IPV6_EXT_HEADER_HOP_BY_HOP
+            | IPV6_EXT_HEADER_ROUTING
+            | IPV6_EXT_HEADER_DESTINATION_OPTIONS => {
                 let hdr = packet.get(offset..offset + 2)?;
                 let ext_len = ((hdr[1] as usize) + 1) * 8;
                 next_header = hdr[0];
@@ -1451,7 +1461,10 @@ enum Ipv6FragmentPayload {
 
 /// Returns true for extension headers that share the generic `next header, length` layout.
 fn is_ipv6_walkable_ext_header(next_header: u8) -> bool {
-    matches!(next_header, 0 | 43 | 60)
+    matches!(
+        next_header,
+        IPV6_EXT_HEADER_HOP_BY_HOP | IPV6_EXT_HEADER_ROUTING | IPV6_EXT_HEADER_DESTINATION_OPTIONS
+    )
 }
 
 /// Walks the extension headers that follow an IPv6 fragment header (starting at `offset` with
@@ -1503,7 +1516,9 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
     let mut offset = IPV6_HEADER_LEN;
     for _ in 0..IPV6_MAX_EXT_HEADERS {
         match next_header {
-            0 | 43 | 60 => {
+            IPV6_EXT_HEADER_HOP_BY_HOP
+            | IPV6_EXT_HEADER_ROUTING
+            | IPV6_EXT_HEADER_DESTINATION_OPTIONS => {
                 let hdr = packet.get(offset..offset.checked_add(2)?)?;
                 next_header = hdr[0];
                 offset = offset.checked_add(((hdr[1] as usize) + 1) * 8)?;
@@ -1839,7 +1854,9 @@ pub fn is_non_first_ip_fragment(packet: &[u8]) -> bool {
                                 (u16::from_be_bytes([hdr[2], hdr[3]]) & IPV6_FRAG_OFFSET_MASK) != 0
                             });
                     }
-                    0 | 43 | 60 => {
+                    IPV6_EXT_HEADER_HOP_BY_HOP
+                    | IPV6_EXT_HEADER_ROUTING
+                    | IPV6_EXT_HEADER_DESTINATION_OPTIONS => {
                         let Some(hdr) = packet.get(offset..offset.saturating_add(2)) else {
                             return false;
                         };
@@ -2823,6 +2840,53 @@ mod tests {
             nat.lookup_udp_fragment_verdict(&key(4)),
             Some(UdpFragmentVerdict::Drop)
         );
+    }
+
+    #[test]
+    fn fragment_verdict_eviction_removes_the_oldest_entry_of_each_kind() {
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        nat.configure(
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            3,
+        );
+        let key = |id: u32| UdpFragmentKey {
+            src_ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
+            protocol: IPPROTO_UDP,
+            fragment_id: id,
+        };
+        let pause = || std::thread::sleep(Duration::from_millis(5));
+        nat.record_udp_fragment_verdict(key(1), UdpFragmentVerdict::Reinject);
+        pause();
+        nat.record_udp_fragment_verdict(key(2), UdpFragmentVerdict::Reinject);
+        pause();
+        nat.record_udp_fragment_verdict(key(3), UdpFragmentVerdict::Reinject);
+        pause();
+        nat.record_udp_fragment_verdict(key(4), UdpFragmentVerdict::Drop);
+        // The oldest Reinject entry (1) is gone, the newer ones survive.
+        assert!(nat.lookup_udp_fragment_verdict(&key(1)).is_none());
+        assert!(nat.lookup_udp_fragment_verdict(&key(2)).is_some());
+        assert!(nat.lookup_udp_fragment_verdict(&key(3)).is_some());
+        assert!(nat.lookup_udp_fragment_verdict(&key(4)).is_some());
+
+        // Only Drop entries: the oldest one is evicted.
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        nat.configure(
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            2,
+        );
+        nat.record_udp_fragment_verdict(key(1), UdpFragmentVerdict::Drop);
+        pause();
+        nat.record_udp_fragment_verdict(key(2), UdpFragmentVerdict::Drop);
+        pause();
+        nat.record_udp_fragment_verdict(key(3), UdpFragmentVerdict::Drop);
+        assert!(nat.lookup_udp_fragment_verdict(&key(1)).is_none());
+        assert!(nat.lookup_udp_fragment_verdict(&key(2)).is_some());
+        assert!(nat.lookup_udp_fragment_verdict(&key(3)).is_some());
     }
 
     #[test]
