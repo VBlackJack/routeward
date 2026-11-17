@@ -38,6 +38,11 @@ mod tests;
 mod tproxy;
 mod watchdog;
 
+pub use watchdog::{
+    decide_crash_cleanup_action, fail_closed_table_name, CrashCleanupAction, WatchdogMode,
+    FAIL_CLOSED_TABLE_SUFFIX, SERVICE_RESULT_SUCCESS,
+};
+
 pub(super) const BACKEND_NAME: &str = "nftables";
 pub(super) const COMPONENT_NFTABLES: &str = "NftablesInterceptor";
 pub(super) const AF_INET_U16: u16 = 2;
@@ -380,6 +385,13 @@ impl Interceptor for NftablesInterceptor {
             }
         }
 
+        // Tell the watchdog what to do if the daemon dies: fail closed with the kill switch on.
+        Self::write_watchdog_mode(
+            &mut watchdog_stdin,
+            WatchdogMode::from_kill_switch(kill_switch_enabled),
+            &controller.telemetry,
+        );
+
         *self.state.lock() = Some(NftActiveState {
             nft_binary: nft_bin.clone(),
             ip_binary: ip_bin,
@@ -461,6 +473,10 @@ impl Interceptor for NftablesInterceptor {
                 "Installed nftables table \"ip {table_name}\" (chain=\"{chain_name}\", fwmark={fwmark:#x}, redirect_port={relay_port}, dns_port={dns_listen_port})"
             ),
         );
+
+        // Own tables are installed: a block table left by a previous crash can now go (deleting it
+        // earlier would open a window, keeping it would block the upstream proxy traffic).
+        Self::delete_fail_closed_table(&nft_bin, &table_name, &controller.telemetry);
 
         Ok(())
     }
@@ -654,15 +670,31 @@ impl Interceptor for NftablesInterceptor {
             ),
         );
 
+        // Keep the crash behaviour in sync with the (possibly toggled) kill switch.
+        if let Some(ref mut st) = *self.state.lock() {
+            Self::write_watchdog_mode(
+                &mut st.watchdog_stdin,
+                WatchdogMode::from_kill_switch(kill_switch_enabled),
+                &st.telemetry,
+            );
+        }
+
         Ok(())
     }
 
     fn stop(&self) {
         self.active.store(false, Ordering::SeqCst);
         if let Some(mut state) = self.state.lock().take() {
-            // Closing the pipe write-end lets the watchdog exit cleanly
+            // A clean stop must never leave the network blocked: disarm, then close the pipe
+            // write-end so the watchdog exits with the plain cleanup.
+            Self::write_watchdog_mode(
+                &mut state.watchdog_stdin,
+                WatchdogMode::Disarm,
+                &state.telemetry,
+            );
             drop(state.watchdog_stdin.take());
             let _ = Self::delete_nft_table(&state.nft_binary, &state.table_name, &state.telemetry);
+            Self::delete_fail_closed_table(&state.nft_binary, &state.table_name, &state.telemetry);
             Self::delete_tproxy_routing(&state.ip_binary, state.tproxy_spec, &state.telemetry);
             if let Some(mut child) = state.watchdog_child.take() {
                 let _ = child.wait();
