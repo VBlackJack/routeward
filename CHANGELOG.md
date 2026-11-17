@@ -10,8 +10,15 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 - Linux: when the daemon crashes or is killed while interception runs with the kill switch on, the host now fails closed through the nftables table `inet routeward_ks` (loopback, established connections, DHCP and IPv6 neighbour discovery stay allowed) until `routeward cleanup --force` or the next interception start. The systemd unit runs `routeward cleanup --force --fail-closed-on-crash` after a failed stop. A clean stop never leaves the network blocked.
 - Windows: later UDP fragments are now captured and replay the first fragment's verdict; an orphan later fragment is dropped when the kill switch is on.
 - Desktop: the WebView only navigates within the loopback UI origin and cannot open new windows.
+- Desktop: the loopback UI server bounds unauthenticated connections and their total request time, so a local process can no longer starve the UI.
+- The temporary profile file is no longer granted to Everyone before its removal.
+- Linux: the systemd unit is hardened (`SystemCallFilter=@system-service`, kernel and control group protection, restricted address families and namespaces); `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH` stay because process attribution needs them.
 
 ### Fixed
+- Windows: turning the system proxy or PAC on saves the user's previous settings and turning it off restores them, only while the values are still RouteWard's; a corporate proxy is no longer lost. The desktop restores them on exit and at logoff.
+- Uninstall: `%ProgramData%\RouteWard` is removed unless `KEEPDATA=1` is passed (never on upgrade), and RouteWard's proxy, PAC and autostart values are removed or restored for every logged-on user (`routeward cleanup --all-users`, read-only and link-checked); `routeward cleanup --user` does the same for the current user. Users not logged on keep their values. On Linux, `purge` removes `/etc/routeward` and `/var/log/routeward`.
+- System errors shown in the UI are localized; dates, times, byte sizes and counts follow the UI language.
+- The process launcher takes one argument per line, so arguments with spaces or quotes are passed unchanged.
 - An MSI upgrade no longer deletes the RouteWard service: the new `routeward service restore` re-registers it with its `--allow-sid` arguments, restarts an automatic-start service, and is rolled back if the install fails.
 - MSI uninstall no longer waits on the WinDivert driver to stop.
 - Fixed-port engine tests no longer collide with each other on Linux.
@@ -21,6 +28,8 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ### Changed
 - The MSI bundles unmodified WinDivert 2.2.2 under the LGPLv3 with its notices, removes its driver service on uninstall, and each release attaches the WinDivert source archive. The portable ZIP still uses `tools/fetch-windivert.ps1`.
+- Linux TPROXY replies reuse one raw socket per address family, and the SOCKS5 UDP session table is no longer scanned on every datagram.
+- The minimum supported Rust version is 1.89 (checked in CI) and the UI requires Node.js 22.12 or later.
 
 ## [v2026.1116.01] - 2026-11-16
 
