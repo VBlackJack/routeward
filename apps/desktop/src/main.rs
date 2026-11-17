@@ -16,7 +16,6 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod downloads;
 mod navigation;
 
 use routeward_core::ipc::generate_ephemeral_token;
@@ -187,6 +186,63 @@ fn spawn_embedded_ui_server(
             });
         }
     });
+}
+
+/// Lets the UI origin trigger several exports in a row on WebView2.
+///
+/// The engine's download limiter raises a "multiple automatic downloads" permission request
+/// from the second export on. wry registers its own handler that only touches the clipboard
+/// kind, and WebView2 invokes every registered handler, so this one only ever sets ALLOW for
+/// that single kind on the UI origin and never sets DENY or any other state.
+#[cfg(target_os = "windows")]
+fn allow_multiple_downloads(
+    webview: &wry::WebView,
+    bridge: &DesktopCommandBridge,
+    allowed_authority: &str,
+) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS,
+        COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+    };
+    use webview2_com::{take_pwstr, PermissionRequestedEventHandler};
+    use windows::core::PWSTR;
+    use wry::WebViewExtWindows;
+
+    let authority = allowed_authority.to_string();
+    let result = unsafe {
+        let core = match webview.controller().CoreWebView2() {
+            Ok(core) => core,
+            Err(err) => {
+                bridge.log_warn(format!("WebView2 core unavailable for permissions: {err}"));
+                return;
+            }
+        };
+        let mut token = Default::default();
+        core.add_PermissionRequested(
+            &PermissionRequestedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+                args.PermissionKind(&mut kind)?;
+                let mut uri = PWSTR::null();
+                args.Uri(&mut uri)?;
+                let uri = take_pwstr(uri);
+                if navigation::should_allow_multiple_downloads(
+                    kind == COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS,
+                    &uri,
+                    &authority,
+                ) {
+                    args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
+                }
+                Ok(())
+            })),
+            &mut token,
+        )
+    };
+    if let Err(err) = result {
+        bridge.log_warn(format!(
+            "Failed to register WebView2 permission handler: {err}"
+        ));
+    }
 }
 
 fn report_fatal_ui_error(bridge: &DesktopCommandBridge, detail: &str) {
@@ -382,9 +438,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bridge_for_nav = Arc::clone(&bridge);
     let bridge_for_new_window = Arc::clone(&bridge);
-    let bridge_for_download = Arc::clone(&bridge);
+    #[cfg(target_os = "windows")]
+    let allowed_authority_for_permissions = allowed_authority.clone();
     let mut web_context = WebContext::new(Some(webview_data_dir));
-    let _webview = match WebViewBuilder::with_web_context(&mut web_context)
+    let webview = match WebViewBuilder::with_web_context(&mut web_context)
         .with_initialization_script(&init_script)
         .with_navigation_handler(move |target| {
             let allowed = navigation::is_navigation_allowed(&target, &allowed_authority);
@@ -403,14 +460,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
             false
         })
-        .with_download_started_handler(move |_url, path| {
-            let accepted = downloads::redirect_download(path);
-            if !accepted {
-                bridge_for_download
-                    .log_warn("Cancelled WebView download: no writable Downloads folder");
-            }
-            accepted
-        })
         // DevTools only in debug builds, so the CSP can be inspected without exposing them to users.
         .with_devtools(cfg!(debug_assertions))
         .with_url(&ui_url)
@@ -422,6 +471,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(Box::new(err));
         }
     };
+
+    #[cfg(target_os = "windows")]
+    allow_multiple_downloads(&webview, &bridge, &allowed_authority_for_permissions);
+    #[cfg(not(target_os = "windows"))]
+    let _ = &webview;
 
     let rt_for_loop = Arc::clone(&runtime);
     let bridge_for_loop = Arc::clone(&bridge);

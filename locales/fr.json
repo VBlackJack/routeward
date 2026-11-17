@@ -119,7 +119,7 @@
       "connection": {
         "terminated": "Socket de connexion terminé",
         "os_scanned": "Sockets TCP réels du système analysés et importés",
-        "exported": "Activité réseau exportée dans votre dossier Téléchargements"
+        "exported": "Activité réseau exportée"
       },
       "system": {
         "proxy_enabled": "Proxy Système Windows activé sur le relais local",
@@ -145,7 +145,7 @@
       "profile": {
         "imported": "Profil de configuration importé",
         "import_error": "Fichier JSON de profil invalide",
-        "exported": "Profil exporté dans votre dossier Téléchargements",
+        "exported": "Profil exporté au format JSON",
         "saved_named": "Profil nommé enregistré",
         "switched": "Profil actif basculé",
         "deleted": "Profil supprimé",
