@@ -29,15 +29,40 @@ use routeward_core::rules::ConnectionRequest;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 
 pub const HTTP_REQ_BUFFER_BYTES: usize = 65536;
 const HTTP_MAX_HEADER_BYTES: usize = 16384;
 const HTTP_MAX_BODY_BYTES: usize = 1024 * 1024;
 const HTTP_READ_TIMEOUT_MS: u64 = 2000;
+/// Total time a client has to deliver the whole request (headers and body). A slow-drip client
+/// that stays under the per-read timeout is still cut off when this elapses.
+pub const HTTP_REQUEST_TOTAL_DEADLINE_MS: u64 = 5000;
+/// HTTP status used when the total request deadline elapses.
+const REQUEST_TIMEOUT_STATUS: u16 = 408;
 /// HTTP status returned when a system operation (proxy, PAC, autostart, launch) fails.
 const SYSTEM_ERROR_STATUS: u16 = 500;
 
+/// Reads one request within [`HTTP_REQUEST_TOTAL_DEADLINE_MS`].
 async fn read_bounded_http_request(stream: &mut TcpStream) -> Result<String, u16> {
+    read_bounded_http_request_within(
+        stream,
+        std::time::Duration::from_millis(HTTP_REQUEST_TOTAL_DEADLINE_MS),
+    )
+    .await
+}
+
+/// Reads one request (headers and body) and gives up with `408` once `total` has elapsed.
+async fn read_bounded_http_request_within(
+    stream: &mut TcpStream,
+    total: std::time::Duration,
+) -> Result<String, u16> {
+    tokio::time::timeout(total, read_http_request_parts(stream))
+        .await
+        .unwrap_or(Err(REQUEST_TIMEOUT_STATUS))
+}
+
+async fn read_http_request_parts(stream: &mut TcpStream) -> Result<String, u16> {
     let mut raw = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let header_end;
@@ -999,6 +1024,7 @@ pub async fn serve_loopback_http_connection<FStatic>(
     bridge: &DesktopCommandBridge,
     on_window_cmd: Option<&(dyn Fn(DesktopWindowCommand) + Send + Sync)>,
     static_asset_handler: Option<FStatic>,
+    admission: Option<&Semaphore>,
 ) where
     FStatic: FnOnce(&str) -> (&'static str, &'static [u8]),
 {
@@ -1039,6 +1065,35 @@ pub async fn serve_loopback_http_connection<FStatic>(
             let _ = stream.shutdown().await;
             return;
         }
+    };
+
+    // The serving permit is taken only once the request is validated, so connections that never
+    // finish or never authenticate cannot use up the slots reserved for real requests.
+    let _admitted = match admission {
+        Some(slots) => match slots.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                let body = b"{\"error\":\"busy\"}";
+                let resp = format!(
+                    "{}
+Content-Type: application/json; charset=utf-8
+Content-Length: {}
+Cache-Control: no-store, no-cache, must-revalidate
+X-Content-Type-Options: nosniff
+Connection: close
+
+",
+                    http_status_line(503),
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+                let _ = stream.shutdown().await;
+                return;
+            }
+        },
+        None => None,
     };
 
     if path.starts_with("/api/events") {
@@ -1095,6 +1150,7 @@ pub async fn serve_loopback_api_connection(
         bridge,
         None,
         None::<fn(&str) -> (&'static str, &'static [u8])>,
+        None,
     )
     .await;
 }
@@ -1127,5 +1183,66 @@ mod tests {
             payload["error"],
             bridge.translate(ERR_KEY_SYSTEM_PATH_EMPTY)
         );
+    }
+
+    #[tokio::test]
+    async fn a_slow_drip_request_is_cut_off_by_the_total_deadline() {
+        const TOTAL_MS: u64 = 400;
+        const DRIP_INTERVAL_MS: u64 = 100;
+        const DRIP_COUNT: usize = 40;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let started = std::time::Instant::now();
+            let result = read_bounded_http_request_within(
+                &mut stream,
+                std::time::Duration::from_millis(TOTAL_MS),
+            )
+            .await;
+            (result, started.elapsed())
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        for _ in 0..DRIP_COUNT {
+            // Each byte arrives well inside the per-read timeout, but never finishes the request.
+            if client.write_all(b"G").await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(DRIP_INTERVAL_MS)).await;
+        }
+        let (result, elapsed) = server.await.unwrap();
+        assert_eq!(result, Err(REQUEST_TIMEOUT_STATUS));
+        assert!(
+            elapsed < std::time::Duration::from_millis(TOTAL_MS * 3),
+            "the read must stop near the deadline, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_complete_request_inside_the_deadline_is_read_whole() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_bounded_http_request(&mut stream).await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"POST /x HTTP/1.1
+Content-Length: 2
+
+{}",
+            )
+            .await
+            .unwrap();
+        let text = server.await.unwrap().unwrap();
+        assert!(text.ends_with(
+            "
+
+{}"
+        ));
     }
 }

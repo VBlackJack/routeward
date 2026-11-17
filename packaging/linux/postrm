@@ -18,6 +18,15 @@ set -e
 # Debian maintainer script run after the package files are removed. Only "purge" deletes data.
 # The system group "routeward" is intentionally kept: a group that may still own files is never
 # safe to remove from a maintainer script.
+
+# The unit file is gone after "remove" as well as "purge": tell systemd (when it is running) so it
+# stops listing a unit that no longer exists.
+if [ "${1:-}" = "remove" ]; then
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+fi
+
 if [ "${1:-}" = "purge" ]; then
     rm -rf /etc/routeward /var/log/routeward
 

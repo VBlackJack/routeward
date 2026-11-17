@@ -27,7 +27,7 @@ use crate::error::{
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 #[cfg(windows)]
-use user_state::{FileBackupStore, RegExeStore};
+use user_state::{FileBackupStore, Win32RegistryStore};
 use user_state::{RegValue, UserCleanupReport, PROXY_SERVER_PREFIX};
 
 /// Serializes every read-modify-write of the saved previous settings: the desktop bridge runs the
@@ -47,8 +47,6 @@ const ENV_HTTPS_PROXY: &str = "HTTPS_PROXY";
 const ENV_NO_PROXY: &str = "NO_PROXY";
 const DEFAULT_NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
 
-#[cfg(windows)]
-const WIN_INET_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 #[cfg(windows)]
 const WIN_RUN_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
@@ -206,18 +204,18 @@ impl SystemProxyManager {
     /// Runs `task` with the per-user registry and the saved-settings file, serialized.
     #[cfg(windows)]
     fn with_user_state<T>(
-        task: impl FnOnce(&RegExeStore, &FileBackupStore) -> RouteWardResult<T>,
+        task: impl FnOnce(&Win32RegistryStore, &FileBackupStore) -> RouteWardResult<T>,
     ) -> RouteWardResult<T> {
         let backups = FileBackupStore::for_current_user()?;
         let _guard = USER_STATE_LOCK.lock();
-        task(&RegExeStore, &backups)
+        task(&Win32RegistryStore::current_user(), &backups)
     }
 
     /// Enables or disables RouteWard's system proxy for the current user.
     ///
     /// Enabling first saves the previous proxy settings; disabling restores them, but only while
     /// the proxy server is still RouteWard's. Returns the state after the call: after a disable
-    /// that left a foreign proxy alone, that is `true`.
+    /// that left a foreign proxy alone, that is `true`; otherwise it is `false`.
     pub fn set_system_proxy(enable: bool, socks_endpoint: &str) -> RouteWardResult<bool> {
         #[cfg(windows)]
         {
@@ -231,7 +229,10 @@ impl SystemProxyManager {
             if enable {
                 Ok(true)
             } else {
-                Ok(Self::is_system_proxy_enabled())
+                // After a disable, "still on" means RouteWard's own proxy could not be removed. A
+                // foreign proxy the user (or a policy) set is none of RouteWard's business and
+                // must not make the call report failure.
+                Ok(Self::is_routeward_proxy_active(socks_endpoint))
             }
         }
         #[cfg(not(windows))]
@@ -280,13 +281,32 @@ impl SystemProxyManager {
         }
     }
 
+    /// Everything `routeward cleanup --all-users` does: for every user hive currently loaded
+    /// under `HKEY_USERS`, restores the proxy and PAC settings that are still RouteWard's and
+    /// removes the autostart entry. Needs an elevated or SYSTEM caller. Users who are not logged
+    /// on have no loaded hive and keep their values. A no-op outside Windows.
+    pub fn cleanup_all_users(
+        socks_endpoint: &str,
+        pac_url: &str,
+    ) -> RouteWardResult<user_state::AllUsersCleanupReport> {
+        #[cfg(windows)]
+        {
+            user_state::cleanup_all_loaded_users(socks_endpoint, pac_url)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (socks_endpoint, pac_url);
+            Ok(user_state::AllUsersCleanupReport::default())
+        }
+    }
+
     /// True when the system proxy is switched on and points to RouteWard's relay.
     pub fn is_routeward_proxy_active(socks_endpoint: &str) -> bool {
         #[cfg(windows)]
         {
             use user_state::{RegLocation, UserSettingsStore};
             let read = |name| {
-                RegExeStore
+                Win32RegistryStore::current_user()
                     .read(RegLocation::InternetSettings, name)
                     .ok()
                     .flatten()
@@ -357,21 +377,15 @@ impl SystemProxyManager {
     pub fn is_system_proxy_enabled() -> bool {
         #[cfg(windows)]
         {
-            let Ok(output) = Command::new(windows_system_tool_path("reg.exe"))
-                .args([
-                    "query",
-                    WIN_INET_REG_PATH,
-                    "/v",
+            use user_state::{RegLocation, UserSettingsStore};
+            Win32RegistryStore::current_user()
+                .read(
+                    RegLocation::InternetSettings,
                     user_state::VALUE_PROXY_ENABLE,
-                ])
-                .output()
-            else {
-                return false;
-            };
-            if !output.status.success() {
-                return false;
-            }
-            parse_reg_dword_value(&String::from_utf8_lossy(&output.stdout)) == Some(1)
+                )
+                .ok()
+                .flatten()
+                == Some(RegValue::Dword(1))
         }
         #[cfg(not(windows))]
         {
@@ -382,23 +396,16 @@ impl SystemProxyManager {
     pub fn get_system_pac_url() -> Option<String> {
         #[cfg(windows)]
         {
-            let output = Command::new(windows_system_tool_path("reg.exe"))
-                .args(["query", WIN_INET_REG_PATH, "/v", "AutoConfigURL"])
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some(idx) = line.find("REG_SZ") {
-                    let val = line[idx + "REG_SZ".len()..].trim();
-                    if !val.is_empty() {
-                        return Some(val.to_string());
-                    }
-                }
-            }
-            None
+            use user_state::{RegLocation, UserSettingsStore};
+            Win32RegistryStore::current_user()
+                .read(
+                    RegLocation::InternetSettings,
+                    user_state::VALUE_AUTO_CONFIG_URL,
+                )
+                .ok()
+                .flatten()
+                .and_then(|value| value.as_text().map(str::to_string))
+                .filter(|url| !url.is_empty())
         }
         #[cfg(not(windows))]
         {

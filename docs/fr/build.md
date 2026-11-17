@@ -131,6 +131,12 @@ Pour une exécution persistante sous `LocalSystem`, enregistrez RouteWard comme 
 
 Les paquets `.msi` de release embarquent WinDivert 2.2.2 (`WinDivert.dll` et `WinDivert64.sys`, non modifiés, sous licence LGPLv3 ; mentions dans `THIRD_PARTY_NOTICES.txt`, archive des sources de WinDivert jointe à chaque release). Une mise à jour MSI réenregistre le service RouteWard avec ses arguments `--allow-sid` (`routeward service restore` ; les services en démarrage automatique sont relancés, ceux en démarrage manuel sont enregistrés arrêtés), et la désinstallation supprime le service du pilote WinDivert. Le ZIP portable ne contient pas WinDivert et exige toujours `tools/fetch-windivert.ps1`.
 
+#### Désinstaller le MSI (ce qui est nettoyé, ce qui ne l'est pas)
+Avant la suppression des fichiers, une désinstallation (pas une mise à jour) exécute deux actions :
+
+- `routeward cleanup --all-users` (sous `LocalSystem`) : pour chaque utilisateur dont la ruche du registre est **actuellement chargée** (chaque utilisateur connecté), elle remet en place le proxy système, l'URL PAC et l'entrée de démarrage automatique modifiés par RouteWard, depuis la sauvegarde de cet utilisateur, et seulement s'ils sont toujours ceux de RouteWard. Les ruches des utilisateurs non connectés ne sont volontairement **pas** chargées : ces utilisateurs gardent leurs valeurs. Pour corriger à la main, désactivez le proxy dans *Paramètres > Réseau et Internet > Proxy* (ou *Options Internet > Connexions > Paramètres réseau*), ou lancez `routeward cleanup --user` sous ce compte avant la désinstallation.
+- `routeward purge-data` : supprime `%ProgramData%\RouteWard` (profil et journaux) sauf si `KEEPDATA=1` a été passé (`msiexec /x RouteWard.msi KEEPDATA=1`). Elle refuse un dossier modifiable par un utilisateur standard. Limite acceptée : les données sont supprimées avant la fin de la désinstallation, donc une désinstallation qui échoue ou est annulée ensuite laisse les données supprimées.
+
 ### Unité `systemd` & Paquet `.deb` sous Linux
 Pour un déploiement système sous Linux, utilisez `packaging/linux/build-deb.sh` (ou installez `packaging/linux/routeward.service` avec le groupe système `routeward`) :
 

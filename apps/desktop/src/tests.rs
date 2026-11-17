@@ -1120,6 +1120,7 @@ async fn spawn_test_loopback_server(
                                 ("text/html; charset=utf-8", &b"<html></html>"[..])
                             }
                         }),
+                        None,
                     )
                     .await;
                 } else {

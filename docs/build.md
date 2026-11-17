@@ -131,6 +131,12 @@ For persistent background execution under `LocalSystem`, register RouteWard as a
 
 Release `.msi` packages bundle WinDivert 2.2.2 (`WinDivert.dll` and `WinDivert64.sys`, unmodified, under the LGPLv3; notices in `THIRD_PARTY_NOTICES.txt`, WinDivert source archive attached to each release). An MSI upgrade re-registers the RouteWard service with its `--allow-sid` arguments (`routeward service restore`; automatic-start services are restarted, manual-start ones are registered stopped), and uninstalling removes the WinDivert driver service. The portable ZIP does not contain WinDivert and still requires `tools/fetch-windivert.ps1`.
 
+#### Uninstalling the MSI (what is cleaned, what is not)
+Before the files are removed, an uninstall (not an upgrade) runs two actions:
+
+- `routeward cleanup --all-users` (as `LocalSystem`): for every user whose registry hive is **currently loaded** (every logged-on user), it gives back the system proxy, the PAC URL and the autostart entry that RouteWard changed, from that user's saved backup, and only while they are still RouteWard's. Hives of users who are not logged on are deliberately **not** loaded, so those users keep their values. To fix one by hand, turn the proxy off in *Settings > Network & Internet > Proxy* (or *Internet Options > Connections > LAN settings*), or run `routeward cleanup --user` as that user before uninstalling.
+- `routeward purge-data`: deletes `%ProgramData%\RouteWard` (profile and logs) unless `KEEPDATA=1` was passed (`msiexec /x RouteWard.msi KEEPDATA=1`). It refuses a directory that a standard user could write to. Accepted limit: the data is deleted before the uninstall has finished, so an uninstall that fails or is rolled back afterwards leaves the data deleted.
+
 ### Linux `systemd` Unit & `.deb` Packaging
 For headless Linux installations, use `packaging/linux/build-deb.sh` (or install `packaging/linux/routeward.service` alongside the `routeward` system group):
 

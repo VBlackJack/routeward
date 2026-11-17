@@ -51,9 +51,12 @@ const WINDOW_DEFAULT_HEIGHT: f64 = 900.0;
 const WINDOW_MIN_WIDTH: f64 = 980.0;
 const WINDOW_MIN_HEIGHT: f64 = 660.0;
 const LOOPBACK_EPHEMERAL_ADDR: &str = "127.0.0.1:0";
-/// Connections the loopback UI server serves at once. The WebView needs a handful (page, assets,
-/// the realtime stream, API calls); anything beyond this is closed before it is read.
-const LOOPBACK_MAX_CONCURRENT_CONNECTIONS: usize = 64;
+/// Connections the loopback UI server holds while they are still sending their request. Each is
+/// cut off by the request deadline; anything beyond this is closed before it is read.
+const LOOPBACK_MAX_PRE_AUTH_CONNECTIONS: usize = 256;
+/// Validated requests served at once (page, assets, the realtime stream, API calls). Taken only
+/// after the token check, so slow or unauthenticated connections never consume these.
+const LOOPBACK_MAX_SERVING_REQUESTS: usize = 64;
 const ICON_WINDOW_DIMENSION: u32 = 32;
 const ICON_TASKBAR_DIMENSION: u32 = 256;
 
@@ -130,6 +133,61 @@ fn apply_window_theme(window: &Window, appearance: WindowThemeAppearance) {
     }
 }
 
+/// Identifier of the session-end window subclass (unique among this window's subclasses).
+#[cfg(target_os = "windows")]
+const SESSION_END_SUBCLASS_ID: usize = 1;
+
+/// Window subclass procedure: when Windows confirms the session is ending (logoff or shutdown),
+/// gives the proxy settings back before the process is terminated. The event loop never sees
+/// `WM_ENDSESSION`, so the usual exit path is not reached in that case.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn session_end_subclass_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+    _subclass_id: usize,
+    bridge_ptr: usize,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::Shell::DefSubclassProc;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_ENDSESSION;
+
+    // A non-zero wParam means the session really ends (zero: the end was cancelled).
+    if msg == WM_ENDSESSION && wparam != 0 {
+        // SAFETY: `bridge_ptr` comes from `Arc::into_raw` in `restore_settings_on_session_end`
+        // and that reference is intentionally never released, so it is valid for the whole run.
+        let bridge = unsafe { &*(bridge_ptr as *const DesktopCommandBridge) };
+        bridge.restore_system_settings_on_exit();
+    }
+    // SAFETY: forwards the unmodified message of this window procedure call.
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+/// Hooks `WM_ENDSESSION` on the main window so a logoff or shutdown restores the proxy settings.
+/// tao 0.30 exposes no event for it, so the window is subclassed; no new dependency is needed.
+#[cfg(target_os = "windows")]
+fn restore_settings_on_session_end(window: &Window, bridge: &Arc<DesktopCommandBridge>) {
+    use tao::platform::windows::WindowExtWindows;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::Shell::SetWindowSubclass;
+
+    let bridge_ptr = Arc::into_raw(Arc::clone(bridge)) as usize;
+    // SAFETY: called on the thread that owns the window; the reference data outlives the window.
+    let installed = unsafe {
+        SetWindowSubclass(
+            window.hwnd() as HWND,
+            Some(session_end_subclass_proc),
+            SESSION_END_SUBCLASS_ID,
+            bridge_ptr,
+        )
+    };
+    if installed == 0 {
+        bridge.log_warn(
+            "Could not hook the Windows session end; proxy settings are not restored on logoff",
+        );
+    }
+}
+
 fn spawn_embedded_ui_server(
     runtime: &tokio::runtime::Handle,
     bridge: Arc<DesktopCommandBridge>,
@@ -155,45 +213,66 @@ fn spawn_embedded_ui_server(
                 return;
             }
         };
-        let token_arc = Arc::new(ephemeral_token);
-
-        accept_bounded(
+        let on_window_cmd: Arc<dyn Fn(DesktopWindowCommand) + Send + Sync> = Arc::new(move |cmd| {
+            let _ = event_proxy.send_event(cmd);
+        });
+        serve_loopback_listener(
             listener,
-            LOOPBACK_MAX_CONCURRENT_CONNECTIONS,
-            move |stream| {
-                let bridge_ref = Arc::clone(&bridge);
-                let proxy_ref = event_proxy.clone();
-                let token_ref = Arc::clone(&token_arc);
-                async move {
-                    let win_cb = |cmd: DesktopWindowCommand| {
-                        let _ = proxy_ref.send_event(cmd);
-                    };
-                    serve_loopback_http_connection(
-                        stream,
-                        bound_port,
-                        &token_ref,
-                        &bridge_ref,
-                        Some(&win_cb),
-                        Some(|path: &str| {
-                            if path.starts_with("/assets/app.js") {
-                                ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
-                            } else if path.starts_with("/assets/app.css") {
-                                ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
-                            } else if path.starts_with("/routeward-glyph.svg") {
-                                ("image/svg+xml", EMBEDDED_GLYPH_SVG)
-                            } else if path.starts_with("/routeward-icon.svg") {
-                                ("image/svg+xml", EMBEDDED_ICON_SVG)
-                            } else {
-                                ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
-                            }
-                        }),
-                    )
-                    .await;
-                }
-            },
+            bound_port,
+            Arc::new(ephemeral_token),
+            bridge,
+            on_window_cmd,
         )
         .await;
     });
+}
+
+/// Serves the loopback UI on `listener` until it fails.
+///
+/// Two separate bounds apply. `LOOPBACK_MAX_PRE_AUTH_CONNECTIONS` limits the connections still
+/// reading their request (each is cut off after the request deadline). The much smaller
+/// `LOOPBACK_MAX_SERVING_REQUESTS` limits validated requests and is only taken after the token
+/// check, so unauthenticated or slow-drip connections cannot starve authenticated ones.
+async fn serve_loopback_listener(
+    listener: TcpListener,
+    bound_port: u16,
+    token: Arc<String>,
+    bridge: Arc<DesktopCommandBridge>,
+    on_window_cmd: Arc<dyn Fn(DesktopWindowCommand) + Send + Sync>,
+) {
+    let serving_slots = Arc::new(Semaphore::new(LOOPBACK_MAX_SERVING_REQUESTS));
+    accept_bounded(listener, LOOPBACK_MAX_PRE_AUTH_CONNECTIONS, move |stream| {
+        let bridge_ref = Arc::clone(&bridge);
+        let token_ref = Arc::clone(&token);
+        let cmd_ref = Arc::clone(&on_window_cmd);
+        let slots_ref = Arc::clone(&serving_slots);
+        async move {
+            let win_cb = |cmd: DesktopWindowCommand| cmd_ref(cmd);
+            serve_loopback_http_connection(
+                stream,
+                bound_port,
+                &token_ref,
+                &bridge_ref,
+                Some(&win_cb),
+                Some(|path: &str| {
+                    if path.starts_with("/assets/app.js") {
+                        ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
+                    } else if path.starts_with("/assets/app.css") {
+                        ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
+                    } else if path.starts_with("/routeward-glyph.svg") {
+                        ("image/svg+xml", EMBEDDED_GLYPH_SVG)
+                    } else if path.starts_with("/routeward-icon.svg") {
+                        ("image/svg+xml", EMBEDDED_ICON_SVG)
+                    } else {
+                        ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
+                    }
+                }),
+                Some(&slots_ref),
+            )
+            .await;
+        }
+    })
+    .await;
 }
 
 /// Accepts connections until the listener fails and serves each one with `handler`, at most
@@ -447,6 +526,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     apply_window_theme(&window, initial_appearance);
+    #[cfg(target_os = "windows")]
+    restore_settings_on_session_end(&window, &bridge);
 
     let webview_data_dir = bridge.webview_data_dir();
     if let Err(err) = std::fs::create_dir_all(&webview_data_dir) {
@@ -664,6 +745,64 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
         }
         assert!(served_again, "a freed slot must serve new connections");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_unauthenticated_connections_cannot_starve_an_authenticated_request() {
+        use routeward_core::config::{ProfileConfig, SystemConstants};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        profile.enable_logging = false;
+        let bridge = Arc::new(DesktopCommandBridge::new(constants, profile, "en"));
+
+        let listener = TcpListener::bind(LOOPBACK_EPHEMERAL_ADDR).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = generate_ephemeral_token();
+        let server = tokio::spawn(serve_loopback_listener(
+            listener,
+            port,
+            Arc::new(token.clone()),
+            bridge,
+            Arc::new(|_cmd: DesktopWindowCommand| {}),
+        ));
+
+        // As many half-sent requests as the serving limit: they never finish and never authenticate.
+        let mut dripping = Vec::new();
+        for _ in 0..LOOPBACK_MAX_SERVING_REQUESTS {
+            let mut slow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            slow.write_all(
+                b"GET /api/state HTTP/1.1
+",
+            )
+            .await
+            .unwrap();
+            dripping.push(slow);
+        }
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let request = format!(
+            "GET /api/state HTTP/1.1
+Host: 127.0.0.1:{port}
+X-RouteWard-Token: {token}
+
+"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("the authenticated request must be answered while slow connections hang")
+        .unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
+
+        drop(dripping);
         server.abort();
     }
 }

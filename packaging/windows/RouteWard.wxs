@@ -109,12 +109,22 @@
       profile and the logs). Any non-empty value keeps them; omit it to delete them.
 
       PurgeProgramData: deferred, no impersonation (runs as LocalSystem), deletes %ProgramData%\RouteWard.
-      The CLI refuses while a RouteWard daemon is active and never follows a link out of the directory.
+      The CLI refuses while a RouteWard daemon is active, refuses a directory that a standard user could
+      write to, and never follows a link out of the directory. Accepted limit: the data is deleted before
+      the rest of the uninstall has finished, so an uninstall that fails or is rolled back AFTER this
+      action leaves the data deleted (KEEPDATA=1 avoids it).
 
-      CleanupUserSettings: deferred WITH impersonation, so it runs as the user who runs the uninstall and
-      restores or removes the RouteWard-owned values of that user's HKCU (system proxy, PAC URL, autostart
-      entry). Other users of the machine keep their values until they run the CLI user cleanup command.
-      It needs no elevation.
+      CleanupUserSettings: deferred, no impersonation (runs as LocalSystem), runs the CLI "cleanup" command with its all-users option:
+      for every user whose registry hive is loaded under HKEY_USERS at that moment (every logged-on
+      user, including the one running the uninstall, whose HKCU is not the installer's own), it restores
+      or removes the RouteWard-owned values (system proxy, PAC URL, autostart entry) from that user's saved
+      backup, only while they are still RouteWard's. Hives of users who are not logged on are NOT loaded
+      (too intrusive), so those users keep their values and must fix them by hand: Settings > Network and
+      Internet > Proxy, or Internet Options > Connections > LAN settings, or run the CLI "cleanup" command with its user option
+      before the uninstall.
+
+      TerminalServerAware is not set on any action: that flag only applies to impersonated deferred
+      actions, and none of these impersonates the user.
     -->
     <Property Id="KEEPDATA" Secure="yes" />
 
@@ -128,9 +138,9 @@
     <CustomAction
         Id="CleanupUserSettings"
         FileRef="RouteWardCliExe"
-        ExeCommand="cleanup --user"
+        ExeCommand="cleanup --all-users"
         Execute="deferred"
-        Impersonate="yes"
+        Impersonate="no"
         Return="ignore" />
 
     <InstallExecuteSequence>

@@ -733,7 +733,8 @@
       },
       "cleanup": {
         "completed": "Interception rules cleanup completed",
-        "user_completed": "Per-user RouteWard settings restored"
+        "user_completed": "Per-user RouteWard settings restored",
+        "all_users_completed": "RouteWard settings restored for every logged-on user"
       },
       "purge": {
         "completed": "RouteWard data directory removed"

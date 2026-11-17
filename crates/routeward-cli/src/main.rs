@@ -31,7 +31,7 @@ use routeward_core::ipc::{wait_for_shutdown_signal, DaemonIpcService, IpcClient}
 use routeward_core::logger::FileLogger;
 use routeward_core::pac::PacGenerator;
 use routeward_core::rules::ConnectionRequest;
-use routeward_core::system::user_state::UserCleanupReport;
+use routeward_core::system::user_state::{AllUsersCleanupReport, UserCleanupReport};
 use routeward_core::system::windows_service::{
     install_windows_service, query_windows_service_status, restore_windows_service,
     run_windows_service_dispatcher, start_windows_service, stop_windows_service,
@@ -121,6 +121,11 @@ enum Commands {
         /// autostart entry); needs no elevation and does not touch the OS interception rules
         #[arg(long, conflicts_with_all = ["force", "fail_closed_on_crash"])]
         user: bool,
+        /// Restore the RouteWard-owned settings of every user whose registry hive is currently
+        /// loaded (Windows; run elevated or as SYSTEM, used by the uninstaller). Users who are
+        /// not logged on keep their values
+        #[arg(long = "all-users", conflicts_with_all = ["force", "fail_closed_on_crash", "user"])]
+        all_users: bool,
     },
     /// Delete the RouteWard data directory (profile and logs) of this machine; run by the
     /// uninstaller. Needs elevation and refuses while a RouteWard daemon is active
@@ -215,6 +220,40 @@ fn run_cleanup_user(constants: &SystemConstants) -> RouteWardResult<UserCleanupR
         "per-user settings cleanup finished"
     );
     Ok(report)
+}
+
+/// Runs `routeward cleanup --all-users`: gives back the per-user settings of every user whose
+/// hive is loaded. A failure for one user does not stop the others; the first one is returned
+/// once every user has been processed.
+fn run_cleanup_all_users(
+    constants: &SystemConstants,
+    i18n: &I18nRegistry,
+) -> RouteWardResult<AllUsersCleanupReport> {
+    if !RouteWardController::detect_elevated_privileges() {
+        return Err(RouteWardError::DaemonError {
+            key: ERR_KEY_DAEMON_NOT_ELEVATED,
+            detail: i18n.t(ERR_KEY_DAEMON_NOT_ELEVATED),
+        });
+    }
+    let net = &constants.network;
+    let socks_endpoint = format!("{}:{}", net.local_bind_host, net.default_relay_tcp_port);
+    let pac_url = local_pac_url(&net.local_bind_host, net.default_pac_port);
+    let mut report = SystemProxyManager::cleanup_all_users(&socks_endpoint, &pac_url)?;
+    tracing::info!(
+        users_processed = report.users_processed,
+        users_changed = report.users_changed,
+        users_skipped = report.users_skipped,
+        users_failed = report.failures.len(),
+        "all-users settings cleanup finished"
+    );
+    for (sid, err) in &report.failures {
+        tracing::warn!(sid = %sid, error = %err, "settings cleanup failed for a user");
+    }
+    if report.failures.is_empty() {
+        Ok(report)
+    } else {
+        Err(report.failures.remove(0).1)
+    }
 }
 
 /// Runs `routeward purge-data`: removes `%ProgramData%\RouteWard` (Windows only). Requires an
@@ -816,6 +855,22 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if matches!(
+        args.command,
+        Commands::Cleanup {
+            all_users: true,
+            ..
+        }
+    ) {
+        let i18n = I18nRegistry::new(&args.locale);
+        if let Err(err) = run_cleanup_all_users(&constants, &i18n) {
+            eprintln!("{}", i18n.t(err.i18n_key()));
+            return Err(err.into());
+        }
+        println!("{}", i18n.t("cli.engine.cleanup.all_users_completed"));
+        return Ok(());
+    }
+
     if matches!(args.command, Commands::Cleanup { user: true, .. }) {
         let i18n = I18nRegistry::new(&args.locale);
         if let Err(err) = run_cleanup_user(&constants) {
@@ -947,6 +1002,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             force,
             fail_closed_on_crash,
             user: _,
+            all_users: _,
         } => {
             if let Err(err) = run_cleanup(&controller, force, fail_closed_on_crash) {
                 let localized = controller.i18n.t(err.i18n_key());
@@ -989,7 +1045,8 @@ mod tests {
                 force,
                 fail_closed_on_crash,
                 user,
-            } => assert!(!force && !fail_closed_on_crash && !user),
+                all_users,
+            } => assert!(!force && !fail_closed_on_crash && !user && !all_users),
             _ => panic!("expected cleanup"),
         }
     }
@@ -1006,6 +1063,25 @@ mod tests {
             "--fail-closed-on-crash"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn cleanup_all_users_flag_parses_and_excludes_the_other_modes() {
+        let args =
+            CliArgs::try_parse_from(["routeward", "cleanup", "--all-users"]).expect("parses");
+        assert!(matches!(
+            args.command,
+            Commands::Cleanup {
+                all_users: true,
+                ..
+            }
+        ));
+        for other in ["--user", "--force", "--fail-closed-on-crash"] {
+            assert!(
+                CliArgs::try_parse_from(["routeward", "cleanup", "--all-users", other]).is_err(),
+                "--all-users must conflict with {other}"
+            );
+        }
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::path::Path;
 
 /// True for symbolic links and, on Windows, for every reparse point (junctions, mount points).
 /// Such entries are removed as links and never entered.
-fn is_link_like(meta: &Metadata) -> bool {
+pub(crate) fn is_link_like(meta: &Metadata) -> bool {
     meta.file_type().is_symlink() || is_reparse_point(meta)
 }
 
@@ -82,8 +82,20 @@ pub fn remove_tree_no_follow(path: &Path) -> io::Result<()> {
 /// Deletes the RouteWard data directory `dir`.
 ///
 /// Refuses any path whose last component is not `RouteWard`, so a wrong resolution can never
-/// turn into the deletion of a parent such as `%ProgramData%` itself.
+/// turn into the deletion of a parent such as `%ProgramData%` itself. Before anything is
+/// removed, the directory itself must pass `verify_profile_path_security` (owned by
+/// SYSTEM/Administrators or root, no entry granting access to another principal): a directory
+/// a standard user could write to may hold links or files planted to steer the deletion.
 pub fn purge_data_dir(dir: &Path) -> RouteWardResult<()> {
+    purge_data_dir_with(dir, crate::config::security::verify_profile_path_security)
+}
+
+/// [`purge_data_dir`] with the directory security check injected, so the refusal path and the
+/// removal logic are testable without an administrator-owned directory.
+fn purge_data_dir_with(
+    dir: &Path,
+    verify_security: impl Fn(&Path) -> RouteWardResult<()>,
+) -> RouteWardResult<()> {
     let name_ok = dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -93,6 +105,25 @@ pub fn purge_data_dir(dir: &Path) -> RouteWardResult<()> {
             key: ERR_KEY_SYSTEM_PURGE_FAILED,
             detail: format!("refusing to remove unexpected directory {}", dir.display()),
         });
+    }
+    match std::fs::symlink_metadata(dir) {
+        // Already gone: nothing to verify, nothing to remove.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        // A link is removed as a link and never entered, so its target's security is moot.
+        Ok(meta) if is_link_like(&meta) => {}
+        Ok(_) => verify_security(dir).map_err(|err| RouteWardError::SystemError {
+            key: ERR_KEY_SYSTEM_PURGE_FAILED,
+            detail: format!(
+                "refusing to remove {} because its security is not trusted: {err}",
+                dir.display()
+            ),
+        })?,
+        Err(err) => {
+            return Err(RouteWardError::SystemError {
+                key: ERR_KEY_SYSTEM_PURGE_FAILED,
+                detail: format!("cannot inspect {}: {err}", dir.display()),
+            })
+        }
     }
     remove_tree_no_follow(dir).map_err(|err| RouteWardError::SystemError {
         key: ERR_KEY_SYSTEM_PURGE_FAILED,
@@ -110,6 +141,11 @@ pub fn program_data_dir() -> RouteWardResult<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    /// Verifier that accepts any directory: temp directories are not administrator-owned.
+    fn trust_everything(_dir: &Path) -> RouteWardResult<()> {
+        Ok(())
+    }
+
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("routeward-purge-{tag}-{}", uuid::Uuid::new_v4()));
@@ -125,9 +161,9 @@ mod tests {
         std::fs::write(data.join("active_profile.json"), "{}").unwrap();
         std::fs::write(data.join("logs").join("old").join("a.log"), "x").unwrap();
 
-        purge_data_dir(&data).unwrap();
+        purge_data_dir_with(&data, trust_everything).unwrap();
         assert!(!data.exists());
-        purge_data_dir(&data).unwrap();
+        purge_data_dir_with(&data, trust_everything).unwrap();
         assert!(root.exists(), "the parent must never be removed");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -136,7 +172,7 @@ mod tests {
     fn purge_refuses_a_directory_that_is_not_named_routeward() {
         let root = scratch("refuse");
         std::fs::write(root.join("keep.txt"), "x").unwrap();
-        let err = purge_data_dir(&root).unwrap_err();
+        let err = purge_data_dir_with(&root, trust_everything).unwrap_err();
         assert_eq!(err.i18n_key(), ERR_KEY_SYSTEM_PURGE_FAILED);
         assert!(root.join("keep.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
@@ -176,7 +212,7 @@ mod tests {
             return;
         }
 
-        purge_data_dir(&data).unwrap();
+        purge_data_dir_with(&data, trust_everything).unwrap();
         assert!(!data.exists());
         assert!(
             outside.join("precious.txt").exists(),
@@ -196,9 +232,50 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             return;
         }
-        purge_data_dir(&data).unwrap();
+        purge_data_dir_with(&data, trust_everything).unwrap();
         assert!(!data.exists());
         assert!(outside.join("precious.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn purge_refuses_an_untrusted_directory_and_removes_nothing() {
+        let root = scratch("untrusted");
+        let data = root.join(DATA_DIR_NAME);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("keep.txt"), "x").unwrap();
+
+        let err = purge_data_dir_with(&data, |_| {
+            Err(RouteWardError::SystemError {
+                key: ERR_KEY_SYSTEM_PURGE_FAILED,
+                detail: "writable by a standard user".into(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(err.i18n_key(), ERR_KEY_SYSTEM_PURGE_FAILED);
+        assert!(data.join("keep.txt").exists(), "nothing may be removed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn purge_verifies_the_directory_before_removing_it_and_skips_a_missing_one() {
+        use std::cell::Cell;
+        let root = scratch("verified");
+        let data = root.join(DATA_DIR_NAME);
+        std::fs::create_dir_all(&data).unwrap();
+
+        let calls = Cell::new(0);
+        let counting = |dir: &Path| {
+            assert!(dir.exists(), "verification must run before the removal");
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        purge_data_dir_with(&data, counting).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(!data.exists());
+
+        purge_data_dir_with(&data, counting).unwrap();
+        assert_eq!(calls.get(), 1, "a missing directory is not verified");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

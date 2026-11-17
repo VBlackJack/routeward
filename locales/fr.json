@@ -733,7 +733,8 @@
       },
       "cleanup": {
         "completed": "Nettoyage des règles d'interception terminé",
-        "user_completed": "Paramètres RouteWard de l'utilisateur courant restaurés"
+        "user_completed": "Paramètres RouteWard de l'utilisateur courant restaurés",
+        "all_users_completed": "Paramètres RouteWard restaurés pour chaque utilisateur connecté"
       },
       "purge": {
         "completed": "Dossier de données RouteWard supprimé"

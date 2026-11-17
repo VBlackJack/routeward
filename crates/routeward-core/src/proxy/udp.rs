@@ -449,6 +449,17 @@ impl UdpAssociationManager {
         true
     }
 
+    /// Removes the entry under `key` only while it is still `session`: a concurrent lookup may
+    /// already have replaced the dead association with a fresh one, which must survive.
+    fn remove_if_same_session(
+        &self,
+        key: &UdpAssociationKey,
+        session: &Arc<UdpAssociationSession>,
+    ) {
+        self.sessions
+            .remove_if(key, |_, current| Arc::ptr_eq(current, session));
+    }
+
     fn evict_oldest_idle(&self) -> bool {
         let oldest_key = self
             .sessions
@@ -492,7 +503,7 @@ impl UdpAssociationManager {
         let expired =
             self.now_ms().saturating_sub(session.last_activity_ms()) >= self.idle_timeout_ms;
         if !session.is_control_alive() || expired {
-            self.sessions.remove(&key);
+            self.remove_if_same_session(&key, &session);
             return None;
         }
         session.touch(self.now_ms());
@@ -1163,6 +1174,41 @@ mod tests {
         assert!(manager
             .get_live_session("127.0.0.1:50101".parse().unwrap(), "proxy-1")
             .is_none());
+        assert_eq!(manager.sessions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn removing_an_expired_session_never_removes_its_replacement() {
+        let manager =
+            UdpAssociationManager::with_limits(Duration::from_secs(60), 8, Duration::from_secs(60));
+        let make = |manager: &UdpAssociationManager| {
+            let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            std_sock.set_nonblocking(true).unwrap();
+            Arc::new(UdpAssociationSession {
+                key: UdpAssociationKey {
+                    client_addr: "127.0.0.1:50201".parse().unwrap(),
+                    proxy_id: "proxy-1".to_string(),
+                },
+                proxy_name: "Proxy 1".to_string(),
+                relay_udp_addr: "127.0.0.1:1080".parse().unwrap(),
+                udp_socket: Arc::new(UdpSocket::from_std(std_sock).unwrap()),
+                control_alive: Arc::new(AtomicBool::new(true)),
+                shutdown_notify: Arc::new(Notify::new()),
+                last_activity_ms: AtomicU64::new(manager.now_ms()),
+                _udp_port_guard: None,
+                _tcp_port_guard: None,
+                recv_state: tokio::sync::Mutex::new(vec![0u8; MAX_UDP_DATAGRAM_BYTES]),
+            })
+        };
+        let stale = make(&manager);
+        let fresh = make(&manager);
+        manager.insert_session(Arc::clone(&fresh));
+
+        // The stale handle was read before `fresh` took its place under the same key.
+        manager.remove_if_same_session(&stale.key, &stale);
+        assert_eq!(manager.sessions.len(), 1, "the replacement was removed");
+
+        manager.remove_if_same_session(&fresh.key, &fresh);
         assert_eq!(manager.sessions.len(), 0);
     }
 
