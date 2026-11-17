@@ -26,19 +26,21 @@ use std::path::Path;
 /// True for symbolic links and, on Windows, for every reparse point (junctions, mount points).
 /// Such entries are removed as links and never entered.
 fn is_link_like(meta: &Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    meta.file_type().is_symlink() || is_reparse_point(meta)
+}
+
+/// True when a Windows entry carries `FILE_ATTRIBUTE_REPARSE_POINT` (junction, mount point).
+#[cfg(windows)]
+fn is_reparse_point(meta: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Reparse points only exist on Windows; symbolic links are covered by `is_link_like`.
+#[cfg(not(windows))]
+fn is_reparse_point(_meta: &Metadata) -> bool {
+    false
 }
 
 /// Removes the link object itself, never its target. A directory link (symlink or junction on
