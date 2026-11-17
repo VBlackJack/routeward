@@ -254,7 +254,7 @@ PROBE_D2=$(probe_exit_code)
 if ! nft list table ip routeward >/dev/null 2>&1 \
     && ! nft list table inet routeward_ks >/dev/null 2>&1 \
     && [[ "${RESP_D2}" == "ROUTEWARD_OK" ]] \
-    && [[ "${PROBE_D2}" -ne 7 ]]; then
+    && [[ "${PROBE_D2}" -ne "${PROBE_BLOCKED_CODE}" ]]; then
     echo "[PASS] Scenario (d2): clean stop with kill switch on left no routeward or routeward_ks table and traffic flows"
 else
     echo "[FAIL] Scenario (d2): clean stop with kill switch on left the host blocked (resp=${RESP_D2}, probe=${PROBE_D2})"
@@ -276,7 +276,7 @@ sleep 0.5
 if ! nft list table ip routeward >/dev/null 2>&1 && ! nft list table inet routeward_ks >/dev/null 2>&1; then
     RESP_AFTER_KILL=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/after-kill9")
     PROBE_E=$(probe_exit_code)
-    if [[ "${RESP_AFTER_KILL}" == "ROUTEWARD_OK" ]] && [[ "${PROBE_E}" -ne 7 ]]; then
+    if [[ "${RESP_AFTER_KILL}" == "ROUTEWARD_OK" ]] && [[ "${PROBE_E}" -ne "${PROBE_BLOCKED_CODE}" ]]; then
         echo "[PASS] Scenario (e): kill switch off, SIGKILL triggered pipe-linked watchdog; table ip routeward deleted and fail-open verified"
     else
         echo "[FAIL] Scenario (e): fail-open check failed after kill -9 (resp=${RESP_AFTER_KILL}, probe=${PROBE_E})"
@@ -304,7 +304,7 @@ if ! wait_for_block_table; then
     exit 1
 fi
 PROBE_E2=$(probe_exit_code)
-if nft list table ip routeward >/dev/null 2>&1 || [[ "${PROBE_E2}" -ne 7 ]]; then
+if nft list table ip routeward >/dev/null 2>&1 || [[ "${PROBE_E2}" -ne "${PROBE_BLOCKED_CODE}" ]]; then
     echo "[FAIL] Scenario (e2): host not blocked after kill -9 with kill switch on (probe=${PROBE_E2})"
     nft list ruleset || true
     exit 1
@@ -315,7 +315,7 @@ RESP_E2=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/after-cleanu
 PROBE_E2_AFTER=$(probe_exit_code)
 if ! nft list table inet routeward_ks >/dev/null 2>&1 \
     && [[ "${RESP_E2}" == "ROUTEWARD_OK" ]] \
-    && [[ "${PROBE_E2_AFTER}" -ne 7 ]]; then
+    && [[ "${PROBE_E2_AFTER}" -ne "${PROBE_BLOCKED_CODE}" ]]; then
     echo "[PASS] Scenario (e2): kill switch on, SIGKILL failed closed (inet routeward_ks, probe blocked) and routeward cleanup restored traffic"
 else
     echo "[FAIL] Scenario (e2): cleanup did not restore traffic (resp=${RESP_E2}, probe=${PROBE_E2_AFTER})"
@@ -455,7 +455,7 @@ if ! wait_for_block_table; then
     exit 1
 fi
 PROBE_I=$(probe_exit_code)
-if nft list table ip routeward >/dev/null 2>&1 || [[ "${PROBE_I}" -ne 7 ]]; then
+if nft list table ip routeward >/dev/null 2>&1 || [[ "${PROBE_I}" -ne "${PROBE_BLOCKED_CODE}" ]]; then
     echo "[FAIL] Scenario (i): host not blocked after daemon kill -9 with kill switch on (probe=${PROBE_I})"
     nft list ruleset || true
     exit 1
@@ -466,7 +466,7 @@ RESP_AFTER_DAEMON_KILL=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_POR
 PROBE_I_AFTER=$(probe_exit_code)
 if ! nft list table inet routeward_ks >/dev/null 2>&1 \
     && [[ "${RESP_AFTER_DAEMON_KILL}" == "ROUTEWARD_OK" ]] \
-    && [[ "${PROBE_I_AFTER}" -ne 7 ]]; then
+    && [[ "${PROBE_I_AFTER}" -ne "${PROBE_BLOCKED_CODE}" ]]; then
     echo "[PASS] Scenario (i): kill switch on, SIGKILL of daemon failed closed (inet routeward_ks, probe blocked) and routeward cleanup restored traffic"
 else
     echo "[FAIL] Scenario (i): cleanup did not restore traffic after daemon kill -9 (resp=${RESP_AFTER_DAEMON_KILL}, probe=${PROBE_I_AFTER})"
@@ -500,7 +500,7 @@ PROBE_I2=$(probe_exit_code)
 if ! nft list table ip routeward >/dev/null 2>&1 \
     && ! nft list table inet routeward_ks >/dev/null 2>&1 \
     && [[ "${RESP_I2}" == "ROUTEWARD_OK" ]] \
-    && [[ "${PROBE_I2}" -ne 7 ]]; then
+    && [[ "${PROBE_I2}" -ne "${PROBE_BLOCKED_CODE}" ]]; then
     echo "[PASS] Scenario (i2): kill switch off, SIGKILL of daemon triggered watchdog; tables deleted and fail-open verified"
 else
     echo "[FAIL] Scenario (i2): fail-open check failed after daemon kill -9 with kill switch off (resp=${RESP_I2}, probe=${PROBE_I2})"
@@ -510,6 +510,41 @@ fi
 
 cp /tmp/profile_proxy.json /etc/routeward/active_profile.json
 chmod 0600 /etc/routeward/active_profile.json
+rm -f /run/routeward/routeward.sock
+
+# ---------------------------------------------------------------------------
+# Scenario (i3): kill switch ON, daemon IDLE (interception never started), kill -9, then the
+#                systemd ExecStopPost hook (`cleanup --force --fail-closed-on-crash` with
+#                SERVICE_RESULT=signal) must NOT install the block table: traffic stays open
+# ---------------------------------------------------------------------------
+"${BIN}" daemon >/tmp/rw_daemon_i3.out 2>&1 &
+DAEMON_I3_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+kill -9 "${DAEMON_I3_PID}"
+wait "${DAEMON_I3_PID}" 2>/dev/null || true
+sleep 0.5
+
+SERVICE_RESULT=signal "${BIN}" cleanup --force --fail-closed-on-crash >/tmp/rw_i3_cleanup.out 2>&1
+RESP_I3=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/after-idle-daemon-kill9")
+PROBE_I3=$(probe_exit_code)
+if ! nft list table inet routeward_ks >/dev/null 2>&1 \
+    && ! nft list table ip routeward >/dev/null 2>&1 \
+    && [[ "${RESP_I3}" == "ROUTEWARD_OK" ]] \
+    && [[ "${PROBE_I3}" -ne "${PROBE_BLOCKED_CODE}" ]]; then
+    echo "[PASS] Scenario (i3): idle daemon killed with kill switch on, fail-closed-on-crash cleanup installed no block table and traffic stayed open"
+else
+    echo "[FAIL] Scenario (i3): idle daemon crash must not fail closed (resp=${RESP_I3}, probe=${PROBE_I3})"
+    cat /tmp/rw_i3_cleanup.out || true
+    nft list ruleset || true
+    exit 1
+fi
+
 rm -f /run/routeward/routeward.sock
 
 # ---------------------------------------------------------------------------
@@ -1710,4 +1745,4 @@ fi
 cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
 kill "${MOCK_PID}" 2>/dev/null || true
 
-echo "=== ALL 39 LINUX CONTAINER SCENARIOS PASSED ==="
+echo "=== ALL 40 LINUX CONTAINER SCENARIOS PASSED ==="

@@ -150,6 +150,10 @@ fn run_cleanup(
             let action = decide_crash_cleanup_action(
                 service_result.as_deref(),
                 persisted_kill_switch_enabled(controller),
+                NftablesInterceptor::interception_was_active(
+                    &net.linux_nft_binary,
+                    &net.linux_nft_table_name,
+                ),
             );
             if action == CrashCleanupAction::InstallFailClosed {
                 controller.check_cleanup_allowed(force)?;

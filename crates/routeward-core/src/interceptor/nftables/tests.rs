@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+use super::watchdog::{
+    DHCP_V4_CLIENT_PORT, DHCP_V4_SERVER_PORT, DHCP_V6_CLIENT_PORT, DHCP_V6_SERVER_PORT,
+};
 use super::*;
 
 #[test]
@@ -447,30 +450,41 @@ fn watchdog_mode_protocol_is_strict() {
 }
 
 #[test]
-fn crash_cleanup_action_fails_closed_only_on_unclean_stop_with_kill_switch() {
+fn crash_cleanup_action_fails_closed_only_on_unclean_stop_with_kill_switch_and_active_interception()
+{
     use CrashCleanupAction::{InstallFailClosed, RemoveAll};
-    assert_eq!(
-        decide_crash_cleanup_action(Some("success"), true),
-        RemoveAll
-    );
-    assert_eq!(
-        decide_crash_cleanup_action(Some("success"), false),
-        RemoveAll
-    );
+    for active in [true, false] {
+        assert_eq!(
+            decide_crash_cleanup_action(Some("success"), true, active),
+            RemoveAll
+        );
+        assert_eq!(
+            decide_crash_cleanup_action(Some("success"), false, active),
+            RemoveAll
+        );
+        assert_eq!(decide_crash_cleanup_action(None, true, active), RemoveAll);
+        assert_eq!(decide_crash_cleanup_action(None, false, active), RemoveAll);
+    }
     for result in ["signal", "exit-code", "core-dump", "timeout", "watchdog"] {
         assert_eq!(
-            decide_crash_cleanup_action(Some(result), true),
+            decide_crash_cleanup_action(Some(result), true, true),
             InstallFailClosed,
             "{result}"
         );
+        // Idle daemon or startup failure: interception never ran, nothing to fail closed.
         assert_eq!(
-            decide_crash_cleanup_action(Some(result), false),
+            decide_crash_cleanup_action(Some(result), true, false),
             RemoveAll,
             "{result}"
         );
+        for active in [true, false] {
+            assert_eq!(
+                decide_crash_cleanup_action(Some(result), false, active),
+                RemoveAll,
+                "{result}"
+            );
+        }
     }
-    assert_eq!(decide_crash_cleanup_action(None, true), RemoveAll);
-    assert_eq!(decide_crash_cleanup_action(None, false), RemoveAll);
 }
 
 #[test]
@@ -491,8 +505,21 @@ fn fail_closed_ruleset_is_one_idempotent_transaction_with_expected_allowances() 
     assert!(ruleset.contains("type filter hook output priority 0; policy drop;"));
     assert!(ruleset.contains("oif \"lo\" accept"));
     assert!(ruleset.contains("ct state established,related accept"));
-    assert!(ruleset.contains("udp sport 68 udp dport 67 accept"));
-    assert!(ruleset.contains("udp sport 546 udp dport 547 accept"));
+    assert!(ruleset.contains(&format!(
+        "udp sport {DHCP_V4_CLIENT_PORT} udp dport {DHCP_V4_SERVER_PORT} accept"
+    )));
+    assert!(ruleset.contains(&format!(
+        "udp sport {DHCP_V6_CLIENT_PORT} udp dport {DHCP_V6_SERVER_PORT} accept"
+    )));
+    assert_eq!(
+        (
+            DHCP_V4_CLIENT_PORT,
+            DHCP_V4_SERVER_PORT,
+            DHCP_V6_CLIENT_PORT,
+            DHCP_V6_SERVER_PORT
+        ),
+        (68, 67, 546, 547)
+    );
     assert!(ruleset.contains(
         "icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept"
     ));
@@ -611,5 +638,128 @@ mod watchdog_script_execution {
         assert!(!rec.contains("-f -"), "{rec}");
         let rec = run_watchdog(&[]);
         assert!(rec.contains("delete table inet routeward_ks"), "{rec}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod failed_start_teardown {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicU32;
+
+    static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
+
+    /// Builds an interceptor holding a fake active state: recording stub `nft`/`ip` binaries
+    /// (`nft list tables` reports `listed_tables`) and a watchdog stand-in that records the
+    /// mode lines it receives. Returns the interceptor, the temp dir, and the stub call log.
+    fn interceptor_with_stubs(
+        kill_switch_enabled: bool,
+        listed_tables: &str,
+    ) -> (NftablesInterceptor, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "routeward-teardown-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("log.txt");
+        let modes = dir.join("modes.txt");
+        for name in ["nft", "ip"] {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"{name} $*\" >> '{}'\nif [ \"$1\" = \"list\" ]; then printf '%s\\n' '{listed_tables}'; fi\n",
+                    log.display()
+                ),
+            )
+            .expect("stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let mut child = Command::new("sh")
+            .args(["-c", &format!("cat >> '{}'", modes.display())])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn watchdog stand-in");
+        let stdin = child.stdin.take();
+        let interceptor = NftablesInterceptor::new();
+        interceptor.active.store(true, Ordering::SeqCst);
+        *interceptor.state.lock() = Some(NftActiveState {
+            nft_binary: dir.join("nft").to_string_lossy().into_owned(),
+            ip_binary: dir.join("ip").to_string_lossy().into_owned(),
+            table_name: "routeward".to_string(),
+            tproxy_spec: TproxyRoutingSpec {
+                fwmark: 21080,
+                route_table: 100,
+                rule_priority: 10810,
+                tproxy_port: 10854,
+            },
+            ipv6_tproxy_active: false,
+            watchdog_stdin: stdin,
+            watchdog_child: Some(child),
+            kill_switch_enabled,
+            telemetry: TelemetryHub::new_with_logging(
+                &crate::config::SystemConstants::load_embedded()
+                    .expect("constants")
+                    .telemetry,
+                false,
+            ),
+        });
+        (interceptor, dir, log)
+    }
+
+    #[test]
+    fn failed_start_keeps_block_table_and_asks_watchdog_to_block() {
+        let (interceptor, dir, log) =
+            interceptor_with_stubs(true, "table inet routeward_ks\ntable ip routeward");
+        interceptor.teardown_failed_start();
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let modes = std::fs::read_to_string(dir.join("modes.txt")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!interceptor.is_active());
+        assert_eq!(modes.trim(), "block", "{modes}");
+        assert!(!modes.contains("disarm"), "{modes}");
+        assert!(calls.contains("delete table ip routeward"), "{calls}");
+        assert!(calls.contains("delete table ip6 routeward"), "{calls}");
+        assert!(!calls.contains("delete table inet"), "{calls}");
+        assert!(interceptor.state.lock().is_none());
+    }
+
+    #[test]
+    fn failed_start_without_block_table_or_kill_switch_asks_watchdog_to_open() {
+        for (kill_switch, listed) in [
+            (true, "table ip routeward"),
+            (false, "table inet routeward_ks"),
+        ] {
+            let (interceptor, dir, log) = interceptor_with_stubs(kill_switch, listed);
+            interceptor.teardown_failed_start();
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            let modes = std::fs::read_to_string(dir.join("modes.txt")).unwrap_or_default();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(modes.trim(), "open", "{modes}");
+            assert!(!calls.contains("delete table inet"), "{calls}");
+        }
+    }
+
+    #[test]
+    fn drop_without_stop_never_sends_disarm() {
+        let (interceptor, dir, log) = interceptor_with_stubs(true, "table inet routeward_ks");
+        drop(interceptor);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let modes = std::fs::read_to_string(dir.join("modes.txt")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!modes.contains("disarm"), "{modes}");
+        assert!(!calls.contains("delete table inet"), "{calls}");
+    }
+
+    #[test]
+    fn explicit_stop_disarms_and_removes_block_table() {
+        let (interceptor, dir, log) = interceptor_with_stubs(true, "table inet routeward_ks");
+        interceptor.stop();
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let modes = std::fs::read_to_string(dir.join("modes.txt")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(modes.trim(), "disarm", "{modes}");
+        assert!(calls.contains("delete table inet routeward_ks"), "{calls}");
     }
 }
