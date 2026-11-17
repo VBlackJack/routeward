@@ -771,6 +771,8 @@
     },
     "daemon": {
       "already_running": "Another RouteWard daemon instance is already running",
+      "untrusted_pipe_owner": "Refusing to talk to the RouteWard daemon pipe: it is owned by an untrusted account",
+      "pipe_squatted": "Another process has taken the RouteWard daemon pipe name and the daemon cannot start",
       "group_missing": "Configured Unix socket group does not exist on the system",
       "not_elevated": "Administrator or root privileges are required to run routeward daemon",
       "ipc_error": "Daemon IPC communication error",

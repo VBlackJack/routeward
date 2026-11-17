@@ -771,6 +771,8 @@
     },
     "daemon": {
       "already_running": "Une autre instance du démon RouteWard est déjà en cours d'exécution",
+      "untrusted_pipe_owner": "Refus de communiquer avec le canal du démon RouteWard : il appartient à un compte non fiable",
+      "pipe_squatted": "Un autre processus occupe le nom du canal du démon RouteWard : le démon ne peut pas démarrer",
       "group_missing": "Le groupe Unix configuré pour le socket du démon n'existe pas sur le système",
       "not_elevated": "Les privilèges Administrateur ou root sont requis pour lancer routeward daemon",
       "ipc_error": "Erreur de communication IPC avec le démon",

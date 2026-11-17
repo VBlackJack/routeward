@@ -19,6 +19,8 @@ use crate::error::{
     RouteWardError, RouteWardResult, ERR_KEY_DAEMON_ALREADY_RUNNING, ERR_KEY_DAEMON_DISCONNECTED,
     ERR_KEY_DAEMON_IPC_ERROR,
 };
+#[cfg(windows)]
+use crate::error::{ERR_KEY_DAEMON_PIPE_SQUATTED, ERR_KEY_DAEMON_UNTRUSTED_PIPE_OWNER};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -171,17 +173,40 @@ impl IpcServer {
 
     #[cfg(windows)]
     pub fn bind_windows(pipe_name: &str) -> RouteWardResult<Self> {
-        Self::bind_windows_with_allowed_sids(pipe_name, &[])
+        Self::bind_windows_inner(pipe_name, &[], false)
     }
 
+    /// Production bind: the pipe is owned by `BUILTIN\Administrators` so clients can verify who
+    /// serves it, and a squatted pipe name is reported distinctly from a running daemon.
     #[cfg(windows)]
     pub fn bind_windows_with_allowed_sids(
         pipe_name: &str,
         allowed_sids: &[String],
     ) -> RouteWardResult<Self> {
+        Self::bind_windows_inner(pipe_name, allowed_sids, true)
+    }
+
+    #[cfg(windows)]
+    fn bind_windows_inner(
+        pipe_name: &str,
+        allowed_sids: &[String],
+        production: bool,
+    ) -> RouteWardResult<Self> {
         let user_sid = query_current_user_sid_string()?;
-        let sddl_string = build_windows_pipe_sddl(&user_sid, allowed_sids)?;
-        let first_pipe = create_windows_named_pipe_instance(pipe_name, &sddl_string, true)?;
+        // Test binds run the server as an unelevated user, who must keep the right to create the
+        // next pipe instance (`GRGW`); production servers run elevated (BA/SY hold full control).
+        let launch_mask = if production {
+            PIPE_USER_ACCESS_MASK_SDDL
+        } else {
+            WINDOWS_TEST_SERVER_USER_MASK_SDDL
+        };
+        let mut sddl_string =
+            build_windows_pipe_sddl_with_launch_mask(&user_sid, allowed_sids, launch_mask)?;
+        if production {
+            sddl_string.insert_str(0, WINDOWS_PIPE_OWNER_SDDL);
+        }
+        let first_pipe =
+            create_windows_named_pipe_instance(pipe_name, &sddl_string, true, production)?;
         Ok(Self {
             current_pipe: first_pipe,
             pipe_name: pipe_name.to_string(),
@@ -340,8 +365,12 @@ impl IpcServer {
                     detail: err.to_string(),
                 })?;
 
-            let next_pipe =
-                create_windows_named_pipe_instance(&self.pipe_name, &self.sddl_string, false)?;
+            let next_pipe = create_windows_named_pipe_instance(
+                &self.pipe_name,
+                &self.sddl_string,
+                false,
+                false,
+            )?;
             let connected_pipe = std::mem::replace(&mut self.current_pipe, next_pipe);
 
             Ok((
@@ -399,7 +428,7 @@ pub fn is_daemon_ipc_active(ipc_config: &IpcConstants) -> bool {
     }
     #[cfg(windows)]
     {
-        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        use tokio::net::windows::named_pipe::ServerOptions;
         use windows_sys::Win32::Foundation::{
             ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY,
         };
@@ -417,7 +446,10 @@ pub fn is_daemon_ipc_active(ipc_config: &IpcConstants) -> bool {
                 if raw == ERROR_ACCESS_DENIED || raw == ERROR_PIPE_BUSY {
                     true
                 } else {
-                    match ClientOptions::new().open(&ipc_config.windows_pipe_name) {
+                    match open_pipe_handle_raw(
+                        &ipc_config.windows_pipe_name,
+                        PIPE_CLIENT_DESIRED_ACCESS,
+                    ) {
                         Ok(_) => true,
                         Err(c_err) => {
                             let c_raw = c_err.raw_os_error().unwrap_or(0) as u32;
@@ -432,16 +464,26 @@ pub fn is_daemon_ipc_active(ipc_config: &IpcConstants) -> bool {
 
 #[cfg(windows)]
 pub async fn connect_windows_named_pipe(pipe_name: &str) -> RouteWardResult<IpcStream> {
+    use std::os::windows::io::IntoRawHandle;
     use std::time::Duration;
-    use tokio::net::windows::named_pipe::ClientOptions;
+    use tokio::net::windows::named_pipe::NamedPipeClient;
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
     const MAX_BUSY_RETRIES: usize = 30;
     const BUSY_RETRY_DELAY_MS: u64 = 10;
 
     for attempt in 0..=MAX_BUSY_RETRIES {
-        match ClientOptions::new().open(pipe_name) {
-            Ok(client) => {
+        match open_pipe_handle_raw(pipe_name, PIPE_CLIENT_DESIRED_ACCESS) {
+            Ok(handle) => {
+                // The owner is verified before any byte is sent on the stream.
+                verify_pipe_server_owner(&handle, pipe_name)?;
+                // SAFETY: the raw handle is a valid overlapped pipe client handle whose
+                // ownership is transferred to tokio here.
+                let client = unsafe { NamedPipeClient::from_raw_handle(handle.into_raw_handle()) }
+                    .map_err(|err| RouteWardError::DaemonError {
+                        key: ERR_KEY_DAEMON_DISCONNECTED,
+                        detail: format!("Cannot register named pipe {pipe_name} with tokio: {err}"),
+                    })?;
                 return Ok(IpcStream {
                     inner: IpcStreamInner::NamedPipeClient(client),
                 });
@@ -660,25 +702,54 @@ fn canonicalize_windows_sid(sid_str: &str) -> RouteWardResult<String> {
     }
 }
 
+/// Access mask granted to the launching user and extra SIDs on the pipe:
+/// `FILE_GENERIC_READ | FILE_WRITE_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES` (0x12019b).
+/// Unlike `GENERIC_WRITE` it omits `FILE_APPEND_DATA`, which on a pipe equals
+/// `FILE_CREATE_PIPE_INSTANCE`, so an allowed non-admin user cannot create its own instance.
+const PIPE_USER_ACCESS_MASK_SDDL: &str = "0x12019b";
+
+/// Owner prefix prepended to the production pipe SDDL (`BUILTIN\Administrators`). Test binds run
+/// non-elevated and cannot assign this owner, so they omit it.
+#[cfg(windows)]
+const WINDOWS_PIPE_OWNER_SDDL: &str = "O:BA";
+
+/// Launching-user mask for test binds only (see `bind_windows_inner`).
+#[cfg(windows)]
+const WINDOWS_TEST_SERVER_USER_MASK_SDDL: &str = "GRGW";
+
 /// Builds a strict Protected DACL (`D:P`) SDDL string granting full control to `SYSTEM` (`SY`)
-/// and `Administrators` (`BA`), plus `GRGW` to the launching user SID and validated extra SIDs.
+/// and `Administrators` (`BA`), plus [`PIPE_USER_ACCESS_MASK_SDDL`] to the launching user SID and
+/// validated extra SIDs.
 pub fn build_windows_pipe_sddl(
     current_user_sid: &str,
     extra_sids: &[String],
+) -> RouteWardResult<String> {
+    build_windows_pipe_sddl_with_launch_mask(
+        current_user_sid,
+        extra_sids,
+        PIPE_USER_ACCESS_MASK_SDDL,
+    )
+}
+
+/// Same as [`build_windows_pipe_sddl`] with an explicit access mask for the launching user ACE.
+fn build_windows_pipe_sddl_with_launch_mask(
+    current_user_sid: &str,
+    extra_sids: &[String],
+    launch_user_mask: &str,
 ) -> RouteWardResult<String> {
     let mut sddl = String::from("D:P(A;;GA;;;SY)(A;;GA;;;BA)");
     let mut seen: Vec<String> = vec!["S-1-5-18".to_string(), "S-1-5-32-544".to_string()];
 
     let launch_canon = validate_and_canonicalize_allowed_sid(current_user_sid)?;
     if !seen.iter().any(|s| s.eq_ignore_ascii_case(&launch_canon)) {
-        sddl.push_str(&format!("(A;;GRGW;;;{launch_canon})"));
+        sddl.push_str(&format!("(A;;{launch_user_mask};;;{launch_canon})"));
         seen.push(launch_canon);
     }
 
     for raw in extra_sids {
         let canon = validate_and_canonicalize_allowed_sid(raw)?;
         if !seen.iter().any(|s| s.eq_ignore_ascii_case(&canon)) {
-            sddl.push_str(&format!("(A;;GRGW;;;{canon})"));
+            sddl.push_str(&format!("(A;;{PIPE_USER_ACCESS_MASK_SDDL};;;{canon})"));
             seen.push(canon);
         }
     }
@@ -760,11 +831,217 @@ fn query_current_user_sid_string() -> RouteWardResult<String> {
     }
 }
 
+/// SID of `BUILTIN\Administrators`.
+#[cfg(windows)]
+const SID_BUILTIN_ADMINISTRATORS: &str = "S-1-5-32-544";
+/// SID of `NT AUTHORITY\SYSTEM` (LocalSystem).
+#[cfg(windows)]
+const SID_LOCAL_SYSTEM: &str = "S-1-5-18";
+/// Desired access of the pipe client handle: `FILE_GENERIC_READ | FILE_WRITE_DATA |
+/// FILE_WRITE_ATTRIBUTES` (0x0012018b). It is a subset of [`PIPE_USER_ACCESS_MASK_SDDL`] and
+/// deliberately omits `FILE_APPEND_DATA` (pipe instance creation), which the server DACL denies.
+#[cfg(windows)]
+const PIPE_CLIENT_DESIRED_ACCESS: u32 = windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
+    | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA
+    | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+
+/// Who owns a pipe, as seen by a client before it sends anything.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipeOwnerKind {
+    Administrators,
+    LocalSystem,
+    CurrentUser,
+    Other,
+}
+
+/// Pure classification of a pipe owner SID relative to the current process user SID.
+#[cfg(windows)]
+pub(crate) fn classify_pipe_owner(owner_sid: &str, current_user_sid: &str) -> PipeOwnerKind {
+    if owner_sid.eq_ignore_ascii_case(SID_BUILTIN_ADMINISTRATORS) {
+        PipeOwnerKind::Administrators
+    } else if owner_sid.eq_ignore_ascii_case(SID_LOCAL_SYSTEM) {
+        PipeOwnerKind::LocalSystem
+    } else if owner_sid.eq_ignore_ascii_case(current_user_sid) {
+        PipeOwnerKind::CurrentUser
+    } else {
+        PipeOwnerKind::Other
+    }
+}
+
+/// Pure accept/reject decision. Clients accept Administrators, SYSTEM and their own user (another
+/// user cannot assign our SID as owner; a same-user squatter is not a security boundary). The
+/// daemon-side squat diagnostic does not trust the current user (`allow_current_user = false`).
+#[cfg(windows)]
+pub(crate) fn is_trusted_pipe_owner(kind: PipeOwnerKind, allow_current_user: bool) -> bool {
+    match kind {
+        PipeOwnerKind::Administrators | PipeOwnerKind::LocalSystem => true,
+        PipeOwnerKind::CurrentUser => allow_current_user,
+        PipeOwnerKind::Other => false,
+    }
+}
+
+/// Opens an existing pipe with a raw `CreateFileW`. `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`
+/// is mandatory: without it a squatting server could impersonate the client.
+#[cfg(windows)]
+fn open_pipe_handle_raw(
+    pipe_name: &str,
+    desired_access: u32,
+) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
+    };
+
+    let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 string; no security attributes or template.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            desired_access,
+            0,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `handle` is a valid handle just returned by CreateFileW and owned by nobody else.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle as _) })
+}
+
+/// Reads the owner SID (string form) of a kernel object handle.
+#[cfg(windows)]
+fn handle_owner_sid_string(handle: &std::os::windows::io::OwnedHandle) -> std::io::Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT,
+    };
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+
+    let mut owner: PSID = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: out-pointers are valid; `owner` points into `descriptor`, freed below.
+    let rc = unsafe {
+        GetSecurityInfo(
+            handle.as_raw_handle() as _,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc as i32));
+    }
+    if owner.is_null() {
+        // SAFETY: `descriptor` was allocated by GetSecurityInfo.
+        unsafe { LocalFree(descriptor as _) };
+        return Err(std::io::Error::other("pipe has no owner SID"));
+    }
+    let mut out_ptr: *mut u16 = null_mut();
+    // SAFETY: `owner` is a valid SID inside `descriptor`; `out_ptr` is freed with LocalFree.
+    let result = unsafe {
+        if ConvertSidToStringSidW(owner, &mut out_ptr) == 0 || out_ptr.is_null() {
+            Err(std::io::Error::last_os_error())
+        } else {
+            let mut len = 0usize;
+            while *out_ptr.add(len) != 0 {
+                len += 1;
+            }
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(out_ptr, len));
+            LocalFree(out_ptr as _);
+            Ok(text)
+        }
+    };
+    // SAFETY: `descriptor` was allocated by GetSecurityInfo and `owner` is no longer used.
+    unsafe { LocalFree(descriptor as _) };
+    result
+}
+
+/// Process id of the server end of a pipe, for diagnostics.
+#[cfg(windows)]
+fn pipe_server_pid(handle: &std::os::windows::io::OwnedHandle) -> Option<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+    let mut pid: u32 = 0;
+    // SAFETY: valid pipe handle and out-pointer.
+    let ok = unsafe { GetNamedPipeServerProcessId(handle.as_raw_handle() as _, &mut pid) };
+    (ok != 0).then_some(pid)
+}
+
+/// Verifies, before any byte is sent, that the pipe server is owned by a trusted principal.
+#[cfg(windows)]
+fn verify_pipe_server_owner(
+    handle: &std::os::windows::io::OwnedHandle,
+    pipe_name: &str,
+) -> RouteWardResult<()> {
+    let pid_text = pipe_server_pid(handle)
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let untrusted = |detail: String| RouteWardError::DaemonError {
+        key: ERR_KEY_DAEMON_UNTRUSTED_PIPE_OWNER,
+        detail,
+    };
+    let owner = handle_owner_sid_string(handle).map_err(|err| {
+        untrusted(format!(
+            "Cannot read the owner of named pipe {pipe_name} (server pid {pid_text}): {err}"
+        ))
+    })?;
+    let current = query_current_user_sid_string()?;
+    let kind = classify_pipe_owner(&owner, &current);
+    if is_trusted_pipe_owner(kind, true) {
+        Ok(())
+    } else {
+        Err(untrusted(format!(
+            "Named pipe {pipe_name} is owned by untrusted SID {owner} (server pid {pid_text})"
+        )))
+    }
+}
+
+/// Called when the first-instance bind is denied: opens the pipe as a client and reports a
+/// squatter when its owner is neither Administrators nor SYSTEM. `None` means "cannot tell" or
+/// "owner is trusted", and the caller reports an already running daemon.
+#[cfg(windows)]
+fn diagnose_pipe_squatter(pipe_name: &str) -> Option<RouteWardError> {
+    use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+
+    let handle = open_pipe_handle_raw(pipe_name, READ_CONTROL).ok()?;
+    let owner = handle_owner_sid_string(&handle).ok()?;
+    let current = query_current_user_sid_string().ok()?;
+    let kind = classify_pipe_owner(&owner, &current);
+    if is_trusted_pipe_owner(kind, false) {
+        return None;
+    }
+    let pid_text = pipe_server_pid(&handle)
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(RouteWardError::DaemonError {
+        key: ERR_KEY_DAEMON_PIPE_SQUATTED,
+        detail: format!(
+            "Named pipe {pipe_name} is held by an untrusted owner SID {owner} (server pid {pid_text})"
+        ),
+    })
+}
+
 #[cfg(windows)]
 fn create_windows_named_pipe_instance(
     pipe_name: &str,
     sddl_string: &str,
     is_first: bool,
+    diagnose_squat: bool,
 ) -> RouteWardResult<tokio::net::windows::named_pipe::NamedPipeServer> {
     use std::ptr::null_mut;
     use tokio::net::windows::named_pipe::ServerOptions;
@@ -820,6 +1097,11 @@ fn create_windows_named_pipe_instance(
             Err(err) => {
                 let raw = err.raw_os_error().unwrap_or(0) as u32;
                 if is_first && (raw == ERROR_ACCESS_DENIED || raw == ERROR_PIPE_BUSY) {
+                    if diagnose_squat {
+                        if let Some(squatted) = diagnose_pipe_squatter(pipe_name) {
+                            return Err(squatted);
+                        }
+                    }
                     Err(RouteWardError::DaemonError {
                         key: ERR_KEY_DAEMON_ALREADY_RUNNING,
                         detail: format!(
@@ -875,7 +1157,11 @@ mod tests {
         let sddl = build_windows_pipe_sddl("S-1-5-18", &extra).expect("valid SDDL");
         assert_eq!(
             sddl,
-            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-1000-2000-3000-1005)"
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;S-1-5-21-1000-2000-3000-1005)"
+        );
+        assert!(
+            !sddl.contains("GRGW") && !sddl.contains("O:"),
+            "user ACE must not use GENERIC_WRITE and the DACL string carries no owner"
         );
 
         let interactive = build_windows_pipe_sddl(
@@ -885,7 +1171,63 @@ mod tests {
         .expect("interactive user SDDL");
         assert_eq!(
             interactive,
-            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-111-222-333-1001)(A;;GRGW;;;S-1-5-21-111-222-333-1002)"
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;S-1-5-21-111-222-333-1001)(A;;0x12019b;;;S-1-5-21-111-222-333-1002)"
         );
+    }
+
+    #[test]
+    fn user_pipe_access_mask_excludes_create_pipe_instance_bit() {
+        let mask = u32::from_str_radix(PIPE_USER_ACCESS_MASK_SDDL.trim_start_matches("0x"), 16)
+            .expect("hex mask");
+        const FILE_CREATE_PIPE_INSTANCE: u32 = 0x4;
+        assert_eq!(mask, 0x0012_019b);
+        assert_eq!(mask & FILE_CREATE_PIPE_INSTANCE, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_owner_decision_accepts_admin_system_and_current_user_only() {
+        let me = "S-1-5-21-111-222-333-1001";
+        let cases = [
+            ("S-1-5-32-544", PipeOwnerKind::Administrators, true, true),
+            ("S-1-5-18", PipeOwnerKind::LocalSystem, true, true),
+            (me, PipeOwnerKind::CurrentUser, true, false),
+            (
+                "s-1-5-21-111-222-333-1001",
+                PipeOwnerKind::CurrentUser,
+                true,
+                false,
+            ),
+            (
+                "S-1-5-21-111-222-333-1002",
+                PipeOwnerKind::Other,
+                false,
+                false,
+            ),
+            ("S-1-1-0", PipeOwnerKind::Other, false, false),
+        ];
+        for (sid, kind, client_ok, daemon_ok) in cases {
+            assert_eq!(classify_pipe_owner(sid, me), kind, "kind for {sid}");
+            assert_eq!(is_trusted_pipe_owner(kind, true), client_ok, "client {sid}");
+            assert_eq!(
+                is_trusted_pipe_owner(kind, false),
+                daemon_ok,
+                "daemon {sid}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn client_accepts_test_pipe_created_by_current_user() {
+        let pipe_name = format!(r"\\.\pipe\routeward-owner-test-{}", std::process::id());
+        let mut server = IpcServer::bind_windows(&pipe_name).expect("bind test pipe");
+        let accept = tokio::spawn(async move {
+            let _ = server.accept().await;
+        });
+        let stream = connect_windows_named_pipe(&pipe_name).await;
+        assert!(stream.is_ok(), "current-user owned pipe must be accepted");
+        drop(stream);
+        let _ = accept.await;
     }
 }
