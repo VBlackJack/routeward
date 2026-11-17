@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::commands::DesktopCommandBridge;
+use crate::commands::{DesktopCommandBridge, SystemOpError};
 use crate::security::{extract_json_body, validate_loopback_http_request_with_method};
 use crate::sse::stream_sse_events;
 use crate::{parse_hex_colorref, resolve_palette_window_appearance, DesktopWindowCommand};
@@ -34,6 +34,8 @@ pub const HTTP_REQ_BUFFER_BYTES: usize = 65536;
 const HTTP_MAX_HEADER_BYTES: usize = 16384;
 const HTTP_MAX_BODY_BYTES: usize = 1024 * 1024;
 const HTTP_READ_TIMEOUT_MS: u64 = 2000;
+/// HTTP status returned when a system operation (proxy, PAC, autostart, launch) fails.
+const SYSTEM_ERROR_STATUS: u16 = 500;
 
 async fn read_bounded_http_request(stream: &mut TcpStream) -> Result<String, u16> {
     let mut raw = Vec::with_capacity(4096);
@@ -222,6 +224,17 @@ fn ipc_error_response(err: &IpcCallError, json_ct: String) -> (u16, String, Vec<
     }))
     .unwrap_or_default();
     (ipc_error_status(err), json_ct, json)
+}
+
+/// Builds the 500 `{error, errorKey}` response for a failed system operation, so the UI can
+/// localize the failure by key in its own locale.
+fn system_error_response(err: &SystemOpError, json_ct: String) -> (u16, String, Vec<u8>) {
+    let json = serde_json::to_vec(&serde_json::json!({
+        "error": err.message(),
+        "errorKey": err.key(),
+    }))
+    .unwrap_or_default();
+    (SYSTEM_ERROR_STATUS, json_ct, json)
 }
 
 /// Builds the 200 response carrying a serializable payload.
@@ -709,9 +722,7 @@ pub async fn handle_api_route(
                         return Some((200, json_ct, json));
                     }
                     Err(err) => {
-                        let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                            .unwrap_or_default();
-                        return Some((500, json_ct, json));
+                        return Some(system_error_response(&err, json_ct));
                     }
                 },
                 Err(err) => {
@@ -740,9 +751,7 @@ pub async fn handle_api_route(
                         return Some((200, json_ct, json));
                     }
                     Err(err) => {
-                        let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                            .unwrap_or_default();
-                        return Some((500, json_ct, json));
+                        return Some(system_error_response(&err, json_ct));
                     }
                 },
                 Err(err) => {
@@ -887,9 +896,7 @@ pub async fn handle_api_route(
                     return Some((200, json_ct, json));
                 }
                 Err(err) => {
-                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                        .unwrap_or_default();
-                    return Some((500, json_ct, json));
+                    return Some(system_error_response(&err, json_ct));
                 }
             },
             Err(err) => {
@@ -914,9 +921,7 @@ pub async fn handle_api_route(
                     return Some((200, json_ct, json));
                 }
                 Err(err) => {
-                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                        .unwrap_or_default();
-                    return Some((500, json_ct, json));
+                    return Some(system_error_response(&err, json_ct));
                 }
             },
             Err(err) => {
@@ -1092,4 +1097,35 @@ pub async fn serve_loopback_api_connection(
         None::<fn(&str) -> (&'static str, &'static [u8])>,
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use routeward_core::config::{ProfileConfig, SystemConstants};
+    use routeward_core::error::ERR_KEY_SYSTEM_PATH_EMPTY;
+
+    #[tokio::test]
+    async fn system_failures_are_answered_with_their_error_key() {
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        profile.enable_logging = false;
+        let bridge = DesktopCommandBridge::new(constants, profile, "fr");
+
+        let err = bridge
+            .launch_process_with_proxy("   ", &[])
+            .await
+            .expect_err("an empty executable path must be refused");
+        let (status, content_type, body) =
+            system_error_response(&err, "application/json".to_string());
+
+        assert_eq!(status, SYSTEM_ERROR_STATUS);
+        assert_eq!(content_type, "application/json");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(payload["errorKey"], ERR_KEY_SYSTEM_PATH_EMPTY);
+        assert_eq!(
+            payload["error"],
+            bridge.translate(ERR_KEY_SYSTEM_PATH_EMPTY)
+        );
+    }
 }
