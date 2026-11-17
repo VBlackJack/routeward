@@ -645,7 +645,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         )}
                       </div>
                       <div className="text-[10px] text-tf-secondary">
-                        {/* Plural keys: settings.profiles.proxies_count_one, settings.profiles.proxies_count_other, settings.profiles.rules_count_one, settings.profiles.rules_count_other */}
                         {t('settings.profiles.proxies_count', {
                           count: prof.proxyCount
                         })}{' '}

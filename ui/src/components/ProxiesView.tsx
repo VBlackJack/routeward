@@ -466,7 +466,6 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="rounded bg-tf-pink/20 px-2 py-0.5 text-[10px] font-bold text-tf-pink">
-                      {/* Plural keys: proxies.section.chains.hops_one, proxies.section.chains.hops_other */}
                       {t('proxies.section.chains.hops', {
                         count: chain.proxyIds.length
                       })}

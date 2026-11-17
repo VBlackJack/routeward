@@ -345,7 +345,6 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                       {group.processName}
                     </span>
                     <span className="rounded bg-tf-surface-alt px-2 py-0.5 text-[11px] font-medium text-tf-secondary">
-                      {/* Plural keys: connections.simple.count_connections_one, connections.simple.count_connections_other */}
                       {t('connections.simple.count_connections', { count: group.count })}
                     </span>
                     <span className="font-mono text-[11px] text-tf-cyan">
