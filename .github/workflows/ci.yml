@@ -100,6 +100,23 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  rust-msrv:
+    name: Rust MSRV Check (1.89, core and cli)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Keep the toolchain below in sync with `rust-version` in the workspace Cargo.toml.
+      # Only core and cli are checked: the desktop crate needs the GTK/WebKit system
+      # libraries and the built ui/dist, which this job deliberately avoids.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # rust-toolchain.toml pins "stable" and would override the default toolchain set by the
+      # action, so the toolchain is selected explicitly here.
+      - run: cargo +1.89 --version && rustc +1.89 --version
+      - run: cargo +1.89 check -p routeward-core -p routeward-cli --locked
+
   rust-audit:
     name: Rust Security Audit (cargo-audit)
     runs-on: ubuntu-latest

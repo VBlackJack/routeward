@@ -340,4 +340,237 @@ mod tests {
         assert_eq!(creds.username, "us+er");
         assert_eq!(creds.password_str(), "pa+ss+x");
     }
+
+    #[test]
+    fn scheme_table_maps_protocol_tls_and_udp() {
+        let cases = [
+            ("socks5://h:1", ProxyProtocol::Socks5, false, true),
+            ("SOCKS5://h:1", ProxyProtocol::Socks5, false, true),
+            ("socks4://h:1", ProxyProtocol::Socks4, false, false),
+            ("socks4a://h:1", ProxyProtocol::Socks4, false, false),
+            ("http://h:1", ProxyProtocol::Http, false, false),
+            ("https://h:1", ProxyProtocol::Https, true, false),
+        ];
+        for (uri, protocol, tls, udp) in cases {
+            let node = ProxyUriCodec::parse_uri(uri).unwrap_or_else(|e| panic!("{uri}: {e:?}"));
+            assert_eq!(node.protocol, protocol, "{uri}");
+            assert_eq!(node.tls, tls, "{uri}");
+            assert_eq!(node.udp_enabled, udp, "{uri}");
+            assert!(node.auth.is_none(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn unsupported_schemes_are_rejected() {
+        for uri in [
+            "ftp://h:1",
+            "ssh://h:1",
+            "vmess://h:1",
+            "socks://h:1",
+            "://h:1",
+            "h:1",
+        ] {
+            assert!(ProxyUriCodec::parse_uri(uri).is_err(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn port_table_accepts_range_and_rejects_the_rest() {
+        let cases: [(&str, Option<u16>); 10] = [
+            ("socks5://h:0", None),
+            ("socks5://h:1", Some(1)),
+            ("socks5://h:80", Some(80)),
+            ("socks5://h:65535", Some(65535)),
+            ("socks5://h:65536", None),
+            ("socks5://h:0x50", None),
+            ("socks5://h:-1", None),
+            ("socks5://h:8o", None),
+            ("socks5://h:", None),
+            ("socks5://h: 80", None),
+        ];
+        for (uri, expected) in cases {
+            let parsed = ProxyUriCodec::parse_uri(uri);
+            match expected {
+                Some(port) => assert_eq!(parsed.expect(uri).port, port, "{uri}"),
+                None => assert!(parsed.is_err(), "{uri}"),
+            }
+        }
+    }
+
+    #[test]
+    fn host_table_handles_ipv6_literals_and_trailing_slash() {
+        let cases = [
+            ("socks5://[::1]:1080", "::1", 1080),
+            ("socks5://[2001:db8::7]:9050", "2001:db8::7", 9050),
+            ("http://u:p@[fe80::1]:8080", "fe80::1", 8080),
+            ("http://example.com:3128/", "example.com", 3128),
+            ("http://10.0.0.1:3128", "10.0.0.1", 3128),
+        ];
+        for (uri, host, port) in cases {
+            let node = ProxyUriCodec::parse_uri(uri).expect(uri);
+            assert_eq!(node.host, host, "{uri}");
+            assert_eq!(node.port, port, "{uri}");
+        }
+    }
+
+    #[test]
+    fn ipv6_literal_without_port_is_rejected() {
+        assert!(ProxyUriCodec::parse_uri("socks5://[::1]").is_err());
+    }
+
+    #[test]
+    fn ipv6_host_round_trips_through_to_uri() {
+        let node = ProxyUriCodec::parse_uri("socks5://[2001:db8::7]:9050#v6").expect("v6 uri");
+        let exported = ProxyUriCodec::to_uri(&node);
+        assert!(
+            exported.starts_with("socks5://[2001:db8::7]:9050"),
+            "{exported}"
+        );
+        let reparsed = ProxyUriCodec::parse_uri(&exported).expect("re-parse");
+        assert_eq!(reparsed.host, "2001:db8::7");
+        assert_eq!(reparsed.port, 9050);
+    }
+
+    #[test]
+    fn missing_parts_are_rejected() {
+        for uri in [
+            "",
+            "   ",
+            "socks5://",
+            "socks5://:1080",
+            "socks5://host",
+            "socks5://user:pass@",
+            "socks5://user:pass@:1080",
+            "http://#frag",
+            "http://?sni=x",
+        ] {
+            assert!(ProxyUriCodec::parse_uri(uri).is_err(), "{uri:?}");
+        }
+    }
+
+    #[test]
+    fn userinfo_table_decodes_percent_escapes_and_keeps_plus() {
+        let cases = [
+            ("http://u:p@h:1", "u", "p"),
+            ("http://u@h:1", "u", ""),
+            ("http://u:@h:1", "u", ""),
+            ("http://:p@h:1", "", "p"),
+            ("http://a+b:c+d@h:1", "a+b", "c+d"),
+            ("http://a%2Bb:c%2Bd@h:1", "a+b", "c+d"),
+            ("http://a%20b:c%20d@h:1", "a b", "c d"),
+            ("http://a%40b:c%3Ad@h:1", "a@b", "c:d"),
+            ("http://a@b:c@h:1", "a@b", "c"),
+            ("http://u:p%zz@h:1", "u", "p%zz"),
+            ("http://u:p%4@h:1", "u", "p%4"),
+        ];
+        for (uri, user, pass) in cases {
+            let node = ProxyUriCodec::parse_uri(uri).expect(uri);
+            let creds = node.auth.as_ref().unwrap_or_else(|| panic!("{uri}: auth"));
+            assert_eq!(creds.username, user, "{uri}");
+            assert_eq!(creds.password_str(), pass, "{uri}");
+        }
+    }
+
+    #[test]
+    fn fragment_and_sni_decode_plus_as_space() {
+        let node = ProxyUriCodec::parse_uri("https://h:443?sni=a+b#Node+One").expect("uri");
+        assert_eq!(node.name, "Node One");
+        assert_eq!(node.sni.as_deref(), Some("a b"));
+    }
+
+    #[test]
+    fn default_name_is_built_when_fragment_is_missing_or_blank() {
+        for uri in ["socks5://h:1", "socks5://h:1#", "socks5://h:1#%20%20"] {
+            let node = ProxyUriCodec::parse_uri(uri).expect(uri);
+            assert_eq!(node.name, "SOCKS5 h:1", "{uri}");
+        }
+    }
+
+    #[test]
+    fn tls_skip_verify_query_table() {
+        let cases = [
+            ("https://h:1?tlsSkipVerify=1", true),
+            ("https://h:1?insecure=true", true),
+            ("https://h:1?INSECURE=YES", true),
+            ("https://h:1?insecure=0", false),
+            ("https://h:1?insecure=false", false),
+            ("https://h:1?insecure", false),
+            ("https://h:1", false),
+        ];
+        for (uri, expected) in cases {
+            let node = ProxyUriCodec::parse_uri(uri).expect(uri);
+            assert_eq!(node.tls_skip_verify, expected, "{uri}");
+        }
+    }
+
+    #[test]
+    fn sni_on_plain_scheme_enables_tls() {
+        let node = ProxyUriCodec::parse_uri("http://h:8080?sni=front.example").expect("uri");
+        assert!(node.tls);
+        assert_eq!(node.sni.as_deref(), Some("front.example"));
+    }
+
+    #[test]
+    fn parse_uri_trims_surrounding_whitespace() {
+        let node = ProxyUriCodec::parse_uri("  socks5://h:1080\n").expect("trimmed uri");
+        assert_eq!(node.host, "h");
+    }
+
+    #[test]
+    fn invalid_uri_errors_never_leak_credentials() {
+        for uri in [
+            "ftp://user:topsecret@h:1",
+            "socks5://user:topsecret@h:99999",
+            "socks5://user:topsecret@:1080",
+        ] {
+            let err = ProxyUriCodec::parse_uri(uri).expect_err(uri);
+            let text = format!("{err:?}");
+            assert!(!text.contains("topsecret"), "{uri}: {text}");
+            assert!(text.contains("[REDACTED]"), "{uri}: {text}");
+        }
+    }
+
+    #[test]
+    fn garbage_input_is_rejected_without_panicking() {
+        let long = "a".repeat(10_000);
+        let garbage = [
+            "garbage",
+            "::::",
+            "://",
+            "@@@@",
+            "socks5:///",
+            "socks5://@:",
+            "socks5://[:1",
+            "socks5://]]]:1",
+            "http://%:%",
+            "\u{0}\u{1}",
+            "socks5://\u{e9}\u{e9}:80\u{e9}",
+            long.as_str(),
+        ];
+        for uri in garbage {
+            let _ = ProxyUriCodec::parse_uri(uri);
+        }
+        assert!(ProxyUriCodec::parse_uri("garbage").is_err());
+        assert!(ProxyUriCodec::parse_uri("socks5://[:1").is_err());
+    }
+
+    #[test]
+    fn parse_batch_skips_comments_blanks_and_invalid_lines() {
+        let text = "# comment\n\nsocks5://a:1\nnot a uri\nhttp://b:2\nftp://c:3\n";
+        let nodes = ProxyUriCodec::parse_batch(text);
+        let hosts: Vec<&str> = nodes.iter().map(|n| n.host.as_str()).collect();
+        assert_eq!(hosts, ["a", "b"]);
+    }
+
+    #[test]
+    fn parse_batch_decodes_base64_subscription_bodies() {
+        let plain = "socks5://a:1\nhttp://b:2";
+        let standard = STANDARD.encode(plain);
+        let url_safe = URL_SAFE_NO_PAD.encode(plain);
+        for body in [standard, url_safe] {
+            let nodes = ProxyUriCodec::parse_batch(&body);
+            assert_eq!(nodes.len(), 2, "{body}");
+        }
+        assert!(ProxyUriCodec::parse_batch("").is_empty());
+    }
 }
