@@ -3,6 +3,22 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
+## [Unreleased]
+
+### Security
+- Windows named pipe: allowed non-administrator SIDs can no longer create their own pipe instance (user ACEs grant `0x12019b` instead of `GRGW`), the production pipe is owned by `BUILTIN\Administrators`, and clients refuse a pipe whose owner is not Administrators, SYSTEM or the current user before sending anything (`errors.daemon.untrusted_pipe_owner`). The daemon reports a squatted pipe name (`errors.daemon.pipe_squatted`) instead of "already running". Clients older than this release cannot connect to a newer daemon.
+- Linux: when the daemon crashes or is killed while interception runs with the kill switch on, the host now fails closed through the nftables table `inet routeward_ks` (loopback, established connections, DHCP and IPv6 neighbour discovery stay allowed) until `routeward cleanup --force` or the next interception start. The systemd unit runs `routeward cleanup --force --fail-closed-on-crash` after a failed stop. A clean stop never leaves the network blocked.
+- Windows: later UDP fragments are now captured and replay the first fragment's verdict; an orphan later fragment is dropped when the kill switch is on.
+- Desktop: the WebView only navigates within the loopback UI origin and cannot open new windows.
+
+### Fixed
+- An MSI upgrade no longer deletes the RouteWard service: the new `routeward service restore` re-registers it with its `--allow-sid` arguments, restarts an automatic-start service, and is rolled back if the install fails.
+- MSI uninstall no longer waits on the WinDivert driver to stop.
+- Fixed-port engine tests no longer collide with each other on Linux.
+
+### Changed
+- The MSI bundles unmodified WinDivert 2.2.2 under the LGPLv3 with its notices, removes its driver service on uninstall, and each release attaches the WinDivert source archive. The portable ZIP still uses `tools/fetch-windivert.ps1`.
+
 ## [v2026.1116.01] - 2026-11-16
 
 ### Security
