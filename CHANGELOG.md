@@ -15,6 +15,9 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 - An MSI upgrade no longer deletes the RouteWard service: the new `routeward service restore` re-registers it with its `--allow-sid` arguments, restarts an automatic-start service, and is rolled back if the install fails.
 - MSI uninstall no longer waits on the WinDivert driver to stop.
 - Fixed-port engine tests no longer collide with each other on Linux.
+- Desktop: the header follows engine changes made outside the UI (for example `routeward ctl start`) by polling the daemon state without overlapping requests, stale responses or false disconnects, and pauses while the window is hidden.
+- Desktop (Windows): consecutive exports no longer trigger the WebView2 "download multiple files" prompt; the permission is granted only to the UI origin.
+- Desktop: WebView developer tools are available in debug builds only.
 
 ### Changed
 - The MSI bundles unmodified WinDivert 2.2.2 under the LGPLv3 with its notices, removes its driver service on uninstall, and each release attaches the WinDivert source archive. The portable ZIP still uses `tools/fetch-windivert.ps1`.
