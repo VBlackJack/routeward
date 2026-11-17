@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use super::fragments::decide_first_udp_fragment;
+use super::fragments::{decide_first_udp_fragment, decide_orphan_fragment};
 use super::*;
 use crate::interceptor::ROUTE_DIRECT_LABEL;
 use crate::process::ProcessIdentity;
@@ -929,8 +929,8 @@ impl WinDivertInterceptor {
     ///
     /// The first fragment (which carries the ports) is attributed, evaluated against the rules and
     /// given a verdict, remembered for the remaining fragments; a later fragment replays the
-    /// remembered verdict and, when none exists, is released unchanged because it cannot be
-    /// attributed on its own.
+    /// remembered verdict and, when none exists (orphan), is dropped under the kill switch and
+    /// released unchanged otherwise because it cannot be attributed on its own.
     fn handle_udp_fragment(
         ctrl: &RouteWardController,
         api: &WinDivertApi,
@@ -943,7 +943,7 @@ impl WinDivertInterceptor {
             UdpFragmentKind::NonFirst => ctrl
                 .nat_table
                 .lookup_udp_fragment_verdict(&frag.key())
-                .unwrap_or(UdpFragmentVerdict::Reinject),
+                .unwrap_or_else(|| decide_orphan_fragment(ctrl, frag)),
             UdpFragmentKind::First => {
                 let verdict = Self::first_udp_fragment_verdict(ctrl, frag);
                 ctrl.nat_table
@@ -1168,6 +1168,14 @@ impl WinDivertInterceptor {
                         &addr,
                         &frag,
                     );
+                    continue;
+                }
+
+                // A later fragment that is not UDP (the filter captures every IPv6 fragment and any
+                // IPv4 one) carries no transport header: its payload must never be parsed as TCP
+                // or UDP, so it is released untouched.
+                if is_non_first_ip_fragment(packet) {
+                    Self::send_packet_guarded(&ctrl_net, &api, handle, &packet[..pkt_len], &addr);
                     continue;
                 }
 
