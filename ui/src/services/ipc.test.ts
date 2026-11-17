@@ -629,6 +629,74 @@ describe('RouteWardClientService', () => {
       expect(client.getDiagnostics().running).toBe(true);
     });
 
+    it('discards a poll started before a toggle even when it resolves after the toggle', async () => {
+      const client = new RouteWardClientService();
+      client.applyFullState(makeState(client, false));
+      const pending: Array<(v: unknown) => void> = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockImplementation((url: string, init?: { method?: string }) => {
+          if (url === stateUrl) {
+            return new Promise((resolve) => pending.push(resolve));
+          }
+          if (init?.method === 'POST') {
+            return Promise.resolve({
+              ok: true,
+              json: async () => makeState(client, true).diagnostics
+            });
+          }
+          return new Promise(() => {});
+        })
+      );
+      const controller = new AbortController();
+      const poll = (
+        client as unknown as { pollState: (s: AbortSignal) => Promise<void> }
+      ).pollState(controller.signal);
+      const toggle = client.toggleEngine(true);
+      await vi.waitFor(() => expect(pending.length).toBe(2));
+      // The toggle's follow-up fetchState answers first, then the old poll resolves.
+      pending[1]({ ok: true, json: async () => makeState(client, true) });
+      await toggle;
+      expect(client.getDiagnostics().running).toBe(true);
+      pending[0]({ ok: true, json: async () => makeState(client, false) });
+      await poll;
+      expect(client.getDiagnostics().running).toBe(true);
+    });
+
+    it('does not accumulate listeners on the stream signal without AbortSignal.any', async () => {
+      const client = new RouteWardClientService();
+      const original = AbortSignal.any;
+      Object.defineProperty(AbortSignal, 'any', {
+        configurable: true,
+        value: undefined
+      });
+      try {
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => makeState(client, false)
+          })
+        );
+        const controller = new AbortController();
+        const addSpy = vi.spyOn(controller.signal, 'addEventListener');
+        const removeSpy = vi.spyOn(controller.signal, 'removeEventListener');
+        const poll = (
+          client as unknown as { pollState: (s: AbortSignal) => Promise<void> }
+        ).pollState.bind(client);
+        for (let i = 0; i < 4; i += 1) {
+          await poll(controller.signal);
+        }
+        expect(addSpy).toHaveBeenCalledTimes(4);
+        expect(removeSpy).toHaveBeenCalledTimes(4);
+      } finally {
+        Object.defineProperty(AbortSignal, 'any', {
+          configurable: true,
+          value: original
+        });
+      }
+    });
+
     it('does not mark the daemon disconnected when a poll fails', async () => {
       vi.useFakeTimers();
       const client = new RouteWardClientService();

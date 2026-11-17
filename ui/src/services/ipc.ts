@@ -145,34 +145,48 @@ function createInitialTelemetry(): TelemetrySnapshot {
   };
 }
 
-/** Combines the request timeout with an optional caller signal (AbortSignal.any when available). */
+/**
+ * Combines the request timeout with an optional caller signal (AbortSignal.any when available).
+ * `cleanup` detaches the listeners added to the caller signal by the fallback path, so a
+ * long-lived stream signal does not accumulate one listener per request.
+ */
 function buildRequestSignal(
   timeoutMs: number,
   externalSignal?: AbortSignal
-): AbortSignal | undefined {
+): { signal: AbortSignal | undefined; cleanup: () => void } {
+  const noop = () => {};
   const timeoutSignal =
     typeof AbortSignal !== 'undefined' &&
     typeof AbortSignal.timeout === 'function'
       ? AbortSignal.timeout(timeoutMs)
       : undefined;
   if (!externalSignal) {
-    return timeoutSignal;
+    return { signal: timeoutSignal, cleanup: noop };
   }
   if (!timeoutSignal) {
-    return externalSignal;
+    return { signal: externalSignal, cleanup: noop };
   }
   if (typeof AbortSignal.any === 'function') {
-    return AbortSignal.any([externalSignal, timeoutSignal]);
+    return {
+      signal: AbortSignal.any([externalSignal, timeoutSignal]),
+      cleanup: noop
+    };
   }
   const combined = new AbortController();
   const abort = () => combined.abort();
   if (externalSignal.aborted || timeoutSignal.aborted) {
     abort();
-  } else {
-    externalSignal.addEventListener('abort', abort, { once: true });
-    timeoutSignal.addEventListener('abort', abort, { once: true });
+    return { signal: combined.signal, cleanup: noop };
   }
-  return combined.signal;
+  externalSignal.addEventListener('abort', abort);
+  timeoutSignal.addEventListener('abort', abort);
+  return {
+    signal: combined.signal,
+    cleanup: () => {
+      externalSignal.removeEventListener('abort', abort);
+      timeoutSignal.removeEventListener('abort', abort);
+    }
+  };
 }
 
 export class RouteWardClientService {
@@ -434,11 +448,34 @@ export class RouteWardClientService {
     const headers = buildAuthHeaders(
       body !== undefined ? { 'Content-Type': 'application/json' } : undefined
     );
+    if (method !== 'GET') {
+      this.lastAppliedStateSeq = ++this.stateRequestSeq;
+    }
+    const { signal, cleanup } = buildRequestSignal(timeoutMs, externalSignal);
+    try {
+      return await this.sendJsonRequest<T>(url, method, headers, body, signal);
+    } finally {
+      cleanup();
+      if (method !== 'GET') {
+        // The mutation response is about to be applied locally: discard any older in-flight
+        // state poll so it cannot briefly revert the new state.
+        this.lastAppliedStateSeq = ++this.stateRequestSeq;
+      }
+    }
+  }
+
+  private async sendJsonRequest<T>(
+    url: string,
+    method: 'GET' | 'POST',
+    headers: Record<string, string>,
+    body: unknown,
+    signal: AbortSignal | undefined
+  ): Promise<T> {
     const response = await fetch(url, {
       method,
       headers,
       cache: 'no-store',
-      signal: buildRequestSignal(timeoutMs, externalSignal),
+      signal,
       body: body !== undefined ? JSON.stringify(body) : undefined
     });
     if (!response.ok) {
