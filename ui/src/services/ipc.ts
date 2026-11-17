@@ -465,6 +465,15 @@ export class RouteWardClientService {
     const streamSignal = abortSignal ?? new AbortController().signal;
     this.activeStreamSignal = streamSignal;
 
+    // The SSE stream does not carry engine state: refresh it on a bounded interval so a
+    // start/stop done from the CLI or the tray shows up in the header.
+    const refreshTimer = window.setInterval(() => {
+      void this.fetchState();
+    }, UI_CONFIG.STATE_REFRESH_INTERVAL_MS);
+    streamSignal.addEventListener('abort', () => {
+      window.clearInterval(refreshTimer);
+    });
+
     void runRealtimeSseLoop(
       {
         endpoint: UI_CONFIG.API_ENDPOINTS.EVENTS,
@@ -478,6 +487,7 @@ export class RouteWardClientService {
       },
       streamSignal
     ).finally(() => {
+      window.clearInterval(refreshTimer);
       if (this.activeStreamSignal === streamSignal) {
         this.activeStreamSignal = null;
       }

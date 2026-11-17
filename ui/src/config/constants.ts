@@ -48,6 +48,8 @@ export const UI_CONFIG = {
   DEFAULT_TEST_PORT: 443,
   TOKEN_HEADER: 'X-RouteWard-Token',
   SSE_RECONNECT_DELAY_MS: 1500,
+  /** Interval of the background state refresh that picks up engine changes made outside the UI (CLI, tray). */
+  STATE_REFRESH_INTERVAL_MS: 3000,
   /** Minimum delay between two UI renders triggered by a burst of SSE events. */
   STREAM_NOTIFY_COALESCE_MS: 100,
   /** Timeout applied to ordinary bridge requests. */

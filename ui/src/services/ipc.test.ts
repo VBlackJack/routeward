@@ -514,6 +514,42 @@ describe('RouteWardClientService', () => {
     second.abort();
   });
 
+  it('refreshes daemon state on an interval so engine changes made outside the UI show up', async () => {
+    vi.useFakeTimers();
+    try {
+      const stateUrl = UI_CONFIG.API_ENDPOINTS.STATE;
+      const fetchMock = vi.fn().mockImplementation(
+        (url: string, init?: { signal?: AbortSignal }) => {
+          if (url === stateUrl) {
+            return Promise.reject(new TypeError('Failed to fetch'));
+          }
+          return new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () =>
+              reject(new DOMException('aborted', 'AbortError'))
+            );
+          });
+        }
+      );
+      vi.stubGlobal('fetch', fetchMock);
+      const client = new RouteWardClientService();
+      const stateCalls = () =>
+        fetchMock.mock.calls.filter((c) => c[0] === stateUrl).length;
+      const controller = new AbortController();
+      client.startRealtimeStream(controller.signal);
+      await vi.advanceTimersByTimeAsync(0);
+      const baseline = stateCalls();
+      await vi.advanceTimersByTimeAsync(UI_CONFIG.STATE_REFRESH_INTERVAL_MS * 2);
+      expect(stateCalls()).toBeGreaterThanOrEqual(baseline + 2);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      const afterAbort = stateCalls();
+      await vi.advanceTimersByTimeAsync(UI_CONFIG.STATE_REFRESH_INTERVAL_MS * 3);
+      expect(stateCalls()).toBe(afterAbort);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('rejects out-of-range or non-numeric ports in proxy URIs', () => {
     const client = new RouteWardClientService();
     expect(client.parseSingleProxyUri('socks5://127.0.0.1:70000')).toBeNull();
