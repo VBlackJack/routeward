@@ -16,6 +16,7 @@
 name = "routeward-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
@@ -62,3 +63,7 @@ windows-sys = { version = "0.59", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Property tests for the DNS codec only (it parses untrusted network input).
+proptest = { version = "1", default-features = false, features = ["std"] }
