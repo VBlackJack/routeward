@@ -86,7 +86,8 @@ try {
     Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
 
     $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    Set-Content -LiteralPath "${zipPath}.sha256" -Value "$hash  $zipName" -Encoding ascii
+    # LF line ending so `sha256sum -c` accepts the sidecar on every platform.
+    [System.IO.File]::WriteAllText("${zipPath}.sha256", "$hash  $zipName`n", [System.Text.Encoding]::ASCII)
     Write-Output "Built $zipPath"
 }
 finally {

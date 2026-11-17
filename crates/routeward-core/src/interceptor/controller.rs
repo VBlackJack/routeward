@@ -2455,6 +2455,46 @@ mod tests {
             .unwrap_or_else(|err| panic!("relay port {addr} must be free after stop: {err}"));
     }
 
+    /// Polls until every fixed engine port can be bound again, yielding to the runtime between
+    /// attempts; panics with the ports still in use once `ENGINE_SHUTDOWN_JOIN_TIMEOUT` elapses.
+    async fn wait_until_engine_ports_bindable(constants: &SystemConstants) {
+        let any_host = constants.network.transparent_bind_host.clone();
+        let net = &constants.network;
+        let tcp_ports = [
+            net.default_relay_tcp_port,
+            net.default_transparent_tcp_port,
+            net.default_dns_listen_port,
+        ];
+        let udp_ports = [
+            net.default_dns_listen_port,
+            net.default_local_name_inspect_port,
+        ];
+        let deadline = tokio::time::Instant::now() + ENGINE_SHUTDOWN_JOIN_TIMEOUT;
+        loop {
+            let busy: Vec<String> = tcp_ports
+                .iter()
+                .filter(|port| std::net::TcpListener::bind(format!("{any_host}:{port}")).is_err())
+                .map(|port| format!("tcp/{port}"))
+                .chain(
+                    udp_ports
+                        .iter()
+                        .filter(|port| {
+                            std::net::UdpSocket::bind(format!("{any_host}:{port}")).is_err()
+                        })
+                        .map(|port| format!("udp/{port}")),
+                )
+                .collect();
+            if busy.is_empty() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "engine ports still in use after stop: {busy:?}"
+            );
+            tokio::time::sleep(LISTENER_SETTLE_DELAY).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn engine_restart_rebinds_listeners_after_stop() {
         let constants = fixed_port_constants();
@@ -2497,10 +2537,9 @@ mod tests {
         controller.start_engine().expect("first start");
         settle_listener_tasks().await;
         controller.stop_engine();
-        // On a current-thread runtime the listener tasks end at the next await point.
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
+        // On a current-thread runtime stop_engine cannot block, so the listener tasks drop their
+        // sockets once this task yields; wait (bounded) until every engine port is free again.
+        wait_until_engine_ports_bindable(&constants).await;
         assert_relay_port_bindable(&constants);
 
         controller.start_engine().expect("restart after stop");
