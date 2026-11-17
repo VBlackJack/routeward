@@ -1225,3 +1225,25 @@ async fn index_page_carries_csp_while_scripts_do_not() {
 
     server_task.abort();
 }
+
+#[tokio::test]
+async fn system_errors_reach_the_ui_as_localized_messages_not_os_text() {
+    use routeward_core::error::ERR_KEY_SYSTEM_PATH_EMPTY;
+
+    let constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+
+    for locale in ["en", "fr"] {
+        let bridge = DesktopCommandBridge::new(constants.clone(), profile.clone(), locale);
+        let err = bridge
+            .launch_process_with_proxy("   ", &[])
+            .await
+            .expect_err("an empty executable path must be refused");
+        assert_eq!(err, bridge.translate(ERR_KEY_SYSTEM_PATH_EMPTY));
+        assert!(
+            !err.contains("errors.system"),
+            "the raw key must never reach the UI, got: {err}"
+        );
+    }
+}

@@ -729,7 +729,11 @@
         "matched": "Rule evaluation completed"
       },
       "cleanup": {
-        "completed": "Interception rules cleanup completed"
+        "completed": "Interception rules cleanup completed",
+        "user_completed": "Per-user RouteWard settings restored"
+      },
+      "purge": {
+        "completed": "RouteWard data directory removed"
       },
       "daemon": {
         "banner": "Starting RouteWard Privileged Daemon",
@@ -783,6 +787,15 @@
     },
     "service": {
       "insecure_binary_location": "Refusing to register the Windows service: the RouteWard executable or its folder is writable by non-administrators. Install it under Program Files."
+    },
+    "system": {
+      "registry_write_failed": "Could not update the Windows proxy settings of the current user",
+      "pac_url_invalid": "The PAC URL must point to the local RouteWard server (http://127.0.0.1:<port>/...)",
+      "executable_path_empty": "The executable path is empty or could not be determined",
+      "launch_failed": "Could not start the selected program",
+      "backup_failed": "Could not save the previous proxy settings, so they were left unchanged",
+      "purge_failed": "Could not remove the RouteWard data directory",
+      "purge_unsupported": "Removing the RouteWard data directory with this command is only available on Windows"
     },
     "desktop": {
       "ui_init": "RouteWard could not initialize its desktop WebView window. Ensure Microsoft Edge WebView2 Runtime is installed and your user data folder is writable."
