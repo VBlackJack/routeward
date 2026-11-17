@@ -55,6 +55,49 @@ const DAEMON_START_POLL_INTERVAL_MS: u64 = 250;
 
 type TrayNotifyCallback = Arc<dyn Fn(TrayStatusSnapshot) + Send + Sync>;
 
+/// A failed system operation (registry tools, process spawn): the localized message plus the
+/// stable i18n key the UI uses to translate it again in its own locale.
+///
+/// It derefs to the message and compares equal to a `String`, so callers that only care about
+/// the text keep working.
+#[derive(Debug, Clone)]
+pub struct SystemOpError {
+    key: Option<&'static str>,
+    message: String,
+}
+
+impl SystemOpError {
+    /// The i18n key of the failure; absent when the blocking task itself could not complete.
+    pub fn key(&self) -> Option<&'static str> {
+        self.key
+    }
+
+    /// The message localized in the bridge locale.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for SystemOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::ops::Deref for SystemOpError {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl PartialEq<String> for SystemOpError {
+    fn eq(&self, other: &String) -> bool {
+        &self.message == other
+    }
+}
+
 #[derive(Clone)]
 pub struct DesktopCommandBridge {
     constants: Arc<SystemConstants>,
@@ -549,7 +592,7 @@ impl DesktopCommandBridge {
     ///
     /// A failure is logged with its English detail and handed to the UI as the message of its
     /// i18n key in the active locale, so the user never sees a raw OS error text.
-    async fn run_system_blocking<T, F>(&self, task: F) -> Result<T, String>
+    async fn run_system_blocking<T, F>(&self, task: F) -> Result<T, SystemOpError>
     where
         T: Send + 'static,
         F: FnOnce() -> RouteWardResult<T> + Send + 'static,
@@ -558,13 +601,19 @@ impl DesktopCommandBridge {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(err)) => {
                 self.log_warn(format!("System operation failed: {err}"));
-                Err(self.i18n.t(err.i18n_key()))
+                Err(SystemOpError {
+                    key: Some(err.i18n_key()),
+                    message: self.i18n.t(err.i18n_key()),
+                })
             }
-            Err(join_err) => Err(join_err.to_string()),
+            Err(join_err) => Err(SystemOpError {
+                key: None,
+                message: join_err.to_string(),
+            }),
         }
     }
 
-    pub async fn set_system_proxy(&self, enabled: bool) -> Result<bool, String> {
+    pub async fn set_system_proxy(&self, enabled: bool) -> Result<bool, SystemOpError> {
         let endpoint = self.get_diagnostics().relay_tcp_endpoint;
         self.run_system_blocking(move || SystemProxyManager::set_system_proxy(enabled, &endpoint))
             .await
@@ -618,7 +667,7 @@ impl DesktopCommandBridge {
         (active, expected)
     }
 
-    pub async fn set_system_pac(&self, enabled: bool) -> Result<(bool, String), String> {
+    pub async fn set_system_pac(&self, enabled: bool) -> Result<(bool, String), SystemOpError> {
         let expected = self.pac_url();
         let expected_for_task = expected.clone();
         self.run_system_blocking(move || {
@@ -634,7 +683,7 @@ impl DesktopCommandBridge {
             .unwrap_or(false)
     }
 
-    pub async fn set_autostart(&self, enabled: bool) -> Result<bool, String> {
+    pub async fn set_autostart(&self, enabled: bool) -> Result<bool, SystemOpError> {
         self.run_system_blocking(move || {
             let exe_path = std::env::current_exe().map_err(|err| RouteWardError::SystemError {
                 key: ERR_KEY_SYSTEM_PATH_EMPTY,
@@ -729,7 +778,7 @@ impl DesktopCommandBridge {
         &self,
         executable_path: &str,
         args: &[String],
-    ) -> Result<LaunchedProcessReport, String> {
+    ) -> Result<LaunchedProcessReport, SystemOpError> {
         let diag = self.get_diagnostics();
         let executable_path = executable_path.to_string();
         let args = args.to_vec();

@@ -34,7 +34,7 @@ import {
   Terminal,
   Wand2
 } from 'lucide-react';
-import { formatBytes } from '../services/ipc';
+import { formatBytes, formatSampleTime } from '../services/format';
 import {
   ProxyNode,
   RoutingRule,
@@ -487,7 +487,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <div
                     key={idx}
                     className="flex h-full flex-1 flex-col justify-end gap-0.5"
-                    title={`${sample.timestamp} - RX: ${formatBytes(
+                    title={`${formatSampleTime(sample.timestamp)} - RX: ${formatBytes(
                       sample.rxBytesPerSec
                     )}/s | TX: ${formatBytes(sample.txBytesPerSec)}/s`}
                   >
@@ -670,7 +670,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </div>
                 </div>
               </div>
-              <input
+              <input name="dashboard-killswitch"
                 type="checkbox"
                 aria-label={t('dashboard.security_shield.panel.killswitch_aria')}
                 checked={securityPolicy.killSwitchEnabled}
@@ -696,7 +696,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </div>
                 </div>
               </div>
-              <input
+              <input name="dashboard-udp-guard"
                 type="checkbox"
                 aria-label={t('dashboard.security_shield.panel.udp_guard_aria')}
                 checked={securityPolicy.blockUdpOnTcpOnlyProxy}
@@ -722,7 +722,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </div>
                 </div>
               </div>
-              <input
+              <input name="dashboard-dns-guard"
                 type="checkbox"
                 aria-label={t('dashboard.security_shield.panel.dns_guard_aria')}
                 checked={securityPolicy.strictDnsNoLocalFallback}

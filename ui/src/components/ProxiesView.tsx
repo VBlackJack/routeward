@@ -466,8 +466,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="rounded bg-tf-pink/20 px-2 py-0.5 text-[10px] font-bold text-tf-pink">
-                      {chain.proxyIds.length}{' '}
-                      {t('proxies.section.chains.hops')}
+                      {t('proxies.section.chains.hops', {
+                        count: chain.proxyIds.length
+                      })}
                     </span>
                     <button
                       type="button"
@@ -525,7 +526,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 {t('proxies.modal.import_uri.subtitle')}
               </p>
             </div>
-            <textarea
+            <textarea name="proxy-uri-batch"
               rows={5}
               required
               aria-label={t('proxies.modal.import_uri.title')}
@@ -700,7 +701,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               <div className="space-y-2 pt-1 text-xs text-tf-primary">
                 <div className="flex items-center gap-6">
                   <label className="flex items-center gap-2">
-                    <input
+                    <input name="proxy-udp-enabled"
                       type="checkbox"
                       checked={udpEnabled}
                       onChange={(e) => setUdpEnabled(e.target.checked)}
@@ -708,7 +709,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     {t('proxies.modal.add_proxy.udp_label')}
                   </label>
                   <label className="flex items-center gap-2">
-                    <input
+                    <input name="proxy-tls"
                       type="checkbox"
                       checked={tls || protocol === 'https'}
                       disabled={protocol === 'https'}
@@ -719,7 +720,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 </div>
                 {(tls || protocol === 'https') && (
                   <label className="flex items-center gap-2 text-[11px] text-tf-orange">
-                    <input
+                    <input name="proxy-tls-skip-verify"
                       type="checkbox"
                       checked={tlsSkipVerify}
                       onChange={(e) => setTlsSkipVerify(e.target.checked)}

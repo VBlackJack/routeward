@@ -61,7 +61,7 @@ export const DnsView: React.FC<DnsViewProps> = ({
       </div>
 
       <form onSubmit={handleSubmit} className="tf-card flex gap-3 p-4">
-        <input
+        <input name="dns-domain"
           type="text"
           value={domainInput}
           onChange={(e) => setDomainInput(e.target.value)}

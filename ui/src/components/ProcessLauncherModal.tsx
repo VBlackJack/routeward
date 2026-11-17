@@ -18,6 +18,7 @@ import React, { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Play, Terminal, X } from 'lucide-react';
 import { UI_CONFIG } from '../config/constants';
+import { formatLauncherArgs, parseLauncherArgs } from '../services/launcher';
 import { ModalContainer } from './ModalContainer';
 
 interface ProcessLauncherModalProps {
@@ -36,17 +37,17 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
   const exeInputId = useId();
   const argsInputId = useId();
   const [executable, setExecutable] = useState<string>(UI_CONFIG.QUICK_LAUNCH_PRESETS[0].exe);
-  const [rawArgs, setRawArgs] = useState<string>(UI_CONFIG.IP_CHECK_URL);
+  const argsHelpId = useId();
+  const [rawArgs, setRawArgs] = useState<string>(
+    formatLauncherArgs(UI_CONFIG.QUICK_LAUNCH_PRESETS[0].args)
+  );
   const [launching, setLaunching] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!executable.trim()) return;
     setLaunching(true);
-    const parsedArgs = rawArgs
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean);
+    const parsedArgs = parseLauncherArgs(rawArgs);
     try {
       await onLaunch(executable.trim(), parsedArgs);
       onClose();
@@ -92,7 +93,7 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
                 type="button"
                 onClick={() => {
                   setExecutable(preset.exe);
-                  setRawArgs(preset.args);
+                  setRawArgs(formatLauncherArgs(preset.args));
                 }}
                 className="tf-surface-alt px-2.5 py-1 font-mono text-[11px] text-tf-cyan hover:border-tf-accent"
               >
@@ -110,6 +111,7 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
             </label>
             <input
               id={exeInputId}
+              name="launcher-executable"
               type="text"
               value={executable}
               onChange={(e) => setExecutable(e.target.value)}
@@ -126,14 +128,20 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
             >
               {t('app.launcher.modal.args_label')}
             </label>
-            <input
+            <textarea
               id={argsInputId}
-              type="text"
+              name="launcher-arguments"
+              rows={4}
+              spellCheck={false}
               value={rawArgs}
               onChange={(e) => setRawArgs(e.target.value)}
               placeholder={t('app.launcher.modal.args_placeholder')}
+              aria-describedby={argsHelpId}
               className="tf-input w-full px-3 py-2 font-mono text-xs"
             />
+            <p id={argsHelpId} className="mt-1 text-[11px] text-tf-secondary">
+              {t('app.launcher.modal.args_help')}
+            </p>
           </div>
 
           <div className="tf-surface-alt p-3 font-mono text-[11px] text-tf-secondary">

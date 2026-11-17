@@ -487,6 +487,33 @@ fn flatten_locale_keys(path: &str, root: &Path) -> BTreeSet<String> {
     map.into_keys().collect()
 }
 
+/// i18next plural category suffixes; sources reference the base key and pass `count`.
+const PLURAL_KEY_SUFFIXES: &[&str] = &["_zero", "_one", "_two", "_few", "_many", "_other"];
+
+/// True when `key` itself, or (for a plural-suffixed key) its base key, appears in `corpus`.
+fn locale_key_is_referenced(key: &str, corpus: &str) -> bool {
+    if corpus.contains(key) {
+        return true;
+    }
+    PLURAL_KEY_SUFFIXES
+        .iter()
+        .filter_map(|suffix| key.strip_suffix(suffix))
+        .any(|base| !base.is_empty() && corpus.contains(base))
+}
+
+#[test]
+fn plural_locale_keys_are_accepted_through_their_base_key_only() {
+    assert!(locale_key_is_referenced(
+        "a.count_other",
+        "t('a.count', { count })"
+    ));
+    assert!(locale_key_is_referenced("a.count_one", "t('a.count')"));
+    assert!(locale_key_is_referenced("a.exact_one", "a.exact_one"));
+    assert!(!locale_key_is_referenced("a.count_one", "t('a.other')"));
+    assert!(!locale_key_is_referenced("a.count_other", ""));
+    assert!(!locale_key_is_referenced("a.count_extra", "t('a.count')"));
+}
+
 #[test]
 fn every_english_locale_key_is_referenced_in_sources() {
     let root = repo_root();
@@ -517,7 +544,7 @@ fn every_english_locale_key_is_referenced_in_sources() {
             !DYNAMIC_LOCALE_KEY_PREFIXES
                 .iter()
                 .any(|prefix| key.starts_with(prefix))
-                && !corpus.contains(key.as_str())
+                && !locale_key_is_referenced(key, &corpus)
         })
         .collect();
     assert!(
