@@ -145,6 +145,16 @@ pub fn build_quoted_service_command_line(
 /// Prefix Windows Installer puts in front of a REG_EXPAND_SZ value read by a raw registry search.
 /// `CreateServiceW` stores `ImagePath` as REG_EXPAND_SZ, so the captured value carries it.
 const IMAGE_PATH_EXPAND_SZ_PREFIX: &str = "#%";
+/// Win32 `ERROR_SERVICE_MARKED_FOR_DELETE`: the previous registration is still pending deletion
+/// (a handle is open elsewhere), so `CreateServiceW` cannot reuse the name yet.
+#[cfg(any(windows, test))]
+const ERROR_SERVICE_MARKED_FOR_DELETE_CODE: u32 = 1072;
+/// Maximum number of registration attempts when the service is still marked for deletion.
+#[cfg(any(windows, test))]
+const RESTORE_MAX_ATTEMPTS: u32 = 5;
+/// Delay between registration attempts while the service is still marked for deletion.
+#[cfg(windows)]
+const RESTORE_RETRY_DELAY_MS: u64 = 1000;
 /// Verb tokens that must follow the executable in a RouteWard service command line.
 const SERVICE_COMMAND_VERBS: [&str; 2] = ["service", "run"];
 /// The only flag a RouteWard service command line may carry.
@@ -990,6 +1000,15 @@ pub fn install_windows_service(
     }
 }
 
+/// Returns true when a failed registration attempt should be retried: the failure is
+/// `ERROR_SERVICE_MARKED_FOR_DELETE` (carried in the error detail as `os error 1072`) and fewer
+/// than `max_attempts` attempts have been made so far (`attempts_made` counts the failed one).
+#[cfg(any(windows, test))]
+fn should_retry_restore(detail: &str, attempts_made: u32, max_attempts: u32) -> bool {
+    let marker = format!("(os error {ERROR_SERVICE_MARKED_FOR_DELETE_CODE})");
+    attempts_made < max_attempts && detail.contains(&marker)
+}
+
 /// Re-registers the RouteWard service after an MSI upgrade removed it.
 ///
 /// `image_path_args` is the old service `ImagePath` captured before the upgrade, split into
@@ -997,6 +1016,13 @@ pub fn install_windows_service(
 /// the service binary is always the currently running executable, i.e. the NEW installed binary,
 /// whose location is re-verified before registration. `demand_start` selects manual start type
 /// (automatic otherwise) and `start` starts the service once registered.
+///
+/// A registration that fails with `ERROR_SERVICE_MARKED_FOR_DELETE` (the old service is still
+/// being deleted) is retried a bounded number of times with a short delay, then fails.
+///
+/// The restore API only distinguishes automatic from manual start: a service that was disabled
+/// (`Start = 4`) before the upgrade is restored as demand start, because the installer passes
+/// `--demand-start` for every old start type other than automatic.
 pub fn restore_windows_service(
     image_path_args: &[String],
     demand_start: bool,
@@ -1005,7 +1031,25 @@ pub fn restore_windows_service(
     let allowed_sids = parse_service_image_path_args(image_path_args)?;
     #[cfg(windows)]
     {
-        let status = win32_impl::install(None, &allowed_sids, !demand_start)?;
+        let mut attempts_made = 0;
+        let status = loop {
+            match win32_impl::install(None, &allowed_sids, !demand_start) {
+                Ok(status) => break status,
+                Err(err) => {
+                    attempts_made += 1;
+                    let retry = match &err {
+                        RouteWardError::DaemonError { detail, .. } => {
+                            should_retry_restore(detail, attempts_made, RESTORE_MAX_ATTEMPTS)
+                        }
+                        _ => false,
+                    };
+                    if !retry {
+                        return Err(err);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(RESTORE_RETRY_DELAY_MS));
+                }
+            }
+        };
         if start {
             win32_impl::start()
         } else {
@@ -1101,6 +1145,27 @@ pub fn run_windows_service_dispatcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_retries_only_marked_for_delete_within_bound() {
+        let marked = "CreateServiceW failed: The specified service has been marked for deletion. (os error 1072)";
+        assert!(should_retry_restore(marked, 1, RESTORE_MAX_ATTEMPTS));
+        assert!(should_retry_restore(
+            marked,
+            RESTORE_MAX_ATTEMPTS - 1,
+            RESTORE_MAX_ATTEMPTS
+        ));
+        assert!(!should_retry_restore(
+            marked,
+            RESTORE_MAX_ATTEMPTS,
+            RESTORE_MAX_ATTEMPTS
+        ));
+        assert!(!should_retry_restore(
+            "CreateServiceW failed: Access is denied. (os error 5)",
+            1,
+            RESTORE_MAX_ATTEMPTS
+        ));
+    }
 
     #[test]
     fn write_class_access_masks_are_detected() {

@@ -78,7 +78,29 @@
         Impersonate="no"
         Return="ignore" />
 
+    <!--
+      Rollback counterparts: if the install fails after a restore ran, remove the freshly registered service so
+      it never points to a binary that the rollback deletes. A rollback action is scheduled before the deferred
+      action it undoes and only runs when that deferred action already ran. "Return=ignore": best effort.
+    -->
+    <CustomAction
+        Id="RollbackRestoreServiceAutoStart"
+        FileRef="RouteWardCliExe"
+        ExeCommand="service uninstall"
+        Execute="rollback"
+        Impersonate="no"
+        Return="ignore" />
+    <CustomAction
+        Id="RollbackRestoreServiceDemandStart"
+        FileRef="RouteWardCliExe"
+        ExeCommand="service uninstall"
+        Execute="rollback"
+        Impersonate="no"
+        Return="ignore" />
+
     <InstallExecuteSequence>
+      <Custom Action="RollbackRestoreServiceAutoStart" Before="RestoreServiceAutoStart" Condition="NOT REMOVE AND (UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND ROUTEWARD_OLD_IMAGEPATH &lt;&gt; &quot;&quot; AND ROUTEWARD_OLD_SVC_START = &quot;#2&quot;" />
+      <Custom Action="RollbackRestoreServiceDemandStart" Before="RestoreServiceDemandStart" Condition="NOT REMOVE AND (UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND ROUTEWARD_OLD_IMAGEPATH &lt;&gt; &quot;&quot; AND ROUTEWARD_OLD_SVC_START &lt;&gt; &quot;#2&quot;" />
       <Custom Action="RestoreServiceAutoStart" After="InstallFiles" Condition="NOT REMOVE AND (UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND ROUTEWARD_OLD_IMAGEPATH &lt;&gt; &quot;&quot; AND ROUTEWARD_OLD_SVC_START = &quot;#2&quot;" />
       <Custom Action="RestoreServiceDemandStart" After="InstallFiles" Condition="NOT REMOVE AND (UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND ROUTEWARD_OLD_IMAGEPATH &lt;&gt; &quot;&quot; AND ROUTEWARD_OLD_SVC_START &lt;&gt; &quot;#2&quot;" />
     </InstallExecuteSequence>
@@ -166,13 +188,15 @@
           The driver service is created by WinDivert.dll at run time, not by this package. Stop and remove it
           on install and uninstall so the driver file is never locked and no orphan service is left behind.
           A missing service is ignored by Windows Installer.
+          Wait="no": StopServices order is not guaranteed, the driver can stay STOP_PENDING while RouteWard still holds
+          its handle, and waiting would end in error 1921 after 30 s (fatal under /qn). RouteWard's own control waits.
         -->
         <ServiceControl
             Id="WinDivertServiceControl"
             Name="WinDivert"
             Stop="both"
             Remove="uninstall"
-            Wait="yes" />
+            Wait="no" />
       </Component>
     </ComponentGroup>
     <?endif ?>
