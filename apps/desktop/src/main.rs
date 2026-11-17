@@ -16,6 +16,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod downloads;
 mod navigation;
 
 use routeward_core::ipc::generate_ephemeral_token;
@@ -381,6 +382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bridge_for_nav = Arc::clone(&bridge);
     let bridge_for_new_window = Arc::clone(&bridge);
+    let bridge_for_download = Arc::clone(&bridge);
     let mut web_context = WebContext::new(Some(webview_data_dir));
     let _webview = match WebViewBuilder::with_web_context(&mut web_context)
         .with_initialization_script(&init_script)
@@ -401,6 +403,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
             false
         })
+        .with_download_started_handler(move |_url, path| {
+            let accepted = downloads::redirect_download(path);
+            if !accepted {
+                bridge_for_download
+                    .log_warn("Cancelled WebView download: no writable Downloads folder");
+            }
+            accepted
+        })
+        // DevTools only in debug builds, so the CSP can be inspected without exposing them to users.
+        .with_devtools(cfg!(debug_assertions))
         .with_url(&ui_url)
         .build(&window)
     {
