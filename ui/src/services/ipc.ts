@@ -145,6 +145,36 @@ function createInitialTelemetry(): TelemetrySnapshot {
   };
 }
 
+/** Combines the request timeout with an optional caller signal (AbortSignal.any when available). */
+function buildRequestSignal(
+  timeoutMs: number,
+  externalSignal?: AbortSignal
+): AbortSignal | undefined {
+  const timeoutSignal =
+    typeof AbortSignal !== 'undefined' &&
+    typeof AbortSignal.timeout === 'function'
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined;
+  if (!externalSignal) {
+    return timeoutSignal;
+  }
+  if (!timeoutSignal) {
+    return externalSignal;
+  }
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([externalSignal, timeoutSignal]);
+  }
+  const combined = new AbortController();
+  const abort = () => combined.abort();
+  if (externalSignal.aborted || timeoutSignal.aborted) {
+    abort();
+  } else {
+    externalSignal.addEventListener('abort', abort, { once: true });
+    timeoutSignal.addEventListener('abort', abort, { once: true });
+  }
+  return combined.signal;
+}
+
 export class RouteWardClientService {
   private profile: ProfileConfig;
   private diagnostics: SystemDiagnostics;
@@ -154,6 +184,9 @@ export class RouteWardClientService {
   private fakeIps: FakeIpEntry[] = [];
   private listeners = new Set<() => void>();
   private activeStreamSignal: AbortSignal | null = null;
+  /** Sequence of the latest state request issued; responses older than the last applied one are dropped. */
+  private stateRequestSeq = 0;
+  private lastAppliedStateSeq = 0;
   private pendingNotifyTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
@@ -395,7 +428,8 @@ export class RouteWardClientService {
     url: string,
     method: 'GET' | 'POST' = 'GET',
     body?: unknown,
-    timeoutMs: number = UI_CONFIG.REQUEST_TIMEOUT_MS
+    timeoutMs: number = UI_CONFIG.REQUEST_TIMEOUT_MS,
+    externalSignal?: AbortSignal
   ): Promise<T> {
     const headers = buildAuthHeaders(
       body !== undefined ? { 'Content-Type': 'application/json' } : undefined
@@ -404,11 +438,7 @@ export class RouteWardClientService {
       method,
       headers,
       cache: 'no-store',
-      signal:
-        typeof AbortSignal !== 'undefined' &&
-        typeof AbortSignal.timeout === 'function'
-          ? AbortSignal.timeout(timeoutMs)
-          : undefined,
+      signal: buildRequestSignal(timeoutMs, externalSignal),
       body: body !== undefined ? JSON.stringify(body) : undefined
     });
     if (!response.ok) {
@@ -438,15 +468,23 @@ export class RouteWardClientService {
   }
 
   public async fetchState(): Promise<DaemonFullState> {
+    const seq = ++this.stateRequestSeq;
     try {
       const state = await this.requestJson<DaemonFullState>(
         UI_CONFIG.API_ENDPOINTS.STATE,
         'GET'
       );
-      this.applyFullState(state);
+      // A response older than the one already applied must not roll the state back.
+      if (seq > this.lastAppliedStateSeq) {
+        this.lastAppliedStateSeq = seq;
+        this.applyFullState(state);
+      }
       return state;
     } catch {
-      this.markDisconnectedState();
+      if (seq > this.lastAppliedStateSeq) {
+        this.lastAppliedStateSeq = seq;
+        this.markDisconnectedState();
+      }
       return {
         diagnostics: this.diagnostics,
         profile: this.profile,
@@ -465,14 +503,9 @@ export class RouteWardClientService {
     const streamSignal = abortSignal ?? new AbortController().signal;
     this.activeStreamSignal = streamSignal;
 
-    // The SSE stream does not carry engine state: refresh it on a bounded interval so a
-    // start/stop done from the CLI or the tray shows up in the header.
-    const refreshTimer = window.setInterval(() => {
-      void this.fetchState();
-    }, UI_CONFIG.STATE_REFRESH_INTERVAL_MS);
-    streamSignal.addEventListener('abort', () => {
-      window.clearInterval(refreshTimer);
-    });
+    // The SSE stream does not carry engine state: poll it so a start/stop done from the
+    // CLI or the tray shows up in the header.
+    const stopStatePolling = this.startStatePolling(streamSignal);
 
     void runRealtimeSseLoop(
       {
@@ -487,11 +520,93 @@ export class RouteWardClientService {
       },
       streamSignal
     ).finally(() => {
-      window.clearInterval(refreshTimer);
+      stopStatePolling();
       if (this.activeStreamSignal === streamSignal) {
         this.activeStreamSignal = null;
       }
     });
+  }
+
+  /**
+   * Polls the daemon state with a self-rescheduling timer armed only after the previous poll
+   * settled (no overlap). Polls are skipped while the document is hidden and resume at once
+   * when it becomes visible. Returns a function that stops the poller and releases its listener.
+   */
+  private startStatePolling(signal: AbortSignal): () => void {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
+
+    const schedule = () => {
+      if (stopped || signal.aborted) {
+        return;
+      }
+      timer = setTimeout(() => {
+        void run();
+      }, UI_CONFIG.STATE_REFRESH_INTERVAL_MS);
+    };
+    const run = async () => {
+      timer = null;
+      if (stopped || signal.aborted) {
+        return;
+      }
+      if (!document.hidden) {
+        await this.pollState(signal);
+      }
+      schedule();
+    };
+    const onVisibilityChange = () => {
+      // Only resume when idle (timer armed): a poll in flight reschedules itself.
+      if (!document.hidden && !stopped && timer !== null) {
+        clearTimeout(timer);
+        void run();
+      }
+    };
+    const stop = () => {
+      stopped = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    signal.addEventListener('abort', stop);
+    schedule();
+    return stop;
+  }
+
+  /**
+   * One background state poll. A failure is ignored on purpose: connectivity is owned by the
+   * SSE loop. Only the diagnostics and profile are compared before applying (small payloads);
+   * telemetry, connections and logs are kept current by the SSE stream, so a poll that finds
+   * the same engine state costs no UI render.
+   */
+  private async pollState(signal: AbortSignal): Promise<void> {
+    const seq = ++this.stateRequestSeq;
+    let state: DaemonFullState;
+    try {
+      state = await this.requestJson<DaemonFullState>(
+        UI_CONFIG.API_ENDPOINTS.STATE,
+        'GET',
+        undefined,
+        UI_CONFIG.STATE_POLL_TIMEOUT_MS,
+        signal
+      );
+    } catch {
+      return;
+    }
+    if (seq <= this.lastAppliedStateSeq) {
+      return;
+    }
+    const unchanged =
+      JSON.stringify(state.diagnostics) === JSON.stringify(this.diagnostics) &&
+      JSON.stringify(state.profile) === JSON.stringify(this.profile);
+    if (unchanged) {
+      return;
+    }
+    this.lastAppliedStateSeq = seq;
+    this.applyFullState(state);
   }
 
   public getProfile(): ProfileConfig {

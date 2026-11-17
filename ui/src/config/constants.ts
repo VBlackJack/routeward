@@ -50,6 +50,8 @@ export const UI_CONFIG = {
   SSE_RECONNECT_DELAY_MS: 1500,
   /** Interval of the background state refresh that picks up engine changes made outside the UI (CLI, tray). */
   STATE_REFRESH_INTERVAL_MS: 3000,
+  /** Timeout of one background state poll, shorter than ordinary requests so a slow daemon never stacks polls. */
+  STATE_POLL_TIMEOUT_MS: 2000,
   /** Minimum delay between two UI renders triggered by a burst of SSE events. */
   STREAM_NOTIFY_COALESCE_MS: 100,
   /** Timeout applied to ordinary bridge requests. */

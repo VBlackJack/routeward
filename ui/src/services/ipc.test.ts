@@ -514,40 +514,169 @@ describe('RouteWardClientService', () => {
     second.abort();
   });
 
-  it('refreshes daemon state on an interval so engine changes made outside the UI show up', async () => {
-    vi.useFakeTimers();
-    try {
-      const stateUrl = UI_CONFIG.API_ENDPOINTS.STATE;
-      const fetchMock = vi.fn().mockImplementation(
-        (url: string, init?: { signal?: AbortSignal }) => {
-          if (url === stateUrl) {
-            return Promise.reject(new TypeError('Failed to fetch'));
-          }
-          return new Promise((_resolve, reject) => {
-            init?.signal?.addEventListener('abort', () =>
-              reject(new DOMException('aborted', 'AbortError'))
-            );
-          });
-        }
+  describe('state polling', () => {
+    const stateUrl = UI_CONFIG.API_ENDPOINTS.STATE;
+
+    function makeState(client: RouteWardClientService, running: boolean) {
+      return {
+        diagnostics: {
+          ...client.getDiagnostics(),
+          daemonConnected: true,
+          running
+        },
+        profile: client.getProfile(),
+        telemetry: client.getTelemetry(),
+        connections: [],
+        logs: [],
+        fakeIps: []
+      };
+    }
+
+    function setHidden(hidden: boolean) {
+      Object.defineProperty(document, 'hidden', {
+        configurable: true,
+        get: () => hidden
+      });
+      document.dispatchEvent(new Event('visibilitychange'));
+    }
+
+    afterEach(() => {
+      setHidden(false);
+      vi.useRealTimers();
+    });
+
+    function sseHangs(url: string, init?: { signal?: AbortSignal }) {
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () =>
+          reject(new DOMException('aborted', 'AbortError'))
+        );
+        void url;
+      });
+    }
+
+    it('picks up an engine start done outside the UI', async () => {
+      vi.useFakeTimers();
+      const client = new RouteWardClientService();
+      let running = false;
+      const fetchMock = vi.fn().mockImplementation((url: string, init) =>
+        url === stateUrl
+          ? Promise.resolve({ ok: true, json: async () => makeState(client, running) })
+          : sseHangs(url, init)
       );
       vi.stubGlobal('fetch', fetchMock);
-      const client = new RouteWardClientService();
-      const stateCalls = () =>
-        fetchMock.mock.calls.filter((c) => c[0] === stateUrl).length;
       const controller = new AbortController();
       client.startRealtimeStream(controller.signal);
       await vi.advanceTimersByTimeAsync(0);
-      const baseline = stateCalls();
-      await vi.advanceTimersByTimeAsync(UI_CONFIG.STATE_REFRESH_INTERVAL_MS * 2);
-      expect(stateCalls()).toBeGreaterThanOrEqual(baseline + 2);
+      expect(client.getDiagnostics().running).toBe(false);
+      running = true;
+      await vi.advanceTimersByTimeAsync(UI_CONFIG.STATE_REFRESH_INTERVAL_MS + 1);
+      expect(client.getDiagnostics().running).toBe(true);
+      controller.abort();
+    });
+
+    it('never overlaps polls when the daemon answers slowly and stops after abort', async () => {
+      vi.useFakeTimers();
+      const client = new RouteWardClientService();
+      let inFlight = 0;
+      let maxInFlight = 0;
+      let stateCalls = 0;
+      const fetchMock = vi.fn().mockImplementation((url: string, init) => {
+        if (url !== stateUrl) {
+          return sseHangs(url, init);
+        }
+        stateCalls += 1;
+        if (stateCalls === 1) {
+          return Promise.reject(new TypeError('initial'));
+        }
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            inFlight -= 1;
+            resolve({ ok: true, json: async () => makeState(client, false) });
+          }, UI_CONFIG.STATE_REFRESH_INTERVAL_MS * 2);
+        });
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const controller = new AbortController();
+      client.startRealtimeStream(controller.signal);
+      await vi.advanceTimersByTimeAsync(UI_CONFIG.STATE_REFRESH_INTERVAL_MS * 12);
+      expect(stateCalls).toBeGreaterThan(2);
+      expect(maxInFlight).toBe(1);
       controller.abort();
       await vi.advanceTimersByTimeAsync(0);
-      const afterAbort = stateCalls();
+      const afterAbort = stateCalls;
+      await vi.advanceTimersByTimeAsync(UI_CONFIG.STATE_REFRESH_INTERVAL_MS * 10);
+      expect(stateCalls).toBe(afterAbort);
+    });
+
+    it('ignores a stale state response that arrives after a newer one', async () => {
+      const client = new RouteWardClientService();
+      const resolvers: Array<(v: unknown) => void> = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockImplementation(
+          () => new Promise((resolve) => resolvers.push(resolve))
+        )
+      );
+      const older = client.fetchState();
+      const newer = client.fetchState();
+      resolvers[1]({ ok: true, json: async () => makeState(client, true) });
+      await newer;
+      expect(client.getDiagnostics().running).toBe(true);
+      resolvers[0]({ ok: true, json: async () => makeState(client, false) });
+      await older;
+      expect(client.getDiagnostics().running).toBe(true);
+    });
+
+    it('does not mark the daemon disconnected when a poll fails', async () => {
+      vi.useFakeTimers();
+      const client = new RouteWardClientService();
+      client.applyFullState(makeState(client, true));
+      let stateCalls = 0;
+      const fetchMock = vi.fn().mockImplementation((url: string, init) => {
+        if (url !== stateUrl) {
+          return sseHangs(url, init);
+        }
+        stateCalls += 1;
+        return stateCalls === 1
+          ? Promise.resolve({ ok: true, json: async () => makeState(client, true) })
+          : Promise.reject(new TypeError('Failed to fetch'));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const controller = new AbortController();
+      client.startRealtimeStream(controller.signal);
       await vi.advanceTimersByTimeAsync(UI_CONFIG.STATE_REFRESH_INTERVAL_MS * 3);
-      expect(stateCalls()).toBe(afterAbort);
-    } finally {
-      vi.useRealTimers();
-    }
+      expect(stateCalls).toBeGreaterThan(1);
+      expect(client.getDiagnostics().daemonConnected).toBe(true);
+      expect(client.getDiagnostics().running).toBe(true);
+      controller.abort();
+    });
+
+    it('skips polls while the document is hidden and resumes when visible', async () => {
+      vi.useFakeTimers();
+      const client = new RouteWardClientService();
+      let stateCalls = 0;
+      const fetchMock = vi.fn().mockImplementation((url: string, init) => {
+        if (url !== stateUrl) {
+          return sseHangs(url, init);
+        }
+        stateCalls += 1;
+        return Promise.resolve({ ok: true, json: async () => makeState(client, false) });
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const controller = new AbortController();
+      client.startRealtimeStream(controller.signal);
+      await vi.advanceTimersByTimeAsync(0);
+      setHidden(true);
+      const whileHiddenStart = stateCalls;
+      await vi.advanceTimersByTimeAsync(UI_CONFIG.STATE_REFRESH_INTERVAL_MS * 5);
+      expect(stateCalls).toBe(whileHiddenStart);
+      setHidden(false);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stateCalls).toBeGreaterThan(whileHiddenStart);
+      controller.abort();
+    });
   });
 
   it('rejects out-of-range or non-numeric ports in proxy URIs', () => {
