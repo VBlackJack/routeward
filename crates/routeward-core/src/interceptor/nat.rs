@@ -773,7 +773,16 @@ impl TransparentNatTable {
             self.udp_fragment_verdicts
                 .retain(|_, (_, at)| at.elapsed() < ttl);
             if self.udp_fragment_verdicts.len() >= capacity {
-                let victim = self.udp_fragment_verdicts.iter().next().map(|e| *e.key());
+                // Evict a Reinject entry first: losing a Drop verdict would turn the remaining
+                // fragments of a blocked datagram into orphans that leak when the kill switch is
+                // off. A Drop entry is evicted only when no Reinject entry exists.
+                let reinject_victim = self
+                    .udp_fragment_verdicts
+                    .iter()
+                    .find(|e| e.value().0 == UdpFragmentVerdict::Reinject)
+                    .map(|e| *e.key());
+                let victim = reinject_victim
+                    .or_else(|| self.udp_fragment_verdicts.iter().next().map(|e| *e.key()));
                 if let Some(victim) = victim {
                     self.udp_fragment_verdicts.remove(&victim);
                 }
@@ -1317,6 +1326,10 @@ pub struct UdpFragmentMeta {
     /// Destination port; 0 for [`UdpFragmentKind::NonFirst`].
     pub dst_port: u16,
     pub fragment_id: u32,
+    /// `true` when the fragment is known to belong to a UDP datagram. It is `false` only for an
+    /// IPv6 later fragment whose fragment header announces another extension header: such a
+    /// fragment may carry any protocol, so it is never dropped as an orphan.
+    pub udp_confirmed: bool,
 }
 
 impl UdpFragmentMeta {
@@ -1409,6 +1422,7 @@ fn parse_ipv4_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
             src_port: 0,
             dst_port: 0,
             fragment_id,
+            udp_confirmed: true,
         });
     }
     let (src_port, dst_port) = read_udp_ports(packet, ihl)?;
@@ -1419,6 +1433,7 @@ fn parse_ipv4_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
         src_port,
         dst_port,
         fragment_id,
+        udp_confirmed: true,
     })
 }
 
@@ -1529,6 +1544,7 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
                         src_port: 0,
                         dst_port: 0,
                         fragment_id,
+                        udp_confirmed: hdr[0] == IPPROTO_UDP,
                     });
                 }
                 // A first fragment that is detected but whose UDP header cannot be located is
@@ -1547,6 +1563,7 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
                     src_port,
                     dst_port,
                     fragment_id,
+                    udp_confirmed: true,
                 });
             }
             _ => return None,
@@ -1797,6 +1814,45 @@ pub fn is_ipv4_packet_fragmented(packet: &[u8]) -> bool {
     }
     let frag_field = u16::from_be_bytes([packet[6], packet[7]]);
     (frag_field & IPV4_FRAG_MORE_OR_OFFSET_MASK) != 0
+}
+
+/// Returns `true` if `packet` is an IPv4 or IPv6 fragment with a non-zero fragment offset, which
+/// carries no transport header: its payload must never be parsed as TCP or UDP.
+pub fn is_non_first_ip_fragment(packet: &[u8]) -> bool {
+    match packet.first().map(|b| b >> 4) {
+        Some(IPV4_VERSION) => {
+            packet.len() >= IPV4_MIN_HEADER_LEN
+                && (u16::from_be_bytes([packet[6], packet[7]]) & IPV4_FRAG_OFFSET_MASK) != 0
+        }
+        Some(IPV6_VERSION) => {
+            if packet.len() < IPV6_HEADER_LEN {
+                return false;
+            }
+            let mut next_header = packet[6];
+            let mut offset = IPV6_HEADER_LEN;
+            for _ in 0..IPV6_MAX_EXT_HEADERS {
+                match next_header {
+                    IPV6_EXT_HEADER_FRAGMENT => {
+                        return packet
+                            .get(offset..offset.saturating_add(IPV6_FRAGMENT_HEADER_LEN))
+                            .is_some_and(|hdr| {
+                                (u16::from_be_bytes([hdr[2], hdr[3]]) & IPV6_FRAG_OFFSET_MASK) != 0
+                            });
+                    }
+                    0 | 43 | 60 => {
+                        let Some(hdr) = packet.get(offset..offset.saturating_add(2)) else {
+                            return false;
+                        };
+                        next_header = hdr[0];
+                        offset = offset.saturating_add(((hdr[1] as usize) + 1) * 8);
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 /// Returns `true` if `ip` is a local, RFC 1918 private, link-local, multicast, or broadcast IPv4 address
@@ -2729,6 +2785,92 @@ mod tests {
             nat.record_udp_fragment_verdict(key(id), UdpFragmentVerdict::Reinject);
         }
         assert!(nat.udp_fragment_verdicts.len() <= 2);
+    }
+
+    #[test]
+    fn fragment_verdict_eviction_spares_drop_verdicts_while_a_reinject_entry_exists() {
+        let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
+        nat.configure(
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            2,
+        );
+        let key = |id: u32| UdpFragmentKey {
+            src_ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
+            protocol: IPPROTO_UDP,
+            fragment_id: id,
+        };
+        nat.record_udp_fragment_verdict(key(1), UdpFragmentVerdict::Drop);
+        nat.record_udp_fragment_verdict(key(2), UdpFragmentVerdict::Reinject);
+        // At capacity: the Reinject entry is the victim, never the Drop entry.
+        nat.record_udp_fragment_verdict(key(3), UdpFragmentVerdict::Drop);
+        assert_eq!(
+            nat.lookup_udp_fragment_verdict(&key(1)),
+            Some(UdpFragmentVerdict::Drop)
+        );
+        assert!(nat.lookup_udp_fragment_verdict(&key(2)).is_none());
+        assert_eq!(
+            nat.lookup_udp_fragment_verdict(&key(3)),
+            Some(UdpFragmentVerdict::Drop)
+        );
+
+        // Only Drop entries left: one of them is evicted so the table stays bounded.
+        nat.record_udp_fragment_verdict(key(4), UdpFragmentVerdict::Drop);
+        assert_eq!(nat.udp_fragment_verdicts.len(), 2);
+        assert_eq!(
+            nat.lookup_udp_fragment_verdict(&key(4)),
+            Some(UdpFragmentVerdict::Drop)
+        );
+    }
+
+    #[test]
+    fn later_fragments_are_recognised_without_parsing_a_transport_header() {
+        // IPv4 non-first TCP fragment: not UDP, but flagged so it is never parsed as TCP.
+        let mut tcp_later = build_ipv4_first_udp_fragment(50123, 9999, 0x1111);
+        tcp_later[9] = IPPROTO_TCP;
+        assert!(!is_non_first_ip_fragment(&tcp_later));
+        tcp_later[6..8].copy_from_slice(&0x00B9u16.to_be_bytes());
+        assert!(is_non_first_ip_fragment(&tcp_later));
+        assert!(parse_udp_fragment_meta(&tcp_later).is_none());
+
+        // IPv4 non-first UDP fragment is a confirmed UDP fragment.
+        let mut udp_later = build_ipv4_first_udp_fragment(50123, 9999, 0x2222);
+        udp_later[6..8].copy_from_slice(&0x00B9u16.to_be_bytes());
+        assert!(is_non_first_ip_fragment(&udp_later));
+        assert!(
+            parse_udp_fragment_meta(&udp_later)
+                .expect("later fragment")
+                .udp_confirmed
+        );
+
+        // IPv6 later fragments: UDP is confirmed, a destination-options next header is not.
+        let mut pkt = vec![0u8; 40 + 8 + 8];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&16u16.to_be_bytes());
+        pkt[6] = IPV6_EXT_HEADER_FRAGMENT;
+        pkt[40] = IPPROTO_UDP;
+        pkt[42..44].copy_from_slice(&0x00B9u16.to_be_bytes());
+        assert!(is_non_first_ip_fragment(&pkt));
+        assert!(
+            parse_udp_fragment_meta(&pkt)
+                .expect("later fragment")
+                .udp_confirmed
+        );
+        pkt[40] = 60;
+        assert!(
+            !parse_udp_fragment_meta(&pkt)
+                .expect("later fragment")
+                .udp_confirmed
+        );
+        pkt[40] = IPPROTO_TCP;
+        assert!(is_non_first_ip_fragment(&pkt));
+        assert!(parse_udp_fragment_meta(&pkt).is_none());
+        // A first fragment (offset 0) is not a later fragment.
+        pkt[42..44].copy_from_slice(&0x0001u16.to_be_bytes());
+        assert!(!is_non_first_ip_fragment(&pkt));
+        assert!(!is_non_first_ip_fragment(&[]));
     }
 
     #[test]

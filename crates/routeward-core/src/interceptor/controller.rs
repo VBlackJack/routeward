@@ -158,6 +158,7 @@ impl RouteWardController {
             udp_manager,
             warn_rate_limiter,
             fragmented_udp_drop_count: Arc::new(AtomicU64::new(0)),
+            orphan_fragment_drop_count: Arc::new(AtomicU64::new(0)),
             last_seen_orig_resolver: Arc::new(RwLock::new(None)),
             system_resolvers_override: Arc::new(RwLock::new(None)),
             bootstrapped_proxy_endpoints: Arc::new(DashMap::new()),
@@ -2329,6 +2330,12 @@ impl RouteWardController {
     /// Returns the total number of fragmented UDP datagrams dropped by the proxy fragmentation guard.
     pub fn fragmented_udp_drop_count(&self) -> u64 {
         self.fragmented_udp_drop_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns the number of later UDP fragments dropped under the kill switch because the first
+    /// fragment of their datagram was never seen (or its verdict had expired or been evicted).
+    pub fn orphan_fragment_drop_count(&self) -> u64 {
+        self.orphan_fragment_drop_count.load(Ordering::SeqCst)
     }
 }
 
