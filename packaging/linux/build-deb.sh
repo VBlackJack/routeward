@@ -93,6 +93,7 @@ chmod 0644 "$STAGE_DIR/DEBIAN/control"
 
 install -m 0755 "$SCRIPT_DIR/postinst" "$STAGE_DIR/DEBIAN/postinst"
 install -m 0755 "$SCRIPT_DIR/prerm" "$STAGE_DIR/DEBIAN/prerm"
+install -m 0755 "$SCRIPT_DIR/postrm" "$STAGE_DIR/DEBIAN/postrm"
 
 install -m 0755 "$TARGET_DIR/routeward" "$STAGE_DIR/usr/bin/routeward"
 if [ -f "$TARGET_DIR/routeward-desktop" ]; then

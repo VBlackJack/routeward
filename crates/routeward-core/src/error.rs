@@ -44,6 +44,13 @@ pub const ERR_KEY_DAEMON_INSECURE_PROFILE: &str = "errors.daemon.insecure_profil
 pub const ERR_KEY_DAEMON_IO_TIMEOUT: &str = "errors.daemon.io_timeout";
 pub const ERR_KEY_SERVICE_INSECURE_BINARY: &str = "errors.service.insecure_binary_location";
 pub const ERR_KEY_CLEANUP_DAEMON_ACTIVE: &str = "errors.daemon.cleanup_refused_active";
+pub const ERR_KEY_SYSTEM_REGISTRY_WRITE: &str = "errors.system.registry_write_failed";
+pub const ERR_KEY_SYSTEM_PAC_URL_INVALID: &str = "errors.system.pac_url_invalid";
+pub const ERR_KEY_SYSTEM_PATH_EMPTY: &str = "errors.system.executable_path_empty";
+pub const ERR_KEY_SYSTEM_LAUNCH_FAILED: &str = "errors.system.launch_failed";
+pub const ERR_KEY_SYSTEM_BACKUP_FAILED: &str = "errors.system.backup_failed";
+pub const ERR_KEY_SYSTEM_PURGE_FAILED: &str = "errors.system.purge_failed";
+pub const ERR_KEY_SYSTEM_PURGE_UNSUPPORTED: &str = "errors.system.purge_unsupported";
 
 pub const DAEMON_EXIT_GENERAL_ERROR: u8 = 1;
 pub const DAEMON_EXIT_NOT_ELEVATED: u8 = 10;
@@ -61,6 +68,9 @@ pub enum RouteWardError {
 
     #[error("{key}: {detail}")]
     DaemonError { key: &'static str, detail: String },
+
+    #[error("{key}: {detail}")]
+    SystemError { key: &'static str, detail: String },
 
     #[error("{key}: {proxy_id}")]
     ProxyNotFound { key: &'static str, proxy_id: String },
@@ -99,6 +109,7 @@ impl RouteWardError {
             Self::ConfigError { key, .. }
             | Self::InterceptorError { key, .. }
             | Self::DaemonError { key, .. }
+            | Self::SystemError { key, .. }
             | Self::ProxyNotFound { key, .. }
             | Self::EmptyProxyChain { key }
             | Self::ProtocolHandshake { key, .. }
@@ -157,5 +168,19 @@ mod tests {
         );
         assert_eq!(key(ErrorKind::PermissionDenied), ERR_KEY_DAEMON_IPC_ERROR);
         assert_eq!(key(ErrorKind::Other), ERR_KEY_DAEMON_IPC_ERROR);
+    }
+
+    #[test]
+    fn system_errors_carry_their_own_key_and_display_the_detail() {
+        let err = RouteWardError::SystemError {
+            key: ERR_KEY_SYSTEM_REGISTRY_WRITE,
+            detail: "reg add failed".to_string(),
+        };
+        assert_eq!(err.i18n_key(), ERR_KEY_SYSTEM_REGISTRY_WRITE);
+        assert_eq!(
+            err.to_string(),
+            "errors.system.registry_write_failed: reg add failed"
+        );
+        assert_eq!(err.daemon_exit_code(), DAEMON_EXIT_GENERAL_ERROR);
     }
 }

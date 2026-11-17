@@ -32,7 +32,8 @@ use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::{Icon, Theme, Window, WindowBuilder};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use wry::{WebContext, WebViewBuilder};
 
 const EMBEDDED_INDEX_HTML: &[u8] = include_bytes!("../../../ui/dist/index.html");
@@ -50,6 +51,9 @@ const WINDOW_DEFAULT_HEIGHT: f64 = 900.0;
 const WINDOW_MIN_WIDTH: f64 = 980.0;
 const WINDOW_MIN_HEIGHT: f64 = 660.0;
 const LOOPBACK_EPHEMERAL_ADDR: &str = "127.0.0.1:0";
+/// Connections the loopback UI server serves at once. The WebView needs a handful (page, assets,
+/// the realtime stream, API calls); anything beyond this is closed before it is read.
+const LOOPBACK_MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const ICON_WINDOW_DIMENSION: u32 = 32;
 const ICON_TASKBAR_DIMENSION: u32 = 256;
 
@@ -153,39 +157,65 @@ fn spawn_embedded_ui_server(
         };
         let token_arc = Arc::new(ephemeral_token);
 
-        while let Ok((stream, _)) = listener.accept().await {
-            let bridge_ref = Arc::clone(&bridge);
-            let proxy_ref = event_proxy.clone();
-            let token_ref = Arc::clone(&token_arc);
-
-            tokio::spawn(async move {
-                let win_cb = |cmd: DesktopWindowCommand| {
-                    let _ = proxy_ref.send_event(cmd);
-                };
-                serve_loopback_http_connection(
-                    stream,
-                    bound_port,
-                    &token_ref,
-                    &bridge_ref,
-                    Some(&win_cb),
-                    Some(|path: &str| {
-                        if path.starts_with("/assets/app.js") {
-                            ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
-                        } else if path.starts_with("/assets/app.css") {
-                            ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
-                        } else if path.starts_with("/routeward-glyph.svg") {
-                            ("image/svg+xml", EMBEDDED_GLYPH_SVG)
-                        } else if path.starts_with("/routeward-icon.svg") {
-                            ("image/svg+xml", EMBEDDED_ICON_SVG)
-                        } else {
-                            ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
-                        }
-                    }),
-                )
-                .await;
-            });
-        }
+        accept_bounded(
+            listener,
+            LOOPBACK_MAX_CONCURRENT_CONNECTIONS,
+            move |stream| {
+                let bridge_ref = Arc::clone(&bridge);
+                let proxy_ref = event_proxy.clone();
+                let token_ref = Arc::clone(&token_arc);
+                async move {
+                    let win_cb = |cmd: DesktopWindowCommand| {
+                        let _ = proxy_ref.send_event(cmd);
+                    };
+                    serve_loopback_http_connection(
+                        stream,
+                        bound_port,
+                        &token_ref,
+                        &bridge_ref,
+                        Some(&win_cb),
+                        Some(|path: &str| {
+                            if path.starts_with("/assets/app.js") {
+                                ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
+                            } else if path.starts_with("/assets/app.css") {
+                                ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
+                            } else if path.starts_with("/routeward-glyph.svg") {
+                                ("image/svg+xml", EMBEDDED_GLYPH_SVG)
+                            } else if path.starts_with("/routeward-icon.svg") {
+                                ("image/svg+xml", EMBEDDED_ICON_SVG)
+                            } else {
+                                ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)
+                            }
+                        }),
+                    )
+                    .await;
+                }
+            },
+        )
+        .await;
     });
+}
+
+/// Accepts connections until the listener fails and serves each one with `handler`, at most
+/// `limit` at a time. A connection that arrives while every slot is taken is closed at once
+/// instead of queued, so a local process cannot pile up unauthenticated tasks and sockets.
+async fn accept_bounded<H, Fut>(listener: TcpListener, limit: usize, handler: H)
+where
+    H: Fn(TcpStream) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let slots = Arc::new(Semaphore::new(limit));
+    while let Ok((stream, _)) = listener.accept().await {
+        let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+        let serving = handler(stream);
+        tokio::spawn(async move {
+            serving.await;
+            drop(permit);
+        });
+    }
 }
 
 /// Lets the UI origin trigger several exports in a row on WebView2.
@@ -492,6 +522,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     #[cfg(target_os = "windows")]
                     tray_handle.lock().shutdown();
+                    bridge_for_loop.restore_system_settings_on_exit();
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -508,6 +539,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         #[cfg(target_os = "windows")]
                         tray_handle.lock().shutdown();
+                        bridge_for_loop.restore_system_settings_on_exit();
                         *control_flow = ControlFlow::Exit;
                     }
                 }
@@ -540,6 +572,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 DesktopWindowCommand::Quit => {
                     #[cfg(target_os = "windows")]
                     tray_handle.lock().shutdown();
+                    bridge_for_loop.restore_system_settings_on_exit();
                     *control_flow = ControlFlow::Exit;
                 }
             },
@@ -578,5 +611,59 @@ mod tests {
         assert!(is_smoke_ipc_arg_list(["--foo", "--smoke-ipc"]));
         assert!(!is_smoke_ipc_arg_list::<[&str; 0], &str>([]));
         assert!(!is_smoke_ipc_arg_list(["--help"]));
+    }
+
+    /// Reads one byte from the stream: `Some(byte)` when the server sent one, `None` on a close.
+    async fn first_byte(stream: &mut TcpStream) -> Option<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await {
+            Ok(Ok(1)) => Some(buf[0]),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_bounded_closes_excess_connections_and_reuses_freed_slots() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SERVED_MARKER: u8 = b'K';
+        const LIMIT: usize = 2;
+        const RETRY_ATTEMPTS: usize = 40;
+        const RETRY_DELAY_MS: u64 = 50;
+
+        let listener = TcpListener::bind(LOOPBACK_EPHEMERAL_ADDR).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The handler marks the connection as served, then holds its slot until the peer closes.
+        let server = tokio::spawn(accept_bounded(listener, LIMIT, |mut stream| async move {
+            let _ = stream.write_all(&[SERVED_MARKER]).await;
+            let mut sink = [0u8; 1];
+            let _ = stream.read(&mut sink).await;
+        }));
+
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(first_byte(&mut first).await, Some(SERVED_MARKER));
+        assert_eq!(first_byte(&mut second).await, Some(SERVED_MARKER));
+
+        let mut excess = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(
+            first_byte(&mut excess).await,
+            None,
+            "a connection beyond the limit must be closed without being served"
+        );
+
+        drop(first);
+        let mut served_again = false;
+        for _ in 0..RETRY_ATTEMPTS {
+            let mut retry = TcpStream::connect(addr).await.unwrap();
+            if first_byte(&mut retry).await == Some(SERVED_MARKER) {
+                served_again = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+        assert!(served_again, "a freed slot must serve new connections");
+        server.abort();
     }
 }
