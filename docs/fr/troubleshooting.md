@@ -60,7 +60,7 @@ L'ouverture du filtre WinDivert requiert les droits **Administrateur**. Ouvrir P
 **Symptôme** :
 - `routeward run` s'arrête avec `errors.interceptor.not_root` ou `errors.interceptor.nft_missing`.
 - Ou, si `routeward` et son processus watchdog ont été tués simultanément, le trafic TCP IPv4 sortant reste redirigé vers `:10810` et échoue.
-- Ou, avec `securityPolicy.killSwitchEnabled = true`, le daemon a planté ou a été tué et l'hôte a échoué en mode fermé : la table nftables `inet routeward_ks` bloque tout le trafic sortant sauf le loopback, les connexions établies, DHCP, la découverte de voisins IPv6 et MLD. Vérifier avec `sudo nft list table inet routeward_ks` ; exécuter `sudo routeward cleanup --force` pour la retirer (ou relancer le daemon avec l'interception active). Sous Windows, un crash laisse toujours passer le trafic.
+- Ou, avec `securityPolicy.killSwitchEnabled = true`, le daemon a planté ou a été tué et l'hôte a échoué en mode fermé : la table nftables `inet routeward_ks` bloque tout le trafic sortant sauf le loopback, les connexions établies, DHCP, la découverte de voisins IPv6 et MLD. Vérifier avec `sudo nft list table inet routeward_ks` ; systemd relance le daemon après le plantage (`Restart=on-failure`), mais avec l'interception arrêtée : la table de blocage reste donc en place. Pour la retirer, exécuter `sudo routeward cleanup --force`, relancer l'interception avec `routeward ctl start`, ou redémarrer proprement le service avec `sudo systemctl restart routeward`. Sous Windows, un crash laisse toujours passer le trafic.
 
 **Solution** :
 - Exécuter `routeward` en tant que `root` (`sudo routeward run`) et vérifier que le paquet `nftables` (binaire `nft`) est installé.

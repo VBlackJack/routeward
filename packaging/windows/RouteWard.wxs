@@ -130,22 +130,42 @@
       user's session at uninstall time may write its settings again after this pass; the desktop also
       restores them when it exits or when that user logs off.
 
+      Logging: both actions run through the WiX Util QuietExec custom action, so the command line and the
+      console output of routeward.exe are written to the MSI log. That log only exists when the uninstall
+      is run with logging (msiexec /x RouteWard.msi /l*v uninstall.log) or when the Windows Installer
+      Logging policy is enabled: an uninstall started from Settings without logging leaves no trace.
+      The build needs the WixToolset.Util.wixext extension (wix build -ext WixToolset.Util.wixext).
+      QuietExec reads its command line from a property named after the action, hence the SetProperty
+      rows with Before set to the action Id.
+
       TerminalServerAware is not set on any action: that flag only applies to impersonated deferred
       actions, and none of these impersonates the user.
     -->
     <Property Id="KEEPDATA" Secure="yes" />
 
+    <SetProperty
+        Id="CleanupUserSettings"
+        Value="&quot;[INSTALLFOLDER]routeward.exe&quot; cleanup --all-users"
+        Before="CleanupUserSettings"
+        Sequence="execute"
+        Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     <CustomAction
-        Id="PurgeProgramData"
-        FileRef="RouteWardCliExe"
-        ExeCommand="purge-data"
+        Id="CleanupUserSettings"
+        BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+        DllEntry="WixQuietExec"
         Execute="deferred"
         Impersonate="no"
         Return="ignore" />
+    <SetProperty
+        Id="PurgeProgramData"
+        Value="&quot;[INSTALLFOLDER]routeward.exe&quot; purge-data"
+        Before="PurgeProgramData"
+        Sequence="execute"
+        Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT KEEPDATA" />
     <CustomAction
-        Id="CleanupUserSettings"
-        FileRef="RouteWardCliExe"
-        ExeCommand="cleanup --all-users"
+        Id="PurgeProgramData"
+        BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+        DllEntry="WixQuietExec"
         Execute="deferred"
         Impersonate="no"
         Return="ignore" />
