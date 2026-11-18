@@ -2093,7 +2093,7 @@ mod tests {
         let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
         let queue: PendingSynQueue<Vec<u8>> = PendingSynQueue::new();
 
-        let client_ip = Ipv4Addr::new(192, 168, 31, 136);
+        let client_ip = Ipv4Addr::new(192, 0, 2, 136);
         let dst_ip = Ipv4Addr::new(93, 184, 215, 14);
         let pkt_resolved = build_sample_ipv4_tcp_syn(client_ip, dst_ip, 51001, 80);
         let meta_resolved = parse_ipv4_tcp_meta(&pkt_resolved).unwrap();
@@ -2169,7 +2169,7 @@ mod tests {
     #[test]
     fn nat_sessions_keyed_by_4_tuple_and_validated_by_relay_peer_tuple() {
         let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
-        let local_ip = Ipv4Addr::new(192, 168, 31, 136);
+        let local_ip = Ipv4Addr::new(192, 0, 2, 136);
         let remote_ip_a = Ipv4Addr::new(93, 184, 215, 14);
         let remote_ip_b = Ipv4Addr::new(1, 1, 1, 1);
 
@@ -2437,7 +2437,7 @@ mod tests {
         let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
         let queue: PendingUdpQueue<Vec<u8>> = PendingUdpQueue::new(2);
 
-        let client_ip = Ipv4Addr::new(192, 168, 31, 136);
+        let client_ip = Ipv4Addr::new(192, 0, 2, 136);
         let dst_ip = Ipv4Addr::new(162, 159, 200, 1);
 
         let pkt1 = build_forged_ipv4_udp_reply(client_ip, 52001, dst_ip, 123, b"ntp1").unwrap();
@@ -3026,7 +3026,7 @@ mod tests {
     #[test]
     fn pending_syn_queue_is_bounded_and_evicts_the_oldest_entry() {
         let queue: PendingSynQueue<Vec<u8>> = PendingSynQueue::with_capacity(2);
-        let client_ip = Ipv4Addr::new(192, 168, 31, 136);
+        let client_ip = Ipv4Addr::new(192, 0, 2, 136);
         let dst_ip = Ipv4Addr::new(93, 184, 215, 14);
         let mut metas = Vec::new();
         for port in [51101u16, 51102, 51103] {
@@ -3047,7 +3047,7 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         let nat = TransparentNatTable::new(9999, 10810, 10808, 10809);
         let queue: PendingSynQueue<Vec<u8>> = PendingSynQueue::new();
-        let client_ip = Ipv4Addr::new(192, 168, 31, 136);
+        let client_ip = Ipv4Addr::new(192, 0, 2, 136);
         let dst_ip = Ipv4Addr::new(93, 184, 215, 14);
         // Three SYNs from the same local port (retransmissions) and one from another.
         for port in [51201u16, 51201, 51201, 51202] {

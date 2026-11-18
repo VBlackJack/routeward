@@ -13,6 +13,7 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 - Desktop: the loopback UI server bounds unauthenticated connections and their total request time, so a local process can no longer starve the UI.
 - The temporary profile file is no longer granted to Everyone before its removal.
 - Linux: the systemd unit is hardened (`SystemCallFilter=@system-service`, kernel and control group protection, restricted address families and namespaces); `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH` stay because process attribution needs them.
+- Windows: `routeward daemon`, `run`, `cleanup --all-users` and `purge-data` now require an enabled `BUILTIN\Administrators` membership or the SYSTEM account; a restricted administrator token (`runas /trustlevel`) or `LOCAL SERVICE` is refused at the start instead of failing later on access checks.
 
 ### Fixed
 - Windows: turning the system proxy or PAC on saves the user's previous settings and turning it off restores them, only while the values are still RouteWard's; a corporate proxy is no longer lost. The desktop restores them on exit and at logoff.
@@ -25,6 +26,8 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 - Desktop: the header follows engine changes made outside the UI (for example `routeward ctl start`) by polling the daemon state without overlapping requests, stale responses or false disconnects, and pauses while the window is hidden.
 - Desktop (Windows): consecutive exports no longer trigger the WebView2 "download multiple files" prompt; the permission is granted only to the UI origin.
 - Desktop: WebView developer tools are available in debug builds only.
+- Uninstall: the output of the user settings cleanup and of the data purge now reaches the MSI log (`msiexec /x ... /l*v`); `cleanup --all-users` and `purge-data` log at INFO level by default, and their errors include the system detail. CLI log lines go to stderr without colour codes when not on a terminal.
+- Linux docs: after a crash with the kill switch on, systemd restarts the daemon with interception stopped, so the block table stays until `routeward cleanup --force`, `routeward ctl start` or a clean `systemctl restart routeward`.
 
 ### Changed
 - The MSI bundles unmodified WinDivert 2.2.2 under the LGPLv3 with its notices, removes its driver service on uninstall, and each release attaches the WinDivert source archive. The portable ZIP still uses `tools/fetch-windivert.ps1`.
