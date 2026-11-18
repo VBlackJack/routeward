@@ -786,7 +786,7 @@ mod tests {
               "type": "socks5",
               "hostname": "socks.corp.example",
               "port": "1080",
-              "username": "jbombled",
+              "username": "user",
               "password": "pw",
               "include": [
                 { "type": "wildcard", "pattern": "*://*.github.com/*", "active": true },
@@ -809,10 +809,7 @@ mod tests {
         assert_eq!(report.skipped_entries, 1);
         assert_eq!(report.proxies.len(), 1);
         assert_eq!(report.proxies[0].protocol, ProxyProtocol::Socks5);
-        assert_eq!(
-            report.proxies[0].auth.as_ref().unwrap().username,
-            "jbombled"
-        );
+        assert_eq!(report.proxies[0].auth.as_ref().unwrap().username, "user");
         assert_eq!(report.rules.len(), 1);
         assert_eq!(report.rules[0].process_patterns, vec!["msedge.exe"]);
         assert_eq!(

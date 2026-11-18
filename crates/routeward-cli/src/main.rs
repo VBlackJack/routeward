@@ -39,6 +39,7 @@ use routeward_core::system::windows_service::{
 };
 use routeward_core::system::{local_pac_url, SystemProxyManager};
 use routeward_core::telemetry::LogLevel;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -229,7 +230,7 @@ fn run_cleanup_all_users(
     constants: &SystemConstants,
     i18n: &I18nRegistry,
 ) -> RouteWardResult<AllUsersCleanupReport> {
-    if !RouteWardController::detect_elevated_privileges() {
+    if !RouteWardController::detect_admin_or_system() {
         return Err(RouteWardError::DaemonError {
             key: ERR_KEY_DAEMON_NOT_ELEVATED,
             detail: i18n.t(ERR_KEY_DAEMON_NOT_ELEVATED),
@@ -260,7 +261,7 @@ fn run_cleanup_all_users(
 /// elevated process and no active daemon (there is no `--force`: a running daemon holds its logs
 /// and profile open).
 fn run_purge_data(constants: &SystemConstants, i18n: &I18nRegistry) -> RouteWardResult<()> {
-    if !RouteWardController::detect_elevated_privileges() {
+    if !RouteWardController::detect_admin_or_system() {
         return Err(RouteWardError::DaemonError {
             key: ERR_KEY_DAEMON_NOT_ELEVATED,
             detail: i18n.t(ERR_KEY_DAEMON_NOT_ELEVATED),
@@ -617,7 +618,7 @@ async fn run_daemon_host(
     mut external_shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let i18n = I18nRegistry::new(locale);
-    if !RouteWardController::detect_elevated_privileges() {
+    if !RouteWardController::detect_admin_or_system() {
         let msg = i18n.t(ERR_KEY_DAEMON_NOT_ELEVATED);
         eprintln!("{msg}");
         return Err(RouteWardError::DaemonError {
@@ -787,9 +788,37 @@ fn handle_service_command(
     }
 }
 
+/// Initializes logging once the arguments are known. The MSI custom actions (`purge-data` and
+/// `cleanup --all-users`) run as SYSTEM and their log is the only diagnostic, so they default to
+/// INFO when `RUST_LOG` is unset; every other command keeps the stock behaviour.
+fn init_logging(command: &Commands) {
+    let verbose_default = matches!(
+        command,
+        Commands::PurgeData
+            | Commands::Cleanup {
+                all_users: true,
+                ..
+            }
+    );
+    let builder = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal());
+    if verbose_default {
+        let filter = tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+            .from_env_lossy();
+        builder.with_env_filter(filter).init();
+    } else {
+        let filter = tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(tracing::level_filters::LevelFilter::ERROR.into())
+            .from_env_lossy();
+        builder.with_env_filter(filter).init();
+    }
+}
+
 fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
     let args = CliArgs::parse();
+    init_logging(&args.command);
 
     if let Commands::Service { action } = args.command {
         return handle_service_command(action, &args.locale);
@@ -848,7 +877,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(args.command, Commands::PurgeData) {
         let i18n = I18nRegistry::new(&args.locale);
         if let Err(err) = run_purge_data(&constants, &i18n) {
-            eprintln!("{}", i18n.t(err.i18n_key()));
+            eprintln!("{}: {err}", i18n.t(err.i18n_key()));
             return Err(err.into());
         }
         println!("{}", i18n.t("cli.engine.purge.completed"));
@@ -864,7 +893,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     ) {
         let i18n = I18nRegistry::new(&args.locale);
         if let Err(err) = run_cleanup_all_users(&constants, &i18n) {
-            eprintln!("{}", i18n.t(err.i18n_key()));
+            eprintln!("{}: {err}", i18n.t(err.i18n_key()));
             return Err(err.into());
         }
         println!("{}", i18n.t("cli.engine.cleanup.all_users_completed"));
@@ -882,7 +911,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if matches!(args.command, Commands::Run { .. })
-        && !RouteWardController::detect_elevated_privileges()
+        && !RouteWardController::detect_admin_or_system()
     {
         let i18n = I18nRegistry::new(&args.locale);
         let msg = i18n.t(routeward_core::error::ERR_KEY_INTERCEPTOR_NOT_ROOT);
