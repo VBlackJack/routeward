@@ -1370,6 +1370,63 @@ impl RouteWardController {
             false
         }
     }
+
+    /// Stricter gate than [`Self::detect_elevated_privileges`], used at the CLI entry points that
+    /// must run as a real administrator or as `LocalSystem`.
+    ///
+    /// On Windows it reports membership of `BUILTIN\Administrators` through
+    /// `CheckTokenMembership` (deny-only groups report FALSE, which is the point), or a process
+    /// token whose user is `S-1-5-18`. `TokenElevation` is deliberately not used: a
+    /// `runas /trustlevel` restricted token and `NT AUTHORITY\LOCAL SERVICE` both report
+    /// `TokenIsElevated` but must not pass this gate.
+    pub fn detect_admin_or_system() -> bool {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::BOOL;
+            use windows_sys::Win32::Security::{
+                CheckTokenMembership, CreateWellKnownSid, WinBuiltinAdministratorsSid,
+                SECURITY_MAX_SID_SIZE,
+            };
+
+            const SID_LOCAL_SYSTEM: &str = "S-1-5-18";
+
+            let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+            let mut sid_len: u32 = SECURITY_MAX_SID_SIZE;
+            // SAFETY: `sid` is a writable buffer of SECURITY_MAX_SID_SIZE bytes and `sid_len`
+            // holds its size; a null token handle makes CheckTokenMembership use the
+            // impersonation or process token of the calling thread.
+            let is_admin = unsafe {
+                if CreateWellKnownSid(
+                    WinBuiltinAdministratorsSid,
+                    std::ptr::null_mut(),
+                    sid.as_mut_ptr().cast(),
+                    &mut sid_len,
+                ) == 0
+                {
+                    false
+                } else {
+                    let mut member: BOOL = 0;
+                    CheckTokenMembership(std::ptr::null_mut(), sid.as_mut_ptr().cast(), &mut member)
+                        != 0
+                        && member != 0
+                }
+            };
+            if is_admin {
+                return true;
+            }
+            crate::ipc::transport::current_user_sid_string()
+                .map(|user| user.eq_ignore_ascii_case(SID_LOCAL_SYSTEM))
+                .unwrap_or(false)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            unsafe { libc::geteuid() == 0 }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1380,6 +1437,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::net::UdpSocket;
+
+    #[test]
+    fn detect_admin_or_system_does_not_panic() {
+        // The value depends on the runner (CI runners are usually administrators).
+        let _ = RouteWardController::detect_admin_or_system();
+    }
 
     fn test_controller() -> RouteWardController {
         let constants = SystemConstants::load_embedded().expect("SystemConstants");

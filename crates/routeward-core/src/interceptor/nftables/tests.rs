@@ -23,7 +23,7 @@ use super::*;
 fn builds_expected_nft_ruleset_with_fwmark_loopback_and_upstream_exclusions() {
     let upstreams = vec![
         (Ipv4Addr::new(127, 0, 0, 1), 1080),
-        (Ipv4Addr::new(192, 168, 31, 10), 1080),
+        (Ipv4Addr::new(192, 0, 2, 10), 1080),
     ];
     let ruleset = NftablesInterceptor::build_nft_table_ruleset(
         "routeward",
@@ -43,13 +43,13 @@ fn builds_expected_nft_ruleset_with_fwmark_loopback_and_upstream_exclusions() {
     assert!(!ruleset.contains("udp dport { 5353, 5355 } redirect to :10854"));
     assert!(ruleset.contains("chain route_output {"));
     assert!(ruleset.contains("type route hook output priority -150; policy accept;"));
-    assert!(ruleset.contains("ip daddr 192.168.31.10 udp dport 1080 return"));
+    assert!(ruleset.contains("ip daddr 192.0.2.10 udp dport 1080 return"));
     assert!(ruleset
         .contains("ip daddr { 224.0.0.0/4, 255.255.255.255 } udp dport != { 5353, 5355 } return"));
     assert!(ruleset.contains("meta l4proto udp meta mark set 21080"));
     assert!(ruleset.contains("chain prerouting {"));
     assert!(ruleset.contains("meta mark 21080 meta l4proto udp tproxy to 127.0.0.1:10854 accept"));
-    assert!(ruleset.contains("ip daddr 192.168.31.10 tcp dport 1080 return"));
+    assert!(ruleset.contains("ip daddr 192.0.2.10 tcp dport 1080 return"));
     assert!(ruleset.contains("tcp dport 1-65535 redirect to :10810"));
     assert!(ruleset.contains("udp dport 853 reject"));
     assert!(ruleset.contains("udp dport 443 reject"));
@@ -204,7 +204,7 @@ fn detects_tproxy_ip_rule_and_route_table_conflicts_and_builds_cleanup_commands(
 #[test]
 fn builds_dual_stack_ip6_nat_tproxy_ruleset_and_parses_sockaddr_in6() {
     let upstreams = vec![
-        (IpAddr::V4(Ipv4Addr::new(192, 168, 31, 10)), 1080),
+        (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 1080),
         (IpAddr::V6("2001:db8::10".parse().unwrap()), 1080),
     ];
     let batch = NftablesInterceptor::build_atomic_replace_ruleset_dual_stack(
