@@ -427,6 +427,7 @@ impl Interceptor for WinDivertInterceptor {
         let active_sock = Arc::clone(&self.active);
         let nat_for_sock = controller.nat_table.clone();
         let telemetry_for_sock = controller.telemetry.clone();
+        let unknown_pid_tx = Self::spawn_dns_server_pid_resolver(controller.clone());
         std::thread::spawn(move || {
             let handle = sock_handle_usize as *mut c_void;
             let mut addr = WinDivertAddress::default();
@@ -454,6 +455,9 @@ impl Interceptor for WinDivertInterceptor {
                     nat_for_sock.record_socket_close(key, event.pid);
                 } else {
                     nat_for_sock.record_socket_event(key, event.pid);
+                    // Never block this thread: a full queue only delays the exemption until the
+                    // next periodic rescan.
+                    let _ = unknown_pid_tx.try_send(event.pid);
                 }
             }
             // The socket listener ends only when its handle is closed (stop) or the driver fails.

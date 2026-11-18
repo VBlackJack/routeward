@@ -1362,7 +1362,9 @@ async fn live_profile_replacement_reapplies_interception_and_flushes_dns_cache_o
     let mut updated_profile = profile;
     updated_profile.security_policy.kill_switch_enabled = true;
     updated_profile.security_policy.block_encrypted_dns_bypass = false;
-    controller.replace_profile(updated_profile);
+    controller
+        .replace_profile(updated_profile)
+        .expect("valid profile");
 
     let logs = controller.telemetry.list_logs();
     assert!(
@@ -2123,7 +2125,9 @@ fn named_profiles_save_list_switch_and_delete() {
     profile_b.name = "Home Direct".to_string();
     profile_b.profile_id = "home-direct".to_string();
     profile_b.rules.clear();
-    controller.replace_profile(profile_b);
+    controller
+        .replace_profile(profile_b)
+        .expect("valid profile");
     let summaries = controller
         .save_named_profile(Some("home-direct"), Some("Home Direct"))
         .expect("save home-direct profile");

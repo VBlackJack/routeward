@@ -28,6 +28,7 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 - Desktop: WebView developer tools are available in debug builds only.
 - Uninstall: the output of the user settings cleanup and of the data purge now reaches the MSI log (`msiexec /x ... /l*v`); `cleanup --all-users` and `purge-data` log at INFO level by default, and their errors include the system detail. CLI log lines go to stderr without colour codes when not on a terminal.
 - Linux docs: after a crash with the kill switch on, systemd restarts the daemon with interception stopped, so the block table stays until `routeward cleanup --force`, `routeward ctl start` or a clean `systemctl restart routeward`.
+- DNS servers on the host (Windows `dns.exe`, Linux `named`, `unbound`, `dnsmasq`, `pihole-FTL`, `pdns_recursor`, `kresd`, `dnsdist`, `coredns`) now get real DNS answers instead of Fake-IP ones, so they no longer cache and serve `198.18.x.x` addresses; `dnsConfig.dnsServerProcesses` adds processes or removes a default with `!name`, an explicit Block rule for the process still applies, and replacing a profile over IPC now validates that list.
 
 ### Changed
 - The MSI bundles unmodified WinDivert 2.2.2 under the LGPLv3 with its notices, removes its driver service on uninstall, and each release attaches the WinDivert source archive. The portable ZIP still uses `tools/fetch-windivert.ps1`.

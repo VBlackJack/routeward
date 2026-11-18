@@ -2008,7 +2008,11 @@ impl RouteWardController {
     /// Replaces the active in-memory profile, synchronizes logging and upstream loop exclusions,
     /// and if the engine is running when `securityPolicy`, `dnsConfig`, or `proxies` changed,
     /// atomically reapplies active interception rules and re-runs proxy bootstrap.
-    pub fn replace_profile(&self, mut new_profile: ProfileConfig) {
+    ///
+    /// The profile is validated first (`dnsConfig.dnsServerProcesses`): an invalid one is refused
+    /// and the active profile stays untouched, whichever entry point (IPC, CLI, desktop) sent it.
+    pub fn replace_profile(&self, mut new_profile: ProfileConfig) -> RouteWardResult<()> {
+        new_profile.dns_config.validate()?;
         self.telemetry
             .set_file_logging_enabled(new_profile.enable_logging);
         self.dns
@@ -2063,6 +2067,7 @@ impl RouteWardController {
                 });
             }
         }
+        Ok(())
     }
 
     pub(super) fn reapply_active_interception_rules(
@@ -2309,7 +2314,7 @@ impl RouteWardController {
         }
         let mut loaded = ProfileConfig::load_from_path(&named_path)?;
         loaded.profile_id = slug.to_string();
-        self.replace_profile(loaded);
+        self.replace_profile(loaded)?;
         self.save_profile_default()?;
         Ok(self.profile.read().redacted_for_ipc())
     }
@@ -2419,6 +2424,25 @@ impl RouteWardController {
         if should_log {
             self.telemetry.push_log(
                 LogLevel::Warn,
+                component,
+                format!("{} [count=#{count}]", message.into()),
+            );
+        }
+        count
+    }
+
+    /// Same as [`push_rate_limited_warn`](Self::push_rate_limited_warn) at INFO level, for
+    /// repetitive informational events.
+    pub fn push_rate_limited_info(
+        &self,
+        category_key: &str,
+        component: &str,
+        message: impl Into<String>,
+    ) -> u64 {
+        let (should_log, count) = self.warn_rate_limiter.should_log(category_key);
+        if should_log {
+            self.telemetry.push_log(
+                LogLevel::Info,
                 component,
                 format!("{} [count=#{count}]", message.into()),
             );
@@ -2730,7 +2754,7 @@ mod tests {
         assert_eq!(ids(&controller), ["early", "middle", "late"]);
 
         profile.rules = vec![rule("c", 3), rule("a", 1), rule("b", 2)];
-        controller.replace_profile(profile);
+        controller.replace_profile(profile).expect("valid profile");
         assert_eq!(ids(&controller), ["a", "b", "c"]);
     }
 
@@ -2773,11 +2797,45 @@ mod tests {
 
         let mut profile = test_profile();
         profile.dns_config.dns_server_processes = vec![removal];
-        controller.replace_profile(profile);
+        controller.replace_profile(profile).expect("valid profile");
         assert!(!controller.dns_server_tracker.note_unknown_pid(12, &sample));
 
-        controller.replace_profile(test_profile());
+        controller
+            .replace_profile(test_profile())
+            .expect("valid profile");
         assert!(controller.dns_server_tracker.note_unknown_pid(13, &sample));
+    }
+
+    #[test]
+    fn profile_replacement_refuses_an_invalid_dns_server_list_and_keeps_the_active_profile() {
+        let controller = RouteWardController::new(test_constants(), test_profile(), "en");
+        let before = controller.profile.read().name.clone();
+
+        for bad in ["*", "", "svchost.exe"] {
+            let mut profile = test_profile();
+            profile.name = "Rejected".to_string();
+            profile.dns_config.dns_server_processes = vec![bad.to_string()];
+            let err = controller
+                .replace_profile(profile)
+                .expect_err("invalid dnsServerProcesses entry must be refused");
+            assert!(
+                matches!(
+                    err,
+                    RouteWardError::ConfigError {
+                        key: crate::error::ERR_KEY_CONFIG_JSON,
+                        ..
+                    }
+                ),
+                "unexpected error for {bad:?}: {err:?}"
+            );
+            assert_eq!(controller.profile.read().name, before);
+        }
+
+        let mut valid = test_profile();
+        valid.dns_config.dns_server_processes = vec!["!dnsmasq".to_string()];
+        controller
+            .replace_profile(valid)
+            .expect("a valid list is accepted");
     }
 
     #[test]

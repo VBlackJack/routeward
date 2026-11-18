@@ -16,6 +16,9 @@
 
 use super::fragments::{decide_first_udp_fragment, decide_orphan_fragment};
 use super::*;
+use crate::interceptor::dns_server_exempt::{
+    blocked_dns_connection_record, dns_server_block_rule, DnsProto,
+};
 use crate::interceptor::ROUTE_DIRECT_LABEL;
 use crate::process::ProcessIdentity;
 use crate::telemetry::udp_flow_key;
@@ -29,6 +32,175 @@ struct DirectUdpDatagram<'a> {
     domain: Option<&'a str>,
     rule_name: &'a str,
     payload_len: u64,
+}
+
+/// What the data path does with a flow that belongs to a DNS server process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DnsServerFlowAction {
+    /// Send the packet unmodified: no Fake-IP, no NAT session.
+    Pass,
+    /// An explicit Block rule that names the process drops the packet.
+    Drop,
+}
+
+/// Smallest DNS message: the 12-byte header.
+const DNS_HEADER_LEN: usize = 12;
+/// Query/response flag in the third header byte; a query leaves it cleared.
+const DNS_FLAG_RESPONSE: u8 = 0x80;
+/// Capacity of the queue between the socket-layer listener and the DNS server PID resolver.
+const DNS_SERVER_PID_QUEUE_LEN: usize = 256;
+/// A PID already looked at is not resolved again before this delay.
+const DNS_SERVER_PID_RECHECK: Duration = Duration::from_secs(60);
+/// Upper bound of the PIDs remembered by the DNS server PID resolver.
+const DNS_SERVER_PID_MAX_CHECKED: usize = 4096;
+/// Rate-limit category of the per-query exemption log.
+const DNS_SERVER_PASS_LOG_KEY: &str = "dns_server_exempt_pass";
+/// Rate-limit category of the per-query block log.
+const DNS_SERVER_BLOCK_LOG_KEY: &str = "dns_server_exempt_block";
+
+/// `true` when `payload` starts with a DNS header of a query.
+fn is_dns_query_header(payload: &[u8]) -> bool {
+    payload.len() >= DNS_HEADER_LEN && payload[2] & DNS_FLAG_RESPONSE == 0
+}
+
+impl WinDivertInterceptor {
+    /// Decides whether a port-53 flow of local port `src_port` belongs to a DNS server process.
+    ///
+    /// Receive-thread safe: only the tracker's port and PID sets and the socket-layer PID cache
+    /// are read, never a socket table. `resolved_pid` is the PID the caller already resolved. Costs
+    /// one atomic load when no DNS server process is known.
+    fn dns_server_flow_action(
+        ctrl: &RouteWardController,
+        proto: DnsProto,
+        ipv6: bool,
+        src_port: u16,
+        resolved_pid: Option<u32>,
+        dst: IpAddr,
+    ) -> Option<DnsServerFlowAction> {
+        let tracker = &ctrl.dns_server_tracker;
+        if tracker.is_empty() {
+            return None;
+        }
+        let protocol = match proto {
+            DnsProto::Udp => IPPROTO_UDP,
+            DnsProto::Tcp => IPPROTO_TCP,
+        };
+        // A dual-stack socket is reported on the IPv6 family while it may send IPv4: look at both.
+        let pid = resolved_pid.or_else(|| {
+            [ipv6, !ipv6].into_iter().find_map(|v6| {
+                ctrl.nat_table
+                    .try_resolve_pid_nonblocking(SocketKey::new(protocol, v6, src_port), |_| None)
+                    .map(|(pid, _)| pid)
+            })
+        });
+        // A known owner decides alone: a port left in the set by a closed socket must not exempt
+        // another process that reused the number before the next rescan.
+        let exempt = match pid {
+            Some(pid) => tracker.is_exempt_pid(pid),
+            None => tracker.is_exempt_port(proto, src_port),
+        };
+        if !exempt {
+            return None;
+        }
+        let identity = pid
+            .map(|pid| ctrl.process_resolver.resolve_by_pid(pid))
+            .unwrap_or_default();
+        let block_rule = {
+            let prof = ctrl.profile.read();
+            dns_server_block_rule(&prof.rules, &prof.default_action, &identity, dst, proto)
+        };
+        if let Some(rule_name) = block_rule {
+            ctrl.push_rate_limited_warn(
+                DNS_SERVER_BLOCK_LOG_KEY,
+                COMPONENT_WINDIVERT,
+                format!(
+                    "Blocked DNS server query PID={} process=\"{}\" -> {}:53 [rule=\"{}\"]",
+                    identity.pid, identity.name, dst, rule_name
+                ),
+            );
+            ctrl.telemetry.record_connection(
+                blocked_dns_connection_record(&identity, dst, proto, rule_name, "BLOCKED"),
+                false,
+            );
+            return Some(DnsServerFlowAction::Drop);
+        }
+        tracing::debug!(
+            component = COMPONENT_WINDIVERT,
+            "DNS server query passed through PID={} process=\"{}\" src_port={} -> {}:53",
+            identity.pid,
+            identity.name,
+            src_port,
+            dst
+        );
+        ctrl.push_rate_limited_info(
+            DNS_SERVER_PASS_LOG_KEY,
+            COMPONENT_WINDIVERT,
+            format!(
+                "DNS server query passed through unmodified PID={} process=\"{}\" -> {}:53",
+                identity.pid, identity.name, dst
+            ),
+        );
+        Some(DnsServerFlowAction::Pass)
+    }
+
+    /// Handles an outbound UDP port-53 datagram of a DNS server process: `true` when it was
+    /// consumed (passed unmodified or dropped), `false` when the normal DNS path must go on.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_dns_server_udp(
+        ctrl: &RouteWardController,
+        api: &WinDivertApi,
+        net_handle: *mut c_void,
+        packet: &[u8],
+        addr: &WinDivertAddress,
+        src_port: u16,
+        dst: IpAddr,
+        payload: &[u8],
+    ) -> bool {
+        if !is_dns_query_header(payload) {
+            return false;
+        }
+        match Self::dns_server_flow_action(ctrl, DnsProto::Udp, dst.is_ipv6(), src_port, None, dst)
+        {
+            None => false,
+            Some(DnsServerFlowAction::Pass) => {
+                Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
+                true
+            }
+            Some(DnsServerFlowAction::Drop) => true,
+        }
+    }
+
+    /// Handles the SYN of an outbound TCP port-53 flow of a DNS server process: `true` when it was
+    /// consumed. Any stale NAT session of the same 4-tuple is removed first so that later
+    /// segments are not reflected to the relay.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_dns_server_syn(
+        ctrl: &RouteWardController,
+        api: &WinDivertApi,
+        net_handle: *mut c_void,
+        packet: &[u8],
+        addr: &WinDivertAddress,
+        flow_key: &crate::interceptor::nat::OutboundFlowKey,
+        src_port: u16,
+        dst: IpAddr,
+        resolved_pid: Option<u32>,
+    ) -> bool {
+        let Some(action) = Self::dns_server_flow_action(
+            ctrl,
+            DnsProto::Tcp,
+            dst.is_ipv6(),
+            src_port,
+            resolved_pid,
+            dst,
+        ) else {
+            return false;
+        };
+        ctrl.nat_table.remove_session_by_flow(flow_key);
+        if action == DnsServerFlowAction::Pass {
+            Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
+        }
+        true
+    }
 }
 
 #[cfg(windows)]
@@ -156,6 +328,23 @@ impl WinDivertInterceptor {
         let dns_port = ctrl.constants.dns.dns_standard_port;
         let dot_port = ctrl.constants.dns.dns_over_tls_port;
         let pid_opt = resolved.map(|(p, _)| p);
+
+        // A DNS server process gets real answers: its TCP port-53 flows never enter the relay.
+        if meta.dst_port == dns_port
+            && Self::handle_dns_server_syn(
+                ctrl,
+                api,
+                net_handle,
+                packet,
+                addr,
+                &meta.outbound_flow_key(),
+                meta.src_port,
+                IpAddr::V4(meta.dst_ip),
+                pid_opt,
+            )
+        {
+            return;
+        }
 
         if !ctrl.nat_table.is_loop_or_excluded(
             pid_opt,
@@ -553,6 +742,27 @@ impl WinDivertInterceptor {
         let dns_port = ctrl.constants.dns.dns_standard_port;
         let dot_port = ctrl.constants.dns.dns_over_tls_port;
         let pid_opt = resolved.map(|(p, _)| p);
+
+        // A DNS server process gets real answers: its TCP port-53 flows never enter the relay.
+        if meta.dst_port == dns_port
+            && !ctrl.nat_table.is_self_pid(pid_opt)
+            && !meta.dst_ip.is_loopback()
+            && !meta.dst_ip.is_multicast()
+            && !meta.dst_ip.is_unspecified()
+            && Self::handle_dns_server_syn(
+                ctrl,
+                api,
+                net_handle,
+                packet,
+                addr,
+                &meta.outbound_flow_key(),
+                meta.src_port,
+                IpAddr::V6(meta.dst_ip),
+                pid_opt,
+            )
+        {
+            return;
+        }
 
         if meta.dst_port == dns_port
             && !ctrl.nat_table.is_self_pid(pid_opt)
@@ -978,6 +1188,22 @@ impl WinDivertInterceptor {
             return UdpFragmentVerdict::Reinject;
         }
 
+        // A first fragment of a DNS server query follows the same rule as an unfragmented one.
+        if frag.dst_port == ctrl.constants.dns.dns_standard_port {
+            match Self::dns_server_flow_action(
+                ctrl,
+                DnsProto::Udp,
+                ipv6,
+                frag.src_port,
+                pid_opt,
+                frag.dst_ip,
+            ) {
+                Some(DnsServerFlowAction::Pass) => return UdpFragmentVerdict::Reinject,
+                Some(DnsServerFlowAction::Drop) => return UdpFragmentVerdict::Drop,
+                None => {}
+            }
+        }
+
         let (block_dot, block_quic) = {
             let prof = ctrl.profile.read();
             (
@@ -1093,6 +1319,48 @@ impl WinDivertInterceptor {
             },
             false,
         );
+    }
+
+    /// Starts the helper that recognises a DNS server process the periodic rescan has not seen
+    /// yet (for example a `dns.exe` that was just restarted): the socket-layer listener hands it
+    /// the PID of every socket event, and the helper resolves the image (a cached call) and
+    /// registers a matching PID at once. Returns the sender for the listener; a full queue drops
+    /// the PID, which only delays the exemption until the next rescan. The thread ends when the
+    /// sender is dropped.
+    pub(super) fn spawn_dns_server_pid_resolver(
+        ctrl: RouteWardController,
+    ) -> std::sync::mpsc::SyncSender<u32> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(DNS_SERVER_PID_QUEUE_LEN);
+        std::thread::spawn(move || {
+            let mut checked: std::collections::HashMap<u32, Instant> =
+                std::collections::HashMap::new();
+            while let Ok(pid) = rx.recv() {
+                if ctrl.dns_server_tracker.is_exempt_pid(pid) {
+                    continue;
+                }
+                let now = Instant::now();
+                if checked
+                    .get(&pid)
+                    .is_some_and(|at| now.duration_since(*at) < DNS_SERVER_PID_RECHECK)
+                {
+                    continue;
+                }
+                if checked.len() >= DNS_SERVER_PID_MAX_CHECKED {
+                    checked.retain(|_, at| now.duration_since(*at) < DNS_SERVER_PID_RECHECK);
+                    if checked.len() >= DNS_SERVER_PID_MAX_CHECKED {
+                        checked.clear();
+                    }
+                }
+                checked.insert(pid, now);
+                let identity = ctrl.process_resolver.resolve_by_pid(pid);
+                if identity.is_unattributed() {
+                    continue;
+                }
+                ctrl.dns_server_tracker
+                    .note_unknown_pid(pid, &identity.executable_path);
+            }
+        });
+        tx
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1255,6 +1523,19 @@ impl WinDivertInterceptor {
                             && !v6_meta.dst_ip.is_multicast()
                             && !v6_meta.dst_ip.is_unspecified()
                         {
+                            if Self::handle_dns_server_udp(
+                                &ctrl_net,
+                                &api,
+                                handle,
+                                &packet[..pkt_len],
+                                &addr,
+                                v6_meta.src_port,
+                                IpAddr::V6(v6_meta.dst_ip),
+                                &packet[v6_meta.payload_offset
+                                    ..v6_meta.payload_offset + v6_meta.payload_len],
+                            ) {
+                                continue;
+                            }
                             ctrl_net.record_orig_dns_resolver(SocketAddr::new(
                                 IpAddr::V6(v6_meta.dst_ip),
                                 v6_meta.dst_port,
@@ -1631,6 +1912,19 @@ impl WinDivertInterceptor {
                         }
 
                         if udp_meta.dst_port == dns_port {
+                            if Self::handle_dns_server_udp(
+                                &ctrl_net,
+                                &api,
+                                handle,
+                                &packet[..pkt_len],
+                                &addr,
+                                udp_meta.src_port,
+                                IpAddr::V4(udp_meta.dst_ip),
+                                &packet[udp_meta.payload_offset
+                                    ..udp_meta.payload_offset + udp_meta.payload_len],
+                            ) {
+                                continue;
+                            }
                             ctrl_net.record_orig_dns_resolver(SocketAddr::new(
                                 IpAddr::V4(udp_meta.dst_ip),
                                 udp_meta.dst_port,

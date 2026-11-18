@@ -140,3 +140,42 @@ Clicking **Start Service** and accepting the Windows UAC prompt does not connect
 ```powershell
 icacls "C:\ProgramData\RouteWard"
 ```
+
+## 12. Host Is a DNS Server
+
+**Symptom**:
+A DNS server running on the same machine (the Windows DNS Server role `dns.exe`, or `named`, `unbound`, `dnsmasq`, `pihole-FTL`, `pdns_recursor`, `kresd`, `dnsdist`, `coredns` on Linux) answers its own clients with `198.18.x.x` addresses, or caches them.
+
+**Cause**:
+A DNS server recurses to the Internet over port `53`. With Fake-IP on, RouteWard answers every port `53` query with a Fake-IP, so the server would cache and serve addresses that only exist inside RouteWard.
+
+**Behavior**:
+- **Exempt by default**: on Windows only `%SystemRoot%\System32\dns.exe` (a `dns.exe` anywhere else is not exempt); on Linux the executables `named`, `unbound`, `dnsmasq`, `pihole-FTL`, `pdns_recursor`, `kresd`, `dnsdist` and `coredns`, and only when the binary lives in `/usr/sbin`, `/usr/bin`, `/usr/local/sbin`, `/usr/local/bin` or `/usr/libexec`. `svchost.exe`, `systemd-resolved` and RouteWard itself can never be exempt.
+- **What exempt means**: the queries of that process leave unmodified (no Fake-IP, no relay). The kill switch and `remoteDnsResolution` do not apply to them.
+- **Explicit Block rule**: a Block rule whose `processPatterns` names the process still blocks its DNS queries. The default action and rules without a process pattern do not.
+- **DoT**: port `853` stays blocked by `securityPolicy.blockEncryptedDnsBypass`, DNS servers included.
+- **Local applications lose Fake-IP**: applications on that host query the local server over loopback, which RouteWard does not capture. They get real addresses, so a domain rule can only match through the TLS SNI or the HTTP `Host:` header.
+- **Log**: each exempt process is logged once at `INFO` (`Exempting DNS server process <name> (PID <pid>) from Fake-IP`); each query is logged at `DEBUG`, and a rate-limited `INFO` line summarises the flow.
+
+**Add or remove a process**:
+Edit `dnsConfig.dnsServerProcesses` in the profile (omitted from the JSON when empty):
+
+```json
+"dnsConfig": {
+  "dnsServerProcesses": ["C:\\Tools\\mydns.exe", "!dnsmasq"]
+}
+```
+
+- A full path or a basename adds a process. On Linux a basename still only matches binaries in the system directories above; on Windows a basename-only entry matches any path.
+- `!name` removes a built-in default. Use `!dnsmasq` on desktops where NetworkManager runs `dnsmasq` as a local cache (`dns=dnsmasq`): otherwise their own applications would stop getting Fake-IP.
+- Empty entries, a bare `*`, and any pattern that would match `svchost.exe`, `systemd-resolved` or RouteWard are refused when the profile is loaded or replaced.
+- A profile with a non-empty list is refused by older daemons (the field is unknown to them); an empty list is omitted and stays compatible.
+
+**Linux limits**:
+- The exemption works per user id, in `nftables` (sets `dns_server_uids` and `dns_server_block_uids`). A server running as `root` or `nobody`, or sharing its user id with another running process, is **not** exempt: RouteWard logs a warning once and leaves it redirected.
+- Reading `/proc/<pid>/exe` of other users' processes needs `CAP_SYS_PTRACE`, which the shipped systemd unit grants. Without it a DNS server of another user is not recognised.
+- In IPv6 guard mode (no IPv6 NAT), raw IPv6 port `53` is dropped, so an exempt server cannot recurse over IPv6 either.
+- A Block rule on Linux acts on the whole user id: write it with `processPatterns` only (no port or address condition).
+
+**Windows limits**:
+- Only the System32 `dns.exe` is exempt by default. The process list is rescanned every `dns.dnsServerProcessScanIntervalMs` (5 s) and at every profile reload; a restarted `dns.exe` is also recognised at once from its first socket event.

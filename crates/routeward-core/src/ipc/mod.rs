@@ -283,7 +283,9 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
             IpcResponse::success(id, &prof)
         }
         IpcCommand::ReplaceProfile { profile } => {
-            controller.replace_profile(profile);
+            if let Err(err) = controller.replace_profile(profile) {
+                return keyed_error_response(id, &err);
+            }
             if let Err(err) = controller.save_profile_default() {
                 return keyed_error_response(id, &err);
             }
@@ -780,7 +782,9 @@ mod tests {
         // 3. Replacing the profile with a proxy whose password is None also preserves the existing password
         let mut replaced_prof = controller.profile.read().redacted_for_ipc();
         replaced_prof.name = "Updated Profile".to_string();
-        controller.replace_profile(replaced_prof);
+        controller
+            .replace_profile(replaced_prof)
+            .expect("valid profile");
         {
             let prof_guard = controller.profile.read();
             let stored = prof_guard

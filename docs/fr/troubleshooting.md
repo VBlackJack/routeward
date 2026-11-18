@@ -140,3 +140,42 @@ Cliquer sur **Démarrer le Service** puis valider l'invite UAC Windows ne connec
 ```powershell
 icacls "C:\ProgramData\RouteWard"
 ```
+
+## 12. L'hôte est un serveur DNS
+
+**Symptôme** :
+Un serveur DNS exécuté sur la même machine (rôle Serveur DNS Windows `dns.exe`, ou `named`, `unbound`, `dnsmasq`, `pihole-FTL`, `pdns_recursor`, `kresd`, `dnsdist`, `coredns` sous Linux) répond à ses propres clients avec des adresses `198.18.x.x`, ou les met en cache.
+
+**Cause** :
+Un serveur DNS fait sa récursion vers Internet sur le port `53`. Avec Fake-IP actif, RouteWard répond à toute requête du port `53` par une Fake-IP : le serveur mettrait donc en cache, puis servirait, des adresses qui n'existent que dans RouteWard.
+
+**Comportement** :
+- **Exemptés par défaut** : sous Windows, uniquement `%SystemRoot%\System32\dns.exe` (un `dns.exe` situé ailleurs n'est pas exempté) ; sous Linux, les exécutables `named`, `unbound`, `dnsmasq`, `pihole-FTL`, `pdns_recursor`, `kresd`, `dnsdist` et `coredns`, et seulement si le binaire se trouve dans `/usr/sbin`, `/usr/bin`, `/usr/local/sbin`, `/usr/local/bin` ou `/usr/libexec`. `svchost.exe`, `systemd-resolved` et RouteWard lui-même ne peuvent jamais être exemptés.
+- **Ce que signifie l'exemption** : les requêtes de ce processus sortent sans modification (ni Fake-IP, ni relais). Le kill switch et `remoteDnsResolution` ne s'y appliquent pas.
+- **Règle Block explicite** : une règle Block dont `processPatterns` désigne le processus bloque toujours ses requêtes DNS. L'action par défaut et les règles sans motif de processus ne les bloquent pas.
+- **DoT** : le port `853` reste bloqué par `securityPolicy.blockEncryptedDnsBypass`, serveurs DNS compris.
+- **Les applications locales perdent la Fake-IP** : les applications de cette machine interrogent le serveur local en loopback, que RouteWard ne capture pas. Elles reçoivent de vraies adresses : une règle de domaine ne peut alors correspondre que par le SNI TLS ou l'en-tête HTTP `Host:`.
+- **Journal** : chaque processus exempté est journalisé une fois en `INFO` (`Exempting DNS server process <nom> (PID <pid>) from Fake-IP`) ; chaque requête l'est en `DEBUG`, et une ligne `INFO` limitée en fréquence résume le flux.
+
+**Ajouter ou retirer un processus** :
+Modifier `dnsConfig.dnsServerProcesses` dans le profil (champ omis du JSON quand la liste est vide) :
+
+```json
+"dnsConfig": {
+  "dnsServerProcesses": ["C:\\Tools\\mydns.exe", "!dnsmasq"]
+}
+```
+
+- Un chemin complet ou un nom de fichier ajoute un processus. Sous Linux, un nom de fichier ne correspond encore qu'aux binaires des dossiers système ci-dessus ; sous Windows, une entrée réduite au nom correspond à n'importe quel chemin.
+- `!nom` retire une valeur par défaut. Utiliser `!dnsmasq` sur les postes de travail où NetworkManager lance `dnsmasq` comme cache local (`dns=dnsmasq`) : sinon leurs propres applications cesseraient de recevoir des Fake-IP.
+- Les entrées vides, un `*` seul et tout motif qui correspondrait à `svchost.exe`, `systemd-resolved` ou RouteWard sont refusés au chargement ou au remplacement du profil.
+- Un profil dont la liste n'est pas vide est refusé par les anciens daemons (le champ leur est inconnu) ; une liste vide est omise et reste compatible.
+
+**Limites sous Linux** :
+- L'exemption fonctionne par identifiant utilisateur, dans `nftables` (ensembles `dns_server_uids` et `dns_server_block_uids`). Un serveur exécuté en `root` ou `nobody`, ou partageant son identifiant avec un autre processus actif, n'est **pas** exempté : RouteWard le signale une fois par un avertissement et le laisse redirigé.
+- Lire `/proc/<pid>/exe` des processus d'autres utilisateurs exige `CAP_SYS_PTRACE`, que l'unité systemd fournie accorde. Sans elle, un serveur DNS d'un autre utilisateur n'est pas reconnu.
+- En mode garde IPv6 (pas de NAT IPv6), le port `53` IPv6 brut est rejeté : un serveur exempté ne peut donc pas non plus faire sa récursion en IPv6.
+- Une règle Block sous Linux agit sur tout l'identifiant utilisateur : la rédiger avec `processPatterns` seul (sans condition de port ni d'adresse).
+
+**Limites sous Windows** :
+- Seul le `dns.exe` de System32 est exempté par défaut. La liste des processus est réanalysée toutes les `dns.dnsServerProcessScanIntervalMs` (5 s) et à chaque rechargement du profil ; un `dns.exe` redémarré est aussi reconnu aussitôt, dès son premier événement de socket.

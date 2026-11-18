@@ -207,7 +207,8 @@ $script:ScenarioExecutionPlan = @(
     [PSCustomObject]@{ ExecutionOrder = 22; Id = "w"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "IPv6 QUIC (UDP 443) rejected with ICMPv6 Port Unreachable" },
     [PSCustomObject]@{ ExecutionOrder = 23; Id = "x"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Direct IPv6 UDP flow attributed to process in ctl connections" },
     [PSCustomObject]@{ ExecutionOrder = 24; Id = "y"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "Windows SCM service status & routeward-desktop --smoke-ipc" },
-    [PSCustomObject]@{ ExecutionOrder = 25; Id = "j"; RequiresSocks5 = $true;  StopsSocks5 = $true;  Title = "Kill-Switch blocks curl when SOCKS5 proxy is stopped" }
+    [PSCustomObject]@{ ExecutionOrder = 25; Id = "z"; RequiresSocks5 = $false; StopsSocks5 = $false; Title = "DNS server processes get real DNS answers instead of Fake-IP" },
+    [PSCustomObject]@{ ExecutionOrder = 26; Id = "j"; RequiresSocks5 = $true;  StopsSocks5 = $true;  Title = "Kill-Switch blocks curl when SOCKS5 proxy is stopped" }
 )
 
 $script:CurrentPowerShellHostExe = ([System.Diagnostics.Process]::GetCurrentProcess().ProcessName + ".exe")
@@ -906,6 +907,36 @@ function Test-IpInFakePool {
     return (($ipU32 -band $maskU32) -eq ($netU32 -band $maskU32))
 }
 
+function Get-NslookupAnswerAddresses {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$OutputText = ""
+    )
+    # The answer section starts at the "Name:" line; the resolver banner before it also carries an
+    # address (the server asked) and must not be mistaken for an answer.
+    $nameMatch = [regex]::Match($OutputText, '(?m)^\s*Name:')
+    if (-not $nameMatch.Success) {
+        return @()
+    }
+    $answerText = $OutputText.Substring($nameMatch.Index)
+    $found = New-Object System.Collections.Generic.List[string]
+    foreach ($m in [regex]::Matches($answerText, '\b(?:\d{1,3}\.){3}\d{1,3}\b')) {
+        $found.Add($m.Value)
+    }
+    return @($found)
+}
+
+function Get-MachineConfiguredIpv4DnsServer {
+    $candidates = @(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.ServerAddresses } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notlike "127.*" -and $_ -notlike "169.254.*" })
+    if ($candidates.Count -gt 0) {
+        return [string]$candidates[0]
+    }
+    return ""
+}
+
 function Get-MachineActiveDirectoryOrPrimaryDnsSuffix {
     $candidates = New-Object System.Collections.Generic.List[string]
     if (-not [string]::IsNullOrWhiteSpace($env:USERDNSDOMAIN)) {
@@ -1166,12 +1197,20 @@ if ($DryRun.IsPresent) {
     if ($frExtractedMethod -ne "dnsapi.dll!DnsFlushResolverCache") {
         throw "DryRun failed: expected invariant English method from localized log, got '$frExtractedMethod'."
     }
-    if ($script:ScenarioExecutionPlan.Count -ne 25) {
-        throw "DryRun failed: expected 25 scenarios in ScenarioExecutionPlan, got $($script:ScenarioExecutionPlan.Count)."
+    if ($script:ScenarioExecutionPlan.Count -ne 26) {
+        throw "DryRun failed: expected 26 scenarios in ScenarioExecutionPlan, got $($script:ScenarioExecutionPlan.Count)."
     }
     $lastScenario = $script:ScenarioExecutionPlan[$script:ScenarioExecutionPlan.Count - 1]
-    if ($lastScenario.Id -ne "j" -or $lastScenario.ExecutionOrder -ne 25 -or (-not $lastScenario.StopsSocks5)) {
-        throw "DryRun failed: Scenario (j) must execute last (ExecutionOrder=25, StopsSocks5=true)."
+    if ($lastScenario.Id -ne "j" -or $lastScenario.ExecutionOrder -ne 26 -or (-not $lastScenario.StopsSocks5)) {
+        throw "DryRun failed: Scenario (j) must execute last (ExecutionOrder=26, StopsSocks5=true)."
+    }
+    $nslookupSample = "Server:  dns.example.test`r`nAddress:  192.0.2.53`r`n`r`nNon-authoritative answer:`r`nName:    example.com`r`nAddresses:  2606:2800:220:1:248:1893:25c8:1946`r`n          93.184.216.34`r`n"
+    $nslookupAnswers = @(Get-NslookupAnswerAddresses -OutputText $nslookupSample)
+    if ($nslookupAnswers.Count -ne 1 -or $nslookupAnswers[0] -ne "93.184.216.34") {
+        throw "DryRun failed: Get-NslookupAnswerAddresses must ignore the server banner and keep only answer IPv4 addresses, got '$($nslookupAnswers -join ',')'."
+    }
+    if (@(Get-NslookupAnswerAddresses -OutputText "Server:  dns.example.test`r`nAddress:  192.0.2.53`r`n*** dns.example.test can't find nx.invalid: Non-existent domain").Count -ne 0) {
+        throw "DryRun failed: Get-NslookupAnswerAddresses must return nothing when nslookup reports no answer."
     }
     foreach ($planItem in $script:ScenarioExecutionPlan) {
         if ($planItem.RequiresSocks5 -and $planItem.Id -ne "j" -and $planItem.ExecutionOrder -ge $lastScenario.ExecutionOrder) {
@@ -3032,7 +3071,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (t) [Order 19/25]: Real Windows WinDivert IPv6 TCP interception
+    # Scenario (t) [Order 19/26]: Real Windows WinDivert IPv6 TCP interception
     #               -> [::]:10810 transparent reflect -> SOCKS5 ATYP=0x04
     #               -> curl.exe -6 HTTP 200 (temporary ULA + route cleaned up)
     # -----------------------------------------------------------------------
@@ -3167,7 +3206,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (u) [Order 20/25]: Real Windows WinDivert IPv6 UDP interception
+    # Scenario (u) [Order 20/26]: Real Windows WinDivert IPv6 UDP interception
     #               -> SOCKS5 UDP ASSOCIATE (ATYP=0x04) -> forged IPv6 UDP reply
     # -----------------------------------------------------------------------
     try {
@@ -3303,7 +3342,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (v) [Order 21/25]: IPv6 DNS (port 53 UDP/TCP Fake-IP A & AAAA NODATA)
+    # Scenario (v) [Order 21/26]: IPv6 DNS (port 53 UDP/TCP Fake-IP A & AAAA NODATA)
     #               and gated IPv6 DoT (port 853) SecurityPolicy check
     # -----------------------------------------------------------------------
     try {
@@ -3367,7 +3406,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (w) [Order 22/25]: IPv6 QUIC (UDP 443) rejected with inbound
+    # Scenario (w) [Order 22/26]: IPv6 QUIC (UDP 443) rejected with inbound
     #               ICMPv6 Port Unreachable (Type 1, Code 4) via WinDivert
     # -----------------------------------------------------------------------
     try {
@@ -3430,7 +3469,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (x) [Order 23/25]: Direct IPv6 UDP flow attributed to process in
+    # Scenario (x) [Order 23/26]: Direct IPv6 UDP flow attributed to process in
     #               ctl connections / ctl logs
     # -----------------------------------------------------------------------
     try {
@@ -3500,7 +3539,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (y) [Order 24/25]: Windows SCM service status command &
+    # Scenario (y) [Order 24/26]: Windows SCM service status command &
     #               routeward-desktop.exe --smoke-ipc against live daemon
     # -----------------------------------------------------------------------
     try {
@@ -3548,7 +3587,123 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Scenario (j) [Order 25/25 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) -
+    # Scenario (z) [Order 25/26]: A process listed in dnsConfig.dnsServerProcesses
+    #               (nslookup.exe here, standing in for a DNS server) gets a real DNS answer
+    #               instead of a Fake-IP one; an optional check on the Windows DNS Server
+    #               service (dns.exe) runs when that service is Running.
+    # -----------------------------------------------------------------------
+    $profileBeforeZ = $null
+    $profileOriginalJsonZ = $null
+    $profileReplacedZ = $false
+    $tempProfileFileZ = $null
+    try {
+        Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
+        $dnsServerZ = Get-MachineConfiguredIpv4DnsServer
+        if ([string]::IsNullOrWhiteSpace($dnsServerZ)) {
+            $dnsServerZ = $ExternalDnsServer
+        }
+        $nslookupPathZ = Join-Path $env:SystemRoot "System32\nslookup.exe"
+        if (-not (Test-Path -LiteralPath $nslookupPathZ)) {
+            Record-ScenarioResult -Id "z" -Status "SKIP" -Title "DNS server processes get real DNS answers instead of Fake-IP" -Detail "nslookup.exe not found at '$nslookupPathZ'"
+        } else {
+            $profileBeforeZ = Get-NormalizedProfileSnapshotJson -ExePath $routeWardExePath -Label "Scenario-z-state-before"
+            $stateResZ = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("state") -Label "Scenario-z-state"
+            $stateObjZ = ConvertFrom-CtlResponseJson `
+                -RawJson $stateResZ.RawText `
+                -Context "Scenario-z-state" `
+                -RequiredResultProperties @("diagnostics", "profile")
+            $profileOriginalJsonZ = ($stateObjZ.profile | ConvertTo-Json -Depth 10 -Compress)
+            try {
+                $profileZ = $profileOriginalJsonZ | ConvertFrom-Json
+                $profileZ.dnsConfig | Add-Member -NotePropertyName "dnsServerProcesses" -NotePropertyValue @($nslookupPathZ) -Force
+                $tempProfileFileZ = Write-Utf8NoBomJsonTempFile -JsonText ($profileZ | ConvertTo-Json -Depth 10 -Compress)
+                $replaceResZ = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("replace-profile", "--json-file", $tempProfileFileZ) -Label "Scenario-z-replace-profile"
+                if ($replaceResZ.ExitCode -ne 0) {
+                    throw "ctl replace-profile with dnsServerProcesses failed (exit=$($replaceResZ.ExitCode)): $($replaceResZ.RawText)"
+                }
+                $profileReplacedZ = $true
+                Start-Sleep -Milliseconds $PollIntervalMs
+
+                $nslookupIpsZ = @()
+                $nslookupTextZ = ""
+                for ($attemptZ = 1; $attemptZ -le 2 -and $nslookupIpsZ.Count -eq 0; $attemptZ++) {
+                    $prevEapZ = $ErrorActionPreference
+                    $ErrorActionPreference = "Continue"
+                    try {
+                        $nslookupTextZ = (& $nslookupPathZ "-type=A" "-timeout=5" $PublicDnsTestDomain $dnsServerZ 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
+                    } finally {
+                        $ErrorActionPreference = $prevEapZ
+                    }
+                    $nslookupIpsZ = @(Get-NslookupAnswerAddresses -OutputText $nslookupTextZ)
+                }
+                $anyFakeZ = $false
+                foreach ($ipZ in $nslookupIpsZ) {
+                    if (Test-IpInFakePool -IpAddressString $ipZ -PoolCidr $FakeIpCidr) {
+                        $anyFakeZ = $true
+                    }
+                }
+
+                $logsResZ = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("logs") -Label "Scenario-z-logs"
+                $logsListZ = ConvertFrom-CtlResponseJson `
+                    -RawJson $logsResZ.RawText `
+                    -Context "Scenario-z-logs" `
+                    -ExpectResultArray `
+                    -RequiredArrayElementProperties @("level", "component", "message")
+                $sawExemptionLogZ = $false
+                foreach ($logZ in $logsListZ) {
+                    if ([string]$logZ.message -match 'Exempting DNS server process nslookup\.exe \(PID \d+\) from Fake-IP') {
+                        $sawExemptionLogZ = $true
+                        break
+                    }
+                }
+
+                # Optional: the Windows DNS Server role (dns.exe) recursing for a public name.
+                $dnsExeDetailZ = "dns.exe check skipped (DNS Server service not running)"
+                $dnsExeFailZ = $false
+                $dnsServiceZ = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
+                if ($null -ne $dnsServiceZ -and $dnsServiceZ.Status -eq "Running") {
+                    $null = Clear-DnsServerCache -Force -ErrorAction Stop
+                    $dnsExeRecordsZ = @(Resolve-DnsName -Name $PublicDnsTestDomain -Type A -Server "127.0.0.1" -DnsOnly -NoHostsFile -ErrorAction Stop | Where-Object { $null -ne $_.IPAddress })
+                    $dnsExeIpsZ = @($dnsExeRecordsZ | ForEach-Object { [string]$_.IPAddress })
+                    $dnsExeFakeZ = $false
+                    foreach ($ipZ in $dnsExeIpsZ) {
+                        if (Test-IpInFakePool -IpAddressString $ipZ -PoolCidr $FakeIpCidr) {
+                            $dnsExeFakeZ = $true
+                        }
+                    }
+                    $dnsExeFailZ = ($dnsExeIpsZ.Count -eq 0) -or $dnsExeFakeZ
+                    $dnsExeDetailZ = "dns.exe resolved $PublicDnsTestDomain to [$($dnsExeIpsZ -join ', ')] (inFakePool=$dnsExeFakeZ)"
+                }
+
+                if ($nslookupIpsZ.Count -gt 0 -and (-not $anyFakeZ) -and $sawExemptionLogZ -and (-not $dnsExeFailZ)) {
+                    Record-ScenarioResult -Id "z" -Status "PASS" -Title "DNS server processes get real DNS answers instead of Fake-IP" -Detail "nslookup.exe asked $dnsServerZ for $PublicDnsTestDomain and got [$($nslookupIpsZ -join ', ')] (outside $FakeIpCidr), exemption logged; $dnsExeDetailZ"
+                } else {
+                    Record-ScenarioResult -Id "z" -Status "FAIL" -Title "DNS server processes get real DNS answers instead of Fake-IP" -Detail "nslookupIps=[$($nslookupIpsZ -join ', ')], anyInFakePool=$anyFakeZ, exemptionLogged=$sawExemptionLogZ; $dnsExeDetailZ; nslookup output: $($nslookupTextZ.Trim())"
+                }
+            } finally {
+                if ($profileReplacedZ) {
+                    $restoreFileZ = Write-Utf8NoBomJsonTempFile -JsonText $profileOriginalJsonZ
+                    try {
+                        $null = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("replace-profile", "--json-file", $restoreFileZ) -Label "Scenario-z-restore-profile"
+                    } finally {
+                        Remove-Item -LiteralPath $restoreFileZ -Force -ErrorAction SilentlyContinue
+                    }
+                }
+                if ($null -ne $tempProfileFileZ) {
+                    Remove-Item -LiteralPath $tempProfileFileZ -Force -ErrorAction SilentlyContinue
+                }
+                $profileAfterZ = Get-NormalizedProfileSnapshotJson -ExePath $routeWardExePath -Label "Scenario-z-state-after"
+                if ($profileBeforeZ -ne $profileAfterZ) {
+                    throw "Scenario (z) cleanup check failed: profile state after cleanup does not match profile state before Scenario (z)."
+                }
+            }
+        }
+    } catch {
+        Record-ScenarioResult -Id "z" -Status "FAIL" -Title "DNS server processes get real DNS answers instead of Fake-IP" -Detail $_.Exception.Message
+    }
+
+    # -----------------------------------------------------------------------
+    # Scenario (j) [Order 26/26 - Executed LAST]: Kill-Switch (killSwitchEnabled=true) -
     #               SOCKS5 proxy stopped during test, curl.exe matched by Proxy rule
     #               fails without falling back to Direct, and ctl connections reports Blocked
     # -----------------------------------------------------------------------

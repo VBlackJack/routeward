@@ -1100,6 +1100,17 @@ impl TransparentNatTable {
         self.sessions_by_flow.remove(&flow_key).map(|(_, v)| v)
     }
 
+    /// Removes the NAT session of a flow, if any, together with its relay peer index entry.
+    /// Used when a flow turns out to be exempt (a DNS server process) so that later segments of the
+    /// 4-tuple are not reflected to the relay by a stale session.
+    pub fn remove_session_by_flow(&self, flow_key: &OutboundFlowKey) -> Option<NatSessionEntry> {
+        let (_, entry) = self.sessions_by_flow.remove(flow_key)?;
+        self.peer_to_flow
+            .remove_if(&entry.relay_peer_key(), |_, mapped| mapped == flow_key);
+        self.adopted_flows.remove(flow_key);
+        Some(entry)
+    }
+
     /// Returns the transparent relay TCP port.
     pub fn transparent_relay_port(&self) -> u16 {
         self.transparent_relay_port
