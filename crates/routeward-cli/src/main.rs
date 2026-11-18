@@ -257,6 +257,18 @@ fn run_cleanup_all_users(
     }
 }
 
+/// Formats a `purge-data` or `cleanup --all-users` failure for stderr: the localized message,
+/// followed by the error and its system detail, except for the privilege refusal whose detail is
+/// already that localized message.
+fn describe_admin_command_error(i18n: &I18nRegistry, err: &RouteWardError) -> String {
+    let message = i18n.t(err.i18n_key());
+    if err.i18n_key() == ERR_KEY_DAEMON_NOT_ELEVATED {
+        message
+    } else {
+        format!("{message}: {err}")
+    }
+}
+
 /// Runs `routeward purge-data`: removes `%ProgramData%\RouteWard` (Windows only). Requires an
 /// elevated process and no active daemon (there is no `--force`: a running daemon holds its logs
 /// and profile open).
@@ -877,7 +889,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(args.command, Commands::PurgeData) {
         let i18n = I18nRegistry::new(&args.locale);
         if let Err(err) = run_purge_data(&constants, &i18n) {
-            eprintln!("{}: {err}", i18n.t(err.i18n_key()));
+            eprintln!("{}", describe_admin_command_error(&i18n, &err));
             return Err(err.into());
         }
         println!("{}", i18n.t("cli.engine.purge.completed"));
@@ -893,7 +905,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     ) {
         let i18n = I18nRegistry::new(&args.locale);
         if let Err(err) = run_cleanup_all_users(&constants, &i18n) {
-            eprintln!("{}: {err}", i18n.t(err.i18n_key()));
+            eprintln!("{}", describe_admin_command_error(&i18n, &err));
             return Err(err.into());
         }
         println!("{}", i18n.t("cli.engine.cleanup.all_users_completed"));
