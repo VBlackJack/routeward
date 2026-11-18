@@ -210,7 +210,9 @@ jobs:
         run: cargo build --release --workspace --locked
 
       - name: Setup WiX Toolset CLI
-        run: dotnet tool install --global wix --version 6.0.2
+        run: |
+          dotnet tool install --global wix --version 6.0.2
+          wix extension add -g WixToolset.Util.wixext/6.0.2
 
       # Pinned SHA-256 of WinDivert-2.2.2-A.zip is enforced by the script. It extracts the unmodified
       # x64 DLL and driver plus the upstream license texts into third_party/windivert/bin.
