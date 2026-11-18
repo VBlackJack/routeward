@@ -1742,7 +1742,109 @@ else
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Scenario (ak): a DNS server process (dnsmasq, in the default list) running as a dedicated
+#                unprivileged user in the same network namespace as the daemon gets real
+#                DNS answers: its upstream query is not redirected to the Fake-IP resolver,
+#                the mock upstream is hit and the domain never enters the Fake-IP table.
+#                The same profile with "!dnsmasq" (live reload, no restart) is the control:
+#                the very same query is then answered with a Fake-IP.
+# ---------------------------------------------------------------------------
+CAP_EFF_HEX=$(awk '/^CapEff:/ {print $2}' /proc/self/status)
+if (( (0x${CAP_EFF_HEX} >> 19) & 1 )); then
+DNSMASQ_UID=$(id -u rwdns)
+rm -f /tmp/dns_hits.log /run/routeward/routeward.sock /tmp/dnsmasq_ak.pid
+
+dnsmasq --conf-file=/dev/null --keep-in-foreground --no-resolv --no-hosts --cache-size=0 \
+    --listen-address=127.0.0.1 --bind-interfaces --port=53 --server="${TARGET_IP}" \
+    --user=rwdns --group=rwdns --pid-file=/tmp/dnsmasq_ak.pid >/tmp/rw_dnsmasq_ak.out 2>&1 &
+DNSMASQ_AK_PID=$!
+for _ in $(seq 1 30); do
+    if python3 /workspace/tests/linux/mock_servers.py --dns-query 127.0.0.1 "warmup.routeward.test" 1 >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.1
+done
+
+sed -e 's|"bypassDomains": \[\(.*\)\]|"bypassDomains": [\1],\n    "dnsServerProcesses": ["!dnsmasq"]|' \
+    /tmp/profile_dns_fakeip.json > /tmp/profile_dns_server_removed.json
+grep -q '"dnsServerProcesses": \["!dnsmasq"\]' /tmp/profile_dns_server_removed.json
+
+cp /tmp/profile_dns_fakeip.json /etc/routeward/active_profile.json
+chmod 0600 /etc/routeward/active_profile.json
+
+"${BIN}" daemon >/tmp/rw_daemon_ak.out 2>&1 &
+DAEMON_AK_PID=$!
+for _ in $(seq 1 30); do
+    if [[ -S /run/routeward/routeward.sock ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+"${BIN}" ctl start >/dev/null
+wait_for_nft_table
+
+rm -f /tmp/dns_hits.log
+DNS_AK=$(python3 /workspace/tests/linux/mock_servers.py --dns-query 127.0.0.1 "exempt.routeward.test" 1)
+FAKE_IPS_AK=$("${BIN}" ctl fake-ips)
+NFT_SET_AK=$(nft list set ip routeward dns_server_uids 2>&1 || true)
+NFT_BLOCK_SET_AK=$(nft list set ip routeward dns_server_block_uids 2>&1 || true)
+LOGS_AK=$("${BIN}" ctl logs)
+
+if echo "${DNS_AK}" | grep -q "RCODE=0 ANCOUNT=1 IP=${TARGET_IP}" \
+    && ! echo "${DNS_AK}" | grep -q "IP=198\.1[89]\." \
+    && grep -q "^UDP .* exempt.routeward.test 1" /tmp/dns_hits.log \
+    && ! echo "${FAKE_IPS_AK}" | grep -q "exempt.routeward.test" \
+    && echo "${NFT_SET_AK}" | grep -Eq "elements = \{ ${DNSMASQ_UID} \}" \
+    && ! echo "${NFT_BLOCK_SET_AK}" | grep -q "elements" \
+    && echo "${LOGS_AK}" | grep -q "Exempting DNS server process dnsmasq"; then
+    echo "[PASS] Scenario (ak): dnsmasq as uid ${DNSMASQ_UID} exempt from Fake-IP (${DNS_AK}; mock upstream hit; no Fake-IP entry)"
+else
+    echo "[FAIL] Scenario (ak): exemption"
+    echo "DNS_AK=${DNS_AK}"
+    cat /tmp/dns_hits.log 2>/dev/null || true
+    echo "FAKE_IPS_AK=${FAKE_IPS_AK}"
+    echo "NFT_SET_AK=${NFT_SET_AK}"
+    echo "NFT_BLOCK_SET_AK=${NFT_BLOCK_SET_AK}"
+    echo "LOGS_AK=${LOGS_AK}"
+    kill -TERM "${DAEMON_AK_PID}" "${DNSMASQ_AK_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# Control: removing the default with "!dnsmasq" through a live profile reload must send the same
+# upstream query to the Fake-IP resolver, which proves the test above is not passing by accident.
+"${BIN}" ctl replace-profile --json-file /tmp/profile_dns_server_removed.json >/dev/null
+sleep 0.3
+
+rm -f /tmp/dns_hits.log
+DNS_AK_CTRL=$(python3 /workspace/tests/linux/mock_servers.py --dns-query 127.0.0.1 "control.routeward.test" 1)
+FAKE_IPS_AK_CTRL=$("${BIN}" ctl fake-ips)
+NFT_SET_AK_CTRL=$(nft list set ip routeward dns_server_uids 2>&1 || true)
+
+kill -TERM "${DAEMON_AK_PID}" "${DNSMASQ_AK_PID}" 2>/dev/null || true
+wait "${DAEMON_AK_PID}" 2>/dev/null || true
+wait "${DNSMASQ_AK_PID}" 2>/dev/null || true
+
+if echo "${DNS_AK_CTRL}" | grep -Eq "RCODE=0 ANCOUNT=1 IP=198\.1[89]\.[0-9]+\.[0-9]+" \
+    && echo "${FAKE_IPS_AK_CTRL}" | grep -q '"domain": "control.routeward.test"' \
+    && ! echo "${NFT_SET_AK_CTRL}" | grep -q "elements"; then
+    echo "[PASS] Scenario (ak): control with !dnsmasq after live reload got a Fake-IP (${DNS_AK_CTRL})"
+else
+    echo "[FAIL] Scenario (ak): control"
+    echo "DNS_AK_CTRL=${DNS_AK_CTRL}"
+    echo "FAKE_IPS_AK_CTRL=${FAKE_IPS_AK_CTRL}"
+    echo "NFT_SET_AK_CTRL=${NFT_SET_AK_CTRL}"
+    exit 1
+fi
+else
+    # The daemon recognises a DNS server of another user through /proc/<pid>/exe, which the
+    # kernel only exposes to root with CAP_SYS_PTRACE (the systemd unit keeps it). Plain
+    # `docker run --cap-add NET_ADMIN` does not grant it; CI runs --privileged.
+    echo "[SKIP] Scenario (ak): needs CAP_SYS_PTRACE (docker run --cap-add NET_ADMIN --cap-add SYS_PTRACE)"
+fi
+
 cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
 kill "${MOCK_PID}" 2>/dev/null || true
 
-echo "=== ALL 40 LINUX CONTAINER SCENARIOS PASSED ==="
+echo "=== ALL 41 LINUX CONTAINER SCENARIOS PASSED ==="

@@ -114,7 +114,19 @@
     "udpResponseBufferBytes": 4096,
     "fakeIpRealResolutionTtlSecs": 30,
     "fakeIpRealResolutionMaxEntries": 1024,
-    "systemResolversCacheTtlMs": 5000
+    "systemResolversCacheTtlMs": 5000,
+    "defaultDnsServerProcesses": [
+      "%SystemRoot%\\System32\\dns.exe",
+      "named",
+      "unbound",
+      "dnsmasq",
+      "pihole-FTL",
+      "pdns_recursor",
+      "kresd",
+      "dnsdist",
+      "coredns"
+    ],
+    "dnsServerProcessScanIntervalMs": 5000
   },
   "checker": {
     "probeTargetHost": "1.1.1.1",

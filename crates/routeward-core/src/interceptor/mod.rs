@@ -17,6 +17,7 @@
 pub mod backend;
 mod controller;
 mod dns_handler;
+pub mod dns_server_exempt;
 pub mod nat;
 pub mod nftables;
 mod tcp_relay;
@@ -35,6 +36,7 @@ use crate::proxy::udp::UdpAssociationManager;
 use crate::telemetry::TelemetryHub;
 use dashmap::DashMap;
 use dns_handler::RelayCaches;
+use dns_server_exempt::DnsServerTracker;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
@@ -171,6 +173,8 @@ pub struct RouteWardController {
     pub(super) fragmented_udp_drop_count: Arc<AtomicU64>,
     /// Later UDP fragments dropped because no verdict was remembered for their datagram.
     pub(super) orphan_fragment_drop_count: Arc<AtomicU64>,
+    /// DNS server processes that always get real DNS (see `dns_server_exempt`).
+    pub dns_server_tracker: DnsServerTracker,
     pub(super) last_seen_orig_resolver: Arc<RwLock<Option<SocketAddr>>>,
     pub(super) system_resolvers_override: Arc<RwLock<Option<Vec<SocketAddr>>>>,
     pub(super) bootstrapped_proxy_endpoints: Arc<DashMap<String, Vec<(IpAddr, u16)>>>,

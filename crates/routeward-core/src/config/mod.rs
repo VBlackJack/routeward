@@ -479,6 +479,32 @@ pub struct DnsConstants {
     /// How long the detected system DNS resolver list is reused, in milliseconds.
     #[serde(default = "default_system_resolvers_cache_ttl_ms")]
     pub system_resolvers_cache_ttl_ms: u64,
+    /// Process images of DNS server software that always get real DNS answers (no Fake-IP).
+    /// Entries are a full path (`%SystemRoot%` is expanded) or a basename; on Linux a basename
+    /// only matches an executable that lives in a root-owned system directory.
+    #[serde(default = "default_dns_server_processes")]
+    pub default_dns_server_processes: Vec<String>,
+    /// How often the set of running DNS server processes is rescanned, in milliseconds.
+    #[serde(default = "default_dns_server_process_scan_interval_ms")]
+    pub dns_server_process_scan_interval_ms: u64,
+}
+
+fn default_dns_server_processes() -> Vec<String> {
+    vec![
+        r"%SystemRoot%\System32\dns.exe".to_string(),
+        "named".to_string(),
+        "unbound".to_string(),
+        "dnsmasq".to_string(),
+        "pihole-FTL".to_string(),
+        "pdns_recursor".to_string(),
+        "kresd".to_string(),
+        "dnsdist".to_string(),
+        "coredns".to_string(),
+    ]
+}
+
+fn default_dns_server_process_scan_interval_ms() -> u64 {
+    5000
 }
 
 fn default_direct_query_timeout_min_ms() -> u64 {
@@ -1063,6 +1089,23 @@ pub struct DnsConfig {
     pub fake_ip_cidr: String,
     pub upstream_dns: String,
     pub bypass_domains: Vec<String>,
+    /// Extra DNS server process patterns (full path or basename) that always get real DNS
+    /// answers, and `!name` entries that remove a default. Omitted from the JSON when empty so
+    /// an older daemon can still load a profile exported by this version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_server_processes: Vec<String>,
+}
+
+impl DnsConfig {
+    /// Checks the DNS server process list (see `interceptor::dns_server_exempt`).
+    pub fn validate(&self) -> RouteWardResult<()> {
+        crate::interceptor::dns_server_exempt::validate_entries(&self.dns_server_processes).map_err(
+            |detail| RouteWardError::ConfigError {
+                key: ERR_KEY_CONFIG_JSON,
+                detail,
+            },
+        )
+    }
 }
 
 fn default_enable_logging() -> bool {
@@ -1116,10 +1159,13 @@ impl ProfileConfig {
     }
 
     pub fn from_json_str(json: &str) -> RouteWardResult<Self> {
-        serde_json::from_str(json).map_err(|err| RouteWardError::ConfigError {
-            key: ERR_KEY_CONFIG_JSON,
-            detail: err.to_string(),
-        })
+        let profile: Self =
+            serde_json::from_str(json).map_err(|err| RouteWardError::ConfigError {
+                key: ERR_KEY_CONFIG_JSON,
+                detail: err.to_string(),
+            })?;
+        profile.dns_config.validate()?;
+        Ok(profile)
     }
 
     pub fn to_json_pretty(&self) -> RouteWardResult<String> {

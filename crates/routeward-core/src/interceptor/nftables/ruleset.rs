@@ -45,6 +45,59 @@ pub(super) fn default_fake_ip_net() -> Ipv4Net {
         .expect("LEGACY_FAKE_IP_CIDR is a valid IPv4 CIDR")
 }
 
+/// Declares the two user id sets of the exempt DNS server processes inside a table.
+fn dns_server_set_declarations() -> String {
+    format!(
+        "    set {NFT_SET_DNS_SERVER_UIDS} {{\n        type uid;\n    }}\n    set {NFT_SET_DNS_SERVER_BLOCK_UIDS} {{\n        type uid;\n    }}\n"
+    )
+}
+
+/// Rules placed in the NAT output chain before the port-53 redirect: DNS egress of an exempt
+/// user id is left alone (no redirect to the Fake-IP resolver).
+fn dns_server_exempt_rules(dns_standard_port: u16) -> String {
+    format!(
+        "        meta skuid @{NFT_SET_DNS_SERVER_UIDS} udp dport {dns_standard_port} return\n        meta skuid @{NFT_SET_DNS_SERVER_UIDS} tcp dport {dns_standard_port} return\n"
+    )
+}
+
+/// Rules placed in the filter output chain: DNS egress of a user id whose process is targeted by
+/// an explicit Block rule is dropped.
+fn dns_server_block_rules(dns_standard_port: u16) -> String {
+    format!(
+        "        meta skuid @{NFT_SET_DNS_SERVER_BLOCK_UIDS} udp dport {dns_standard_port} drop\n        meta skuid @{NFT_SET_DNS_SERVER_BLOCK_UIDS} tcp dport {dns_standard_port} drop\n"
+    )
+}
+
+/// Builds the `nft` commands that load `exempt` and `block` into the sets of `table_name`
+/// (family `ip` or `ip6`). Empty sets produce no command (an empty element list is invalid).
+/// With `flush` the current elements are removed first, in the same transaction.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn build_dns_server_uid_elements(
+    family: &str,
+    table_name: &str,
+    exempt: &BTreeSet<u32>,
+    block: &BTreeSet<u32>,
+    flush: bool,
+) -> String {
+    let mut script = String::new();
+    for (set_name, uids) in [
+        (NFT_SET_DNS_SERVER_UIDS, exempt),
+        (NFT_SET_DNS_SERVER_BLOCK_UIDS, block),
+    ] {
+        if flush {
+            script.push_str(&format!("flush set {family} {table_name} {set_name}\n"));
+        }
+        if !uids.is_empty() {
+            let list: Vec<String> = uids.iter().map(u32::to_string).collect();
+            script.push_str(&format!(
+                "add element {family} {table_name} {set_name} {{ {} }}\n",
+                list.join(", ")
+            ));
+        }
+    }
+    script
+}
+
 impl NftablesInterceptor {
     /// Generates the dedicated IPv4 `nftables` ruleset for `nft -f -`.
     pub fn build_nft_table_ruleset(
@@ -210,10 +263,12 @@ impl NftablesInterceptor {
     ) -> String {
         let mut script = String::with_capacity(1536);
         script.push_str(&format!("table ip {table_name} {{\n"));
+        script.push_str(&dns_server_set_declarations());
         script.push_str(&format!("    chain {chain_name} {{\n"));
         script.push_str("        type nat hook output priority -100; policy accept;\n");
         script.push_str(&format!("        meta mark {fwmark} return\n"));
         script.push_str("        ip daddr 127.0.0.0/8 return\n");
+        script.push_str(&dns_server_exempt_rules(dns_standard_port));
         script.push_str(&format!(
             "        udp dport {dns_standard_port} redirect to :{dns_listen_port}\n"
         ));
@@ -269,6 +324,7 @@ impl NftablesInterceptor {
         ));
         script.push_str(&format!("        meta mark {fwmark} return\n"));
         script.push_str("        ip daddr 127.0.0.0/8 return\n");
+        script.push_str(&dns_server_block_rules(dns_standard_port));
         if block_encrypted_dns {
             script.push_str(&format!("        udp dport {dot_port} reject\n"));
         }
@@ -311,10 +367,12 @@ impl NftablesInterceptor {
     ) -> String {
         let mut script = String::with_capacity(1536);
         script.push_str(&format!("table ip6 {table_name} {{\n"));
+        script.push_str(&dns_server_set_declarations());
         script.push_str(&format!("    chain {chain_name} {{\n"));
         script.push_str("        type nat hook output priority -100; policy accept;\n");
         script.push_str(&format!("        meta mark {fwmark} return\n"));
         script.push_str("        ip6 daddr ::1 return\n");
+        script.push_str(&dns_server_exempt_rules(dns_standard_port));
         script.push_str(&format!(
             "        udp dport {dns_standard_port} redirect to :{dns_listen_port}\n"
         ));
@@ -369,6 +427,7 @@ impl NftablesInterceptor {
         script.push_str("        type filter hook output priority 0; policy accept;\n");
         script.push_str(&format!("        meta mark {fwmark} return\n"));
         script.push_str("        ip6 daddr ::1 return\n");
+        script.push_str(&dns_server_block_rules(dns_standard_port));
         if block_encrypted_dns {
             script.push_str(&format!("        udp dport {dot_port} reject\n"));
             script.push_str(&format!(

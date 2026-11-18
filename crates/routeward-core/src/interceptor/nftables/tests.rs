@@ -763,3 +763,140 @@ mod failed_start_teardown {
         assert!(calls.contains("delete table inet routeward_ks"), "{calls}");
     }
 }
+
+fn position_of(haystack: &str, needle: &str) -> usize {
+    haystack
+        .find(needle)
+        .unwrap_or_else(|| panic!("missing {needle:?} in ruleset:\n{haystack}"))
+}
+
+#[test]
+fn ip_ruleset_exempts_dns_server_uids_before_the_redirect_and_blocks_listed_ones() {
+    let ruleset =
+        NftablesInterceptor::build_nft_table_ruleset("routeward", "output", 21079, 10810, &[]);
+
+    // Both sets are declared even when empty, so the ruleset loads with no DNS server running.
+    assert!(ruleset.contains("set dns_server_uids {\n        type uid;\n    }"));
+    assert!(ruleset.contains("set dns_server_block_uids {\n        type uid;\n    }"));
+
+    let exempt_udp = position_of(&ruleset, "meta skuid @dns_server_uids udp dport 53 return");
+    let exempt_tcp = position_of(&ruleset, "meta skuid @dns_server_uids tcp dport 53 return");
+    let redirect_udp = position_of(&ruleset, "udp dport 53 redirect to :10853");
+    let redirect_tcp = position_of(&ruleset, "tcp dport 53 redirect to :10853");
+    assert!(exempt_udp < redirect_udp);
+    assert!(exempt_tcp < redirect_tcp);
+
+    // The drop for an explicit Block rule lives in the filter chain, after the loopback return.
+    let filter = position_of(&ruleset, "chain filter_output {");
+    let block_udp = position_of(
+        &ruleset,
+        "meta skuid @dns_server_block_uids udp dport 53 drop",
+    );
+    let block_tcp = position_of(
+        &ruleset,
+        "meta skuid @dns_server_block_uids tcp dport 53 drop",
+    );
+    assert!(block_udp > filter && block_tcp > filter);
+    let loopback_in_filter =
+        filter + position_of(&ruleset[filter..], "ip daddr 127.0.0.0/8 return");
+    assert!(block_udp > loopback_in_filter);
+    assert!(block_udp < position_of(&ruleset, "udp dport 853 reject"));
+}
+
+#[test]
+fn ip6_ruleset_carries_the_same_dns_server_uid_sets_and_rules() {
+    let ruleset = NftablesInterceptor::build_nft_ip6_table_ruleset(
+        "routeward",
+        "output",
+        21079,
+        53,
+        853,
+        false,
+        true,
+    )
+    .expect("ip6 ruleset");
+    assert!(ruleset.contains("set dns_server_uids {"));
+    assert!(ruleset.contains("set dns_server_block_uids {"));
+    let exempt = position_of(&ruleset, "meta skuid @dns_server_uids udp dport 53 return");
+    let redirect = position_of(&ruleset, "udp dport 53 redirect to :10853");
+    assert!(exempt < redirect);
+    let filter = position_of(&ruleset, "chain filter_output {");
+    assert!(
+        position_of(
+            &ruleset,
+            "meta skuid @dns_server_block_uids tcp dport 53 drop"
+        ) > filter
+    );
+}
+
+#[test]
+fn atomic_replace_batches_declare_the_sets_in_both_tables() {
+    let batch = NftablesInterceptor::build_atomic_replace_ruleset(
+        "routeward",
+        "output",
+        21079,
+        10810,
+        10853,
+        53,
+        853,
+        false,
+        false,
+        &[],
+    );
+    assert_eq!(batch.matches("set dns_server_uids {").count(), 2);
+    assert_eq!(batch.matches("set dns_server_block_uids {").count(), 2);
+}
+
+#[test]
+fn ip6_fallback_guard_has_no_sets_and_drops_raw_dns() {
+    let guard = NftablesInterceptor::build_nft_ip6_fallback_guard_ruleset(
+        "routeward",
+        "output",
+        21079,
+        53,
+        853,
+        false,
+        true,
+    );
+    assert!(!guard.contains("dns_server_uids"));
+    assert!(guard.contains("udp dport 53 reject"));
+    assert!(guard.contains("tcp dport 53 reject with tcp reset"));
+}
+
+#[test]
+fn dns_server_uid_elements_skip_empty_sets_and_flush_on_request() {
+    let exempt = BTreeSet::from([105u32, 33]);
+    let block = BTreeSet::new();
+    let load = ruleset::build_dns_server_uid_elements("ip", "routeward", &exempt, &block, false);
+    assert_eq!(
+        load,
+        "add element ip routeward dns_server_uids { 33, 105 }\n"
+    );
+    let reload = ruleset::build_dns_server_uid_elements("ip6", "routeward", &exempt, &exempt, true);
+    assert_eq!(
+        reload,
+        "flush set ip6 routeward dns_server_uids\n\
+         add element ip6 routeward dns_server_uids { 33, 105 }\n\
+         flush set ip6 routeward dns_server_block_uids\n\
+         add element ip6 routeward dns_server_block_uids { 33, 105 }\n"
+    );
+    let empty = ruleset::build_dns_server_uid_elements(
+        "ip",
+        "routeward",
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        false,
+    );
+    assert!(empty.is_empty());
+    let cleared = ruleset::build_dns_server_uid_elements(
+        "ip",
+        "routeward",
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        true,
+    );
+    assert_eq!(
+        cleared,
+        "flush set ip routeward dns_server_uids\nflush set ip routeward dns_server_block_uids\n"
+    );
+}

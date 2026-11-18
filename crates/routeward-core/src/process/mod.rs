@@ -653,7 +653,7 @@ impl ProcessResolver {
     }
 
     #[cfg(windows)]
-    fn query_iphelper_buffer<F>(fetch: F) -> Option<Vec<u8>>
+    pub(crate) fn query_iphelper_buffer<F>(fetch: F) -> Option<Vec<u8>>
     where
         F: Fn(*mut u8, &mut u32) -> u32,
     {
@@ -686,7 +686,7 @@ impl ProcessResolver {
     /// # Safety
     /// `buffer` must hold a table of rows of type `R` filled in by the matching IP Helper call.
     #[cfg(windows)]
-    unsafe fn iphelper_rows<R>(buffer: &[u8]) -> &[R] {
+    pub(crate) unsafe fn iphelper_rows<R>(buffer: &[u8]) -> &[R] {
         let header = std::mem::size_of::<u32>().next_multiple_of(std::mem::align_of::<R>());
         if buffer.len() < header {
             return &[];
@@ -852,7 +852,7 @@ impl ProcessResolver {
     }
 
     #[cfg(windows)]
-    fn query_executable_path(pid: u32) -> Option<String> {
+    pub(crate) fn query_executable_path(pid: u32) -> Option<String> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
             OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -1105,7 +1105,7 @@ impl ProcessResolver {
     }
 
     #[cfg(target_os = "linux")]
-    fn query_executable_path(pid: u32) -> Option<String> {
+    pub(crate) fn query_executable_path(pid: u32) -> Option<String> {
         std::fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
             .map(|p| p.to_string_lossy().into_owned())
@@ -1137,7 +1137,7 @@ impl ProcessResolver {
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
-    fn query_executable_path(_pid: u32) -> Option<String> {
+    pub(crate) fn query_executable_path(_pid: u32) -> Option<String> {
         None
     }
 }

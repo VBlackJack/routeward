@@ -27,7 +27,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
-const DEFAULT_FALLBACK_RULE_ID: &str = "default-policy";
+pub(crate) const DEFAULT_FALLBACK_RULE_ID: &str = "default-policy";
 const DEFAULT_FALLBACK_RULE_NAME: &str = "Default Profile Policy";
 const REGEX_PREFIX: &str = "regex:";
 /// Maximum number of compiled patterns kept per cache (user regexes and wildcard-derived
