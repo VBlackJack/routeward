@@ -1351,6 +1351,9 @@ pub struct UdpFragmentMeta {
     /// IPv6 later fragment whose fragment header announces another extension header: such a
     /// fragment may carry any protocol, so it is never dropped as an orphan.
     pub udp_confirmed: bool,
+    /// Packet offset of the UDP payload for a [`UdpFragmentKind::First`] fragment whose UDP header
+    /// was located; `None` otherwise.
+    pub udp_payload_offset: Option<usize>,
 }
 
 impl UdpFragmentMeta {
@@ -1444,6 +1447,7 @@ fn parse_ipv4_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
             dst_port: 0,
             fragment_id,
             udp_confirmed: true,
+            udp_payload_offset: None,
         });
     }
     let (src_port, dst_port) = read_udp_ports(packet, ihl)?;
@@ -1455,6 +1459,7 @@ fn parse_ipv4_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
         dst_port,
         fragment_id,
         udp_confirmed: true,
+        udp_payload_offset: Some(ihl + UDP_HEADER_LEN),
     })
 }
 
@@ -1571,6 +1576,7 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
                         dst_port: 0,
                         fragment_id,
                         udp_confirmed: hdr[0] == IPPROTO_UDP,
+                        udp_payload_offset: None,
                     });
                 }
                 // A first fragment that is detected but whose UDP header cannot be located is
@@ -1582,6 +1588,12 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
                     }
                     _ => (0, 0),
                 };
+                let udp_payload_offset = match payload {
+                    Ipv6FragmentPayload::Udp(udp_offset) if src_port != 0 || dst_port != 0 => {
+                        Some(udp_offset + UDP_HEADER_LEN)
+                    }
+                    _ => None,
+                };
                 return Some(UdpFragmentMeta {
                     kind: UdpFragmentKind::First,
                     src_ip,
@@ -1590,6 +1602,7 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
                     dst_port,
                     fragment_id,
                     udp_confirmed: true,
+                    udp_payload_offset,
                 });
             }
             _ => return None,

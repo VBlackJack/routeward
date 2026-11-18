@@ -36,9 +36,11 @@
 //!
 //! - [`DnsServerTracker::is_empty`]: `true` when no DNS server process is known. Check it first;
 //!   when it is `true` the whole feature costs one atomic load per packet.
-//! - [`DnsServerTracker::is_exempt_port`] `(proto, local_port)`: the local port of a UDP or TCP
-//!   socket owned by a DNS server process (rebuilt by every rescan from one UDP and one TCP table
-//!   dump; the IPv6 flag is ignored because a dual-stack socket sends IPv4 from the IPv6 table).
+//! - [`DnsServerTracker::exempt_port_owner`] `(proto, local_port, local_ip)`: the PID of the DNS
+//!   server process that owns the socket a packet comes from (rebuilt by every rescan from one UDP
+//!   and one TCP table dump). Rows keep their family and local address; an IPv6 row only covers
+//!   IPv4 packets when bound to `::` (a dual-stack socket).
+//! - [`DnsServerTracker::is_exempt_port`] `(proto, local_port)`: the port-only variant.
 //! - [`DnsServerTracker::is_exempt_pid`] `(pid)`: for a PID known from the socket-layer cache.
 //! - [`DnsServerTracker::is_exempt_flow`] `(proto, port, resolve_pid)`: the two above in one call,
 //!   with the PID lookup run only when the port alone did not decide.
@@ -185,9 +187,16 @@ pub struct DnsServerMatcher {
     entries: Vec<Entry>,
 }
 
-/// Lowercase key used to compare list entries (`!name` removals match a default by it).
-fn entry_key(raw: &str) -> String {
-    raw.trim().to_lowercase()
+/// Key used to compare list entries (`!name` removals match a default by it). On Windows the
+/// `%SystemRoot%` tokens are expanded and the path normalised first, so that
+/// `!C:\Windows\System32\dns.exe` removes the default `%SystemRoot%\System32\dns.exe`.
+fn entry_key(raw: &str, platform: ImagePlatform, system_root: &str) -> String {
+    match platform {
+        ImagePlatform::Windows => {
+            normalize_windows_image(&expand_system_root(raw.trim(), system_root))
+        }
+        ImagePlatform::Unix => raw.trim().to_lowercase(),
+    }
 }
 
 /// Normalises a Windows image path: lowercase, `\` separators, no `\\?\` prefix.
@@ -200,11 +209,17 @@ pub fn normalize_windows_image(path: &str) -> String {
 }
 
 /// Replaces `%SystemRoot%` and `%windir%` (any case) with `system_root`.
+///
+/// The search folds ASCII case only, so every byte offset found in the folded text is a valid
+/// offset of the original (Unicode lowercasing can change the byte length of a character).
 fn expand_system_root(raw: &str, system_root: &str) -> String {
     let mut out = raw.to_string();
     for token in SYSTEM_ROOT_TOKENS {
-        while let Some(pos) = out.to_lowercase().find(token) {
+        let mut from = 0;
+        while let Some(rel) = out[from..].to_ascii_lowercase().find(token) {
+            let pos = from + rel;
             out.replace_range(pos..pos + token.len(), system_root);
+            from = pos + system_root.len();
         }
     }
     out
@@ -325,11 +340,11 @@ impl DnsServerMatcher {
         let removed: HashSet<String> = user
             .iter()
             .filter_map(|raw| raw.trim().strip_prefix('!'))
-            .map(entry_key)
+            .map(|name| entry_key(name, platform, system_root))
             .collect();
         let mut entries: Vec<Entry> = Vec::new();
         for raw in defaults {
-            if removed.contains(&entry_key(raw)) {
+            if removed.contains(&entry_key(raw, platform, system_root)) {
                 continue;
             }
             if let Some(pattern) = classify(raw, platform, system_root, Origin::Default) {
@@ -338,7 +353,7 @@ impl DnsServerMatcher {
         }
         let mut seen: HashSet<String> = HashSet::new();
         for raw in user {
-            if raw.trim().starts_with('!') || !seen.insert(entry_key(raw)) {
+            if raw.trim().starts_with('!') || !seen.insert(entry_key(raw, platform, system_root)) {
                 continue;
             }
             if is_bare_wildcard(raw.trim()) {
@@ -665,12 +680,54 @@ pub fn parse_status_euid(status: &str) -> Option<u32> {
 struct TrackerState {
     /// Matched process ids with their image basename.
     pids: HashMap<u32, String>,
-    udp_ports: HashSet<u16>,
-    tcp_ports: HashSet<u16>,
+    udp_ports: HashMap<u16, Vec<ExemptSocket>>,
+    tcp_ports: HashMap<u16, Vec<ExemptSocket>>,
     uids: UidSets,
 }
 
+/// A local socket of a DNS server process: its owner and the address it is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ExemptSocket {
+    pid: u32,
+    ip: IpAddr,
+}
+
+impl ExemptSocket {
+    /// `true` when a packet sent from `local_ip` can come from this socket. A socket matches its
+    /// own address family, or its wildcard address; an IPv6 row also covers IPv4 packets, but only
+    /// when bound to `::` (a dual-stack socket sends IPv4 from the IPv6 table).
+    fn covers(&self, local_ip: IpAddr) -> bool {
+        match (self.ip, local_ip) {
+            (IpAddr::V4(sock), IpAddr::V4(local)) => sock.is_unspecified() || sock == local,
+            (IpAddr::V6(sock), IpAddr::V6(local)) => sock.is_unspecified() || sock == local,
+            (IpAddr::V6(sock), IpAddr::V4(_)) => sock.is_unspecified(),
+            (IpAddr::V4(_), IpAddr::V6(_)) => false,
+        }
+    }
+}
+
 impl TrackerState {
+    fn ports(&self, proto: DnsProto) -> &HashMap<u16, Vec<ExemptSocket>> {
+        match proto {
+            DnsProto::Udp => &self.udp_ports,
+            DnsProto::Tcp => &self.tcp_ports,
+        }
+    }
+
+    #[cfg(any(test, windows))]
+    fn add_socket(&mut self, proto: DnsProto, port: u16, pid: u32, ip: IpAddr) {
+        let map = match proto {
+            DnsProto::Udp => &mut self.udp_ports,
+            DnsProto::Tcp => &mut self.tcp_ports,
+        };
+        let sockets = map.entry(port).or_default();
+        let socket = ExemptSocket { pid, ip };
+        if !sockets.contains(&socket) {
+            sockets.push(socket);
+            sockets.sort();
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.pids.is_empty()
             && self.udp_ports.is_empty()
@@ -695,6 +752,8 @@ struct TrackerInner {
     announced: Mutex<HashSet<u32>>,
     warned_uids: Mutex<HashSet<u32>>,
     applied_uids: Mutex<UidSets>,
+    /// Serialises a scan, its application and the firewall sync (see [`DnsServerTracker::lock_sync`]).
+    sync_lock: Mutex<()>,
     telemetry: TelemetryHub,
 }
 
@@ -720,6 +779,7 @@ impl DnsServerTracker {
                 announced: Mutex::new(HashSet::new()),
                 warned_uids: Mutex::new(HashSet::new()),
                 applied_uids: Mutex::new(UidSets::default()),
+                sync_lock: Mutex::new(()),
                 telemetry,
             }),
         }
@@ -741,11 +801,24 @@ impl DnsServerTracker {
         if self.is_empty() {
             return false;
         }
-        let state = self.inner.state.read();
-        match proto {
-            DnsProto::Udp => state.udp_ports.contains(&port),
-            DnsProto::Tcp => state.tcp_ports.contains(&port),
+        self.inner.state.read().ports(proto).contains_key(&port)
+    }
+
+    /// The PID of the DNS server process that owns the socket a packet from `local_ip:port` comes
+    /// from, when there is one. Rows are kept per address family: an IPv4 socket never matches an
+    /// IPv6 packet, an IPv6 row only matches an IPv4 packet when bound to `::`, and a socket bound
+    /// to one address never matches a packet sent from another.
+    pub fn exempt_port_owner(&self, proto: DnsProto, port: u16, local_ip: IpAddr) -> Option<u32> {
+        if self.is_empty() {
+            return None;
         }
+        let state = self.inner.state.read();
+        state
+            .ports(proto)
+            .get(&port)?
+            .iter()
+            .find(|socket| socket.covers(local_ip))
+            .map(|socket| socket.pid)
     }
 
     /// `true` when `pid` is a known DNS server process.
@@ -792,6 +865,14 @@ impl DnsServerTracker {
         self.inner.active.store(true, Ordering::Relaxed);
         self.announce(pid, &name);
         true
+    }
+
+    /// Takes the lock that serialises "scan, apply, sync the firewall" with a firewall reload that
+    /// builds its batch from [`uid_sets`](Self::uid_sets) and then calls
+    /// [`mark_uid_sets_applied`](Self::mark_uid_sets_applied). Not reentrant: never call
+    /// [`refresh`](Self::refresh)-driven code from a holder.
+    pub fn lock_sync(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.sync_lock.lock()
     }
 
     /// The user ids currently exempt (Linux; always empty elsewhere).
@@ -918,9 +999,7 @@ fn scan(matcher: &DnsServerMatcher, _is_blocked: &dyn Fn(&ProcessIdentity) -> bo
     let pids = windows_matching_processes(matcher);
     let mut state = TrackerState::default();
     if !pids.is_empty() {
-        let (udp, tcp) = windows_ports_of(&pids);
-        state.udp_ports = udp;
-        state.tcp_ports = tcp;
+        windows_ports_of(&pids, &mut state);
         state.pids = pids;
     }
     ScanResult {
@@ -981,11 +1060,11 @@ fn windows_matching_processes(matcher: &DnsServerMatcher) -> HashMap<u32, String
     found
 }
 
-/// One UDP and one TCP table dump (IPv4 and IPv6) reduced to the local ports owned by `pids`.
-/// The IPv6 flag is dropped on purpose: a dual-stack socket appears in the IPv6 table but sends
-/// IPv4 packets.
+/// One UDP and one TCP table dump (IPv4 and IPv6) reduced to the local sockets owned by `pids`.
+/// Every row keeps its family and local address: a dual-stack socket appears in the IPv6 table
+/// bound to `::` while it sends IPv4 packets, and [`ExemptSocket::covers`] accounts for that.
 #[cfg(windows)]
-fn windows_ports_of(pids: &HashMap<u32, String>) -> (HashSet<u16>, HashSet<u16>) {
+fn windows_ports_of(pids: &HashMap<u32, String>, state: &mut TrackerState) {
     use crate::process::ProcessResolver;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
@@ -996,23 +1075,22 @@ fn windows_ports_of(pids: &HashMap<u32, String>) -> (HashSet<u16>, HashSet<u16>)
     fn collect<R>(
         buffer: Option<Vec<u8>>,
         pids: &HashMap<u32, String>,
-        out: &mut HashSet<u16>,
-        row_port_pid: impl Fn(&R) -> (u32, u32),
+        proto: DnsProto,
+        state: &mut TrackerState,
+        row_socket: impl Fn(&R) -> (IpAddr, u32, u32),
     ) {
         let Some(buffer) = buffer else {
             return;
         };
         let rows: &[R] = unsafe { ProcessResolver::iphelper_rows::<R>(&buffer) };
         for row in rows {
-            let (raw_port, pid) = row_port_pid(row);
+            let (ip, raw_port, pid) = row_socket(row);
             if pids.contains_key(&pid) {
-                out.insert(u16::from_be((raw_port & 0xFFFF) as u16));
+                state.add_socket(proto, u16::from_be((raw_port & 0xFFFF) as u16), pid, ip);
             }
         }
     }
 
-    let mut udp = HashSet::new();
-    let mut tcp = HashSet::new();
     for family in [AF_INET as u32, AF_INET6 as u32] {
         let udp_buffer = ProcessResolver::query_iphelper_buffer(|ptr, size| unsafe {
             GetExtendedUdpTable(ptr as *mut _, size, 0, family, UDP_TABLE_OWNER_PID, 0)
@@ -1021,22 +1099,29 @@ fn windows_ports_of(pids: &HashMap<u32, String>) -> (HashSet<u16>, HashSet<u16>)
             GetExtendedTcpTable(ptr as *mut _, size, 0, family, TCP_TABLE_OWNER_PID_ALL, 0)
         });
         if family == AF_INET as u32 {
-            collect::<MIB_UDPROW_OWNER_PID>(udp_buffer, pids, &mut udp, |r| {
-                (r.dwLocalPort, r.dwOwningPid)
+            collect::<MIB_UDPROW_OWNER_PID>(udp_buffer, pids, DnsProto::Udp, state, |r| {
+                (
+                    IpAddr::from(r.dwLocalAddr.to_ne_bytes()),
+                    r.dwLocalPort,
+                    r.dwOwningPid,
+                )
             });
-            collect::<MIB_TCPROW_OWNER_PID>(tcp_buffer, pids, &mut tcp, |r| {
-                (r.dwLocalPort, r.dwOwningPid)
+            collect::<MIB_TCPROW_OWNER_PID>(tcp_buffer, pids, DnsProto::Tcp, state, |r| {
+                (
+                    IpAddr::from(r.dwLocalAddr.to_ne_bytes()),
+                    r.dwLocalPort,
+                    r.dwOwningPid,
+                )
             });
         } else {
-            collect::<MIB_UDP6ROW_OWNER_PID>(udp_buffer, pids, &mut udp, |r| {
-                (r.dwLocalPort, r.dwOwningPid)
+            collect::<MIB_UDP6ROW_OWNER_PID>(udp_buffer, pids, DnsProto::Udp, state, |r| {
+                (IpAddr::from(r.ucLocalAddr), r.dwLocalPort, r.dwOwningPid)
             });
-            collect::<MIB_TCP6ROW_OWNER_PID>(tcp_buffer, pids, &mut tcp, |r| {
-                (r.dwLocalPort, r.dwOwningPid)
+            collect::<MIB_TCP6ROW_OWNER_PID>(tcp_buffer, pids, DnsProto::Tcp, state, |r| {
+                (IpAddr::from(r.ucLocalAddr), r.dwLocalPort, r.dwOwningPid)
             });
         }
     }
-    (udp, tcp)
 }
 
 #[cfg(test)]
@@ -1044,7 +1129,7 @@ mod tests {
     use super::*;
     use crate::config::{PortRange, SystemConstants};
     use std::cell::Cell;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     const WIN_ROOT: &str = r"C:\Windows";
 
@@ -1232,6 +1317,43 @@ mod tests {
         assert!(!win.matches_image(r"C:\Windows\System32\dns.exe"));
         let other = unix_matcher(&["!dns"]);
         assert!(other.matches_image("/usr/sbin/dnsmasq"));
+    }
+
+    #[test]
+    fn bang_entry_matches_a_default_after_system_root_expansion() {
+        let win = windows_matcher(&[r"!C:\Windows\System32\dns.exe"]);
+        assert!(!win.matches_image(r"C:\Windows\System32\dns.exe"));
+        let slashes = windows_matcher(&[r"!c:/windows/system32/DNS.EXE"]);
+        assert!(!slashes.matches_image(r"C:\Windows\System32\dns.exe"));
+        let windir = windows_matcher(&[r"!%windir%\System32\dns.exe"]);
+        assert!(!windir.matches_image(r"C:\Windows\System32\dns.exe"));
+        // A different directory does not remove the default.
+        let other = windows_matcher(&[r"!D:\Windows\System32\dns.exe"]);
+        assert!(other.matches_image(r"C:\Windows\System32\dns.exe"));
+    }
+
+    #[test]
+    fn system_root_expansion_never_panics_on_unicode_case_changes() {
+        // U+0130 lowercases to two characters and U+212A (Kelvin sign) to one ASCII letter, both
+        // changing the byte length of the text: offsets found in a folded copy would be wrong.
+        for raw in [
+            "\u{130}%SystemRoot%",
+            "\u{212A}%SystemRoot%",
+            r"%SystemRoot%\System32\dns.exe",
+            "\u{130}%SystemRoot%\\System32\\dns.exe",
+            "\u{212A}%WINDIR%\u{130}%windir%",
+        ] {
+            let out = expand_system_root(raw, WIN_ROOT);
+            assert!(!out.to_ascii_lowercase().contains("%systemroot%"));
+            assert!(!out.to_ascii_lowercase().contains("%windir%"));
+            assert!(out.contains(WIN_ROOT));
+            assert!(validate_entries(&[raw.to_string()]).is_ok());
+            let _ = windows_matcher(&[raw]);
+        }
+        assert_eq!(
+            expand_system_root(r"%SYSTEMROOT%\a;%WinDir%", WIN_ROOT),
+            r"C:\Windows\a;C:\Windows"
+        );
     }
 
     #[test]
@@ -1454,8 +1576,8 @@ mod tests {
         let t = tracker();
         let mut state = TrackerState::default();
         state.pids.insert(7, "dns.exe".to_string());
-        state.udp_ports.insert(53100);
-        state.tcp_ports.insert(53);
+        state.add_socket(DnsProto::Udp, 53100, 7, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        state.add_socket(DnsProto::Tcp, 53, 7, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert!(t.apply(ScanResult {
             state,
             refusals: Vec::new()
@@ -1476,6 +1598,61 @@ mod tests {
         assert!(t.apply(ScanResult::default()));
         assert!(t.is_empty());
         assert!(!t.apply(ScanResult::default()));
+    }
+
+    fn tracker_with_sockets(sockets: &[(DnsProto, u16, u32, IpAddr)]) -> DnsServerTracker {
+        let t = tracker();
+        let mut state = TrackerState::default();
+        for (proto, port, pid, ip) in sockets {
+            state.pids.insert(*pid, "dns.exe".to_string());
+            state.add_socket(*proto, *port, *pid, *ip);
+        }
+        assert!(t.apply(ScanResult {
+            state,
+            refusals: Vec::new()
+        }));
+        t
+    }
+
+    #[test]
+    fn port_owner_keeps_the_pid_of_the_matching_socket() {
+        let v4: IpAddr = Ipv4Addr::new(192, 0, 2, 10).into();
+        let t = tracker_with_sockets(&[(DnsProto::Udp, 53100, 7, Ipv4Addr::UNSPECIFIED.into())]);
+        assert_eq!(t.exempt_port_owner(DnsProto::Udp, 53100, v4), Some(7));
+        assert_eq!(t.exempt_port_owner(DnsProto::Udp, 53101, v4), None);
+        assert_eq!(t.exempt_port_owner(DnsProto::Tcp, 53100, v4), None);
+        assert_eq!(
+            t.exempt_port_owner(DnsProto::Udp, 53100, Ipv6Addr::LOCALHOST.into()),
+            None,
+            "an IPv4 socket never owns an IPv6 packet"
+        );
+    }
+
+    #[test]
+    fn ipv6_row_covers_ipv4_packets_only_when_bound_to_the_wildcard() {
+        let v4: IpAddr = Ipv4Addr::new(192, 0, 2, 10).into();
+        let v6: IpAddr = "2001:db8::10".parse::<Ipv6Addr>().unwrap().into();
+        let dual = tracker_with_sockets(&[(DnsProto::Udp, 53100, 7, Ipv6Addr::UNSPECIFIED.into())]);
+        assert_eq!(dual.exempt_port_owner(DnsProto::Udp, 53100, v4), Some(7));
+        assert_eq!(dual.exempt_port_owner(DnsProto::Udp, 53100, v6), Some(7));
+        let only = tracker_with_sockets(&[(DnsProto::Udp, 53100, 7, v6)]);
+        assert_eq!(
+            only.exempt_port_owner(DnsProto::Udp, 53100, v4),
+            None,
+            "an IPv6-only socket must not exempt an IPv4 flow on the same port number"
+        );
+        assert_eq!(only.exempt_port_owner(DnsProto::Udp, 53100, v6), Some(7));
+        let other_v6: IpAddr = "2001:db8::11".parse::<Ipv6Addr>().unwrap().into();
+        assert_eq!(only.exempt_port_owner(DnsProto::Udp, 53100, other_v6), None);
+    }
+
+    #[test]
+    fn socket_bound_to_one_address_does_not_cover_another_local_address() {
+        let bound: IpAddr = Ipv4Addr::new(192, 0, 2, 10).into();
+        let other: IpAddr = Ipv4Addr::new(192, 0, 2, 11).into();
+        let t = tracker_with_sockets(&[(DnsProto::Tcp, 53, 7, bound)]);
+        assert_eq!(t.exempt_port_owner(DnsProto::Tcp, 53, bound), Some(7));
+        assert_eq!(t.exempt_port_owner(DnsProto::Tcp, 53, other), None);
     }
 
     #[test]

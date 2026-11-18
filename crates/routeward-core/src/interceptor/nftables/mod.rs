@@ -307,6 +307,9 @@ impl Interceptor for NftablesInterceptor {
         };
         Self::set_fake_ip_guard_net(fake_ip_net);
 
+        // Held until this function returns: the batch is built from the tracker's sets and the sets
+        // are marked applied, with no scan landing in between.
+        let _dns_sync = controller.dns_server_tracker.lock_sync();
         let dns_uid_sets = controller.dns_server_tracker.uid_sets();
         let mut ipv6_tproxy_active = false;
         let mut ip6_ruleset = Self::build_nft_ip6_table_ruleset_with_tproxy(
@@ -626,6 +629,9 @@ impl Interceptor for NftablesInterceptor {
             }
         }
 
+        // Held until this function returns: the batch is built from the tracker's sets and the sets
+        // are marked applied, with no scan landing in between.
+        let _dns_sync = controller.dns_server_tracker.lock_sync();
         let dns_uid_sets = controller.dns_server_tracker.uid_sets();
         let mut atomic_batch = if ipv6_tproxy_active {
             Self::build_atomic_replace_ruleset_dual_stack(

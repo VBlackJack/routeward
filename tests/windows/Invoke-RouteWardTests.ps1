@@ -3615,8 +3615,15 @@ try {
             $profileOriginalJsonZ = ($stateObjZ.profile | ConvertTo-Json -Depth 10 -Compress)
             try {
                 $profileZ = $profileOriginalJsonZ | ConvertFrom-Json
-                $profileZ.dnsConfig | Add-Member -NotePropertyName "dnsServerProcesses" -NotePropertyValue @($nslookupPathZ) -Force
-                $tempProfileFileZ = Write-Utf8NoBomJsonTempFile -JsonText ($profileZ | ConvertTo-Json -Depth 10 -Compress)
+                # A typed string[] property serializes as a JSON array on Windows PowerShell 5.1 and
+                # PowerShell 7 alike; the JSON text is checked because a bare string would be refused
+                # by the daemon.
+                $profileZ.dnsConfig | Add-Member -NotePropertyName "dnsServerProcesses" -NotePropertyValue ([string[]]@($nslookupPathZ)) -Force
+                $profileJsonZ = $profileZ | ConvertTo-Json -Depth 10 -Compress
+                if ($profileJsonZ -notmatch '"dnsServerProcesses"\s*:\s*\[') {
+                    throw "Scenario (z) fixture error: dnsServerProcesses was not serialized as a JSON array."
+                }
+                $tempProfileFileZ = Write-Utf8NoBomJsonTempFile -JsonText $profileJsonZ
                 $replaceResZ = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("replace-profile", "--json-file", $tempProfileFileZ) -Label "Scenario-z-replace-profile"
                 if ($replaceResZ.ExitCode -ne 0) {
                     throw "ctl replace-profile with dnsServerProcesses failed (exit=$($replaceResZ.ExitCode)): $($replaceResZ.RawText)"
@@ -3624,9 +3631,15 @@ try {
                 $profileReplacedZ = $true
                 Start-Sleep -Milliseconds $PollIntervalMs
 
+                # The exemption is applied by a helper thread that may trail the first query: retry
+                # while the answer is missing or still inside the Fake-IP pool, a bounded number of
+                # times with a short wait.
+                $maxAttemptsZ = 5
+                $retryWaitMsZ = 1000
                 $nslookupIpsZ = @()
                 $nslookupTextZ = ""
-                for ($attemptZ = 1; $attemptZ -le 2 -and $nslookupIpsZ.Count -eq 0; $attemptZ++) {
+                $anyFakeZ = $false
+                for ($attemptZ = 1; $attemptZ -le $maxAttemptsZ; $attemptZ++) {
                     $prevEapZ = $ErrorActionPreference
                     $ErrorActionPreference = "Continue"
                     try {
@@ -3635,11 +3648,17 @@ try {
                         $ErrorActionPreference = $prevEapZ
                     }
                     $nslookupIpsZ = @(Get-NslookupAnswerAddresses -OutputText $nslookupTextZ)
-                }
-                $anyFakeZ = $false
-                foreach ($ipZ in $nslookupIpsZ) {
-                    if (Test-IpInFakePool -IpAddressString $ipZ -PoolCidr $FakeIpCidr) {
-                        $anyFakeZ = $true
+                    $anyFakeZ = $false
+                    foreach ($ipZ in $nslookupIpsZ) {
+                        if (Test-IpInFakePool -IpAddressString $ipZ -PoolCidr $FakeIpCidr) {
+                            $anyFakeZ = $true
+                        }
+                    }
+                    if ($nslookupIpsZ.Count -gt 0 -and (-not $anyFakeZ)) {
+                        break
+                    }
+                    if ($attemptZ -lt $maxAttemptsZ) {
+                        Start-Sleep -Milliseconds $retryWaitMsZ
                     }
                 }
 
@@ -3661,7 +3680,9 @@ try {
                 $dnsExeDetailZ = "dns.exe check skipped (DNS Server service not running)"
                 $dnsExeFailZ = $false
                 $dnsServiceZ = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
-                if ($null -ne $dnsServiceZ -and $dnsServiceZ.Status -eq "Running") {
+                if ($null -ne $dnsServiceZ -and $dnsServiceZ.Status -eq "Running" -and -not (Get-Command -Name "Clear-DnsServerCache" -ErrorAction SilentlyContinue)) {
+                    $dnsExeDetailZ = "dns.exe check SKIP (Clear-DnsServerCache cmdlet not available)"
+                } elseif ($null -ne $dnsServiceZ -and $dnsServiceZ.Status -eq "Running") {
                     $null = Clear-DnsServerCache -Force -ErrorAction Stop
                     $dnsExeRecordsZ = @(Resolve-DnsName -Name $PublicDnsTestDomain -Type A -Server "127.0.0.1" -DnsOnly -NoHostsFile -ErrorAction Stop | Where-Object { $null -ne $_.IPAddress })
                     $dnsExeIpsZ = @($dnsExeRecordsZ | ForEach-Object { [string]$_.IPAddress })

@@ -176,6 +176,8 @@ Edit `dnsConfig.dnsServerProcesses` in the profile (omitted from the JSON when e
 - Reading `/proc/<pid>/exe` of other users' processes needs `CAP_SYS_PTRACE`, which the shipped systemd unit grants. Without it a DNS server of another user is not recognised.
 - In IPv6 guard mode (no IPv6 NAT), raw IPv6 port `53` is dropped, so an exempt server cannot recurse over IPv6 either.
 - A Block rule on Linux acts on the whole user id: write it with `processPatterns` only (no port or address condition).
+- A server that opens its sockets as `root` and only then drops privileges keeps the sockets it opened before the switch under uid 0: those sockets are not exempt.
+- A DNS server started after a scan can still receive Fake-IP answers for up to `dns.dnsServerProcessScanIntervalMs` (5 s by default) until the next rescan recognises it.
 
 **Windows limits**:
 - Only the System32 `dns.exe` is exempt by default. The process list is rescanned every `dns.dnsServerProcessScanIntervalMs` (5 s) and at every profile reload; a restarted `dns.exe` is also recognised at once from its first socket event.

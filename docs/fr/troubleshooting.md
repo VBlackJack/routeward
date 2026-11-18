@@ -176,6 +176,8 @@ Modifier `dnsConfig.dnsServerProcesses` dans le profil (champ omis du JSON quand
 - Lire `/proc/<pid>/exe` des processus d'autres utilisateurs exige `CAP_SYS_PTRACE`, que l'unité systemd fournie accorde. Sans elle, un serveur DNS d'un autre utilisateur n'est pas reconnu.
 - En mode garde IPv6 (pas de NAT IPv6), le port `53` IPv6 brut est rejeté : un serveur exempté ne peut donc pas non plus faire sa récursion en IPv6.
 - Une règle Block sous Linux agit sur tout l'identifiant utilisateur : la rédiger avec `processPatterns` seul (sans condition de port ni d'adresse).
+- Un serveur qui ouvre ses sockets en `root` puis abandonne ses privilèges conserve l'uid 0 sur les sockets ouverts avant le changement : ces sockets ne sont pas exemptés.
+- Un serveur DNS démarré après une analyse peut encore recevoir des réponses Fake-IP pendant au plus `dns.dnsServerProcessScanIntervalMs` (5 s par défaut), jusqu'à la prochaine analyse qui le reconnaît.
 
 **Limites sous Windows** :
 - Seul le `dns.exe` de System32 est exempté par défaut. La liste des processus est réanalysée toutes les `dns.dnsServerProcessScanIntervalMs` (5 s) et à chaque rechargement du profil ; un `dns.exe` redémarré est aussi reconnu aussitôt, dès son premier événement de socket.

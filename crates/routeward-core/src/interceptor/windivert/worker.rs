@@ -72,7 +72,7 @@ impl WinDivertInterceptor {
     fn dns_server_flow_action(
         ctrl: &RouteWardController,
         proto: DnsProto,
-        ipv6: bool,
+        src_ip: IpAddr,
         src_port: u16,
         resolved_pid: Option<u32>,
         dst: IpAddr,
@@ -86,6 +86,7 @@ impl WinDivertInterceptor {
             DnsProto::Tcp => IPPROTO_TCP,
         };
         // A dual-stack socket is reported on the IPv6 family while it may send IPv4: look at both.
+        let ipv6 = src_ip.is_ipv6();
         let pid = resolved_pid.or_else(|| {
             [ipv6, !ipv6].into_iter().find_map(|v6| {
                 ctrl.nat_table
@@ -94,17 +95,16 @@ impl WinDivertInterceptor {
             })
         });
         // A known owner decides alone: a port left in the set by a closed socket must not exempt
-        // another process that reused the number before the next rescan.
-        let exempt = match pid {
-            Some(pid) => tracker.is_exempt_pid(pid),
-            None => tracker.is_exempt_port(proto, src_port),
+        // another process that reused the number before the next rescan. Without a known owner,
+        // the socket table owner of the port (matched on family and local address) decides.
+        let owner = match pid {
+            Some(pid) => tracker.is_exempt_pid(pid).then_some(pid),
+            None => tracker.exempt_port_owner(proto, src_port, src_ip),
         };
-        if !exempt {
-            return None;
-        }
-        let identity = pid
-            .map(|pid| ctrl.process_resolver.resolve_by_pid(pid))
-            .unwrap_or_default();
+        let owner = owner?;
+        // The owner PID resolves the real process, so an explicit Block rule that names the DNS
+        // server still matches and the logs show its PID and name.
+        let identity = ctrl.process_resolver.resolve_by_pid(owner);
         let block_rule = {
             let prof = ctrl.profile.read();
             dns_server_block_rule(&prof.rules, &prof.default_action, &identity, dst, proto)
@@ -152,6 +152,7 @@ impl WinDivertInterceptor {
         net_handle: *mut c_void,
         packet: &[u8],
         addr: &WinDivertAddress,
+        src_ip: IpAddr,
         src_port: u16,
         dst: IpAddr,
         payload: &[u8],
@@ -159,8 +160,7 @@ impl WinDivertInterceptor {
         if !is_dns_query_header(payload) {
             return false;
         }
-        match Self::dns_server_flow_action(ctrl, DnsProto::Udp, dst.is_ipv6(), src_port, None, dst)
-        {
+        match Self::dns_server_flow_action(ctrl, DnsProto::Udp, src_ip, src_port, None, dst) {
             None => false,
             Some(DnsServerFlowAction::Pass) => {
                 Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
@@ -181,18 +181,14 @@ impl WinDivertInterceptor {
         packet: &[u8],
         addr: &WinDivertAddress,
         flow_key: &crate::interceptor::nat::OutboundFlowKey,
+        src_ip: IpAddr,
         src_port: u16,
         dst: IpAddr,
         resolved_pid: Option<u32>,
     ) -> bool {
-        let Some(action) = Self::dns_server_flow_action(
-            ctrl,
-            DnsProto::Tcp,
-            dst.is_ipv6(),
-            src_port,
-            resolved_pid,
-            dst,
-        ) else {
+        let Some(action) =
+            Self::dns_server_flow_action(ctrl, DnsProto::Tcp, src_ip, src_port, resolved_pid, dst)
+        else {
             return false;
         };
         ctrl.nat_table.remove_session_by_flow(flow_key);
@@ -314,6 +310,98 @@ impl WinDivertInterceptor {
         }
     }
 
+    /// Case B guard (IPv4): a SYN whose flow key already has a NAT session must still meet the DNS
+    /// server handling first, otherwise the stale session reflects it to the relay and the session
+    /// is never removed. `true` when the SYN was consumed.
+    #[cfg(windows)]
+    fn dns_server_syn_before_session(
+        ctrl: &RouteWardController,
+        api: &WinDivertApi,
+        net_handle: *mut c_void,
+        packet: &[u8],
+        addr: &WinDivertAddress,
+        meta: &Ipv4TcpPacketMeta,
+    ) -> bool {
+        if !meta.is_syn_only()
+            || meta.dst_port != ctrl.constants.dns.dns_standard_port
+            || ctrl.dns_server_tracker.is_empty()
+            || ctrl.nat_table.is_self_tcp_port(meta.src_port)
+        {
+            return false;
+        }
+        let pid_opt = ctrl
+            .nat_table
+            .try_resolve_pid_nonblocking(
+                SocketKey::new(IPPROTO_TCP, false, meta.src_port),
+                ProcessResolver::find_pid_for_tcp_port,
+            )
+            .map(|(pid, _)| pid);
+        if ctrl.nat_table.is_self_pid(pid_opt)
+            || meta.dst_ip.is_loopback()
+            || meta.dst_ip.is_multicast()
+            || meta.dst_ip.is_unspecified()
+        {
+            return false;
+        }
+        Self::handle_dns_server_syn(
+            ctrl,
+            api,
+            net_handle,
+            packet,
+            addr,
+            &meta.outbound_flow_key(),
+            IpAddr::V4(meta.src_ip),
+            meta.src_port,
+            IpAddr::V4(meta.dst_ip),
+            pid_opt,
+        )
+    }
+
+    /// IPv6 twin of [`Self::dns_server_syn_before_session`].
+    #[cfg(windows)]
+    fn dns_server_syn_before_session_v6(
+        ctrl: &RouteWardController,
+        api: &WinDivertApi,
+        net_handle: *mut c_void,
+        packet: &[u8],
+        addr: &WinDivertAddress,
+        meta: &Ipv6TransportPacketMeta,
+    ) -> bool {
+        if !meta.is_syn_only()
+            || meta.dst_port != ctrl.constants.dns.dns_standard_port
+            || ctrl.dns_server_tracker.is_empty()
+            || ctrl.nat_table.is_self_tcp_port(meta.src_port)
+        {
+            return false;
+        }
+        let pid_opt = ctrl
+            .nat_table
+            .try_resolve_pid_nonblocking(
+                SocketKey::new(IPPROTO_TCP, true, meta.src_port),
+                ProcessResolver::find_pid_for_tcp_port,
+            )
+            .map(|(pid, _)| pid);
+        if ctrl.nat_table.is_self_pid(pid_opt)
+            || meta.dst_ip.is_loopback()
+            || meta.dst_ip.is_multicast()
+            || meta.dst_ip.is_unspecified()
+        {
+            return false;
+        }
+        Self::handle_dns_server_syn(
+            ctrl,
+            api,
+            net_handle,
+            packet,
+            addr,
+            &meta.outbound_flow_key(),
+            IpAddr::V6(meta.src_ip),
+            meta.src_port,
+            IpAddr::V6(meta.dst_ip),
+            pid_opt,
+        )
+    }
+
     #[cfg(windows)]
     pub(super) fn dispatch_resolved_syn(
         ctrl: &RouteWardController,
@@ -331,6 +419,10 @@ impl WinDivertInterceptor {
 
         // A DNS server process gets real answers: its TCP port-53 flows never enter the relay.
         if meta.dst_port == dns_port
+            && !ctrl.nat_table.is_self_pid(pid_opt)
+            && !meta.dst_ip.is_loopback()
+            && !meta.dst_ip.is_multicast()
+            && !meta.dst_ip.is_unspecified()
             && Self::handle_dns_server_syn(
                 ctrl,
                 api,
@@ -338,6 +430,7 @@ impl WinDivertInterceptor {
                 packet,
                 addr,
                 &meta.outbound_flow_key(),
+                IpAddr::V4(meta.src_ip),
                 meta.src_port,
                 IpAddr::V4(meta.dst_ip),
                 pid_opt,
@@ -756,6 +849,7 @@ impl WinDivertInterceptor {
                 packet,
                 addr,
                 &meta.outbound_flow_key(),
+                IpAddr::V6(meta.src_ip),
                 meta.src_port,
                 IpAddr::V6(meta.dst_ip),
                 pid_opt,
@@ -1155,7 +1249,7 @@ impl WinDivertInterceptor {
                 .lookup_udp_fragment_verdict(&frag.key())
                 .unwrap_or_else(|| decide_orphan_fragment(ctrl, frag)),
             UdpFragmentKind::First => {
-                let verdict = Self::first_udp_fragment_verdict(ctrl, frag);
+                let verdict = Self::first_udp_fragment_verdict(ctrl, packet, frag);
                 ctrl.nat_table
                     .record_udp_fragment_verdict(frag.key(), verdict);
                 verdict
@@ -1168,6 +1262,7 @@ impl WinDivertInterceptor {
 
     fn first_udp_fragment_verdict(
         ctrl: &RouteWardController,
+        packet: &[u8],
         frag: &UdpFragmentMeta,
     ) -> UdpFragmentVerdict {
         let ipv6 = frag.src_ip.is_ipv6();
@@ -1188,12 +1283,17 @@ impl WinDivertInterceptor {
             return UdpFragmentVerdict::Reinject;
         }
 
-        // A first fragment of a DNS server query follows the same rule as an unfragmented one.
-        if frag.dst_port == ctrl.constants.dns.dns_standard_port {
+        // A first fragment of a DNS server query follows the same rule as an unfragmented one,
+        // including the DNS header check: a response or a short payload is not a query.
+        let is_dns_query = frag
+            .udp_payload_offset
+            .and_then(|offset| packet.get(offset..))
+            .is_some_and(is_dns_query_header);
+        if frag.dst_port == ctrl.constants.dns.dns_standard_port && is_dns_query {
             match Self::dns_server_flow_action(
                 ctrl,
                 DnsProto::Udp,
-                ipv6,
+                frag.src_ip,
                 frag.src_port,
                 pid_opt,
                 frag.dst_ip,
@@ -1529,6 +1629,7 @@ impl WinDivertInterceptor {
                                 handle,
                                 &packet[..pkt_len],
                                 &addr,
+                                IpAddr::V6(v6_meta.src_ip),
                                 v6_meta.src_port,
                                 IpAddr::V6(v6_meta.dst_ip),
                                 &packet[v6_meta.payload_offset
@@ -1671,6 +1772,11 @@ impl WinDivertInterceptor {
                                     0,
                                 );
                             }
+                        } else if Self::dns_server_syn_before_session_v6(
+                            &ctrl_net, &api, handle, packet, &addr, &v6_meta,
+                        ) {
+                            // Case B0 (IPv6): see the IPv4 twin.
+                            continue;
                         } else if let Some(existing_session) = ctrl_net
                             .nat_table
                             .get_session_by_flow(&v6_meta.outbound_flow_key())
@@ -1918,6 +2024,7 @@ impl WinDivertInterceptor {
                                 handle,
                                 &packet[..pkt_len],
                                 &addr,
+                                IpAddr::V4(udp_meta.src_ip),
                                 udp_meta.src_port,
                                 IpAddr::V4(udp_meta.dst_ip),
                                 &packet[udp_meta.payload_offset
@@ -2105,6 +2212,12 @@ impl WinDivertInterceptor {
                                 0,
                             );
                         }
+                    } else if Self::dns_server_syn_before_session(
+                        &ctrl_net, &api, handle, packet, &addr, &meta,
+                    ) {
+                        // Case B0: a DNS server SYN reusing a flow key that still has a stale
+                        // session: the handler removed the session and sent the SYN unmodified.
+                        continue;
                     } else if let Some(existing_session) = ctrl_net
                         .nat_table
                         .get_session_by_flow(&meta.outbound_flow_key())

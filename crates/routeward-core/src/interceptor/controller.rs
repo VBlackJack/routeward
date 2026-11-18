@@ -1972,6 +1972,10 @@ impl RouteWardController {
     /// Rescans the DNS server processes and, on Linux, pushes the user id sets to the firewall.
     /// Blocking: run it from a blocking context.
     pub fn refresh_dns_server_tracker(&self) {
+        // One scan + apply + firewall sync at a time, and never concurrently with a firewall
+        // reload: an old-matcher scan must not land after a reload, and the applied-sets marker
+        // must not go stale against it.
+        let _sync = self.dns_server_tracker.lock_sync();
         // The firewall cannot tell UDP from TCP per user id in one set, so a uid is dropped only
         // when both protocols are blocked for the process.
         let is_blocked = |identity: &ProcessIdentity| {
@@ -1981,6 +1985,22 @@ impl RouteWardController {
         };
         self.dns_server_tracker.refresh(&is_blocked);
         self.sync_dns_server_uid_sets();
+    }
+
+    /// Refreshes the DNS server tracker after a change the block verdict depends on (a rule added
+    /// or removed). Runs on the blocking pool when called from an async runtime, and does nothing
+    /// while the engine is stopped.
+    fn schedule_dns_server_refresh(&self) {
+        if !self.is_running() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let ctrl = self.clone();
+                handle.spawn_blocking(move || ctrl.refresh_dns_server_tracker());
+            }
+            Err(_) => self.refresh_dns_server_tracker(),
+        }
     }
 
     fn sync_dns_server_uid_sets(&self) {
@@ -2377,18 +2397,24 @@ impl RouteWardController {
     }
 
     pub fn upsert_rule(&self, rule: RoutingRule) {
-        let mut prof = self.profile.write();
-        if let Some(existing) = prof.rules.iter_mut().find(|r| r.id == rule.id) {
-            *existing = rule;
-        } else {
-            prof.rules.push(rule);
+        {
+            let mut prof = self.profile.write();
+            if let Some(existing) = prof.rules.iter_mut().find(|r| r.id == rule.id) {
+                *existing = rule;
+            } else {
+                prof.rules.push(rule);
+            }
+            RuleEngine::sort_rules(&mut prof.rules);
         }
-        RuleEngine::sort_rules(&mut prof.rules);
+        self.schedule_dns_server_refresh();
     }
 
     pub fn remove_rule(&self, rule_id: &str) {
-        let mut prof = self.profile.write();
-        prof.rules.retain(|r| r.id != rule_id);
+        {
+            let mut prof = self.profile.write();
+            prof.rules.retain(|r| r.id != rule_id);
+        }
+        self.schedule_dns_server_refresh();
     }
 
     pub fn set_interception_mode(&self, mode: InterceptionMode) {
