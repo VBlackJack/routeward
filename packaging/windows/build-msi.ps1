@@ -52,6 +52,28 @@ function Resolve-WixExecutable {
     throw 'WiX Toolset CLI (wix.exe) was not found in PATH or %USERPROFILE%\.dotnet\tools.'
 }
 
+function Assert-WixUtilExtension {
+    param([string]$WixExecutable)
+
+    # The wxs runs its uninstall actions through WixQuietExec (WixToolset.Util.wixext), so the extension
+    # must be installed and match the major version of the wix CLI.
+    $wixVersionText = ((& $WixExecutable --version) | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0 -or $wixVersionText -notmatch '^(\d+)\.(\d+)\.(\d+)') {
+        throw "Could not determine the WiX CLI version from '$WixExecutable --version'."
+    }
+    $wixMajor = $Matches[1]
+    $wixFullVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+
+    $installed = @(& $WixExecutable extension list -g)
+    if ($LASTEXITCODE -ne 0) {
+        throw "'wix extension list -g' failed with exit code $LASTEXITCODE"
+    }
+    $found = $installed | Where-Object { $_ -match "WixToolset\.Util\.wixext\s+$wixMajor\." }
+    if (-not $found) {
+        throw "WiX extension WixToolset.Util.wixext $wixMajor.x is not installed. Install it with: wix extension add -g WixToolset.Util.wixext/$wixFullVersion"
+    }
+}
+
 function ConvertTo-MsiVersion {
     param([string]$DisplayVersion)
 
@@ -121,6 +143,7 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 
 $msiVersion = ConvertTo-MsiVersion -DisplayVersion $Version
 $wixExe = Resolve-WixExecutable -ExplicitPath $WixPath
+Assert-WixUtilExtension -WixExecutable $wixExe
 
 $cliExe = Join-Path $resolvedTargetDir 'routeward.exe'
 $desktopExe = Join-Path $resolvedTargetDir 'routeward-desktop.exe'
@@ -179,6 +202,7 @@ try {
         'build',
         $wxsPath,
         '-arch', $Arch,
+        '-ext', 'WixToolset.Util.wixext',
         '-d', "MsiVersion=$msiVersion",
         '-d', "DisplayVersion=$Version",
         '-d', "StageDir=$stageDir",

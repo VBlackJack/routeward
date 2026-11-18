@@ -28,7 +28,9 @@ ExecStart=/usr/bin/routeward daemon
 # nftables table "inet routeward_ks" (drops all output except loopback, established traffic,
 # DHCP, ICMPv6 neighbour discovery and MLD) instead of removing every rule. With the kill switch
 # off, or after a clean stop, every RouteWard rule is removed (fail-open).
-# Recovery while blocked: run "routeward cleanup --force" (or start the daemon again).
+# systemd then restarts the daemon (Restart=on-failure), but with interception stopped, so the
+# table stays in place. Recovery while blocked: run "routeward cleanup --force", start interception
+# again with "routeward ctl start", or restart the service cleanly with "systemctl restart routeward".
 ExecStopPost=/usr/bin/routeward cleanup --force --fail-closed-on-crash
 Restart=on-failure
 RestartSec=3s

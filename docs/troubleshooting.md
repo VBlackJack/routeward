@@ -60,7 +60,7 @@ Loading and opening the WinDivert kernel filter requires **Administrator** privi
 **Symptom**:
 - `routeward run` exits with `errors.interceptor.not_root` or `errors.interceptor.nft_missing`.
 - Or, if both `routeward` and its pipe-linked fail-open watchdog were killed simultaneously, outbound IPv4 TCP traffic remains redirected to `:10810` and fails to connect.
-- Or, with `securityPolicy.killSwitchEnabled = true`, the daemon crashed or was killed and the host failed closed: the nftables table `inet routeward_ks` drops all outgoing traffic except loopback, established connections, DHCP, IPv6 neighbour discovery and MLD. Check with `sudo nft list table inet routeward_ks`; run `sudo routeward cleanup --force` to remove it (or start the daemon again with interception running). On Windows a crash still fails open.
+- Or, with `securityPolicy.killSwitchEnabled = true`, the daemon crashed or was killed and the host failed closed: the nftables table `inet routeward_ks` drops all outgoing traffic except loopback, established connections, DHCP, IPv6 neighbour discovery and MLD. Check with `sudo nft list table inet routeward_ks`; systemd restarts the daemon after the crash (`Restart=on-failure`), but with interception stopped, so the block table stays in place. To lift it, run `sudo routeward cleanup --force`, start interception again with `routeward ctl start`, or restart the service cleanly with `sudo systemctl restart routeward`. On Windows a crash still fails open.
 
 **Resolution**:
 - Ensure `routeward` is executed as `root` (`sudo routeward run`) and that the `nftables` package (`nft` binary) is installed.
