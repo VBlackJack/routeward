@@ -16,6 +16,7 @@ FROM rust:1.97.1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nftables \
+    dnsmasq-base \
     iproute2 \
     curl \
     python3 \
@@ -24,6 +25,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add rustfmt clippy
+
+# Dedicated unprivileged account that runs the DNS server of the Fake-IP exemption scenario.
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin rwdns
 
 WORKDIR /workspace
 COPY . /workspace

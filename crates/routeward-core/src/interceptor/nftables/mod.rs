@@ -27,6 +27,8 @@ use crate::interceptor::RouteWardController;
 use crate::telemetry::{LogLevel, TelemetryHub};
 use ipnet::Ipv4Net;
 use parking_lot::{Mutex, RwLock};
+#[cfg(any(target_os = "linux", test))]
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +50,10 @@ pub(super) const COMPONENT_NFTABLES: &str = "NftablesInterceptor";
 pub(super) const AF_INET_U16: u16 = 2;
 pub(super) const AF_INET6_U16: u16 = 10;
 pub(super) const DEFAULT_TPROXY_FWMARK: u32 = 21080;
+/// Named set holding the user ids of exempt DNS server processes (no Fake-IP redirect).
+pub(super) const NFT_SET_DNS_SERVER_UIDS: &str = "dns_server_uids";
+/// Named set holding the subset of those user ids that an explicit Block rule still drops.
+pub(super) const NFT_SET_DNS_SERVER_BLOCK_UIDS: &str = "dns_server_block_uids";
 
 /// Fake-IP network enforced by the raw-socket egress guard (`None` until configured, which
 /// means the RFC 2544 default).
@@ -301,8 +307,12 @@ impl Interceptor for NftablesInterceptor {
         };
         Self::set_fake_ip_guard_net(fake_ip_net);
 
+        // Held until this function returns: the batch is built from the tracker's sets and the sets
+        // are marked applied, with no scan landing in between.
+        let _dns_sync = controller.dns_server_tracker.lock_sync();
+        let dns_uid_sets = controller.dns_server_tracker.uid_sets();
         let mut ipv6_tproxy_active = false;
-        let ip6_ruleset = Self::build_nft_ip6_table_ruleset_with_tproxy(
+        let mut ip6_ruleset = Self::build_nft_ip6_table_ruleset_with_tproxy(
             &table_name,
             &chain_name,
             fwmark,
@@ -319,6 +329,13 @@ impl Interceptor for NftablesInterceptor {
             block_quic_udp_443,
             &upstream_v6,
         );
+        ip6_ruleset.push_str(&ruleset::build_dns_server_uid_elements(
+            "ip6",
+            &table_name,
+            &dns_uid_sets.exempt,
+            &dns_uid_sets.block,
+            false,
+        ));
         match Self::apply_nft_script(&nft_bin, &ip6_ruleset) {
             Ok(()) => {
                 ipv6_tproxy_active = true;
@@ -442,7 +459,7 @@ impl Interceptor for NftablesInterceptor {
             telemetry: controller.telemetry.clone(),
         });
 
-        let ruleset = Self::build_nft_table_ruleset_with_fake_ip(
+        let mut ruleset = Self::build_nft_table_ruleset_with_fake_ip(
             &table_name,
             &chain_name,
             fwmark,
@@ -461,6 +478,13 @@ impl Interceptor for NftablesInterceptor {
             &upstream_v4,
             fake_ip_net,
         );
+        ruleset.push_str(&ruleset::build_dns_server_uid_elements(
+            "ip",
+            &table_name,
+            &dns_uid_sets.exempt,
+            &dns_uid_sets.block,
+            false,
+        ));
 
         let mut apply_child = match Command::new(&nft_bin)
             .args(["-f", "-"])
@@ -516,6 +540,10 @@ impl Interceptor for NftablesInterceptor {
         // Own tables are installed: a block table left by a previous crash can now go (deleting it
         // earlier would open a window, keeping it would block the upstream proxy traffic).
         Self::delete_fail_closed_table(&nft_bin, &table_name, &controller.telemetry);
+
+        controller
+            .dns_server_tracker
+            .mark_uid_sets_applied(dns_uid_sets);
 
         Ok(())
     }
@@ -601,7 +629,11 @@ impl Interceptor for NftablesInterceptor {
             }
         }
 
-        let atomic_batch = if ipv6_tproxy_active {
+        // Held until this function returns: the batch is built from the tracker's sets and the sets
+        // are marked applied, with no scan landing in between.
+        let _dns_sync = controller.dns_server_tracker.lock_sync();
+        let dns_uid_sets = controller.dns_server_tracker.uid_sets();
+        let mut atomic_batch = if ipv6_tproxy_active {
             Self::build_atomic_replace_ruleset_dual_stack(
                 &table_name,
                 &chain_name,
@@ -666,6 +698,23 @@ impl Interceptor for NftablesInterceptor {
             batch
         };
 
+        atomic_batch.push_str(&ruleset::build_dns_server_uid_elements(
+            "ip",
+            &table_name,
+            &dns_uid_sets.exempt,
+            &dns_uid_sets.block,
+            false,
+        ));
+        if ipv6_tproxy_active {
+            atomic_batch.push_str(&ruleset::build_dns_server_uid_elements(
+                "ip6",
+                &table_name,
+                &dns_uid_sets.exempt,
+                &dns_uid_sets.block,
+                false,
+            ));
+        }
+
         let mut apply_child = Command::new(&nft_bin)
             .args(["-f", "-"])
             .stdin(Stdio::piped())
@@ -709,6 +758,10 @@ impl Interceptor for NftablesInterceptor {
             ),
         );
 
+        controller
+            .dns_server_tracker
+            .mark_uid_sets_applied(dns_uid_sets);
+
         // Keep the crash behaviour in sync with the (possibly toggled) kill switch.
         if let Some(ref mut st) = *self.state.lock() {
             st.kill_switch_enabled = kill_switch_enabled;
@@ -720,6 +773,43 @@ impl Interceptor for NftablesInterceptor {
         }
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sync_dns_server_uids(
+        &self,
+        exempt: &BTreeSet<u32>,
+        block: &BTreeSet<u32>,
+    ) -> RouteWardResult<()> {
+        let (nft_bin, table_name, ipv6_tproxy_active) = {
+            let guard = self.state.lock();
+            match guard.as_ref() {
+                Some(state) => (
+                    state.nft_binary.clone(),
+                    state.table_name.clone(),
+                    state.ipv6_tproxy_active,
+                ),
+                None => return Ok(()),
+            }
+        };
+        // One transaction: flush and refill both sets, so the exemption never has a gap.
+        let mut script =
+            ruleset::build_dns_server_uid_elements("ip", &table_name, exempt, block, true);
+        if ipv6_tproxy_active {
+            script.push_str(&ruleset::build_dns_server_uid_elements(
+                "ip6",
+                &table_name,
+                exempt,
+                block,
+                true,
+            ));
+        }
+        Self::apply_nft_script(&nft_bin, &script).map_err(|detail| {
+            RouteWardError::InterceptorError {
+                key: ERR_KEY_INTERCEPTOR_NFT_FAILED,
+                detail: format!("DNS server user id set update rejected by nft: {detail}"),
+            }
+        })
     }
 
     fn stop(&self) {

@@ -16,6 +16,7 @@
 
 use crate::error::RouteWardResult;
 use crate::interceptor::RouteWardController;
+use std::collections::BTreeSet;
 
 /// Pluggable OS packet interception backend abstraction.
 ///
@@ -33,6 +34,17 @@ pub trait Interceptor: Send + Sync {
     /// Reapplies packet capture / firewall rules in-place without any permissive gap.
     fn reload(&self, controller: RouteWardController) -> RouteWardResult<()> {
         let _ = controller;
+        Ok(())
+    }
+
+    /// Pushes the user ids of exempt DNS server processes into the firewall (Linux only; the
+    /// other backends decide per packet). `block` is the subset an explicit Block rule drops.
+    fn sync_dns_server_uids(
+        &self,
+        exempt: &BTreeSet<u32>,
+        block: &BTreeSet<u32>,
+    ) -> RouteWardResult<()> {
+        let _ = (exempt, block);
         Ok(())
     }
 

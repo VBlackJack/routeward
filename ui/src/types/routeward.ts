@@ -135,6 +135,7 @@ export interface DnsConfig {
   fakeIpCidr: string;
   upstreamDns: string;
   bypassDomains: string[];
+  dnsServerProcesses?: string[];
 }
 
 export interface SecurityPolicyConfig {

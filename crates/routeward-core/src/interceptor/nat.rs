@@ -1100,6 +1100,17 @@ impl TransparentNatTable {
         self.sessions_by_flow.remove(&flow_key).map(|(_, v)| v)
     }
 
+    /// Removes the NAT session of a flow, if any, together with its relay peer index entry.
+    /// Used when a flow turns out to be exempt (a DNS server process) so that later segments of the
+    /// 4-tuple are not reflected to the relay by a stale session.
+    pub fn remove_session_by_flow(&self, flow_key: &OutboundFlowKey) -> Option<NatSessionEntry> {
+        let (_, entry) = self.sessions_by_flow.remove(flow_key)?;
+        self.peer_to_flow
+            .remove_if(&entry.relay_peer_key(), |_, mapped| mapped == flow_key);
+        self.adopted_flows.remove(flow_key);
+        Some(entry)
+    }
+
     /// Returns the transparent relay TCP port.
     pub fn transparent_relay_port(&self) -> u16 {
         self.transparent_relay_port
@@ -1340,6 +1351,9 @@ pub struct UdpFragmentMeta {
     /// IPv6 later fragment whose fragment header announces another extension header: such a
     /// fragment may carry any protocol, so it is never dropped as an orphan.
     pub udp_confirmed: bool,
+    /// Packet offset of the UDP payload for a [`UdpFragmentKind::First`] fragment whose UDP header
+    /// was located; `None` otherwise.
+    pub udp_payload_offset: Option<usize>,
 }
 
 impl UdpFragmentMeta {
@@ -1433,6 +1447,7 @@ fn parse_ipv4_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
             dst_port: 0,
             fragment_id,
             udp_confirmed: true,
+            udp_payload_offset: None,
         });
     }
     let (src_port, dst_port) = read_udp_ports(packet, ihl)?;
@@ -1444,6 +1459,7 @@ fn parse_ipv4_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
         dst_port,
         fragment_id,
         udp_confirmed: true,
+        udp_payload_offset: Some(ihl + UDP_HEADER_LEN),
     })
 }
 
@@ -1560,6 +1576,7 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
                         dst_port: 0,
                         fragment_id,
                         udp_confirmed: hdr[0] == IPPROTO_UDP,
+                        udp_payload_offset: None,
                     });
                 }
                 // A first fragment that is detected but whose UDP header cannot be located is
@@ -1571,6 +1588,12 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
                     }
                     _ => (0, 0),
                 };
+                let udp_payload_offset = match payload {
+                    Ipv6FragmentPayload::Udp(udp_offset) if src_port != 0 || dst_port != 0 => {
+                        Some(udp_offset + UDP_HEADER_LEN)
+                    }
+                    _ => None,
+                };
                 return Some(UdpFragmentMeta {
                     kind: UdpFragmentKind::First,
                     src_ip,
@@ -1579,6 +1602,7 @@ fn parse_ipv6_udp_fragment_meta(packet: &[u8]) -> Option<UdpFragmentMeta> {
                     dst_port,
                     fragment_id,
                     udp_confirmed: true,
+                    udp_payload_offset,
                 });
             }
             _ => return None,

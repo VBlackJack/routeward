@@ -34,6 +34,9 @@ use crate::error::{
 };
 use crate::i18n::I18nRegistry;
 use crate::interceptor::backend::Interceptor;
+use crate::interceptor::dns_server_exempt::{
+    dns_server_block_verdict, DnsProto, DnsServerTracker, UidSets,
+};
 use crate::interceptor::nat::{
     PendingSynOutcome, PendingSynQueue, PendingUdpOutcome, PendingUdpQueue, TransparentNatTable,
 };
@@ -42,7 +45,7 @@ use crate::interceptor::nftables::NftablesInterceptor;
 use crate::interceptor::nftables::TproxyRoutingSpec;
 #[cfg(windows)]
 use crate::interceptor::windivert::WinDivertInterceptor;
-use crate::process::{ProcessAttribution, ProcessResolver};
+use crate::process::{ProcessAttribution, ProcessIdentity, ProcessResolver};
 use crate::proxy::sni::TlsSniExtractor;
 use crate::proxy::udp::UdpAssociationManager;
 use crate::proxy::uri::ProxyUriCodec;
@@ -142,6 +145,12 @@ impl RouteWardController {
         #[cfg(not(windows))]
         let interceptor_backend: Arc<dyn Interceptor> = Arc::new(NftablesInterceptor::new());
 
+        let dns_server_tracker = DnsServerTracker::new(telemetry.clone());
+        dns_server_tracker.configure(
+            &constants.dns.default_dns_server_processes,
+            &profile.dns_config.dns_server_processes,
+        );
+
         let udp_manager = UdpAssociationManager::new(&constants);
         let warn_rate_limiter = WarnRateLimiter::new(Duration::from_secs(
             constants.network.udp_warn_rate_limit_secs.max(1),
@@ -157,6 +166,7 @@ impl RouteWardController {
             nat_table,
             udp_manager,
             warn_rate_limiter,
+            dns_server_tracker,
             fragmented_udp_drop_count: Arc::new(AtomicU64::new(0)),
             orphan_fragment_drop_count: Arc::new(AtomicU64::new(0)),
             last_seen_orig_resolver: Arc::new(RwLock::new(None)),
@@ -347,6 +357,33 @@ impl RouteWardController {
             while ticker_ctrl.is_running() {
                 ticker_ctrl.telemetry.tick_bandwidth_sample();
                 if or_shutdown(&mut ticker_signal, tokio::time::sleep(interval))
+                    .await
+                    .is_none()
+                {
+                    break;
+                }
+            }
+        }));
+
+        let dns_scan_ctrl = self.clone();
+        let mut dns_scan_signal = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
+            let interval = Duration::from_millis(
+                dns_scan_ctrl
+                    .constants
+                    .dns
+                    .dns_server_process_scan_interval_ms
+                    .max(1),
+            );
+            while dns_scan_ctrl.is_running() {
+                let scan_ctrl = dns_scan_ctrl.clone();
+                let scan = tokio::task::spawn_blocking(move || {
+                    scan_ctrl.refresh_dns_server_tracker();
+                });
+                if or_shutdown(&mut dns_scan_signal, scan).await.is_none() {
+                    break;
+                }
+                if or_shutdown(&mut dns_scan_signal, tokio::time::sleep(interval))
                     .await
                     .is_none()
                 {
@@ -978,6 +1015,7 @@ impl RouteWardController {
                 detail,
             });
         }
+        self.refresh_dns_server_tracker();
         if let Err(err) = self.interceptor_backend.start(self.clone()) {
             self.telemetry.push_log(
                 LogLevel::Error,
@@ -1002,6 +1040,8 @@ impl RouteWardController {
         let _lifecycle = self.engine_lifecycle.lock();
         let was_active = self.interceptor_backend.is_active();
         self.interceptor_backend.stop();
+        self.dns_server_tracker
+            .mark_uid_sets_applied(UidSets::default());
         self.udp_manager.clear_all();
         let was_running = self.running.swap(false, Ordering::SeqCst);
         self.shutdown_engine_tasks();
@@ -1910,10 +1950,89 @@ impl RouteWardController {
         self.nat_table.set_upstream_endpoints(upstream_endpoints);
     }
 
+    /// Rebuilds the DNS server identity patterns from the built-in defaults and the profile list.
+    fn configure_dns_server_tracker(&self) {
+        let user = self.profile.read().dns_config.dns_server_processes.clone();
+        self.dns_server_tracker
+            .configure(&self.constants.dns.default_dns_server_processes, &user);
+    }
+
+    /// `true` when an explicit Block rule that names the process drops its DNS query to `dst`.
+    /// The kill switch, the remote DNS option and the default policy never block a DNS server.
+    pub fn dns_server_block_verdict(
+        &self,
+        identity: &ProcessIdentity,
+        dst: IpAddr,
+        proto: DnsProto,
+    ) -> bool {
+        let prof = self.profile.read();
+        dns_server_block_verdict(&prof.rules, &prof.default_action, identity, dst, proto)
+    }
+
+    /// Rescans the DNS server processes and, on Linux, pushes the user id sets to the firewall.
+    /// Blocking: run it from a blocking context.
+    pub fn refresh_dns_server_tracker(&self) {
+        // One scan + apply + firewall sync at a time, and never concurrently with a firewall
+        // reload: an old-matcher scan must not land after a reload, and the applied-sets marker
+        // must not go stale against it.
+        let _sync = self.dns_server_tracker.lock_sync();
+        // The firewall cannot tell UDP from TCP per user id in one set, so a uid is dropped only
+        // when both protocols are blocked for the process.
+        let is_blocked = |identity: &ProcessIdentity| {
+            [DnsProto::Udp, DnsProto::Tcp].into_iter().all(|proto| {
+                self.dns_server_block_verdict(identity, IpAddr::V4(Ipv4Addr::UNSPECIFIED), proto)
+            })
+        };
+        self.dns_server_tracker.refresh(&is_blocked);
+        self.sync_dns_server_uid_sets();
+    }
+
+    /// Refreshes the DNS server tracker after a change the block verdict depends on (a rule added
+    /// or removed). Runs on the blocking pool when called from an async runtime, and does nothing
+    /// while the engine is stopped.
+    fn schedule_dns_server_refresh(&self) {
+        if !self.is_running() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let ctrl = self.clone();
+                handle.spawn_blocking(move || ctrl.refresh_dns_server_tracker());
+            }
+            Err(_) => self.refresh_dns_server_tracker(),
+        }
+    }
+
+    fn sync_dns_server_uid_sets(&self) {
+        let sets = self.dns_server_tracker.uid_sets();
+        if sets == self.dns_server_tracker.applied_uid_sets()
+            || !self.interceptor_backend.is_active()
+        {
+            return;
+        }
+        match self
+            .interceptor_backend
+            .sync_dns_server_uids(&sets.exempt, &sets.block)
+        {
+            Ok(()) => self.dns_server_tracker.mark_uid_sets_applied(sets),
+            Err(err) => {
+                self.push_rate_limited_warn(
+                    "dns-server-uid-sync",
+                    COMPONENT_ENGINE,
+                    format!("Could not update the DNS server user id sets: {err}"),
+                );
+            }
+        }
+    }
+
     /// Replaces the active in-memory profile, synchronizes logging and upstream loop exclusions,
     /// and if the engine is running when `securityPolicy`, `dnsConfig`, or `proxies` changed,
     /// atomically reapplies active interception rules and re-runs proxy bootstrap.
-    pub fn replace_profile(&self, mut new_profile: ProfileConfig) {
+    ///
+    /// The profile is validated first (`dnsConfig.dnsServerProcesses`): an invalid one is refused
+    /// and the active profile stays untouched, whichever entry point (IPC, CLI, desktop) sent it.
+    pub fn replace_profile(&self, mut new_profile: ProfileConfig) -> RouteWardResult<()> {
+        new_profile.dns_config.validate()?;
         self.telemetry
             .set_file_logging_enabled(new_profile.enable_logging);
         self.dns
@@ -1949,6 +2068,10 @@ impl RouteWardController {
             self.bootstrapped_proxy_endpoints.clear();
         }
         self.sync_upstream_proxy_exclusions();
+        self.configure_dns_server_tracker();
+        if self.is_running() {
+            self.refresh_dns_server_tracker();
+        }
 
         if self.is_running() && (security_changed || dns_changed || proxies_changed) {
             self.reapply_active_interception_rules(security_changed, dns_changed);
@@ -1964,6 +2087,7 @@ impl RouteWardController {
                 });
             }
         }
+        Ok(())
     }
 
     pub(super) fn reapply_active_interception_rules(
@@ -2210,7 +2334,7 @@ impl RouteWardController {
         }
         let mut loaded = ProfileConfig::load_from_path(&named_path)?;
         loaded.profile_id = slug.to_string();
-        self.replace_profile(loaded);
+        self.replace_profile(loaded)?;
         self.save_profile_default()?;
         Ok(self.profile.read().redacted_for_ipc())
     }
@@ -2273,18 +2397,24 @@ impl RouteWardController {
     }
 
     pub fn upsert_rule(&self, rule: RoutingRule) {
-        let mut prof = self.profile.write();
-        if let Some(existing) = prof.rules.iter_mut().find(|r| r.id == rule.id) {
-            *existing = rule;
-        } else {
-            prof.rules.push(rule);
+        {
+            let mut prof = self.profile.write();
+            if let Some(existing) = prof.rules.iter_mut().find(|r| r.id == rule.id) {
+                *existing = rule;
+            } else {
+                prof.rules.push(rule);
+            }
+            RuleEngine::sort_rules(&mut prof.rules);
         }
-        RuleEngine::sort_rules(&mut prof.rules);
+        self.schedule_dns_server_refresh();
     }
 
     pub fn remove_rule(&self, rule_id: &str) {
-        let mut prof = self.profile.write();
-        prof.rules.retain(|r| r.id != rule_id);
+        {
+            let mut prof = self.profile.write();
+            prof.rules.retain(|r| r.id != rule_id);
+        }
+        self.schedule_dns_server_refresh();
     }
 
     pub fn set_interception_mode(&self, mode: InterceptionMode) {
@@ -2320,6 +2450,25 @@ impl RouteWardController {
         if should_log {
             self.telemetry.push_log(
                 LogLevel::Warn,
+                component,
+                format!("{} [count=#{count}]", message.into()),
+            );
+        }
+        count
+    }
+
+    /// Same as [`push_rate_limited_warn`](Self::push_rate_limited_warn) at INFO level, for
+    /// repetitive informational events.
+    pub fn push_rate_limited_info(
+        &self,
+        category_key: &str,
+        component: &str,
+        message: impl Into<String>,
+    ) -> u64 {
+        let (should_log, count) = self.warn_rate_limiter.should_log(category_key);
+        if should_log {
+            self.telemetry.push_log(
+                LogLevel::Info,
                 component,
                 format!("{} [count=#{count}]", message.into()),
             );
@@ -2631,7 +2780,7 @@ mod tests {
         assert_eq!(ids(&controller), ["early", "middle", "late"]);
 
         profile.rules = vec![rule("c", 3), rule("a", 1), rule("b", 2)];
-        controller.replace_profile(profile);
+        controller.replace_profile(profile).expect("valid profile");
         assert_eq!(ids(&controller), ["a", "b", "c"]);
     }
 
@@ -2650,5 +2799,125 @@ mod tests {
         assert_eq!(tracked.latency_ms, 0);
         assert_eq!(tracked.rx_bytes, 0);
         assert_eq!(tracked.tx_bytes, 0);
+    }
+
+    /// A path that the built-in defaults of the running OS recognise as a DNS server, and the
+    /// default entry that removes it.
+    fn default_dns_server_sample() -> (String, String) {
+        if cfg!(windows) {
+            let root = crate::interceptor::dns_server_exempt::system_root_from_env();
+            (
+                format!(r"{root}\System32\dns.exe"),
+                r"!%SystemRoot%\System32\dns.exe".to_string(),
+            )
+        } else {
+            ("/usr/sbin/named".to_string(), "!named".to_string())
+        }
+    }
+
+    #[test]
+    fn profile_replacement_reconfigures_the_dns_server_identity_list() {
+        let (sample, removal) = default_dns_server_sample();
+        let controller = RouteWardController::new(test_constants(), test_profile(), "en");
+        assert!(controller.dns_server_tracker.note_unknown_pid(11, &sample));
+
+        let mut profile = test_profile();
+        profile.dns_config.dns_server_processes = vec![removal];
+        controller.replace_profile(profile).expect("valid profile");
+        assert!(!controller.dns_server_tracker.note_unknown_pid(12, &sample));
+
+        controller
+            .replace_profile(test_profile())
+            .expect("valid profile");
+        assert!(controller.dns_server_tracker.note_unknown_pid(13, &sample));
+    }
+
+    #[test]
+    fn profile_replacement_refuses_an_invalid_dns_server_list_and_keeps_the_active_profile() {
+        let controller = RouteWardController::new(test_constants(), test_profile(), "en");
+        let before = controller.profile.read().name.clone();
+
+        for bad in ["*", "", "svchost.exe"] {
+            let mut profile = test_profile();
+            profile.name = "Rejected".to_string();
+            profile.dns_config.dns_server_processes = vec![bad.to_string()];
+            let err = controller
+                .replace_profile(profile)
+                .expect_err("invalid dnsServerProcesses entry must be refused");
+            assert!(
+                matches!(
+                    err,
+                    RouteWardError::ConfigError {
+                        key: crate::error::ERR_KEY_CONFIG_JSON,
+                        ..
+                    }
+                ),
+                "unexpected error for {bad:?}: {err:?}"
+            );
+            assert_eq!(controller.profile.read().name, before);
+        }
+
+        let mut valid = test_profile();
+        valid.dns_config.dns_server_processes = vec!["!dnsmasq".to_string()];
+        controller
+            .replace_profile(valid)
+            .expect("a valid list is accepted");
+    }
+
+    #[test]
+    fn controller_block_verdict_uses_only_explicit_block_rules_with_process_patterns() {
+        let mut profile = test_profile();
+        profile.default_action = RuleAction::Block;
+        let mut block_named = rule("block-named", 5);
+        block_named.action = RuleAction::Block;
+        block_named.process_patterns = vec!["named".to_string()];
+        profile.rules = vec![block_named];
+        let controller = RouteWardController::new(test_constants(), profile, "en");
+        let resolver = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53));
+        let named = ProcessIdentity {
+            pid: 5,
+            name: "named".to_string(),
+            executable_path: "/usr/sbin/named".to_string(),
+        };
+        let other = ProcessIdentity {
+            pid: 6,
+            name: "unbound".to_string(),
+            executable_path: "/usr/sbin/unbound".to_string(),
+        };
+        assert!(controller.dns_server_block_verdict(&named, resolver, DnsProto::Udp));
+        // The default policy is Block, yet it never blocks a DNS server.
+        assert!(!controller.dns_server_block_verdict(&other, resolver, DnsProto::Udp));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rescan_finds_the_sockets_of_a_matching_process() {
+        let exe = std::env::current_exe().expect("current exe");
+        let controller = RouteWardController::new(test_constants(), test_profile(), "en");
+        controller
+            .dns_server_tracker
+            .configure(&[], &[exe.to_string_lossy().into_owned()]);
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp bind");
+        let udp_port = udp.local_addr().expect("udp addr").port();
+        let tcp_port = tcp.local_addr().expect("tcp addr").port();
+
+        assert!(controller.dns_server_tracker.is_empty());
+        controller.refresh_dns_server_tracker();
+        assert!(!controller.dns_server_tracker.is_empty());
+        assert!(controller
+            .dns_server_tracker
+            .is_exempt_pid(std::process::id()));
+        assert!(controller
+            .dns_server_tracker
+            .is_exempt_port(DnsProto::Udp, udp_port));
+        assert!(controller
+            .dns_server_tracker
+            .is_exempt_port(DnsProto::Tcp, tcp_port));
+
+        // Dropping the matching entry empties the tracker at the next rescan.
+        controller.dns_server_tracker.configure(&[], &[]);
+        controller.refresh_dns_server_tracker();
+        assert!(controller.dns_server_tracker.is_empty());
     }
 }
