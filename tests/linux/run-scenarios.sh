@@ -27,10 +27,104 @@ echo "=== RouteWard Milestone 2 - Linux Container Integration Suite ==="
 ip addr add "${TARGET_IP}/32" dev lo 2>/dev/null || true
 ip -6 addr add "${TARGET_IPV6}/128" dev lo nodad 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# Polling helpers: wait on the real condition instead of a fixed sleep. Every helper is bounded and
+# returns non-zero with a message on stderr when the timeout expires.
+# ---------------------------------------------------------------------------
+POLL_INTERVAL="0.1"
+IPC_SOCKET="/run/routeward/routeward.sock"
+
+# wait_until <timeout_s> <interval_s> <command...>
+wait_until() {
+    local timeout_s="$1" interval_s="$2"
+    shift 2
+    local max_tries try
+    max_tries=$(awk -v t="${timeout_s}" -v i="${interval_s}" 'BEGIN { n = int(t / i + 0.5); print (n < 1 ? 1 : n) }')
+    for ((try = 0; try < max_tries; try++)); do
+        if "$@" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep "${interval_s}"
+    done
+    echo "[WAIT] timed out after ${timeout_s}s waiting for: $*" >&2
+    return 1
+}
+
+# port_bound <tcp|udp> <port>: true when a local socket is listening or bound on that port
+port_bound() {
+    local flag
+    case "$1" in
+        tcp) flag="t" ;;
+        udp) flag="u" ;;
+        *) return 2 ;;
+    esac
+    ss -H -l"${flag}"n | awk -v p="$2" '{ n = split($4, a, ":"); if (a[n] == p) found = 1 } END { exit !found }'
+}
+
+# nft_tables_absent "<family> <name>"...: true when none of the named nft tables exist
+nft_tables_absent() {
+    local spec
+    for spec in "$@"; do
+        # shellcheck disable=SC2086
+        if nft list table ${spec} >/dev/null 2>&1; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# routing_cleaned_up: true when the TPROXY ip rule (priority 10810) and the local route table 100 are gone
+routing_cleaned_up() {
+    [[ -z "$(ip rule show | grep '10810:' || true)" ]] \
+        && [[ -z "$(ip route show table 100 2>/dev/null || true)" ]]
+}
+
+# ctl_output_matches <ctl subcommand> <ERE>: true when "ctl <subcommand>" output matches
+ctl_output_matches() {
+    "${BIN}" ctl "$1" 2>/dev/null | grep -Eq -- "$2"
+}
+
+# file_matches <file> <ERE>: true when the file exists and contains a matching line
+file_matches() {
+    grep -Eq -- "$2" "$1" 2>/dev/null
+}
+
+# nft_set_has_no_elements <set>: true when the ip routeward set is empty or absent
+nft_set_has_no_elements() {
+    ! nft list set ip routeward "$1" 2>&1 | grep -q "elements"
+}
+
+# watchdog_gone: true when no nft watchdog shell (the orphan left by a SIGKILLed daemon) is running
+watchdog_gone() {
+    ! pgrep -f 'while read -r m; do case' >/dev/null
+}
+
+dns_query_ok() {
+    python3 /workspace/tests/linux/mock_servers.py --dns-query "$1" "$2" 1
+}
+
+wait_for_ipc_socket() {
+    wait_until 10 "${POLL_INTERVAL}" test -S "${IPC_SOCKET}"
+}
+
+wait_for_http_target() {
+    wait_until 10 "${POLL_INTERVAL}" port_bound tcp 18080
+}
+
+# Full mock server set: HTTP, SOCKS5, DNS (UDP and TCP), UDP direct echo and LLMNR listeners
+wait_for_mock_servers() {
+    wait_for_http_target \
+        && wait_until 10 "${POLL_INTERVAL}" port_bound tcp 1080 \
+        && wait_until 10 "${POLL_INTERVAL}" port_bound tcp 53 \
+        && wait_until 10 "${POLL_INTERVAL}" port_bound udp 53 \
+        && wait_until 10 "${POLL_INTERVAL}" port_bound udp 5355 \
+        && wait_until 10 "${POLL_INTERVAL}" port_bound udp 19990
+}
+
 # Start local HTTP target server (0.0.0.0:18080) and SOCKS5 gateway (127.0.0.1:1080)
 python3 /workspace/tests/linux/mock_servers.py &
 MOCK_PID=$!
-sleep 0.5
+wait_for_mock_servers
 
 write_profile() {
     local out_path="$1"
@@ -120,23 +214,11 @@ probe_exit_code() {
 }
 
 wait_for_block_table() {
-    for _ in $(seq 1 50); do
-        if nft list table inet routeward_ks >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 0.1
-    done
-    return 1
+    wait_until 15 "${POLL_INTERVAL}" nft list table inet routeward_ks
 }
 
 wait_for_nft_table() {
-    for _ in $(seq 1 30); do
-        if nft list table ip routeward >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 0.1
-    done
-    return 1
+    wait_until 15 "${POLL_INTERVAL}" nft list table ip routeward
 }
 
 # ---------------------------------------------------------------------------
@@ -247,7 +329,8 @@ wait_for_nft_table
 
 kill -TERM "${RW_PID}"
 wait "${RW_PID}" || true
-sleep 0.5
+wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "inet routeward_ks" || true
+wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 RESP_D2=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/after-clean-stop")
 PROBE_D2=$(probe_exit_code)
@@ -271,7 +354,8 @@ wait_for_nft_table
 
 kill -9 "${RW_PID}"
 wait "${RW_PID}" 2>/dev/null || true
-sleep 0.5
+wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "inet routeward_ks" || true
+wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 if ! nft list table ip routeward >/dev/null 2>&1 && ! nft list table inet routeward_ks >/dev/null 2>&1; then
     RESP_AFTER_KILL=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/after-kill9")
@@ -370,12 +454,7 @@ chmod 0600 /etc/routeward/active_profile.json
 "${BIN}" daemon >/tmp/rw_daemon.out 2>&1 &
 DAEMON_PID=$!
 
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket || true
 
 if [[ ! -S /run/routeward/routeward.sock ]]; then
     echo "[FAIL] Scenario (g): /run/routeward/routeward.sock was not created by daemon"
@@ -399,7 +478,7 @@ wait_for_nft_table
 
 RESP_G=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
     curl --noproxy "" -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/scenario-g")
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches connections '"rxBytes": [1-9]' || true
 CONNS_G=$(su -s /bin/bash rwmember -c "${BIN} ctl connections")
 LOGS_G=$(su -s /bin/bash rwmember -c "${BIN} ctl logs")
 
@@ -482,18 +561,14 @@ chmod 0600 /etc/routeward/active_profile.json
 rm -f /run/routeward/routeward.sock
 "${BIN}" daemon >/tmp/rw_daemon_i2.out 2>&1 &
 DAEMON_I2_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 "${BIN}" ctl start >/tmp/rw_i2_start.out 2>&1
 wait_for_nft_table
 
 kill -9 "${DAEMON_I2_PID}"
 wait "${DAEMON_I2_PID}" 2>/dev/null || true
-sleep 0.5
+wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "inet routeward_ks" || true
+wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 RESP_I2=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/after-daemon-kill9-ks-off")
 PROBE_I2=$(probe_exit_code)
@@ -519,16 +594,11 @@ rm -f /run/routeward/routeward.sock
 # ---------------------------------------------------------------------------
 "${BIN}" daemon >/tmp/rw_daemon_i3.out 2>&1 &
 DAEMON_I3_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 kill -9 "${DAEMON_I3_PID}"
 wait "${DAEMON_I3_PID}" 2>/dev/null || true
-sleep 0.5
+wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 SERVICE_RESULT=signal "${BIN}" cleanup --force --fail-closed-on-crash >/tmp/rw_i3_cleanup.out 2>&1
 RESP_I3=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/after-idle-daemon-kill9")
@@ -583,12 +653,7 @@ rm -f /run/routeward/routeward.sock
 "${BIN}" daemon >/tmp/rw_daemon_k.out 2>&1 &
 DAEMON_K_PID=$!
 
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
@@ -622,7 +687,7 @@ rm -f "${SOCKS_LOG}" /tmp/http_target_hits.log /run/routeward/routeward.sock
 # Restart only the HTTP target server so the SOCKS5 proxy (127.0.0.1:1080) is stopped
 python3 /workspace/tests/linux/mock_servers.py --http-only &
 MOCK_HTTP_PID=$!
-sleep 0.3
+wait_for_http_target
 
 cp /tmp/profile_proxy.json /etc/routeward/active_profile.json
 chmod 0600 /etc/routeward/active_profile.json
@@ -630,12 +695,7 @@ chmod 0600 /etc/routeward/active_profile.json
 "${BIN}" daemon >/tmp/rw_daemon_l.out 2>&1 &
 DAEMON_L_PID=$!
 
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
@@ -646,7 +706,8 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u al
 CURL_EXIT_L=$?
 set -e
 
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches connections '"status": "blocked"' || true
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches logs 'Kill-Switch blocked connection' || true
 CONNS_L=$("${BIN}" ctl connections)
 LOGS_L=$("${BIN}" ctl logs)
 
@@ -674,7 +735,7 @@ fi
 rm -f "${SOCKS_LOG}" /tmp/http_target_hits.log /tmp/dns_hits.log /run/routeward/routeward.sock
 python3 /workspace/tests/linux/mock_servers.py &
 MOCK_PID=$!
-sleep 0.4
+wait_for_mock_servers
 
 cp /etc/resolv.conf /tmp/resolv.conf.bak
 echo "nameserver ${TARGET_IP}" > /etc/resolv.conf
@@ -797,12 +858,7 @@ chmod 0600 /etc/routeward/active_profile.json
 
 "${BIN}" daemon >/tmp/rw_daemon_m.out 2>&1 &
 DAEMON_M_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
@@ -812,7 +868,7 @@ DNS_M_AAAA=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGE
 
 RESP_M=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
     curl --noproxy "" -sS --max-time 5 "http://app.routeward.test:${TARGET_PORT}/scenario-m")
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches fake-ips '"domain": "app.routeward.test"' || true
 FAKE_IPS_M=$("${BIN}" ctl fake-ips)
 LOGS_M=$("${BIN}" ctl logs)
 
@@ -873,7 +929,7 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u al
 DOT_TCP_EXIT=$?
 set -e
 
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches logs 'Blocked encrypted DNS bypass \(DoT TCP port 853\)' || true
 LOGS_P=$("${BIN}" ctl logs)
 
 if echo "${DNS_P_CANARY}" | grep -q "RCODE=3 ANCOUNT=0" \
@@ -916,12 +972,7 @@ chmod 0600 /etc/routeward/active_profile.json
 
 "${BIN}" daemon >/tmp/rw_daemon_n.out 2>&1 &
 DAEMON_N_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
@@ -948,7 +999,8 @@ fi
 # ---------------------------------------------------------------------------
 kill -9 "${DAEMON_N_PID}"
 wait "${DAEMON_N_PID}" 2>/dev/null || true
-sleep 0.5
+wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "ip6 routeward" || true
+wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 rm -f /tmp/dns_hits.log
 DNS_Q=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGET_IP}" "after-kill9.routeward.test" 1)
@@ -982,12 +1034,7 @@ chmod 0600 /etc/routeward/active_profile.json
 
 "${BIN}" daemon >/tmp/rw_daemon_r.out 2>&1 &
 DAEMON_R_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
@@ -1017,7 +1064,8 @@ echo "nameserver ${TARGET_IP}" > /etc/resolv.conf
 rm -f /run/systemd/resolve/resolv.conf "${SOCKS_LOG}" /tmp/https_443_hits.log
 
 RESP_S=$(python3 /workspace/tests/linux/mock_servers.py --tls-sni-probe "${TARGET_IP}" "sni.routeward.test")
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" file_matches "${SOCKS_LOG}" 'CONNECT sni\.routeward\.test:443' || true
+wait_until 10 "${POLL_INTERVAL}" file_matches /tmp/https_443_hits.log '^TLS_443 ' || true
 
 if [[ "${RESP_S}" == "HTTPS_SNI_OK" ]] \
     && grep -q "CONNECT sni.routeward.test:443" "${SOCKS_LOG}" \
@@ -1042,7 +1090,7 @@ sed -e 's/"killSwitchEnabled": true/"killSwitchEnabled": false/' \
     /tmp/profile_dns_fakeip.json > /tmp/profile_hot_reload.json
 
 "${BIN}" ctl replace-profile --json-file /tmp/profile_hot_reload.json >/dev/null
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches logs 'securityPolicyChanged=true' || true
 
 NFT_IP4_T=$(nft list table ip routeward)
 NFT_IP6_T=$(nft list table ip6 routeward)
@@ -1082,7 +1130,7 @@ rm -f /tmp/udp_srv_u.json /run/routeward/routeward.sock
     --map-domain "udp.routeward.test=${TARGET_IP}" \
     --stats-file /tmp/udp_srv_u.json >/tmp/udp_srv_u.out 2>&1 &
 UDP_SRV_U_PID=$!
-sleep 0.3
+wait_until 10 "${POLL_INTERVAL}" port_bound tcp 1082
 
 cat > /tmp/profile_udp_u.json <<EOF
 {
@@ -1134,12 +1182,7 @@ chmod 0600 /etc/routeward/active_profile.json
 
 "${BIN}" daemon >/tmp/rw_daemon_u.out 2>&1 &
 DAEMON_U_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
@@ -1179,14 +1222,14 @@ rm -f /tmp/udp_srv_v.json
     --disable-udp-associate \
     --stats-file /tmp/udp_srv_v.json >/tmp/udp_srv_v.out 2>&1 &
 UDP_SRV_V_PID=$!
-sleep 0.3
+wait_until 10 "${POLL_INTERVAL}" port_bound tcp 1083
 
 sed -e 's/"socks-udp-1082"/"socks-no-udp-1083"/g' \
     -e 's/"port": 1082/"port": 1083/' \
     /tmp/profile_udp_u.json > /tmp/profile_udp_v.json
 
 "${BIN}" ctl replace-profile --json-file /tmp/profile_udp_v.json >/dev/null
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches logs 'securityPolicyChanged=' || true
 
 set +e
 UDP_V_RESP1=$(python3 /workspace/tests/linux/mock_servers.py --socks5-udp-exchange 10808 "${TARGET_IP}" 19998 "blocked-datagram-1")
@@ -1229,7 +1272,8 @@ rm -f /tmp/udp_443_hits.log /tmp/llmnr_5355_hits.log
 QUIC_W_OUT=$(python3 /workspace/tests/linux/mock_servers.py --quic-udp-probe "${TARGET_IP}" 443)
 python3 /workspace/tests/linux/mock_servers.py --llmnr-query "${TARGET_IP}" "public.leak.example.com" >/dev/null
 python3 /workspace/tests/linux/mock_servers.py --llmnr-query "${TARGET_IP}" "fileserver" >/dev/null
-sleep 0.3
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches logs 'Blocked public FQDN .*public\.leak\.example\.com.* on local name resolution protocol' || true
+wait_until 10 "${POLL_INTERVAL}" file_matches /tmp/llmnr_5355_hits.log 'LLMNR_5355 .* fileserver' || true
 
 LOGS_W=$("${BIN}" ctl logs)
 
@@ -1255,12 +1299,14 @@ fi
 # ---------------------------------------------------------------------------
 kill -9 "${DAEMON_U_PID}"
 wait "${DAEMON_U_PID}" 2>/dev/null || true
-sleep 0.5
+wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "ip6 routeward" || true
+wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 rm -f /tmp/udp_443_hits.log /tmp/llmnr_5355_hits.log
 python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b'QUIC_AFTER_KILL9', ('${TARGET_IP}', 443)); s.close()"
 python3 /workspace/tests/linux/mock_servers.py --llmnr-query "${TARGET_IP}" "after-kill9.example.com" >/dev/null
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" file_matches /tmp/udp_443_hits.log 'UDP_443 ' || true
+wait_until 10 "${POLL_INTERVAL}" file_matches /tmp/llmnr_5355_hits.log 'after-kill9\.example\.com' || true
 
 if ! nft list table ip routeward >/dev/null 2>&1 \
     && ! nft list table ip6 routeward >/dev/null 2>&1 \
@@ -1287,7 +1333,7 @@ rm -f /tmp/udp_srv_y.json /tmp/udp_direct_hits.log /run/routeward/routeward.sock
     --map-domain "udp-tproxy.routeward.test=${TARGET_IP}" \
     --stats-file /tmp/udp_srv_y.json >/tmp/udp_srv_y.out 2>&1 &
 UDP_SRV_Y_PID=$!
-sleep 0.3
+wait_until 10 "${POLL_INTERVAL}" port_bound tcp 1084
 
 cat > /tmp/profile_udp_tproxy.json <<EOF
 {
@@ -1352,12 +1398,7 @@ chmod 0600 /etc/routeward/active_profile.json
 
 "${BIN}" daemon >/tmp/rw_daemon_y.out 2>&1 &
 DAEMON_Y_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
@@ -1434,7 +1475,8 @@ fi
 rm -f /tmp/llmnr_5355_hits.log
 LLMNR_AB_OUT=$(python3 /workspace/tests/linux/mock_servers.py --llmnr-query "${TARGET_IP}" "fileserver")
 LLMNR_AB_PORT=$(echo "${LLMNR_AB_OUT}" | sed -n 's/.*SRC_PORT=\([0-9]*\).*/\1/p')
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches logs 'Routed UDP .*python3(\.[0-9]+)?.*-> 10\.200\.1\.1:19990 .*via DIRECT' || true
+wait_until 10 "${POLL_INTERVAL}" file_matches /tmp/llmnr_5355_hits.log "LLMNR_5355 .*:.*${LLMNR_AB_PORT} fileserver" || true
 
 STATE_AB=$("${BIN}" ctl state)
 LOGS_AB=$("${BIN}" ctl logs)
@@ -1466,14 +1508,14 @@ rm -f /tmp/udp_srv_ac.json
     --disable-udp-associate \
     --stats-file /tmp/udp_srv_ac.json >/tmp/udp_srv_ac.out 2>&1 &
 UDP_SRV_AC_PID=$!
-sleep 0.3
+wait_until 10 "${POLL_INTERVAL}" port_bound tcp 1085
 
 sed -e 's/"socks-udp-1084"/"socks-no-udp-1085"/g' \
     -e 's/"port": 1084/"port": 1085/' \
     /tmp/profile_udp_tproxy.json > /tmp/profile_udp_ac.json
 
 "${BIN}" ctl replace-profile --json-file /tmp/profile_udp_ac.json >/dev/null
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches logs 'securityPolicyChanged=' || true
 
 set +e
 UDP_AC_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp-send "${TARGET_IP}" 19997 "blocked-tproxy-ac")
@@ -1508,7 +1550,9 @@ wait "${UDP_SRV_AC_PID}" 2>/dev/null || true
 # ---------------------------------------------------------------------------
 kill -9 "${DAEMON_Y_PID}"
 wait "${DAEMON_Y_PID}" 2>/dev/null || true
-sleep 0.5
+wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "ip6 routeward" || true
+wait_until 15 "${POLL_INTERVAL}" routing_cleaned_up || true
+wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 RULE_AD=$(ip rule show | grep "10810:" || true)
 ROUTE_AD=$(ip route show table 100 2>/dev/null || true)
@@ -1561,12 +1605,7 @@ ip route add 198.51.100.0/24 dev lo table 100
 
 "${BIN}" daemon >/tmp/rw_daemon_af.out 2>&1 &
 DAEMON_AF_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 set +e
 START_AF_OUT=$("${BIN}" ctl start 2>&1)
@@ -1600,12 +1639,7 @@ chmod 0600 /etc/routeward/active_profile.json
 
 "${BIN}" daemon >/tmp/rw_daemon_ag.out 2>&1 &
 DAEMON_AG_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
@@ -1614,7 +1648,8 @@ DNS_AG_OUT=$(python3 /workspace/tests/linux/mock_servers.py --dns-query "${TARGE
 FAKE_IP_AG=$(echo "${DNS_AG_OUT}" | sed -n 's/.*IP=\([0-9.]*\) .*/\1/p')
 
 UDP_AG_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp-send "${FAKE_IP_AG}" 19990 "direct-fakeip-42b1")
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" file_matches /tmp/udp_direct_hits.log 'direct-fakeip-42b1' || true
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches logs 'direct-fakeip-udp\.routeward\.test' || true
 LOGS_AG=$("${BIN}" ctl logs)
 
 kill -TERM "${DAEMON_AG_PID}" 2>/dev/null || true
@@ -1644,19 +1679,14 @@ chmod 0600 /etc/routeward/active_profile.json
 
 "${BIN}" daemon >/tmp/rw_daemon_ah.out 2>&1 &
 DAEMON_AH_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
 
 CURL_AH_OUT=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
     curl -6 --noproxy "" -sS --max-time 5 "http://[${TARGET_IPV6}]:${TARGET_PORT}/v6-proxy-test")
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches logs 'via Local SOCKS5 Gateway' || true
 LOGS_AH=$("${BIN}" ctl logs)
 
 kill -TERM "${DAEMON_AH_PID}" 2>/dev/null || true
@@ -1688,26 +1718,22 @@ rm -f /tmp/udp_srv_aj.json /tmp/udp_direct_hits.log /run/routeward/routeward.soc
     --echo-prefix "UDP6_ECHO_OK:" \
     --stats-file /tmp/udp_srv_aj.json >/tmp/udp_srv_aj.out 2>&1 &
 UDP_SRV_AJ_PID=$!
-sleep 0.3
+wait_until 10 "${POLL_INTERVAL}" port_bound tcp 1084
 
 cp /tmp/profile_udp_tproxy.json /etc/routeward/active_profile.json
 chmod 0600 /etc/routeward/active_profile.json
 
 "${BIN}" daemon >/tmp/rw_daemon_aiaj.out 2>&1 &
 DAEMON_AIAJ_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
 
 UDP_AI_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp6-send "${TARGET_IPV6}" 19990 "transparent-v6-direct")
 UDP_AJ_OUT=$(python3 /workspace/tests/linux/mock_servers.py --transparent-udp6-send "${TARGET_IPV6}" 19999 "transparent-v6-proxy")
-sleep 0.2
+wait_until 10 "${POLL_INTERVAL}" file_matches /tmp/udp_srv_aj.json '"udp_echo_received":1' || true
+wait_until 10 "${POLL_INTERVAL}" ctl_output_matches logs "${TARGET_IPV6}.*:19990.*via DIRECT" || true
 STATS_AJ=$(cat /tmp/udp_srv_aj.json 2>/dev/null || echo "{}")
 LOGS_AIAJ=$("${BIN}" ctl logs)
 
@@ -1759,12 +1785,7 @@ dnsmasq --conf-file=/dev/null --keep-in-foreground --no-resolv --no-hosts --cach
     --listen-address=127.0.0.1 --bind-interfaces --port=53 --server="${TARGET_IP}" \
     --user=rwdns --group=rwdns --pid-file=/tmp/dnsmasq_ak.pid >/tmp/rw_dnsmasq_ak.out 2>&1 &
 DNSMASQ_AK_PID=$!
-for _ in $(seq 1 30); do
-    if python3 /workspace/tests/linux/mock_servers.py --dns-query 127.0.0.1 "warmup.routeward.test" 1 >/dev/null 2>&1; then
-        break
-    fi
-    sleep 0.1
-done
+wait_until 10 "${POLL_INTERVAL}" dns_query_ok 127.0.0.1 "warmup.routeward.test"
 
 sed -e 's|"bypassDomains": \[\(.*\)\]|"bypassDomains": [\1],\n    "dnsServerProcesses": ["!dnsmasq"]|' \
     /tmp/profile_dns_fakeip.json > /tmp/profile_dns_server_removed.json
@@ -1775,12 +1796,7 @@ chmod 0600 /etc/routeward/active_profile.json
 
 "${BIN}" daemon >/tmp/rw_daemon_ak.out 2>&1 &
 DAEMON_AK_PID=$!
-for _ in $(seq 1 30); do
-    if [[ -S /run/routeward/routeward.sock ]]; then
-        break
-    fi
-    sleep 0.1
-done
+wait_for_ipc_socket
 
 "${BIN}" ctl start >/dev/null
 wait_for_nft_table
@@ -1815,7 +1831,7 @@ fi
 # Control: removing the default with "!dnsmasq" through a live profile reload must send the same
 # upstream query to the Fake-IP resolver, which proves the test above is not passing by accident.
 "${BIN}" ctl replace-profile --json-file /tmp/profile_dns_server_removed.json >/dev/null
-sleep 0.3
+wait_until 10 "${POLL_INTERVAL}" nft_set_has_no_elements dns_server_uids || true
 
 rm -f /tmp/dns_hits.log
 DNS_AK_CTRL=$(python3 /workspace/tests/linux/mock_servers.py --dns-query 127.0.0.1 "control.routeward.test" 1)
