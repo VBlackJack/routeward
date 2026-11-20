@@ -20,7 +20,9 @@ param(
     [string]$OutDir = 'dist',
     [string]$Version = '',
     [string]$Arch = 'x64',
-    [switch]$SkipDesktop
+    [switch]$SkipDesktop,
+    [switch]$IncludeWinDivert,
+    [string]$WinDivertDir = 'third_party/windivert/bin'
 )
 
 Set-StrictMode -Version Latest
@@ -36,6 +38,11 @@ $resolvedOutDir = if ([System.IO.Path]::IsPathRooted($OutDir)) {
     $OutDir
 } else {
     Join-Path $repoRoot $OutDir
+}
+$resolvedWinDivertDir = if ([System.IO.Path]::IsPathRooted($WinDivertDir)) {
+    $WinDivertDir
+} else {
+    Join-Path $repoRoot $WinDivertDir
 }
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
@@ -70,12 +77,31 @@ try {
         Copy-Item -LiteralPath $desktopExe -Destination (Join-Path $stageDir 'routeward-desktop.exe')
     }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install-service.ps1') -Destination (Join-Path $stageDir 'install-service.ps1')
+    # Next to the binaries, the script extracts WinDivert into third_party\windivert\bin, a folder
+    # routeward.exe and install-service.ps1 both look in: a ZIP built without WinDivert stays usable.
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'tools\fetch-windivert.ps1') -Destination (Join-Path $stageDir 'fetch-windivert.ps1')
 
     foreach ($docName in @('LICENSE', 'NOTICE')) {
         $docPath = Join-Path $repoRoot $docName
         if (Test-Path -LiteralPath $docPath) {
             Copy-Item -LiteralPath $docPath -Destination (Join-Path $stageDir $docName)
         }
+    }
+
+    if ($IncludeWinDivert) {
+        # tools/fetch-windivert.ps1 only extracts the x64 binaries; there is no x86 or arm64 driver to embed.
+        if ($Arch -ne 'x64') {
+            throw "-IncludeWinDivert is only supported for -Arch x64 (requested: $Arch): tools/fetch-windivert.ps1 extracts the x64 WinDivert binaries only."
+        }
+        # Same unmodified files and notices as the MSI (LGPLv3; source archive attached to each release).
+        foreach ($wdFile in @('WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt', 'WinDivert-README.txt')) {
+            $wdSource = Join-Path $resolvedWinDivertDir $wdFile
+            if (-not (Test-Path -LiteralPath $wdSource)) {
+                throw "WinDivert file '$wdFile' not found in: $resolvedWinDivertDir (run tools/fetch-windivert.ps1)"
+            }
+            Copy-Item -LiteralPath $wdSource -Destination (Join-Path $stageDir $wdFile)
+        }
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'THIRD_PARTY_NOTICES.txt') -Destination (Join-Path $stageDir 'THIRD_PARTY_NOTICES.txt')
     }
 
     $zipName = "${bundleName}.zip"

@@ -118,8 +118,8 @@ function Copy-RouteWardBundle {
             Copy-Item -Path (Join-Path $windivertSource '*') -Destination $windivertDest -Recurse -Force
         }
         # The first windivertDllPaths entry is a WinDivert.dll sitting next to routeward.exe:
-        # copy that root-level pair too (the driver is loaded from the same directory).
-        foreach ($rootFile in @('WinDivert.dll', 'WinDivert64.sys')) {
+        # copy that root-level pair too (the driver is loaded from the same directory), with its license texts.
+        foreach ($rootFile in @('WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt', 'WinDivert-README.txt', 'THIRD_PARTY_NOTICES.txt')) {
             $rootSource = Join-Path $sourceDir $rootFile
             if (Test-Path -LiteralPath $rootSource) {
                 Copy-Item -LiteralPath $rootSource -Destination (Join-Path $destFull $rootFile) -Force

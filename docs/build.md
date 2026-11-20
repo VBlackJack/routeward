@@ -122,14 +122,14 @@ For persistent background execution under `LocalSystem`, register RouteWard as a
 .\target\release\routeward.exe service stop
 .\target\release\routeward.exe service uninstall
 
-# Package release binaries into a distributable ZIP + SHA-256 (excludes WinDivert drivers):
-.\packaging\windows\package-windows.ps1
+# Package release binaries into a distributable ZIP + SHA-256 (`-IncludeWinDivert` bundles the staged WinDivert 2.2.2 files, as in release ZIPs):
+.\packaging\windows\package-windows.ps1 -TargetDir target/release -OutDir dist -Arch x64
 
 # Build the Windows MSI installer (requires WiX Toolset v6 `wix.exe`; `-IncludeWinDivert` bundles the staged WinDivert 2.2.2 files, as in release MSIs):
 .\packaging\windows\build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64
 ```
 
-Release `.msi` packages bundle WinDivert 2.2.2 (`WinDivert.dll` and `WinDivert64.sys`, unmodified, under the LGPLv3; notices in `THIRD_PARTY_NOTICES.txt`, WinDivert source archive attached to each release). An MSI upgrade re-registers the RouteWard service with its `--allow-sid` arguments (`routeward service restore`; automatic-start services are restarted, manual-start ones are registered stopped), and uninstalling removes the WinDivert driver service. The portable ZIP does not contain WinDivert and still requires `tools/fetch-windivert.ps1`.
+Release `.msi` packages bundle WinDivert 2.2.2 (`WinDivert.dll` and `WinDivert64.sys`, unmodified, under the LGPLv3; notices in `THIRD_PARTY_NOTICES.txt`, WinDivert source archive attached to each release). An MSI upgrade re-registers the RouteWard service with its `--allow-sid` arguments (`routeward service restore`; automatic-start services are restarted, manual-start ones are registered stopped), and uninstalling removes the WinDivert driver service. The release ZIP bundles the same WinDivert files and notices next to the binaries, so it runs as is after extraction. Every ZIP also ships `fetch-windivert.ps1`, which extracts WinDivert into `third_party\windivert\bin` next to the binaries when a ZIP is built without `-IncludeWinDivert`.
 
 #### Uninstalling the MSI (what is cleaned, what is not)
 Before the files are removed, an uninstall (not an upgrade) runs two actions:
