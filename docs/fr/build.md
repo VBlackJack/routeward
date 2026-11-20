@@ -148,6 +148,8 @@ sudo apt install ./dist/routeward_*.deb
 sudo systemctl enable --now routeward
 ```
 
+Les binaires sont liés à la glibc de la machine qui les compile. Le `.deb` publié est compilé sous Ubuntu 22.04 (glibc 2.35) : il fonctionne sous Debian 12, Ubuntu 22.04 et les versions plus récentes. Le job de release échoue si un binaire demande un symbole glibc plus récent (`packaging/linux/check-glibc-floor.sh --max 2.35`). Un paquet compilé sur une distribution plus récente ne fonctionne qu'avec cette glibc ou une plus récente.
+
 ### Emplacement des Journaux (Daemon vs Bureau / CLI)
 Les fichiers journaux (`RouteWard_yyyyMMdd.log`) sont écrits dans des dossiers système ou utilisateur fixes, indépendamment du répertoire courant (`CWD`) :
 - **Daemon privilégié (`routeward daemon`, `routeward run`, `routeward cleanup`)** :

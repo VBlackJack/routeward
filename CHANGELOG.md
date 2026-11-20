@@ -6,6 +6,7 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 ## [Unreleased]
 
 ### Fixed
+- Linux: the `.deb` is built on Ubuntu 22.04 (glibc 2.35) instead of the latest runner, so the binaries no longer print "weak version `GLIBC_2.39' not found" on every start on Debian 12; the release job now fails when a binary needs a glibc symbol newer than 2.35.
 - Windows: at most one injected ICMP Port Unreachable per flow and second for blocked UDP (Block rules, DoQ, QUIC), so an application that retransmits a blocked datagram no longer makes RouteWard forge one message per packet.
 - Windows: a DNS server process whose image cannot be queried is identified by the name the tracker already knows, so name-based Block rules match it and the packet path no longer repeats the failing query.
 - The profile reload no longer stalls an async worker while the DNS server tracker scans processes and the firewall rules are reapplied.
