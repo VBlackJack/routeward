@@ -1207,7 +1207,7 @@ impl WinDivertInterceptor {
         }
 
         // A Block rule refuses the datagram with ICMP Port Unreachable, like a closed port. The
-        // spawned forwarder below still records the block; fragments stay a silent drop.
+        // spawned forwarder below still records the block.
         if matches!(eval.action, RuleAction::Block) {
             if let Some(mut icmp6_reply) = build_forged_ipv6_icmpv6_port_unreachable(packet) {
                 Self::inject_inbound_packet(ctrl, api, net_handle, &mut icmp6_reply, *addr);
