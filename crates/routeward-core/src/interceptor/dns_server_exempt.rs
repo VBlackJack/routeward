@@ -700,7 +700,10 @@ impl ExemptSocket {
         match (self.ip, local_ip) {
             (IpAddr::V4(sock), IpAddr::V4(local)) => sock.is_unspecified() || sock == local,
             (IpAddr::V6(sock), IpAddr::V6(local)) => sock.is_unspecified() || sock == local,
-            (IpAddr::V6(sock), IpAddr::V4(_)) => sock.is_unspecified(),
+            // A dual-stack socket bound to `::` or to an IPv4-mapped address sends IPv4 packets.
+            (IpAddr::V6(sock), IpAddr::V4(local)) => {
+                sock.is_unspecified() || sock.to_ipv4_mapped() == Some(local)
+            }
             (IpAddr::V4(_), IpAddr::V6(_)) => false,
         }
     }
@@ -1644,6 +1647,19 @@ mod tests {
         assert_eq!(only.exempt_port_owner(DnsProto::Udp, 53100, v6), Some(7));
         let other_v6: IpAddr = "2001:db8::11".parse::<Ipv6Addr>().unwrap().into();
         assert_eq!(only.exempt_port_owner(DnsProto::Udp, 53100, other_v6), None);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_row_covers_only_its_own_ipv4_address() {
+        let local: IpAddr = Ipv4Addr::new(192, 0, 2, 10).into();
+        let other: IpAddr = Ipv4Addr::new(192, 0, 2, 11).into();
+        let mapped: IpAddr = Ipv4Addr::new(192, 0, 2, 10).to_ipv6_mapped().into();
+        let tracker = tracker_with_sockets(&[(DnsProto::Tcp, 53200, 9, mapped)]);
+        assert_eq!(
+            tracker.exempt_port_owner(DnsProto::Tcp, 53200, local),
+            Some(9)
+        );
+        assert_eq!(tracker.exempt_port_owner(DnsProto::Tcp, 53200, other), None);
     }
 
     #[test]
