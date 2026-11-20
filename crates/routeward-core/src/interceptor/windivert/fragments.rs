@@ -29,6 +29,25 @@ use crate::rules::ConnectionRequest;
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 
+/// Smallest DNS message: the 12-byte header.
+const DNS_HEADER_LEN: usize = 12;
+/// Query/response flag in the third header byte; a query leaves it cleared.
+const DNS_FLAG_RESPONSE: u8 = 0x80;
+
+/// `true` when `payload` starts with a DNS header of a query.
+pub(super) fn is_dns_query_header(payload: &[u8]) -> bool {
+    payload.len() >= DNS_HEADER_LEN && payload[2] & DNS_FLAG_RESPONSE == 0
+}
+
+/// `true` when the first fragment `frag` of a UDP datagram carries a DNS query header at its UDP
+/// payload offset. A fragment whose UDP header could not be located (no payload offset) or whose
+/// payload is cut before the 12-byte header is never a query.
+pub(super) fn first_fragment_is_dns_query(packet: &[u8], frag: &UdpFragmentMeta) -> bool {
+    frag.udp_payload_offset
+        .and_then(|offset| packet.get(offset..))
+        .is_some_and(is_dns_query_header)
+}
+
 /// Outcome of evaluating the first fragment of a UDP datagram.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FragmentDecision {
@@ -150,6 +169,64 @@ mod tests {
         IPPROTO_UDP,
     };
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// First IPv4 UDP fragment with `payload` right after the UDP header.
+    fn first_fragment_with_payload(payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 20 + 8 + payload.len()];
+        pkt[0] = 0x45;
+        let total_len = pkt.len() as u16;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+        pkt[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = IPPROTO_UDP;
+        pkt[12..16].copy_from_slice(&[192, 168, 1, 25]);
+        pkt[16..20].copy_from_slice(&[93, 184, 215, 14]);
+        pkt[20..22].copy_from_slice(&50123u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&53u16.to_be_bytes());
+        pkt[24..26].copy_from_slice(&4000u16.to_be_bytes());
+        pkt[28..].copy_from_slice(payload);
+        pkt
+    }
+
+    #[test]
+    fn first_fragment_dns_gate_accepts_only_a_full_query_header() {
+        let mut query = [0u8; 12];
+        query[2] = 0x01; // QR = 0, RD = 1
+        let pkt = first_fragment_with_payload(&query);
+        let meta = parse_udp_fragment_meta(&pkt).expect("first fragment");
+        assert!(first_fragment_is_dns_query(&pkt, &meta));
+
+        // A response (QR bit set) is not a query.
+        let mut response = query;
+        response[2] = 0x81;
+        let pkt = first_fragment_with_payload(&response);
+        let meta = parse_udp_fragment_meta(&pkt).expect("first fragment");
+        assert!(!first_fragment_is_dns_query(&pkt, &meta));
+
+        // A payload cut before the 12-byte header is not a query either.
+        let pkt = first_fragment_with_payload(&query[..11]);
+        let meta = parse_udp_fragment_meta(&pkt).expect("first fragment");
+        assert!(!first_fragment_is_dns_query(&pkt, &meta));
+
+        // No payload offset (UDP header not located): never a query.
+        let mut unlocated = meta;
+        unlocated.udp_payload_offset = None;
+        let full = first_fragment_with_payload(&query);
+        assert!(!first_fragment_is_dns_query(&full, &unlocated));
+        // An offset past the end of the packet is handled without panicking.
+        unlocated.udp_payload_offset = Some(full.len() + 10);
+        assert!(!first_fragment_is_dns_query(&full, &unlocated));
+    }
+
+    #[test]
+    fn dns_query_header_needs_twelve_bytes_and_a_clear_response_flag() {
+        assert!(!is_dns_query_header(&[]));
+        assert!(!is_dns_query_header(&[0u8; 11]));
+        assert!(is_dns_query_header(&[0u8; 12]));
+        let mut response = [0u8; 12];
+        response[2] = 0x80;
+        assert!(!is_dns_query_header(&response));
+    }
 
     fn controller(kill_switch: bool) -> RouteWardController {
         let constants = SystemConstants::load_embedded().expect("SystemConstants");

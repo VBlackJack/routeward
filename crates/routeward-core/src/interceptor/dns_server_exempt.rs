@@ -42,8 +42,6 @@
 //!   IPv4 packets when bound to `::` (a dual-stack socket).
 //! - [`DnsServerTracker::is_exempt_port`] `(proto, local_port)`: the port-only variant.
 //! - [`DnsServerTracker::is_exempt_pid`] `(pid)`: for a PID known from the socket-layer cache.
-//! - [`DnsServerTracker::is_exempt_flow`] `(proto, port, resolve_pid)`: the two above in one call,
-//!   with the PID lookup run only when the port alone did not decide.
 //! - [`DnsServerTracker::note_unknown_pid`] `(pid, image_path)`: call when a socket-layer event
 //!   comes from a PID the tracker does not know; it adds the PID at once when the image matches.
 //! - [`DnsServerTracker::refresh`]: the periodic rescan, driven by the controller, not the worker.
@@ -832,9 +830,16 @@ impl DnsServerTracker {
         self.inner.state.read().pids.contains_key(&pid)
     }
 
+    /// The image basename the tracker stored for a known DNS server `pid`.
+    pub fn pid_name(&self, pid: u32) -> Option<String> {
+        self.inner.state.read().pids.get(&pid).cloned()
+    }
+
     /// Decides a flow from its local port, falling back to `resolve_pid` (a cache lookup, never a
     /// table query) only when the port alone did not decide. An empty tracker returns `false`
-    /// without calling `resolve_pid`.
+    /// without calling `resolve_pid`. Port-only and without a production caller (the data path
+    /// uses [`exempt_port_owner`](Self::exempt_port_owner)), so it exists for tests only.
+    #[cfg(test)]
     pub fn is_exempt_flow(
         &self,
         proto: DnsProto,

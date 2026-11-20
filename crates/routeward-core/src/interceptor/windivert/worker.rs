@@ -14,7 +14,11 @@
  * limitations under the License.
  */
 
-use super::fragments::{decide_first_udp_fragment, decide_orphan_fragment};
+use super::fragments::{
+    decide_first_udp_fragment, decide_orphan_fragment, first_fragment_is_dns_query,
+    is_dns_query_header,
+};
+use super::icmp_limit::{IcmpFlowKey, IcmpRateLimiter};
 use super::*;
 use crate::interceptor::dns_server_exempt::{
     blocked_dns_connection_record, dns_server_block_rule, DnsProto,
@@ -43,10 +47,6 @@ enum DnsServerFlowAction {
     Drop,
 }
 
-/// Smallest DNS message: the 12-byte header.
-const DNS_HEADER_LEN: usize = 12;
-/// Query/response flag in the third header byte; a query leaves it cleared.
-const DNS_FLAG_RESPONSE: u8 = 0x80;
 /// Capacity of the queue between the socket-layer listener and the DNS server PID resolver.
 const DNS_SERVER_PID_QUEUE_LEN: usize = 256;
 /// A PID already looked at is not resolved again before this delay.
@@ -60,11 +60,6 @@ const DNS_SERVER_BLOCK_LOG_KEY: &str = "dns_server_exempt_block";
 /// Rate-limit category of the failed packet injection warning.
 #[cfg(windows)]
 const WINDIVERT_INJECT_FAILED_LOG_KEY: &str = "windivert_inject_failed";
-
-/// `true` when `payload` starts with a DNS header of a query.
-fn is_dns_query_header(payload: &[u8]) -> bool {
-    payload.len() >= DNS_HEADER_LEN && payload[2] & DNS_FLAG_RESPONSE == 0
-}
 
 impl WinDivertInterceptor {
     /// Decides whether a port-53 flow of local port `src_port` belongs to a DNS server process.
@@ -107,7 +102,14 @@ impl WinDivertInterceptor {
         let owner = owner?;
         // The owner PID resolves the real process, so an explicit Block rule that names the DNS
         // server still matches and the logs show its PID and name.
-        let identity = ctrl.process_resolver.resolve_by_pid(owner);
+        // The tracker already knows the image name: fall back to it so a failing image query is
+        // cached by the resolver instead of being repeated for every packet on this thread.
+        let identity = match tracker.pid_name(owner) {
+            Some(name) => ctrl
+                .process_resolver
+                .resolve_by_pid_with_fallback(owner, &name),
+            None => ctrl.process_resolver.resolve_by_pid(owner),
+        };
         let block_rule = {
             let prof = ctrl.profile.read();
             dns_server_block_rule(&prof.rules, &prof.default_action, &identity, dst, proto)
@@ -257,6 +259,27 @@ impl WinDivertInterceptor {
                 dgram.payload_len
             );
         }
+    }
+
+    /// `true` when an ICMP rejection may be injected for this flow now: at most one per flow and
+    /// window, so a retransmitting application cannot make RouteWard forge a message per packet.
+    fn icmp_rejection_allowed(
+        src_ip: IpAddr,
+        src_port: u16,
+        dst_ip: IpAddr,
+        dst_port: u16,
+    ) -> bool {
+        static LIMITER: std::sync::LazyLock<IcmpRateLimiter> =
+            std::sync::LazyLock::new(IcmpRateLimiter::new);
+        LIMITER.allow(
+            IcmpFlowKey {
+                src_ip,
+                src_port,
+                dst_ip,
+                dst_port,
+            },
+            Instant::now(),
+        )
     }
 
     /// Injects `packet` toward the local stack as an inbound packet, copying the interface indexes of
@@ -804,7 +827,15 @@ impl WinDivertInterceptor {
 
         // A Block rule refuses the datagram with ICMP Port Unreachable, like a closed port. The
         // spawned forwarder below still records the block; fragments stay a silent drop.
-        if matches!(eval.action, RuleAction::Block) && !is_fragmented {
+        if matches!(eval.action, RuleAction::Block)
+            && !is_fragmented
+            && Self::icmp_rejection_allowed(
+                IpAddr::V4(meta.src_ip),
+                meta.src_port,
+                IpAddr::V4(meta.dst_ip),
+                meta.dst_port,
+            )
+        {
             if let Some(mut icmp_reply) = build_forged_ipv4_icmp_port_unreachable(packet) {
                 Self::inject_inbound_packet(ctrl, api, net_handle, &mut icmp_reply, *addr);
             }
@@ -1208,7 +1239,14 @@ impl WinDivertInterceptor {
 
         // A Block rule refuses the datagram with ICMP Port Unreachable, like a closed port. The
         // spawned forwarder below still records the block.
-        if matches!(eval.action, RuleAction::Block) {
+        if matches!(eval.action, RuleAction::Block)
+            && Self::icmp_rejection_allowed(
+                IpAddr::V6(meta.src_ip),
+                meta.src_port,
+                IpAddr::V6(meta.dst_ip),
+                meta.dst_port,
+            )
+        {
             if let Some(mut icmp6_reply) = build_forged_ipv6_icmpv6_port_unreachable(packet) {
                 Self::inject_inbound_packet(ctrl, api, net_handle, &mut icmp6_reply, *addr);
             }
@@ -1346,10 +1384,7 @@ impl WinDivertInterceptor {
 
         // A first fragment of a DNS server query follows the same rule as an unfragmented one,
         // including the DNS header check: a response or a short payload is not a query.
-        let is_dns_query = frag
-            .udp_payload_offset
-            .and_then(|offset| packet.get(offset..))
-            .is_some_and(is_dns_query_header);
+        let is_dns_query = first_fragment_is_dns_query(packet, frag);
         if frag.dst_port == ctrl.constants.dns.dns_standard_port && is_dns_query {
             match Self::dns_server_flow_action(
                 ctrl,
@@ -1643,30 +1678,44 @@ impl WinDivertInterceptor {
                                 IpAddr::V6(v6_meta.dst_ip),
                                 v6_meta.dst_port,
                             );
-                            if let Some(mut icmp6_reply) =
-                                build_forged_ipv6_icmpv6_port_unreachable(packet)
-                            {
-                                Self::inject_inbound_packet(
-                                    &ctrl_net,
-                                    &api,
-                                    handle,
-                                    &mut icmp6_reply,
-                                    addr,
-                                );
+                            if Self::icmp_rejection_allowed(
+                                IpAddr::V6(v6_meta.src_ip),
+                                v6_meta.src_port,
+                                IpAddr::V6(v6_meta.dst_ip),
+                                v6_meta.dst_port,
+                            ) {
+                                if let Some(mut icmp6_reply) =
+                                    build_forged_ipv6_icmpv6_port_unreachable(packet)
+                                {
+                                    Self::inject_inbound_packet(
+                                        &ctrl_net,
+                                        &api,
+                                        handle,
+                                        &mut icmp6_reply,
+                                        addr,
+                                    );
+                                }
                             }
                             continue;
                         }
                         if v6_meta.dst_port == quic_port && block_quic {
-                            if let Some(mut icmp6_reply) =
-                                build_forged_ipv6_icmpv6_port_unreachable(packet)
-                            {
-                                Self::inject_inbound_packet(
-                                    &ctrl_net,
-                                    &api,
-                                    handle,
-                                    &mut icmp6_reply,
-                                    addr,
-                                );
+                            if Self::icmp_rejection_allowed(
+                                IpAddr::V6(v6_meta.src_ip),
+                                v6_meta.src_port,
+                                IpAddr::V6(v6_meta.dst_ip),
+                                v6_meta.dst_port,
+                            ) {
+                                if let Some(mut icmp6_reply) =
+                                    build_forged_ipv6_icmpv6_port_unreachable(packet)
+                                {
+                                    Self::inject_inbound_packet(
+                                        &ctrl_net,
+                                        &api,
+                                        handle,
+                                        &mut icmp6_reply,
+                                        addr,
+                                    );
+                                }
                             }
                             Self::record_quic_udp_443_blocked(
                                 &ctrl_net,
@@ -1947,16 +1996,23 @@ impl WinDivertInterceptor {
                                 IpAddr::V4(udp_meta.dst_ip),
                                 udp_meta.dst_port,
                             );
-                            if let Some(mut icmp_reply) =
-                                build_forged_ipv4_icmp_port_unreachable(packet)
-                            {
-                                Self::inject_inbound_packet(
-                                    &ctrl_net,
-                                    &api,
-                                    handle,
-                                    &mut icmp_reply,
-                                    addr,
-                                );
+                            if Self::icmp_rejection_allowed(
+                                IpAddr::V4(udp_meta.src_ip),
+                                udp_meta.src_port,
+                                IpAddr::V4(udp_meta.dst_ip),
+                                udp_meta.dst_port,
+                            ) {
+                                if let Some(mut icmp_reply) =
+                                    build_forged_ipv4_icmp_port_unreachable(packet)
+                                {
+                                    Self::inject_inbound_packet(
+                                        &ctrl_net,
+                                        &api,
+                                        handle,
+                                        &mut icmp_reply,
+                                        addr,
+                                    );
+                                }
                             }
                             continue;
                         }
@@ -1965,16 +2021,23 @@ impl WinDivertInterceptor {
                         if udp_meta.dst_port == quic_port
                             && ctrl_net.profile.read().security_policy.block_quic_udp_443
                         {
-                            if let Some(mut icmp_reply) =
-                                build_forged_ipv4_icmp_port_unreachable(packet)
-                            {
-                                Self::inject_inbound_packet(
-                                    &ctrl_net,
-                                    &api,
-                                    handle,
-                                    &mut icmp_reply,
-                                    addr,
-                                );
+                            if Self::icmp_rejection_allowed(
+                                IpAddr::V4(udp_meta.src_ip),
+                                udp_meta.src_port,
+                                IpAddr::V4(udp_meta.dst_ip),
+                                udp_meta.dst_port,
+                            ) {
+                                if let Some(mut icmp_reply) =
+                                    build_forged_ipv4_icmp_port_unreachable(packet)
+                                {
+                                    Self::inject_inbound_packet(
+                                        &ctrl_net,
+                                        &api,
+                                        handle,
+                                        &mut icmp_reply,
+                                        addr,
+                                    );
+                                }
                             }
                             Self::record_quic_udp_443_blocked(
                                 &ctrl_net,

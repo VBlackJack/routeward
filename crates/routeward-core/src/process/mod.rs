@@ -419,6 +419,42 @@ impl ProcessResolver {
         identity
     }
 
+    /// Like [`Self::resolve_by_pid`], for a caller that already knows the image name of `pid`
+    /// (for example from the DNS server tracker). When the image query fails, the identity built
+    /// from `fallback_name` is cached for the normal TTL, so a hot path never repeats a failing
+    /// query for every packet; the query is retried once the entry expires.
+    pub fn resolve_by_pid_with_fallback(&self, pid: u32, fallback_name: &str) -> ProcessIdentity {
+        if pid == 0 {
+            return ProcessIdentity::default();
+        }
+        if let Some(entry) = self.cache.get(&pid) {
+            if entry.cached_at.elapsed() < self.cache_ttl {
+                return entry.identity.clone();
+            }
+        }
+        let identity = match Self::query_executable_path(pid) {
+            Some(executable_path) => ProcessIdentity {
+                pid,
+                name: Self::extract_basename(&executable_path),
+                executable_path,
+            },
+            None => ProcessIdentity {
+                pid,
+                name: fallback_name.to_string(),
+                executable_path: fallback_name.to_string(),
+            },
+        };
+        self.purge_cache_if_full();
+        self.cache.insert(
+            pid,
+            CachedProcess {
+                identity: identity.clone(),
+                cached_at: Instant::now(),
+            },
+        );
+        identity
+    }
+
     /// Keeps the PID cache bounded: drops expired entries, then the oldest ones if still full.
     fn purge_cache_if_full(&self) {
         if self.cache.len() < MAX_PID_CACHE_ENTRIES {
