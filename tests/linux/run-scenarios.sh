@@ -38,11 +38,14 @@ IPC_SOCKET="/run/routeward/routeward.sock"
 wait_until() {
     local timeout_s="$1" interval_s="$2"
     shift 2
-    local max_tries try
-    max_tries=$(awk -v t="${timeout_s}" -v i="${interval_s}" 'BEGIN { n = int(t / i + 0.5); print (n < 1 ? 1 : n) }')
-    for ((try = 0; try < max_tries; try++)); do
+    # Wall-clock deadline (whole seconds, rounded up) so a slow condition cannot stretch the budget.
+    local deadline=$((SECONDS + ${timeout_s%.*} + 1))
+    while true; do
         if "$@" >/dev/null 2>&1; then
             return 0
+        fi
+        if ((SECONDS >= deadline)); then
+            break
         fi
         sleep "${interval_s}"
     done
@@ -81,7 +84,9 @@ routing_cleaned_up() {
 
 # ctl_output_matches <ctl subcommand> <ERE>: true when "ctl <subcommand>" output matches
 ctl_output_matches() {
-    "${BIN}" ctl "$1" 2>/dev/null | grep -Eq -- "$2"
+    local out
+    out=$("${BIN}" ctl "$1" 2>/dev/null) || return 1
+    grep -Eq -- "$2" <<<"${out}"
 }
 
 # file_matches <file> <ERE>: true when the file exists and contains a matching line
@@ -91,7 +96,9 @@ file_matches() {
 
 # nft_set_has_no_elements <set>: true when the ip routeward set is empty or absent
 nft_set_has_no_elements() {
-    ! nft list set ip routeward "$1" 2>&1 | grep -q "elements"
+    local out
+    out=$(nft list set ip routeward "$1" 2>&1 || true)
+    ! grep -q "elements" <<<"${out}"
 }
 
 # watchdog_gone: true when no nft watchdog shell (the orphan left by a SIGKILLed daemon) is running
@@ -329,7 +336,7 @@ wait_for_nft_table
 
 kill -TERM "${RW_PID}"
 wait "${RW_PID}" || true
-wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "inet routeward_ks" || true
+wait_until 2 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "inet routeward_ks" || true
 wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 RESP_D2=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/after-clean-stop")
@@ -354,7 +361,7 @@ wait_for_nft_table
 
 kill -9 "${RW_PID}"
 wait "${RW_PID}" 2>/dev/null || true
-wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "inet routeward_ks" || true
+wait_until 2 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "inet routeward_ks" || true
 wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 if ! nft list table ip routeward >/dev/null 2>&1 && ! nft list table inet routeward_ks >/dev/null 2>&1; then
@@ -567,7 +574,7 @@ wait_for_nft_table
 
 kill -9 "${DAEMON_I2_PID}"
 wait "${DAEMON_I2_PID}" 2>/dev/null || true
-wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "inet routeward_ks" || true
+wait_until 2 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "inet routeward_ks" || true
 wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 RESP_I2=$(curl -sS --max-time 5 "http://${TARGET_IP}:${TARGET_PORT}/after-daemon-kill9-ks-off")
@@ -714,6 +721,7 @@ LOGS_L=$("${BIN}" ctl logs)
 kill -TERM "${DAEMON_L_PID}" 2>/dev/null || true
 wait "${DAEMON_L_PID}" 2>/dev/null || true
 kill "${MOCK_HTTP_PID}" 2>/dev/null || true
+wait "${MOCK_HTTP_PID}" 2>/dev/null || true
 
 if [[ "${CURL_EXIT_L}" -ne 0 ]] \
     && [[ ! -s /tmp/http_target_hits.log ]] \
@@ -999,7 +1007,7 @@ fi
 # ---------------------------------------------------------------------------
 kill -9 "${DAEMON_N_PID}"
 wait "${DAEMON_N_PID}" 2>/dev/null || true
-wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "ip6 routeward" || true
+wait_until 2 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "ip6 routeward" || true
 wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 rm -f /tmp/dns_hits.log
@@ -1299,7 +1307,7 @@ fi
 # ---------------------------------------------------------------------------
 kill -9 "${DAEMON_U_PID}"
 wait "${DAEMON_U_PID}" 2>/dev/null || true
-wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "ip6 routeward" || true
+wait_until 2 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "ip6 routeward" || true
 wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
 rm -f /tmp/udp_443_hits.log /tmp/llmnr_5355_hits.log
@@ -1550,7 +1558,7 @@ wait "${UDP_SRV_AC_PID}" 2>/dev/null || true
 # ---------------------------------------------------------------------------
 kill -9 "${DAEMON_Y_PID}"
 wait "${DAEMON_Y_PID}" 2>/dev/null || true
-wait_until 15 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "ip6 routeward" || true
+wait_until 2 "${POLL_INTERVAL}" nft_tables_absent "ip routeward" "ip6 routeward" || true
 wait_until 15 "${POLL_INTERVAL}" routing_cleaned_up || true
 wait_until 15 "${POLL_INTERVAL}" watchdog_gone || true
 
