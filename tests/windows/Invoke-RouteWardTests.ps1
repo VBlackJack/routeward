@@ -681,6 +681,43 @@ function Test-NamedPipeExists {
     }
 }
 
+# Polls a condition until it returns true or the timeout elapses. Returns $true/$false and never throws
+# on timeout; exceptions raised by the condition count as "not yet". Condition variable names must not
+# collide with this function's own locals (waitSw, waitOk, Condition, TimeoutMs, IntervalMs, Description).
+function Wait-Until {
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Condition,
+        [int]$TimeoutMs = 5000,
+        [int]$IntervalMs = 0,
+        [string]$Description = "condition"
+    )
+    if ($IntervalMs -le 0) {
+        $IntervalMs = $PollIntervalMs
+    }
+    if ($IntervalMs -lt 50) {
+        $IntervalMs = 50
+    }
+    $waitSw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $waitOk = $false
+        try {
+            $waitOk = [bool](& $Condition)
+        } catch {
+            $waitOk = $false
+        }
+        if ($waitOk) {
+            return $true
+        }
+        if ($waitSw.ElapsedMilliseconds -ge $TimeoutMs) {
+            break
+        }
+        Start-Sleep -Milliseconds $IntervalMs
+    }
+    Write-Host "[WARN] Timed out after ${TimeoutMs}ms waiting for: $Description" -ForegroundColor Yellow
+    return $false
+}
+
 function Wait-ForNamedPipe {
     param(
         [string]$FullPipePath,
@@ -1940,7 +1977,8 @@ function Invoke-RouteWardCtl {
     param(
         [string]$ExePath,
         [string[]]$CtlArgs,
-        [string]$Label
+        [string]$Label,
+        [switch]$SkipCapture
     )
     $argList = @("ctl") + $CtlArgs
     $prevEap = $ErrorActionPreference
@@ -1953,7 +1991,9 @@ function Invoke-RouteWardCtl {
     }
     $rawText = ($outputLines | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
     $sanitized = Remove-SensitiveText -InputText $rawText
-    $script:RawCtlCapture.Add("--- [$Label] routeward $($argList -join ' ') (exit=$exitCode) ---`r`n$sanitized")
+    if (-not $SkipCapture.IsPresent) {
+        $script:RawCtlCapture.Add("--- [$Label] routeward $($argList -join ' ') (exit=$exitCode) ---`r`n$sanitized")
+    }
     return [PSCustomObject]@{
         ExitCode = $exitCode
         RawText  = $rawText
@@ -1981,7 +2021,7 @@ function Stop-AllTrackedDaemons {
     if (-not $ForceKillOnly.IsPresent -and (Test-NamedPipeExists -FullPipePath $FullPipePath)) {
         try {
             $null = Invoke-RouteWardCtl -ExePath $ExePath -CtlArgs @("stop") -Label "Cleanup-GracefulStop"
-            Start-Sleep -Milliseconds 150
+            $null = Wait-Until -TimeoutMs 5000 -Description "firewall rule absent after graceful stop" -Condition { -not (Test-FirewallRulePresent -RuleName $FirewallRuleName) }
         } catch {
             # Continue to PID termination
         }
@@ -2054,6 +2094,49 @@ function Ensure-ScenarioDaemonState {
             throw "Ensure-ScenarioDaemonState failed to stop interception."
         }
     }
+}
+
+# Polls "ctl connections" or "ctl logs" until one entry satisfies the Match predicate (param($c) -> bool).
+# Polling reads are not added to the raw ctl capture. Returns $true/$false, never throws on timeout.
+function Wait-ForCtlEntry {
+    param(
+        [string]$ExePath,
+        [ValidateSet("connections", "logs")]
+        [string]$CtlCommand,
+        [scriptblock]$Match,
+        [string]$Description,
+        [int]$TimeoutMs = 5000
+    )
+    $entryLabel = "Wait-$CtlCommand"
+    $entryMatch = $Match
+    return (Wait-Until -TimeoutMs $TimeoutMs -Description $Description -Condition {
+        $entryRes = Invoke-RouteWardCtl -ExePath $ExePath -CtlArgs @($CtlCommand) -Label $entryLabel -SkipCapture
+        $entryItems = ConvertFrom-CtlResponseJson -RawJson $entryRes.RawText -Context $entryLabel -ExpectResultArray
+        foreach ($entryItem in @($entryItems)) {
+            if (& $entryMatch $entryItem) {
+                return $true
+            }
+        }
+        return $false
+    })
+}
+
+# Returns the daemon log lines appended after the first SkipLines lines of the newest matching log file.
+function Get-NewDaemonLogLines {
+    param(
+        [string]$LogsDir,
+        [string]$Filter,
+        [int]$SkipLines
+    )
+    $logFiles = @(Get-ChildItem -Path $LogsDir -Filter $Filter -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    if ($logFiles.Count -eq 0) {
+        return @()
+    }
+    $logLines = @(Get-Content -LiteralPath $logFiles[0].FullName -Encoding UTF8)
+    if ($logLines.Count -gt $SkipLines) {
+        return @($logLines[$SkipLines..($logLines.Count - 1)])
+    }
+    return @($logLines)
 }
 
 # ---------------------------------------------------------------------------
@@ -2299,7 +2382,10 @@ try {
                 Record-ScenarioResult -Id "d" -Status "FAIL" -Title "ctl start and SOCKS5 routing" -Detail "ctl start failed or result.running!=true"
             } else {
                 $curlRes = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
-                Start-Sleep -Milliseconds $PollIntervalMs
+                $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "curl.exe connection routed by '$ExpectedProxyRuleName' with rxBytes > 0" -Match {
+                    param($c)
+                    $c.processName -ieq "curl.exe" -and $c.matchedRule -eq $ExpectedProxyRuleName -and ([int64]$c.rxBytes) -gt 0
+                }
                 $connsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-d-connections"
                 $connsList = ConvertFrom-CtlResponseJson `
                     -RawJson $connsRes.RawText `
@@ -2366,7 +2452,10 @@ try {
 
         try {
             $curlBlocked = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec 15 -ConnectTimeoutSec 10
-            Start-Sleep -Milliseconds $PollIntervalMs
+            $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "blocked curl.exe connection" -Match {
+                param($c)
+                $c.processName -ieq "curl.exe" -and $c.status -eq "blocked"
+            }
             $connsBlockedRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-e-connections"
             $connsBlockedList = ConvertFrom-CtlResponseJson `
                 -RawJson $connsBlockedRes.RawText `
@@ -2419,7 +2508,7 @@ try {
             -RawJson $stopRes.RawText `
             -Context "Scenario-f-stop" `
             -RequiredResultProperties @("running")
-        Start-Sleep -Milliseconds $PollIntervalMs
+        $null = Wait-Until -TimeoutMs 5000 -Description "firewall rule '$FirewallRuleName' removed after ctl stop" -Condition { -not (Test-FirewallRulePresent -RuleName $FirewallRuleName) }
         $fwStillPresent = Test-FirewallRulePresent -RuleName $FirewallRuleName
         $curlDirect = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
 
@@ -2437,7 +2526,7 @@ try {
     # -----------------------------------------------------------------------
     try {
         Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
-        Start-Sleep -Milliseconds $PollIntervalMs
+        $null = Wait-Until -TimeoutMs 5000 -Description "firewall rule '$FirewallRuleName' present after ctl start" -Condition { Test-FirewallRulePresent -RuleName $FirewallRuleName }
         $fwBeforeCrash = Test-FirewallRulePresent -RuleName $FirewallRuleName
 
         if (-not $fwBeforeCrash) {
@@ -2446,7 +2535,7 @@ try {
             $killedPid = $script:CurrentDaemonProc.Id
             Stop-AllTrackedUdpTestServers
     Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
-            Start-Sleep -Milliseconds $PollIntervalMs
+            $null = Wait-Until -TimeoutMs 5000 -Description "killed daemon PID=$killedPid to exit" -Condition { $null -eq (Get-Process -Id $killedPid -ErrorAction SilentlyContinue) }
 
             $curlAfterCrash = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
             $fwOrphanPresent = Test-FirewallRulePresent -RuleName $FirewallRuleName
@@ -2478,7 +2567,11 @@ try {
 
         $null = Start-TrackedDaemon -ExePath $routeWardExePath -WorkDir $resolvedBinDir
         $pipeReadyAfterCrash = Wait-ForNamedPipe -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs
-        Start-Sleep -Milliseconds $LogFlushWaitMs
+        $null = Wait-Until -TimeoutMs ([Math]::Max(5000, 3 * $LogFlushWaitMs)) -Description "orphan cleanup line in daemon log" -Condition {
+            $cleanupLines = @(Get-NewDaemonLogLines -LogsDir $daemonLogsDir -Filter $logWildcard -SkipLines $daemonLogBeforeLines)
+            $cleanupHits = @($cleanupLines | Where-Object { $_.Contains($ExpectedCleanupLogText) -and $_.Contains($FirewallRuleName) })
+            $cleanupHits.Count -gt 0
+        }
 
         $fwAfterRestart = Test-FirewallRulePresent -RuleName $FirewallRuleName
         $sawCleanupInLog = $false
@@ -2513,7 +2606,11 @@ try {
     try {
         Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $false
         $null = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("status") -Label "Scenario-i-status-log-check"
-        Start-Sleep -Milliseconds $LogFlushWaitMs
+        $null = Wait-Until -TimeoutMs ([Math]::Max(5000, 3 * $LogFlushWaitMs)) -Description "daemon and user logs written since script start" -Condition {
+            $pollDaemonLogs = @(Get-ChildItem -Path $daemonLogsDir -Filter $logWildcard -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+            $pollUserLogs = @(Get-ChildItem -Path $userLogsDir -Filter $logWildcard -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+            ($pollDaemonLogs.Count -gt 0) -and ($pollDaemonLogs[0].LastWriteTime -ge $scriptStartTime.AddSeconds(-2)) -and ($pollUserLogs.Count -gt 0) -and ($pollUserLogs[0].LastWriteTime -ge $scriptStartTime.AddSeconds(-2))
+        }
 
         $daemonLogFiles = @(Get-ChildItem -Path $daemonLogsDir -Filter $logWildcard -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
         $userLogFiles = @(Get-ChildItem -Path $userLogsDir -Filter $logWildcard -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
@@ -2561,7 +2658,11 @@ try {
             }
 
             $curlResK = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec $CurlTimeoutSec
-            Start-Sleep -Milliseconds $PollIntervalMs
+            $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "curl.exe connection to '$PublicDnsTestDomain' routed by '$ExpectedProxyRuleName'" -Match {
+                param($c)
+                $domMatchPoll = ($c.targetHost -ieq $PublicDnsTestDomain) -or ($null -ne $c.resolvedDomain -and $c.resolvedDomain -ieq $PublicDnsTestDomain)
+                $c.processName -ieq "curl.exe" -and $domMatchPoll -and $c.matchedRule -eq $ExpectedProxyRuleName -and ([int64]$c.rxBytes) -gt 0
+            }
 
             $connsResK = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-k-connections"
             $connsListK = ConvertFrom-CtlResponseJson `
@@ -2695,7 +2796,14 @@ try {
         Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
 
         $quicProbe = Invoke-QuicUdp443Probe -TargetIp $ExternalDnsServer -Port 443 -ReceiveTimeoutMs 1500
-        Start-Sleep -Milliseconds $PollIntervalMs
+        $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "blocked QUIC UDP 443 connection" -Match {
+            param($c)
+            [int]$c.targetPort -eq 443 -and $c.protocol -eq "udp" -and $c.matchedRule -eq "SecurityPolicy:blockQuicUdp443" -and $c.status -eq "blocked"
+        }
+        $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "logs" -Description "QUIC rejection WARN log" -Match {
+            param($l)
+            $l.level -eq "WARN" -and ([string]$l.message).Contains("Rejected QUIC (UDP port 443) with ICMP Port Unreachable")
+        }
 
         $connsResO = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-o-connections"
         $connsListO = ConvertFrom-CtlResponseJson `
@@ -2755,7 +2863,14 @@ try {
         } finally {
             $llmnrSock.Close()
         }
-        Start-Sleep -Milliseconds $PollIntervalMs
+        $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "LLMNR public FQDN blocked connection" -Match {
+            param($c)
+            [int]$c.targetPort -eq 5355 -and $c.protocol -eq "udp" -and $c.matchedRule -eq "LocalNameGuard:LLMNR" -and $c.status -eq "blocked" -and $c.resolvedDomain -ieq $publicLlmnrFqdn
+        }
+        $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "logs" -Description "LLMNR WARN log" -Match {
+            param($l)
+            $l.level -eq "WARN" -and ([string]$l.message).Contains("Blocked public FQDN `"$publicLlmnrFqdn`" over LLMNR")
+        }
 
         $connsResP = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-p-connections"
         $connsListP = ConvertFrom-CtlResponseJson `
@@ -2868,9 +2983,13 @@ try {
             }
             $ruleAddedQ = $true
 
+            # Intentional fixed wait: no observable signal that the engine has applied the new rule to its filter set.
             Start-Sleep -Milliseconds 250
             $ntpExchQ = Invoke-UdpNtpExchange -TargetHost $PublicNtpServer -Port $NtpPort -ReceiveTimeoutMs 4000
-            Start-Sleep -Milliseconds $PollIntervalMs
+            $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "proxied UDP NTP connection for rule '$tempRuleNameQ'" -Match {
+                param($c)
+                [int]$c.targetPort -eq $NtpPort -and $c.protocol -eq "udp" -and $c.matchedRule -eq $tempRuleNameQ -and $c.status -ne "blocked"
+            }
 
             $connsResQ = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-q-connections"
             $connsListQ = ConvertFrom-CtlResponseJson `
@@ -3001,9 +3120,13 @@ try {
             }
             $ruleAddedR = $true
 
+            # Intentional fixed wait: no observable signal that the engine has applied the new rule to its filter set.
             Start-Sleep -Milliseconds 250
             $ntpExchR = Invoke-UdpNtpExchange -TargetHost $PublicNtpServer -Port $NtpPort -ReceiveTimeoutMs 2000
-            Start-Sleep -Milliseconds $PollIntervalMs
+            $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "blocked UDP NTP connection for rule '$tempRuleNameR'" -Match {
+                param($c)
+                [int]$c.targetPort -eq $NtpPort -and $c.protocol -eq "udp" -and $c.matchedRule -eq $tempRuleNameR -and $c.status -eq "blocked" -and $c.routeLabel -eq "BLOCKED"
+            }
 
             $connsResR = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-r-connections"
             $connsListR = ConvertFrom-CtlResponseJson `
@@ -3060,7 +3183,15 @@ try {
         Ensure-ScenarioDaemonState -ExePath $routeWardExePath -WorkDir $resolvedBinDir -FullPipePath $PipeName -TimeoutMs $PipeReadyTimeoutMs -IntervalMs $PollIntervalMs -RequireInterceptionRunning $true
 
         $ntpExchS = Invoke-UdpNtpExchange -TargetHost $PublicNtpServer -Port $NtpPort -ReceiveTimeoutMs 4000
-        Start-Sleep -Milliseconds $PollIntervalMs
+        $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "direct UDP NTP connection attributed to a process" -Match {
+            param($c)
+            [int]$c.targetPort -eq $NtpPort -and $c.protocol -eq "udp" -and $c.routeLabel -eq "DIRECT" -and ($script:ExpectedUdpHostProcesses -contains $c.processName)
+        }
+        $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "logs" -Description "direct UDP Routed log line" -Match {
+            param($l)
+            $msgPoll = [string]$l.message
+            $msgPoll.Contains("Routed UDP") -and $msgPoll.Contains(":$NtpPort") -and $msgPoll.Contains("DIRECT")
+        }
 
         $connsResS = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-s-connections"
         $connsListS = ConvertFrom-CtlResponseJson `
@@ -3194,10 +3325,14 @@ try {
                 }
                 $ruleAddedT = $true
 
+                # Intentional fixed wait: no observable signal that the engine has applied the new rule to its filter set.
                 Start-Sleep -Milliseconds 250
                 $ipv6UrlT = "http://[${ipv6TargetIpT}]:${Ipv6TestHttpPort}/"
                 $curlResT = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $ipv6UrlT -TimeoutSec 8
-                Start-Sleep -Milliseconds $PollIntervalMs
+                $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "IPv6 curl.exe connection routed by '$tempRuleNameT'" -Match {
+                    param($c)
+                    $c.processName -ieq "curl.exe" -and $c.targetHost -ieq $ipv6TargetIpT -and [int]$c.targetPort -eq $Ipv6TestHttpPort -and $c.matchedRule -eq $tempRuleNameT -and ([int64]$c.rxBytes) -gt 0
+                }
 
                 $connsResT = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-t-connections"
                 $connsListT = ConvertFrom-CtlResponseJson `
@@ -3328,9 +3463,13 @@ try {
                 }
                 $ruleAddedU = $true
 
+                # Intentional fixed wait: no observable signal that the engine has applied the new rule to its filter set.
                 Start-Sleep -Milliseconds 250
                 $udpExchU = Invoke-Ipv6UdpNtpExchange -TargetIp $ipv6TargetIpU -Port $Ipv6TestUdpPort -ReceiveTimeoutMs 4000 -LocalIp $ipv6LocalUlaU
-                Start-Sleep -Milliseconds $PollIntervalMs
+                $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "IPv6 UDP connection routed by '$tempRuleNameU'" -Match {
+                    param($c)
+                    [int]$c.targetPort -eq $Ipv6TestUdpPort -and $c.protocol -eq "udp" -and $c.targetHost -ieq $ipv6TargetIpU -and $c.matchedRule -eq $tempRuleNameU -and $c.status -ne "blocked"
+                }
 
                 $connsResU = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-u-connections"
                 $connsListU = ConvertFrom-CtlResponseJson `
@@ -3401,6 +3540,7 @@ try {
                 throw "No connected non-loopback network adapter found to attach transient IPv6 route for Scenario (v)."
             }
 
+            # Intentional fixed wait: lets the transient IPv6 route and neighbor entry settle (no observable signal beyond the Preferred address state already awaited).
             Start-Sleep -Milliseconds 200
             $dnsV6UdpA = Invoke-Ipv6DnsWireQuery -TargetIp $ipv6TargetIpV -QueryName "example.com" -Port 53 -Protocol "udp" -QType 1 -TimeoutMs 3500 -LocalIp $ipv6LocalUlaV
             $dnsV6UdpAaaa = Invoke-Ipv6DnsWireQuery -TargetIp $ipv6TargetIpV -QueryName "example.com" -Port 53 -Protocol "udp" -QType 28 -TimeoutMs 3500 -LocalIp $ipv6LocalUlaV
@@ -3414,7 +3554,10 @@ try {
             } finally {
                 $dotProbeUdp.Close()
             }
-            Start-Sleep -Milliseconds $PollIntervalMs
+            $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "blocked IPv6 DoT 853 connection" -Match {
+                param($c)
+                [int]$c.targetPort -eq 853 -and $c.targetHost -ieq $ipv6TargetIpV -and $c.matchedRule -eq "SecurityPolicy:blockEncryptedDnsBypass" -and $c.status -eq "blocked"
+            }
 
             $connsResV = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-v-connections"
             $connsListV = ConvertFrom-CtlResponseJson `
@@ -3465,9 +3608,17 @@ try {
                 throw "No connected non-loopback network adapter found to attach transient IPv6 route for Scenario (w)."
             }
 
+            # Intentional fixed wait: lets the transient IPv6 route and neighbor entry settle (no observable signal beyond the Preferred address state already awaited).
             Start-Sleep -Milliseconds 150
             $quicProbeV6 = Invoke-QuicUdp443Probe -TargetIp $ipv6TargetIpW -Port 443 -ReceiveTimeoutMs 1500 -LocalIp $ipv6LocalUlaW
-            Start-Sleep -Milliseconds $PollIntervalMs
+            $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "blocked IPv6 QUIC UDP 443 connection" -Match {
+                param($c)
+                [int]$c.targetPort -eq 443 -and $c.protocol -eq "udp" -and $c.targetHost -ieq $ipv6TargetIpW -and $c.matchedRule -eq "SecurityPolicy:blockQuicUdp443" -and $c.status -eq "blocked"
+            }
+            $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "logs" -Description "IPv6 QUIC rejection WARN log" -Match {
+                param($l)
+                $l.level -eq "WARN" -and ([string]$l.message).Contains("Rejected QUIC (UDP port 443) with ICMPv6 Port Unreachable") -and ([string]$l.message).Contains($ipv6TargetIpW)
+            }
 
             $connsResW = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-w-connections"
             $connsListW = ConvertFrom-CtlResponseJson `
@@ -3529,6 +3680,7 @@ try {
                 throw "No connected non-loopback network adapter found to attach transient IPv6 route for Scenario (x)."
             }
 
+            # Intentional fixed wait: lets the transient IPv6 route and neighbor entry settle (no observable signal beyond the Preferred address state already awaited).
             Start-Sleep -Milliseconds 150
             $null = Invoke-Ipv6UdpNtpExchange -TargetIp $ipv6TargetIpX -Port $ipv6DirectPortX -ReceiveTimeoutMs 400 -LocalIp $ipv6LocalUlaX
 
@@ -3673,6 +3825,7 @@ try {
                     throw "ctl replace-profile with dnsServerProcesses failed (exit=$($replaceResZ.ExitCode)): $($replaceResZ.RawText)"
                 }
                 $profileReplacedZ = $true
+                # Intentional fixed wait: the profile apply has no observable completion signal; the bounded retry loop below absorbs any remaining lag.
                 Start-Sleep -Milliseconds $PollIntervalMs
 
                 # The exemption is applied by a helper thread that may trail the first query: retry
@@ -3799,7 +3952,14 @@ try {
                     Record-ScenarioResult -Id "j" -Status "FAIL" -Title "Kill-Switch blocks curl when SOCKS5 proxy is stopped" -Detail "Could not stop SOCKS5 listener on ${Socks5Host}:${Socks5Port}"
                 } else {
                     $curlKillSwitch = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec 5
-                    Start-Sleep -Milliseconds $PollIntervalMs
+                    $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "connections" -Description "Kill-Switch blocked curl.exe connection" -Match {
+                        param($c)
+                        $c.processName -ieq "curl.exe" -and $c.matchedRule -eq $ExpectedProxyRuleName -and $c.status -eq "blocked" -and $c.routeLabel -eq "BLOCKED"
+                    }
+                    $null = Wait-ForCtlEntry -ExePath $routeWardExePath -CtlCommand "logs" -Description "Kill-Switch WARN log" -Match {
+                        param($l)
+                        $l.level -eq "WARN" -and ([string]$l.message).Contains("Kill-Switch blocked connection")
+                    }
 
                     $connsKsRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-j-connections"
                     $connsKsList = ConvertFrom-CtlResponseJson `
