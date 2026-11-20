@@ -3,7 +3,7 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
-## [Unreleased]
+## [v2026.1120.00] - 2026-11-20
 
 ### Security
 - Windows named pipe: allowed non-administrator SIDs can no longer create their own pipe instance (user ACEs grant `0x12019b` instead of `GRGW`), the production pipe is owned by `BUILTIN\Administrators`, and clients refuse a pipe whose owner is not Administrators, SYSTEM or the current user before sending anything (`errors.daemon.untrusted_pipe_owner`). The daemon reports a squatted pipe name (`errors.daemon.pipe_squatted`) instead of "already running". Clients older than this release cannot connect to a newer daemon.
