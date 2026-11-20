@@ -148,6 +148,8 @@ sudo apt install ./dist/routeward_*.deb
 sudo systemctl enable --now routeward
 ```
 
+The binaries link against the glibc of the machine that builds them. The published `.deb` is built on Ubuntu 22.04 (glibc 2.35), so it runs on Debian 12, Ubuntu 22.04 and newer; the release job fails if a binary needs a newer glibc symbol (`packaging/linux/check-glibc-floor.sh --max 2.35`). A package built on a newer distribution only runs on that glibc or a newer one.
+
 ### Log File Locations (Daemon vs Desktop / CLI)
 Log files (`RouteWard_yyyyMMdd.log`) are resolved from fixed OS system paths rather than the process working directory (`CWD`):
 - **Privileged Daemon (`routeward daemon`, `routeward run`, `routeward cleanup`)**:
