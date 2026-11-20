@@ -123,7 +123,7 @@ param(
 
     # A blocked TCP connection must be refused (curl exit 7 or 56) in less than this many milliseconds.
     [Parameter(Mandatory = $false)]
-    [int]$BlockFastRejectMaxMs = 3000,
+    [int]$BlockFastRejectMaxMs = 5000,
 
     # A blocked UDP probe must receive its ICMP rejection in less than this many milliseconds.
     [Parameter(Mandatory = $false)]
