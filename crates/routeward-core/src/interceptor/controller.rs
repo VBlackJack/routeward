@@ -133,6 +133,19 @@ fn format_preexisting_connections_notice(
     ))
 }
 
+/// Runs `f`, which may block for a whole process scan plus a firewall sync, without stalling an
+/// async worker: on a multi-thread tokio runtime the worker hands its queue over through
+/// `block_in_place`; elsewhere (no runtime, or a current-thread runtime where `block_in_place`
+/// would panic) `f` simply runs inline, as it always did.
+fn run_blocking_section<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 impl RouteWardController {
     pub fn new(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
         let log_dir = constants.telemetry.resolve_process_log_dir();
@@ -2157,11 +2170,13 @@ impl RouteWardController {
         self.sync_upstream_proxy_exclusions();
         self.configure_dns_server_tracker();
         if self.is_running() {
-            self.refresh_dns_server_tracker();
+            run_blocking_section(|| self.refresh_dns_server_tracker());
         }
 
         if self.is_running() && (security_changed || dns_changed || proxies_changed) {
-            self.reapply_active_interception_rules(security_changed, dns_changed);
+            run_blocking_section(|| {
+                self.reapply_active_interception_rules(security_changed, dns_changed);
+            });
             if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
                 let ctrl_boot = self.clone();
                 rt_handle.spawn(async move {
@@ -2169,7 +2184,13 @@ impl RouteWardController {
                     ctrl_boot.bootstrap_resolve_proxy_hosts().await;
                     let after = ctrl_boot.nat_table.upstream_endpoints();
                     if before != after && ctrl_boot.interceptor_backend.is_active() {
-                        let _ = ctrl_boot.interceptor_backend.reload(ctrl_boot.clone());
+                        // The reload takes the tracker's sync lock and may run a firewall sync:
+                        // keep it off the async worker.
+                        let ctrl_reload = ctrl_boot.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = ctrl_reload.interceptor_backend.reload(ctrl_reload.clone());
+                        })
+                        .await;
                     }
                 });
             }

@@ -107,6 +107,8 @@ mod ffi;
 mod filters;
 #[cfg(any(windows, test))]
 mod fragments;
+#[cfg(any(windows, test))]
+mod icmp_limit;
 #[cfg(test)]
 mod tests;
 #[cfg(windows)]

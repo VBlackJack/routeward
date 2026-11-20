@@ -30,6 +30,8 @@ const IPHELPER_MAX_FETCH_ATTEMPTS: usize = 8;
 /// Upper bound for the PID identity cache. Expired entries are purged first; if the cache is
 /// still full the oldest entries are dropped.
 const MAX_PID_CACHE_ENTRIES: usize = 4096;
+/// Lifetime of an identity built from a caller-supplied name after a failed image query.
+const FALLBACK_IDENTITY_TTL: Duration = Duration::from_secs(1);
 const PATH_SEPARATORS: &[char] = &['/', '\\'];
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -416,6 +418,52 @@ impl ProcessResolver {
             );
         }
 
+        identity
+    }
+
+    /// Like [`Self::resolve_by_pid`], for a caller that already knows the image name of `pid`
+    /// (for example from the DNS server tracker). When the image query fails, the identity built
+    /// from `fallback_name` is cached for at most [`FALLBACK_IDENTITY_TTL`], so a hot path does
+    /// not repeat a failing query for every packet, while a transient failure or a reused PID
+    /// cannot hide the real identity from the other users of this shared cache for long.
+    pub fn resolve_by_pid_with_fallback(&self, pid: u32, fallback_name: &str) -> ProcessIdentity {
+        if pid == 0 {
+            return ProcessIdentity::default();
+        }
+        if let Some(entry) = self.cache.get(&pid) {
+            if entry.cached_at.elapsed() < self.cache_ttl {
+                return entry.identity.clone();
+            }
+        }
+        let now = Instant::now();
+        let (identity, cached_at) = match Self::query_executable_path(pid) {
+            Some(executable_path) => (
+                ProcessIdentity {
+                    pid,
+                    name: Self::extract_basename(&executable_path),
+                    executable_path,
+                },
+                now,
+            ),
+            None => (
+                ProcessIdentity {
+                    pid,
+                    name: fallback_name.to_string(),
+                    executable_path: fallback_name.to_string(),
+                },
+                // Backdated so the entry expires FALLBACK_IDENTITY_TTL from now.
+                now.checked_sub(self.cache_ttl.saturating_sub(FALLBACK_IDENTITY_TTL))
+                    .unwrap_or(now),
+            ),
+        };
+        self.purge_cache_if_full();
+        self.cache.insert(
+            pid,
+            CachedProcess {
+                identity: identity.clone(),
+                cached_at,
+            },
+        );
         identity
     }
 

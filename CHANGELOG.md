@@ -3,6 +3,14 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
+## [Unreleased]
+
+### Fixed
+- Windows: at most one injected ICMP Port Unreachable per flow and second for blocked UDP (Block rules, DoQ, QUIC), so an application that retransmits a blocked datagram no longer makes RouteWard forge one message per packet.
+- Windows: a DNS server process whose image cannot be queried is identified by the name the tracker already knows, so name-based Block rules match it and the packet path no longer repeats the failing query.
+- The profile reload no longer stalls an async worker while the DNS server tracker scans processes and the firewall rules are reapplied.
+- Documented that on Windows a directed broadcast (for example 192.168.1.255) is not recognised by the ICMP guard and is answered like a unicast address; only multicast and the limited broadcast 255.255.255.255 stay silent.
+
 ## [v2026.1120.00] - 2026-11-20
 
 ### Security

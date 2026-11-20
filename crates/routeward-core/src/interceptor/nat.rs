@@ -2022,7 +2022,9 @@ pub fn build_forged_ipv4_icmp_port_unreachable(original_ipv4_packet: &[u8]) -> O
         original_ipv4_packet[18],
         original_ipv4_packet[19],
     );
-    // Never answer a multicast or broadcast datagram (RFC 1122 3.2.2): LLMNR, mDNS and NetBIOS stay silent.
+    // Never answer a multicast or limited broadcast datagram (RFC 1122 3.2.2): LLMNR and mDNS stay
+    // silent. A directed broadcast (for example 192.168.1.255) is not recognised: the builder has no
+    // view of the local interface prefixes, so such a datagram is answered like a unicast one.
     if orig_dst_ip.is_multicast() || orig_dst_ip.is_broadcast() {
         return None;
     }
@@ -2925,6 +2927,88 @@ mod tests {
         pkt[49] = 0;
         pkt[48] = IPPROTO_TCP;
         assert!(parse_udp_fragment_meta(&pkt).is_none());
+    }
+
+    #[test]
+    fn ipv4_first_fragment_payload_offset_follows_the_header_options() {
+        // Plain 20-byte header: the payload starts after the 8-byte UDP header.
+        let plain = build_ipv4_first_udp_fragment(50123, 53, 0x1111);
+        let meta = parse_udp_fragment_meta(&plain).expect("first fragment");
+        assert_eq!(meta.udp_payload_offset, Some(20 + UDP_HEADER_LEN));
+
+        // IHL = 6 (4 option bytes): ports and payload both move by the option length.
+        let mut with_options = vec![0u8; 24 + 1476];
+        with_options[..20].copy_from_slice(&plain[..20]);
+        with_options[0] = 0x46;
+        with_options[24..28].copy_from_slice(&plain[20..24]);
+        let meta = parse_udp_fragment_meta(&with_options).expect("first fragment with options");
+        assert_eq!((meta.src_port, meta.dst_port), (50123, 53));
+        assert_eq!(meta.udp_payload_offset, Some(24 + UDP_HEADER_LEN));
+
+        // A later fragment has no UDP header, hence no payload offset.
+        let mut later = plain.clone();
+        later[6..8].copy_from_slice(&0x00B9u16.to_be_bytes());
+        let meta = parse_udp_fragment_meta(&later).expect("later fragment");
+        assert_eq!(meta.kind, UdpFragmentKind::NonFirst);
+        assert_eq!(meta.udp_payload_offset, None);
+    }
+
+    #[test]
+    fn ipv6_first_fragment_payload_offset_skips_extension_headers() {
+        // IPv6 header, fragment header (next = destination options), destination options
+        // (next = UDP), UDP header: the payload starts after the three headers.
+        let mut pkt = vec![0u8; 40 + 8 + 8 + 8 + 8];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&32u16.to_be_bytes());
+        pkt[6] = IPV6_EXT_HEADER_FRAGMENT;
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
+        pkt[24..40].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets());
+        pkt[40] = IPV6_EXT_HEADER_DESTINATION_OPTIONS;
+        pkt[42..44].copy_from_slice(&0x0001u16.to_be_bytes()); // offset 0, M=1
+        pkt[44..48].copy_from_slice(&0x0BADF00Du32.to_be_bytes());
+        pkt[48] = IPPROTO_UDP; // destination options: next header
+        pkt[49] = 0; // 8 bytes long
+        pkt[56..58].copy_from_slice(&40000u16.to_be_bytes());
+        pkt[58..60].copy_from_slice(&53u16.to_be_bytes());
+
+        let meta = parse_udp_fragment_meta(&pkt).expect("first fragment with extension header");
+        assert_eq!((meta.src_port, meta.dst_port), (40000, 53));
+        assert_eq!(meta.udp_payload_offset, Some(56 + UDP_HEADER_LEN));
+
+        // Without the extra extension header the UDP header follows the fragment header.
+        let mut direct = vec![0u8; 40 + 8 + 8];
+        direct[..48].copy_from_slice(&pkt[..48]);
+        direct[4..6].copy_from_slice(&16u16.to_be_bytes());
+        direct[40] = IPPROTO_UDP;
+        direct[48..50].copy_from_slice(&40000u16.to_be_bytes());
+        direct[50..52].copy_from_slice(&53u16.to_be_bytes());
+        let meta = parse_udp_fragment_meta(&direct).expect("first fragment");
+        assert_eq!(meta.udp_payload_offset, Some(48 + UDP_HEADER_LEN));
+    }
+
+    #[test]
+    fn ipv6_first_fragment_with_unresolvable_ports_has_no_payload_offset() {
+        let mut pkt = vec![0u8; 40 + 8 + 8 + 8];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&24u16.to_be_bytes());
+        pkt[6] = IPV6_EXT_HEADER_FRAGMENT;
+        pkt[7] = 64;
+        pkt[40] = IPV6_EXT_HEADER_DESTINATION_OPTIONS;
+        pkt[42..44].copy_from_slice(&0x0001u16.to_be_bytes());
+        pkt[48] = IPPROTO_UDP;
+        pkt[49] = 100; // runs past the packet: the UDP header cannot be located
+
+        let meta = parse_udp_fragment_meta(&pkt).expect("detected but unparseable");
+        assert_eq!(meta.kind, UdpFragmentKind::First);
+        assert_eq!((meta.src_port, meta.dst_port), (0, 0));
+        assert_eq!(meta.udp_payload_offset, None);
+
+        // Located header carrying zero ports: unattributed as well, so no offset.
+        pkt[49] = 0;
+        let meta = parse_udp_fragment_meta(&pkt).expect("zero ports");
+        assert_eq!((meta.src_port, meta.dst_port), (0, 0));
+        assert_eq!(meta.udp_payload_offset, None);
     }
 
     #[test]
