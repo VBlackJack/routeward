@@ -3,7 +3,7 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
-## [Unreleased]
+## [v2026.1120.01] - 2026-11-20
 
 ### Fixed
 - Linux: the `.deb` is built on Ubuntu 22.04 (glibc 2.35) instead of the latest runner, so the binaries no longer print "weak version `GLIBC_2.39' not found" on every start on Debian 12; the release job now fails when a binary needs a glibc symbol newer than 2.35.
