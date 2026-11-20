@@ -3,6 +3,11 @@
 All notable changes to RouteWard are documented in this file.
 Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.NN`).
 
+## [Unreleased]
+
+### Changed
+- Windows: the portable ZIP bundles WinDivert 2.2.2 (unmodified `WinDivert.dll` and `WinDivert64.sys`, LGPLv3, with `THIRD_PARTY_NOTICES.txt` and the upstream license), so it intercepts traffic as soon as it is extracted. It also ships `fetch-windivert.ps1`.
+
 ## [v2026.1120.01] - 2026-11-20
 
 ### Fixed

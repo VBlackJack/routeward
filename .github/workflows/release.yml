@@ -181,7 +181,7 @@ jobs:
     permissions:
       contents: read
     env:
-      # WinDivert 2.2.2 corresponding source (LGPLv3 obligation for the DLL and driver shipped in the MSI).
+      # WinDivert 2.2.2 corresponding source (LGPLv3 obligation for the DLL and driver shipped in the MSI and the ZIP).
       # The binary archive is pinned inside tools/fetch-windivert.ps1.
       WINDIVERT_SOURCE_URL: https://github.com/basil00/WinDivert/archive/refs/tags/v2.2.2.tar.gz
       WINDIVERT_SOURCE_SHA256: 300c1b14e08652e0f8647bf06e9b212f924af76cb2459bd0f88da481c9b08336
@@ -230,7 +230,7 @@ jobs:
       - name: Package Windows bundle and MSI installer
         shell: pwsh
         run: |
-          ./packaging/windows/package-windows.ps1 -TargetDir target/release -OutDir dist -Arch x64
+          ./packaging/windows/package-windows.ps1 -TargetDir target/release -OutDir dist -Arch x64 -IncludeWinDivert
           ./packaging/windows/build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64 -IncludeWinDivert
 
       - name: Download WinDivert corresponding source archive

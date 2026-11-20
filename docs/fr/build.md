@@ -122,14 +122,14 @@ Pour une exécution persistante sous `LocalSystem`, enregistrez RouteWard comme 
 .\target\release\routeward.exe service stop
 .\target\release\routeward.exe service uninstall
 
-# Empaqueter les binaires release en ZIP + SHA-256 (sans inclure les pilotes WinDivert) :
-.\packaging\windows\package-windows.ps1
+# Empaqueter les binaires release en ZIP + SHA-256 (l'option `-IncludeWinDivert` embarque les fichiers WinDivert 2.2.2 présents, comme dans les ZIP de release) :
+.\packaging\windows\package-windows.ps1 -TargetDir target/release -OutDir dist -Arch x64
 
 # Générer l'installateur Windows MSI (requiert WiX Toolset v6 `wix.exe`; l'option `-IncludeWinDivert` embarque les fichiers WinDivert 2.2.2 présents, comme dans les MSI de release) :
 .\packaging\windows\build-msi.ps1 -TargetDir target/release -OutDir dist -Arch x64
 ```
 
-Les paquets `.msi` de release embarquent WinDivert 2.2.2 (`WinDivert.dll` et `WinDivert64.sys`, non modifiés, sous licence LGPLv3 ; mentions dans `THIRD_PARTY_NOTICES.txt`, archive des sources de WinDivert jointe à chaque release). Une mise à jour MSI réenregistre le service RouteWard avec ses arguments `--allow-sid` (`routeward service restore` ; les services en démarrage automatique sont relancés, ceux en démarrage manuel sont enregistrés arrêtés), et la désinstallation supprime le service du pilote WinDivert. Le ZIP portable ne contient pas WinDivert et exige toujours `tools/fetch-windivert.ps1`.
+Les paquets `.msi` de release embarquent WinDivert 2.2.2 (`WinDivert.dll` et `WinDivert64.sys`, non modifiés, sous licence LGPLv3 ; mentions dans `THIRD_PARTY_NOTICES.txt`, archive des sources de WinDivert jointe à chaque release). Une mise à jour MSI réenregistre le service RouteWard avec ses arguments `--allow-sid` (`routeward service restore` ; les services en démarrage automatique sont relancés, ceux en démarrage manuel sont enregistrés arrêtés), et la désinstallation supprime le service du pilote WinDivert. Le ZIP de release embarque les mêmes fichiers WinDivert et leurs mentions à côté des binaires : il fonctionne tel quel une fois extrait. Chaque ZIP contient aussi `fetch-windivert.ps1`, qui extrait WinDivert dans `third_party\windivert\bin` à côté des binaires quand le ZIP est construit sans `-IncludeWinDivert`.
 
 #### Désinstaller le MSI (ce qui est nettoyé, ce qui ne l'est pas)
 Avant la suppression des fichiers, une désinstallation (pas une mise à jour) exécute deux actions :
