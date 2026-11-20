@@ -97,6 +97,42 @@ struct EngineListeners {
     local_name: Arc<UdpSocket>,
 }
 
+/// Upper bound of the established connections inspected by the start notice.
+#[cfg(windows)]
+const PREEXISTING_SCAN_LIMIT: usize = 8192;
+/// Number of processes named in the start notice before the rest is summarised.
+#[cfg(windows)]
+const PREEXISTING_NOTICE_TOP_PROCESSES: usize = 5;
+
+/// Builds the start notice from per-process counts of connections opened before the start, or
+/// `None` when there are none.
+#[cfg(windows)]
+fn format_preexisting_connections_notice(
+    per_process: std::collections::HashMap<String, usize>,
+) -> Option<String> {
+    let total: usize = per_process.values().sum();
+    if total == 0 {
+        return None;
+    }
+    let mut ranked: Vec<(String, usize)> = per_process.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let hidden = ranked
+        .len()
+        .saturating_sub(PREEXISTING_NOTICE_TOP_PROCESSES);
+    let mut names: Vec<String> = ranked
+        .iter()
+        .take(PREEXISTING_NOTICE_TOP_PROCESSES)
+        .map(|(name, count)| format!("{name} x{count}"))
+        .collect();
+    if hidden > 0 {
+        names.push(format!("and {hidden} more"));
+    }
+    Some(format!(
+        "{total} connections opened before start are not intercepted until they reconnect ({}); restart these apps",
+        names.join(", ")
+    ))
+}
+
 impl RouteWardController {
     pub fn new(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
         let log_dir = constants.telemetry.resolve_process_log_dir();
@@ -364,6 +400,19 @@ impl RouteWardController {
                 }
             }
         }));
+
+        // Read-only notice about connections opened before the engine started: they keep their
+        // original route until the application reconnects. Runs once, off every packet path.
+        #[cfg(windows)]
+        {
+            let notice_ctrl = self.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    notice_ctrl.report_preexisting_connections();
+                })
+                .await;
+            }));
+        }
 
         let dns_scan_ctrl = self.clone();
         let mut dns_scan_signal = shutdown_rx.clone();
@@ -1763,6 +1812,44 @@ impl RouteWardController {
         tracked
     }
 
+    /// Logs one Info line counting the established TCP connections opened before the engine started
+    /// whose process now matches a Proxy, Chain or Block rule. Windows redirects new connections
+    /// only, so these keep their original route (and bypass Block rules) until the application
+    /// reconnects. Read-only: one IP Helper table dump, nothing is reset.
+    #[cfg(windows)]
+    fn report_preexisting_connections(&self) {
+        let own_pid = std::process::id();
+        let sockets = self
+            .process_resolver
+            .scan_established_tcp_sockets(PREEXISTING_SCAN_LIMIT);
+        let mut per_process: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        {
+            let prof = self.profile.read();
+            for sock in sockets.into_iter().filter(|sock| sock.pid != own_pid) {
+                let req = ConnectionRequest {
+                    process_name: sock.process_name.clone(),
+                    process_path: Some(sock.process_path),
+                    target_host: sock.remote_ip.clone(),
+                    target_ip: Some(sock.remote_ip),
+                    target_port: sock.remote_port,
+                    protocol: TransportProtocol::Tcp,
+                };
+                let eval = RuleEngine::evaluate(&req, &prof.rules, &prof.default_action, None);
+                if matches!(
+                    eval.action,
+                    RuleAction::Proxy { .. } | RuleAction::Chain { .. } | RuleAction::Block
+                ) {
+                    *per_process.entry(sock.process_name).or_insert(0) += 1;
+                }
+            }
+        }
+        if let Some(message) = format_preexisting_connections_notice(per_process) {
+            self.telemetry
+                .push_log(LogLevel::Info, COMPONENT_ENGINE, message);
+        }
+    }
+
     pub fn scan_and_ingest_os_sockets(&self, max_entries: usize) -> Vec<TrackedConnection> {
         let os_sockets = self
             .process_resolver
@@ -2490,6 +2577,29 @@ impl RouteWardController {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn preexisting_connections_notice_ranks_processes_and_caps_the_list() {
+        assert!(format_preexisting_connections_notice(Default::default()).is_none());
+
+        let mut counts = std::collections::HashMap::new();
+        for (name, count) in [
+            ("chrome.exe", 12),
+            ("firefox.exe", 4),
+            ("a.exe", 1),
+            ("b.exe", 1),
+            ("c.exe", 1),
+            ("d.exe", 1),
+        ] {
+            counts.insert(name.to_string(), count);
+        }
+        let notice = format_preexisting_connections_notice(counts).expect("notice");
+        assert!(notice.starts_with("20 connections opened before start"));
+        assert!(notice.contains("chrome.exe x12, firefox.exe x4, a.exe x1"));
+        assert!(notice.contains("and 1 more"));
+        assert!(!notice.contains("d.exe"));
+    }
+
     use super::*;
     use crate::config::PortRange;
     use std::sync::atomic::AtomicU16;

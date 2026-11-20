@@ -1962,6 +1962,10 @@ pub fn build_forged_ipv6_icmpv6_port_unreachable(original_ipv6_packet: &[u8]) ->
     orig_src.copy_from_slice(&original_ipv6_packet[8..24]);
     let mut orig_dst = [0u8; 16];
     orig_dst.copy_from_slice(&original_ipv6_packet[24..40]);
+    // Never answer a multicast datagram (RFC 4443 2.4(e.3)).
+    if Ipv6Addr::from(orig_dst).is_multicast() {
+        return None;
+    }
 
     let max_quoted = IPV6_MIN_MTU - IPV6_HEADER_LEN - ICMPV6_HEADER_LEN;
     let quoted_len = original_ipv6_packet.len().min(max_quoted);
@@ -2018,6 +2022,10 @@ pub fn build_forged_ipv4_icmp_port_unreachable(original_ipv4_packet: &[u8]) -> O
         original_ipv4_packet[18],
         original_ipv4_packet[19],
     );
+    // Never answer a multicast or broadcast datagram (RFC 1122 3.2.2): LLMNR, mDNS and NetBIOS stay silent.
+    if orig_dst_ip.is_multicast() || orig_dst_ip.is_broadcast() {
+        return None;
+    }
 
     let icmp_len = ICMPV4_HEADER_LEN.checked_add(quoted_len)?;
     let total_len = IPV4_MIN_HEADER_LEN.checked_add(icmp_len)?;
@@ -2065,6 +2073,126 @@ pub fn build_forged_ipv4_icmp_port_unreachable(original_ipv4_packet: &[u8]) -> O
     let icmp_csum = ones_complement_checksum(&pkt[icmp_offset..], 0);
     pkt[icmp_offset + 2..icmp_offset + 4].copy_from_slice(&icmp_csum.to_be_bytes());
 
+    Some(pkt)
+}
+
+/// Parsed fields of a TCP SYN (without ACK) that is about to be refused with a forged RST.
+struct SynToReject {
+    src_port: [u8; 2],
+    dst_port: [u8; 2],
+    /// Acknowledgement number to put in the RST: ISN + 1 + SYN payload length (TCP Fast Open).
+    ack: u32,
+}
+
+/// Validates the TCP segment starting at `tcp_offset` as a SYN without ACK/RST and extracts the fields
+/// needed to answer it. `segment_len` is the TCP segment length (header plus payload).
+fn parse_syn_to_reject(
+    packet: &[u8],
+    tcp_offset: usize,
+    segment_len: usize,
+) -> Option<SynToReject> {
+    if segment_len < TCP_MIN_HEADER_LEN || packet.len() < tcp_offset + TCP_MIN_HEADER_LEN {
+        return None;
+    }
+    let flags = packet[tcp_offset + 13];
+    if flags & TCP_FLAG_SYN == 0 || flags & (TCP_FLAG_ACK | TCP_FLAG_RST | TCP_FLAG_FIN) != 0 {
+        return None;
+    }
+    let data_offset = ((packet[tcp_offset + 12] >> 4) as usize) * 4;
+    if data_offset < TCP_MIN_HEADER_LEN || segment_len < data_offset {
+        return None;
+    }
+    let payload_len = (segment_len - data_offset) as u32;
+    let isn = u32::from_be_bytes([
+        packet[tcp_offset + 4],
+        packet[tcp_offset + 5],
+        packet[tcp_offset + 6],
+        packet[tcp_offset + 7],
+    ]);
+    Some(SynToReject {
+        src_port: [packet[tcp_offset], packet[tcp_offset + 1]],
+        dst_port: [packet[tcp_offset + 2], packet[tcp_offset + 3]],
+        ack: isn.wrapping_add(1).wrapping_add(payload_len),
+    })
+}
+
+/// Writes a bare 20-byte RST|ACK TCP header answering `syn`, with the ports swapped.
+fn write_rst_tcp_header(tcp: &mut [u8], syn: &SynToReject) {
+    tcp[0..2].copy_from_slice(&syn.dst_port);
+    tcp[2..4].copy_from_slice(&syn.src_port);
+    // Sequence number 0 (bytes 4..8), acknowledging the SYN.
+    tcp[8..12].copy_from_slice(&syn.ack.to_be_bytes());
+    tcp[12] = ((TCP_MIN_HEADER_LEN / 4) as u8) << 4;
+    tcp[13] = TCP_FLAG_RST | TCP_FLAG_ACK;
+    // Window 0 (bytes 14..16), checksum filled by the caller, urgent pointer 0.
+}
+
+/// Builds a forged inbound TCP RST|ACK refusing an outbound IPv4 SYN, as a closed port would.
+/// Returns `None` unless `syn_packet` is a well-formed SYN without ACK, RST or FIN.
+pub fn build_forged_ipv4_tcp_rst(syn_packet: &[u8]) -> Option<Vec<u8>> {
+    if syn_packet.len() < IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN
+        || (syn_packet[0] >> 4) != IPV4_VERSION
+        || syn_packet[9] != IPPROTO_TCP
+    {
+        return None;
+    }
+    let ihl = ((syn_packet[0] & 0x0F) as usize) * 4;
+    if ihl < IPV4_MIN_HEADER_LEN || syn_packet.len() < ihl + TCP_MIN_HEADER_LEN {
+        return None;
+    }
+    let declared_len = u16::from_be_bytes([syn_packet[2], syn_packet[3]]) as usize;
+    // A zero or oversized total length can come from offload; fall back to the captured length.
+    let total_len = if declared_len >= ihl + TCP_MIN_HEADER_LEN && declared_len <= syn_packet.len()
+    {
+        declared_len
+    } else {
+        syn_packet.len()
+    };
+    let syn = parse_syn_to_reject(syn_packet, ihl, total_len - ihl)?;
+
+    let out_len = IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN;
+    let mut pkt = vec![0u8; out_len];
+    pkt[0] = 0x45; // IPv4, IHL = 5 (20 bytes)
+    pkt[2..4].copy_from_slice(&(out_len as u16).to_be_bytes());
+    pkt[6..8].copy_from_slice(&[0x40, 0x00]); // Don't Fragment
+    pkt[8] = 64; // TTL
+    pkt[9] = IPPROTO_TCP;
+    pkt[12..16].copy_from_slice(&syn_packet[16..20]);
+    pkt[16..20].copy_from_slice(&syn_packet[12..16]);
+    write_rst_tcp_header(&mut pkt[IPV4_MIN_HEADER_LEN..], &syn);
+    recompute_ipv4_and_tcp_checksums(&mut pkt, IPV4_MIN_HEADER_LEN);
+    Some(pkt)
+}
+
+/// Builds a forged inbound TCP RST|ACK refusing an outbound IPv6 SYN (no extension headers).
+/// Returns `None` unless `syn_packet` is a well-formed SYN without ACK, RST or FIN.
+pub fn build_forged_ipv6_tcp_rst(syn_packet: &[u8]) -> Option<Vec<u8>> {
+    if syn_packet.len() < IPV6_HEADER_LEN + TCP_MIN_HEADER_LEN
+        || (syn_packet[0] >> 4) != IPV6_VERSION
+        || syn_packet[6] != IPPROTO_TCP
+    {
+        return None;
+    }
+    let declared_len = u16::from_be_bytes([syn_packet[4], syn_packet[5]]) as usize;
+    let segment_len = if declared_len >= TCP_MIN_HEADER_LEN
+        && IPV6_HEADER_LEN + declared_len <= syn_packet.len()
+    {
+        declared_len
+    } else {
+        syn_packet.len() - IPV6_HEADER_LEN
+    };
+    let syn = parse_syn_to_reject(syn_packet, IPV6_HEADER_LEN, segment_len)?;
+
+    let out_len = IPV6_HEADER_LEN + TCP_MIN_HEADER_LEN;
+    let mut pkt = vec![0u8; out_len];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&(TCP_MIN_HEADER_LEN as u16).to_be_bytes());
+    pkt[6] = IPPROTO_TCP;
+    pkt[7] = 64; // Hop limit
+    pkt[8..24].copy_from_slice(&syn_packet[24..40]);
+    pkt[24..40].copy_from_slice(&syn_packet[8..24]);
+    write_rst_tcp_header(&mut pkt[IPV6_HEADER_LEN..], &syn);
+    recompute_ipv6_and_tcp_checksums(&mut pkt, IPV6_HEADER_LEN);
     Some(pkt)
 }
 
@@ -3088,5 +3216,158 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         // The unresolved SYN stays queued, and enqueueing remains possible afterwards.
         assert_eq!(queue.len(), 1);
+    }
+
+    fn ipv4_header_checksum_is_valid(pkt: &[u8]) -> bool {
+        ones_complement_checksum(&pkt[..IPV4_MIN_HEADER_LEN], 0) == 0
+    }
+
+    fn ipv4_tcp_checksum_is_valid(pkt: &[u8]) -> bool {
+        let tcp_len = pkt.len() - IPV4_MIN_HEADER_LEN;
+        let mut sum: u32 = 0;
+        for idx in (12..20).step_by(2) {
+            sum += u16::from_be_bytes([pkt[idx], pkt[idx + 1]]) as u32;
+        }
+        sum += IPPROTO_TCP as u32 + tcp_len as u32;
+        ones_complement_checksum(&pkt[IPV4_MIN_HEADER_LEN..], sum) == 0
+    }
+
+    fn build_sample_ipv6_tcp_syn(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
+        let tcp_len = TCP_MIN_HEADER_LEN + payload.len();
+        let mut pkt = vec![0u8; IPV6_HEADER_LEN + tcp_len];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+        pkt[6] = IPPROTO_TCP;
+        pkt[7] = 128;
+        pkt[8..24].copy_from_slice(&src.octets());
+        pkt[24..40].copy_from_slice(&dst.octets());
+        pkt[40..42].copy_from_slice(&50000u16.to_be_bytes());
+        pkt[42..44].copy_from_slice(&443u16.to_be_bytes());
+        pkt[44..48].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        pkt[52] = 0x50;
+        pkt[53] = TCP_FLAG_SYN;
+        pkt[60..].copy_from_slice(payload);
+        recompute_ipv6_and_tcp_checksums(&mut pkt, IPV6_HEADER_LEN);
+        pkt
+    }
+
+    #[test]
+    fn forged_ipv4_tcp_rst_swaps_tuple_acks_isn_plus_one_and_has_valid_checksums() {
+        let client = Ipv4Addr::new(192, 168, 1, 25);
+        let server = Ipv4Addr::new(93, 184, 215, 14);
+        let mut syn = build_sample_ipv4_tcp_syn(client, server, 50000, 443);
+        syn[24..28].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        recompute_ipv4_and_tcp_checksums(&mut syn, IPV4_MIN_HEADER_LEN);
+
+        let rst = build_forged_ipv4_tcp_rst(&syn).expect("RST for plain SYN");
+        assert_eq!(rst.len(), 40);
+        assert_eq!(&rst[12..16], &server.octets());
+        assert_eq!(&rst[16..20], &client.octets());
+        assert_eq!(rst[9], IPPROTO_TCP);
+        assert_eq!(rst[8], 64);
+        assert_eq!(&rst[20..22], &443u16.to_be_bytes());
+        assert_eq!(&rst[22..24], &50000u16.to_be_bytes());
+        assert_eq!(&rst[24..28], &[0, 0, 0, 0]);
+        // ISN 0xFFFFFFFF + 1 wraps to 0.
+        assert_eq!(&rst[28..32], &0u32.to_be_bytes());
+        assert_eq!(rst[33], 0x14);
+        assert_eq!(&rst[34..36], &[0, 0]);
+        assert!(ipv4_header_checksum_is_valid(&rst));
+        assert!(ipv4_tcp_checksum_is_valid(&rst));
+    }
+
+    #[test]
+    fn forged_ipv4_tcp_rst_accounts_for_fast_open_payload() {
+        let mut syn = build_sample_ipv4_tcp_syn(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(1, 1, 1, 1),
+            40000,
+            443,
+        );
+        syn.extend_from_slice(b"hello");
+        let total = syn.len() as u16;
+        syn[2..4].copy_from_slice(&total.to_be_bytes());
+        syn[24..28].copy_from_slice(&1000u32.to_be_bytes());
+        recompute_ipv4_and_tcp_checksums(&mut syn, IPV4_MIN_HEADER_LEN);
+
+        let rst = build_forged_ipv4_tcp_rst(&syn).expect("RST for TFO SYN");
+        assert_eq!(&rst[28..32], &1006u32.to_be_bytes());
+    }
+
+    #[test]
+    fn forged_ipv4_tcp_rst_rejects_non_syn_and_short_packets() {
+        let syn = build_sample_ipv4_tcp_syn(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(1, 1, 1, 1),
+            40000,
+            443,
+        );
+        let mut syn_ack = syn.clone();
+        syn_ack[33] = TCP_FLAG_SYN | TCP_FLAG_ACK;
+        assert!(build_forged_ipv4_tcp_rst(&syn_ack).is_none());
+        let mut plain_ack = syn.clone();
+        plain_ack[33] = TCP_FLAG_ACK;
+        assert!(build_forged_ipv4_tcp_rst(&plain_ack).is_none());
+        assert!(build_forged_ipv4_tcp_rst(&syn[..30]).is_none());
+        assert!(build_forged_ipv4_tcp_rst(&[]).is_none());
+    }
+
+    #[test]
+    fn forged_ipv6_tcp_rst_swaps_tuple_acks_isn_plus_one_and_has_valid_checksum() {
+        let client: Ipv6Addr = "fd00::25".parse().unwrap();
+        let server: Ipv6Addr = "2606:4700::1111".parse().unwrap();
+        let syn = build_sample_ipv6_tcp_syn(client, server, b"");
+        let rst = build_forged_ipv6_tcp_rst(&syn).expect("RST for plain SYN");
+        assert_eq!(rst.len(), 60);
+        assert_eq!(&rst[8..24], &server.octets());
+        assert_eq!(&rst[24..40], &client.octets());
+        assert_eq!(rst[6], IPPROTO_TCP);
+        assert_eq!(rst[7], 64);
+        assert_eq!(&rst[40..42], &443u16.to_be_bytes());
+        assert_eq!(&rst[42..44], &50000u16.to_be_bytes());
+        assert_eq!(&rst[44..48], &[0, 0, 0, 0]);
+        assert_eq!(&rst[48..52], &0x0102_0305u32.to_be_bytes());
+        assert_eq!(rst[53], 0x14);
+        let sum = ipv6_pseudo_header_sum(&rst, TCP_MIN_HEADER_LEN as u32, IPPROTO_TCP);
+        assert_eq!(ones_complement_checksum(&rst[IPV6_HEADER_LEN..], sum), 0);
+
+        let tfo = build_sample_ipv6_tcp_syn(client, server, b"abc");
+        let rst_tfo = build_forged_ipv6_tcp_rst(&tfo).expect("RST for TFO SYN");
+        assert_eq!(&rst_tfo[48..52], &0x0102_0308u32.to_be_bytes());
+    }
+
+    #[test]
+    fn forged_ipv6_tcp_rst_rejects_non_syn_and_short_packets() {
+        let client: Ipv6Addr = "fd00::25".parse().unwrap();
+        let server: Ipv6Addr = "2606:4700::1111".parse().unwrap();
+        let mut syn_ack = build_sample_ipv6_tcp_syn(client, server, b"");
+        syn_ack[53] = TCP_FLAG_SYN | TCP_FLAG_ACK;
+        assert!(build_forged_ipv6_tcp_rst(&syn_ack).is_none());
+        assert!(build_forged_ipv6_tcp_rst(&syn_ack[..50]).is_none());
+    }
+
+    #[test]
+    fn forged_icmp_builders_stay_silent_toward_multicast_and_broadcast() {
+        let client = Ipv4Addr::new(192, 168, 1, 25);
+        for dst in [
+            Ipv4Addr::new(224, 0, 0, 251),
+            Ipv4Addr::new(224, 0, 0, 252),
+            Ipv4Addr::new(255, 255, 255, 255),
+        ] {
+            let udp = build_forged_ipv4_udp_reply(client, 55000, dst, 5353, b"q").expect("udp");
+            assert!(build_forged_ipv4_icmp_port_unreachable(&udp).is_none());
+        }
+        let unicast =
+            build_forged_ipv4_udp_reply(client, 55000, Ipv4Addr::new(8, 8, 8, 8), 853, b"q")
+                .expect("udp");
+        assert!(build_forged_ipv4_icmp_port_unreachable(&unicast).is_some());
+
+        let client6: Ipv6Addr = "fd00::25".parse().unwrap();
+        let mdns6: Ipv6Addr = "ff02::fb".parse().unwrap();
+        let udp6 = build_forged_ipv6_udp_reply(client6, 55000, mdns6, 5353, b"q").expect("udp6");
+        assert!(build_forged_ipv6_icmpv6_port_unreachable(&udp6).is_none());
+        let unicast6: Ipv6Addr = "2606:4700::1111".parse().unwrap();
+        let udp6u = build_forged_ipv6_udp_reply(client6, 55000, unicast6, 853, b"q").expect("udp6");
+        assert!(build_forged_ipv6_icmpv6_port_unreachable(&udp6u).is_some());
     }
 }

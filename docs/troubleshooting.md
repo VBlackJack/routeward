@@ -181,3 +181,17 @@ Edit `dnsConfig.dnsServerProcesses` in the profile (omitted from the JSON when e
 
 **Windows limits**:
 - Only the System32 `dns.exe` is exempt by default. The process list is rescanned every `dns.dnsServerProcessScanIntervalMs` (5 s) and at every profile reload; a restarted `dns.exe` is also recognised at once from its first socket event.
+
+## 13. Connections Opened Before Start Keep Their Route
+
+**Symptom**:
+After `routeward ctl start`, an application that was already connected (a browser tab, a download, a chat client) keeps its old route: it is not proxied, and a `Block` rule does not cut it.
+
+**Cause**:
+Known limitation: RouteWard only steers **new** connections. On Windows, WinDivert sees the `SYN` of a new connection; on Linux, `nftables` redirects new connections only. A connection that was already established keeps its original route, including bypassing `Block` rules, until the application reconnects. RouteWard does not reset existing connections.
+
+**Behavior**:
+At engine start on Windows, RouteWard logs one `INFO` line such as `N connections opened before start are not intercepted until they reconnect (chrome.exe x12, ...); restart these apps`. It counts the established TCP connections whose process now matches a `Proxy`, `Chain` or `Block` rule. The scan is read-only and runs once, away from the packet path.
+
+**Fix**:
+Restart the listed applications (or reload the page or reconnect the session) so that their new connections go through RouteWard.

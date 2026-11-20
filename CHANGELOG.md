@@ -31,6 +31,8 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 - DNS servers on the host (Windows `dns.exe`, Linux `named`, `unbound`, `dnsmasq`, `pihole-FTL`, `pdns_recursor`, `kresd`, `dnsdist`, `coredns`) now get real DNS answers instead of Fake-IP ones, so they no longer cache and serve `198.18.x.x` addresses; `dnsConfig.dnsServerProcesses` adds processes or removes a default with `!name`, an explicit Block rule for the process still applies, and replacing a profile over IPC now validates that list.
 
 ### Changed
+- Windows refuses blocked TCP connections at once with an injected TCP RST (Block rules, kill switch, DoT and IPv6 port 853 blocks) instead of letting them time out; blocked DoQ (UDP 853) and UDP Block rules get an injected ICMP Port Unreachable like QUIC (never toward multicast or the limited broadcast address), which was not delivered on the Windows Server 2022 test VM, so those clients may still time out; failed packet injections are logged (`windivert_inject_failed`).
+- Windows logs a start notice counting the connections opened before the engine started that match a Proxy, Chain or Block rule: they keep their route until the application reconnects (documented in the troubleshooting guide, also true on Linux).
 - The MSI bundles unmodified WinDivert 2.2.2 under the LGPLv3 with its notices, removes its driver service on uninstall, and each release attaches the WinDivert source archive. The portable ZIP still uses `tools/fetch-windivert.ps1`.
 - Linux TPROXY replies reuse one raw socket per address family, and the SOCKS5 UDP session table is no longer scanned on every datagram.
 - The minimum supported Rust version is 1.89 (checked in CI) and the UI requires Node.js 22.12 or later.
