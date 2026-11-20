@@ -33,11 +33,12 @@ use crate::dns::codec::{enforce_udp_truncation, parse_dns_query};
 use crate::dns::LocalNameQueryDecision;
 #[cfg(windows)]
 use crate::interceptor::nat::{
-    build_forged_ipv4_icmp_port_unreachable, build_forged_ipv4_udp_reply,
-    build_forged_ipv6_icmpv6_port_unreachable, build_forged_ipv6_udp_reply,
-    is_ipv4_packet_fragmented, is_non_first_ip_fragment, is_private_or_local_ipv4,
-    parse_ipv4_tcp_meta, parse_ipv4_udp_meta, parse_ipv6_tcp_meta, parse_ipv6_transport_meta,
-    parse_udp_fragment_meta, reflect_outbound_ipv6_to_local_relay, reflect_outbound_to_local_relay,
+    build_forged_ipv4_icmp_port_unreachable, build_forged_ipv4_tcp_rst,
+    build_forged_ipv4_udp_reply, build_forged_ipv6_icmpv6_port_unreachable,
+    build_forged_ipv6_tcp_rst, build_forged_ipv6_udp_reply, is_ipv4_packet_fragmented,
+    is_non_first_ip_fragment, is_private_or_local_ipv4, parse_ipv4_tcp_meta, parse_ipv4_udp_meta,
+    parse_ipv6_tcp_meta, parse_ipv6_transport_meta, parse_udp_fragment_meta,
+    reflect_outbound_ipv6_to_local_relay, reflect_outbound_to_local_relay,
     reflect_relay_reply_ipv6_to_client, reflect_relay_reply_to_client, Ipv4TcpPacketMeta,
     Ipv4UdpPacketMeta, Ipv6TransportPacketMeta, NatSessionEntry, PendingSynOutcome,
     PendingSynQueue, PendingUdpOutcome, PendingUdpQueue, PidResolutionSource, SocketKey,

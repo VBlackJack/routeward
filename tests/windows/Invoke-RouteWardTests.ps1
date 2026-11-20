@@ -121,6 +121,14 @@ param(
     [Parameter(Mandatory = $false)]
     [int]$PollIntervalMs = 200,
 
+    # A blocked TCP connection must be refused (curl exit 7 or 56) in less than this many milliseconds.
+    [Parameter(Mandatory = $false)]
+    [int]$BlockFastRejectMaxMs = 3000,
+
+    # A blocked UDP probe must receive its ICMP rejection in less than this many milliseconds.
+    [Parameter(Mandatory = $false)]
+    [int]$UdpFastRejectMaxMs = 500,
+
     [Parameter(Mandatory = $false)]
     [int]$TcpConnectTimeoutMs = 3000,
 
@@ -385,6 +393,20 @@ function Get-RoutedUdpLogLines {
         }
     }
     return $lines.ToArray()
+}
+
+function Get-FastRejectionNote {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Probe
+    )
+    # Fast means the ICMP rejection reached the client within $UdpFastRejectMaxMs. A blocked but not fast
+    # probe stays a PASS until the VM confirms the injected ICMP is not dropped by the host firewall.
+    $isFast = ($Probe.FastRejection -eq $true) -and ([double]$Probe.DelayMs -lt $UdpFastRejectMaxMs)
+    if ($isFast) {
+        return "fastRejection=True (under $UdpFastRejectMaxMs ms)"
+    }
+    return "fastRejection=False (NOT fast: no ICMP rejection under $UdpFastRejectMaxMs ms, check that the firewall does not drop the injected ICMP)"
 }
 
 function Invoke-QuicUdp443Probe {
@@ -724,11 +746,14 @@ function Build-CurlArguments {
         [string]$Url,
 
         [Parameter(Mandatory = $true)]
-        [int]$TimeoutSec
+        [int]$TimeoutSec,
+
+        # When greater than zero, adds --connect-timeout so a missing refusal shows as a timeout (exit 28).
+        [int]$ConnectTimeoutSec = 0
     )
     # Note: Never pass an empty string "" to --noproxy in Windows PowerShell 5.1,
     # as PowerShell 5.1 strips "" when invoking native binaries, causing --noproxy to consume -s.
-    return @(
+    $curlCliArgs = @(
         "-s",
         "-o",
         "NUL",
@@ -737,16 +762,21 @@ function Build-CurlArguments {
         "--noproxy",
         "*",
         "--max-time",
-        "$TimeoutSec",
-        $Url
+        "$TimeoutSec"
     )
+    if ($ConnectTimeoutSec -gt 0) {
+        $curlCliArgs += @("--connect-timeout", "$ConnectTimeoutSec")
+    }
+    $curlCliArgs += $Url
+    return $curlCliArgs
 }
 
 function Invoke-UnproxiedCurl {
     param(
         [string]$CurlBin,
         [string]$Url,
-        [int]$TimeoutSec
+        [int]$TimeoutSec,
+        [int]$ConnectTimeoutSec = 0
     )
     $proxyVars = @("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
     $savedVars = @{}
@@ -754,13 +784,15 @@ function Invoke-UnproxiedCurl {
         $savedVars[$v] = [Environment]::GetEnvironmentVariable($v, "Process")
         [Environment]::SetEnvironmentVariable($v, $null, "Process")
     }
-    $curlArgs = Build-CurlArguments -Url $Url -TimeoutSec $TimeoutSec
+    $curlArgs = Build-CurlArguments -Url $Url -TimeoutSec $TimeoutSec -ConnectTimeoutSec $ConnectTimeoutSec
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
+    $curlStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         # Capture standard output only; discard standard error so progress/diagnostics never mix with %{http_code}
         $stdoutLines = & $CurlBin @curlArgs 2>$null
         $code = $LASTEXITCODE
+        $curlStopwatch.Stop()
     } finally {
         $ErrorActionPreference = $prevEap
         foreach ($v in $proxyVars) {
@@ -769,8 +801,9 @@ function Invoke-UnproxiedCurl {
     }
     $httpCodeOnly = (($stdoutLines | ForEach-Object { $_.ToString() }) -join "").Trim()
     return [PSCustomObject]@{
-        ExitCode = $code
-        HttpCode = $httpCodeOnly
+        ExitCode  = $code
+        HttpCode  = $httpCodeOnly
+        ElapsedMs = [int][Math]::Round($curlStopwatch.Elapsed.TotalMilliseconds)
     }
 }
 
@@ -1031,6 +1064,15 @@ if ($DryRun.IsPresent) {
         if ($closedPortCurl.ExitCode -eq 0 -or $closedPortCurl.HttpCode -notmatch '^\d{3}$') {
             throw "DryRun failed: expected clean 3-digit HTTP code and non-zero exit from closed port curl, got HttpCode='$($closedPortCurl.HttpCode)' ExitCode=$($closedPortCurl.ExitCode)"
         }
+    }
+    $sampleConnectArgs = Build-CurlArguments -Url $TestUrl -TimeoutSec $CurlTimeoutSec -ConnectTimeoutSec 10
+    if (($sampleConnectArgs -join ' ') -notmatch '--connect-timeout 10 ') {
+        throw "DryRun failed: --connect-timeout missing from curl arguments: $($sampleConnectArgs -join ' ')"
+    }
+    $fastNote = Get-FastRejectionNote -Probe ([PSCustomObject]@{ FastRejection = $true; DelayMs = 12 })
+    $slowNote = Get-FastRejectionNote -Probe ([PSCustomObject]@{ FastRejection = $true; DelayMs = $UdpFastRejectMaxMs + 1 })
+    if ($fastNote -notmatch 'fastRejection=True' -or $slowNote -notmatch 'fastRejection=False') {
+        throw "DryRun failed: unexpected fast rejection notes '$fastNote' / '$slowNote'"
     }
     Write-Host "[DRYRUN-PASS] Verified curl command construction (-s -o NUL -w '%{http_code}') and stdout-only HTTP code capture." -ForegroundColor Green
 
@@ -2323,7 +2365,7 @@ try {
         }
 
         try {
-            $curlBlocked = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec 5
+            $curlBlocked = Invoke-UnproxiedCurl -CurlBin $CurlExePath -Url $TestUrl -TimeoutSec 15 -ConnectTimeoutSec 10
             Start-Sleep -Milliseconds $PollIntervalMs
             $connsBlockedRes = Invoke-RouteWardCtl -ExePath $routeWardExePath -CtlArgs @("connections") -Label "Scenario-e-connections"
             $connsBlockedList = ConvertFrom-CtlResponseJson `
@@ -2355,10 +2397,12 @@ try {
             }
         }
 
-        if ($curlBlocked.ExitCode -ne 0 -and $sawBlockedConn -and $profileRestoredIdentical) {
-            Record-ScenarioResult -Id "e" -Status "PASS" -Title "Temporary Block rule via ctl" -Detail "curl failed as expected (exit=$($curlBlocked.ExitCode)), connection marked blocked, rule removed and profile verified identical"
+        # A refused connection (injected TCP RST) ends with curl exit 7 (or 56) well before the connect timeout.
+        $blockedRefusedFast = (($curlBlocked.ExitCode -eq 7) -or ($curlBlocked.ExitCode -eq 56)) -and ($curlBlocked.ElapsedMs -lt $BlockFastRejectMaxMs)
+        if ($blockedRefusedFast -and $sawBlockedConn -and $profileRestoredIdentical) {
+            Record-ScenarioResult -Id "e" -Status "PASS" -Title "Temporary Block rule via ctl" -Detail "curl refused as expected (exit=$($curlBlocked.ExitCode), elapsed=$($curlBlocked.ElapsedMs) ms < $BlockFastRejectMaxMs ms), connection marked blocked, rule removed and profile verified identical"
         } else {
-            Record-ScenarioResult -Id "e" -Status "FAIL" -Title "Temporary Block rule via ctl" -Detail "curlExit=$($curlBlocked.ExitCode), sawBlocked=$sawBlockedConn, profileRestoredIdentical=$profileRestoredIdentical"
+            Record-ScenarioResult -Id "e" -Status "FAIL" -Title "Temporary Block rule via ctl" -Detail "curlExit=$($curlBlocked.ExitCode) (expected 7 or 56), elapsedMs=$($curlBlocked.ElapsedMs) (expected < $BlockFastRejectMaxMs), sawBlocked=$sawBlockedConn, profileRestoredIdentical=$profileRestoredIdentical"
         }
     } catch {
         Record-ScenarioResult -Id "e" -Status "FAIL" -Title "Temporary Block rule via ctl" -Detail $_.Exception.Message
@@ -2684,7 +2728,7 @@ try {
         }
 
         if ($sawQuicBlockedConn -and $sawQuicWarnLog -and (-not $quicProbe.UnexpectedReplyReceived)) {
-            Record-ScenarioResult -Id "o" -Status "PASS" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail "UDP 443 toward ${ExternalDnsServer}:443 blocked=true, fastRejection=$($quicProbe.FastRejection) (clientError=$($quicProbe.SocketErrorCode), measuredDelay=$($quicProbe.DelayMs) ms, matchedRule=SecurityPolicy:blockQuicUdp443, status=blocked)"
+            Record-ScenarioResult -Id "o" -Status "PASS" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail "UDP 443 toward ${ExternalDnsServer}:443 blocked=true, $(Get-FastRejectionNote -Probe $quicProbe) (clientError=$($quicProbe.SocketErrorCode), measuredDelay=$($quicProbe.DelayMs) ms, matchedRule=SecurityPolicy:blockQuicUdp443, status=blocked)"
         } else {
             Record-ScenarioResult -Id "o" -Status "FAIL" -Title "QUIC (UDP 443) rejected with ICMP Port Unreachable" -Detail "blocked=$sawQuicBlockedConn, sawWarnLog=$sawQuicWarnLog, unexpectedReply=$($quicProbe.UnexpectedReplyReceived), fastRejection=$($quicProbe.FastRejection), clientError=$($quicProbe.SocketErrorCode), delayMs=$($quicProbe.DelayMs)"
         }
@@ -3457,7 +3501,7 @@ try {
             }
 
             if ($sawQuicV6BlockedConn -and $sawQuicV6WarnLog -and (-not $quicProbeV6.UnexpectedReplyReceived)) {
-                Record-ScenarioResult -Id "w" -Status "PASS" -Title "IPv6 QUIC (UDP 443) rejected with ICMPv6 Port Unreachable" -Detail "IPv6 UDP 443 toward [${ipv6TargetIpW}]:443 blocked=true, fastRejection=$($quicProbeV6.FastRejection) (clientError=$($quicProbeV6.SocketErrorCode), measuredDelay=$($quicProbeV6.DelayMs) ms, matchedRule=SecurityPolicy:blockQuicUdp443, status=blocked)"
+                Record-ScenarioResult -Id "w" -Status "PASS" -Title "IPv6 QUIC (UDP 443) rejected with ICMPv6 Port Unreachable" -Detail "IPv6 UDP 443 toward [${ipv6TargetIpW}]:443 blocked=true, $(Get-FastRejectionNote -Probe $quicProbeV6) (clientError=$($quicProbeV6.SocketErrorCode), measuredDelay=$($quicProbeV6.DelayMs) ms, matchedRule=SecurityPolicy:blockQuicUdp443, status=blocked)"
             } else {
                 Record-ScenarioResult -Id "w" -Status "FAIL" -Title "IPv6 QUIC (UDP 443) rejected with ICMPv6 Port Unreachable" -Detail "blocked=$sawQuicV6BlockedConn, sawWarnLog=$sawQuicV6WarnLog, unexpectedReply=$($quicProbeV6.UnexpectedReplyReceived), fastRejection=$($quicProbeV6.FastRejection), clientError=$($quicProbeV6.SocketErrorCode), delayMs=$($quicProbeV6.DelayMs)"
             }

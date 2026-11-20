@@ -57,6 +57,9 @@ const DNS_SERVER_PID_MAX_CHECKED: usize = 4096;
 const DNS_SERVER_PASS_LOG_KEY: &str = "dns_server_exempt_pass";
 /// Rate-limit category of the per-query block log.
 const DNS_SERVER_BLOCK_LOG_KEY: &str = "dns_server_exempt_block";
+/// Rate-limit category of the failed packet injection warning.
+#[cfg(windows)]
+const WINDIVERT_INJECT_FAILED_LOG_KEY: &str = "windivert_inject_failed";
 
 /// `true` when `payload` starts with a DNS header of a query.
 fn is_dns_query_header(payload: &[u8]) -> bool {
@@ -256,30 +259,69 @@ impl WinDivertInterceptor {
         }
     }
 
+    /// Injects `packet` toward the local stack as an inbound packet, copying the interface indexes of
+    /// `reply_addr`. Returns `false` and logs a rate-limited warning when `WinDivertSend` fails, so a
+    /// silently failing injection is visible instead of looking like a plain drop.
     #[cfg(windows)]
     fn inject_inbound_packet(
+        ctrl: &RouteWardController,
         api: &WinDivertApi,
         net_handle: *mut c_void,
         packet: &mut [u8],
         mut reply_addr: WinDivertAddress,
-    ) {
+    ) -> bool {
         reply_addr.set_outbound(false);
         reply_addr.clear_impostor();
         let mut send_len: u32 = 0;
-        unsafe {
+        let sent = unsafe {
             let _ = (api.calc_checksums)(
                 packet.as_mut_ptr() as *mut c_void,
                 packet.len() as u32,
                 &mut reply_addr as *mut WinDivertAddress,
                 0,
             );
-            let _ = (api.send)(
+            (api.send)(
                 net_handle,
                 packet.as_ptr() as *const c_void,
                 packet.len() as u32,
                 &mut send_len,
                 &reply_addr as *const WinDivertAddress,
-            );
+            )
+        };
+        if sent != 0 {
+            return true;
+        }
+        let os_error = std::io::Error::last_os_error();
+        ctrl.push_rate_limited_warn(
+            WINDIVERT_INJECT_FAILED_LOG_KEY,
+            COMPONENT_WINDIVERT,
+            format!(
+                "WinDivertSend failed to inject a {}-byte inbound packet: {}",
+                packet.len(),
+                os_error
+            ),
+        );
+        false
+    }
+
+    /// Refuses a blocked outbound SYN at once with an injected TCP RST, so the application gets
+    /// "connection refused" instead of waiting for its connect timeout. Best effort: the SYN is
+    /// never forwarded either way, and a SYN that cannot be answered stays a silent drop.
+    #[cfg(windows)]
+    fn reject_blocked_syn(
+        ctrl: &RouteWardController,
+        api: &WinDivertApi,
+        net_handle: *mut c_void,
+        packet: &[u8],
+        addr: &WinDivertAddress,
+    ) {
+        let rst = match packet.first().map(|b| b >> 4) {
+            Some(4) => build_forged_ipv4_tcp_rst(packet),
+            Some(6) => build_forged_ipv6_tcp_rst(packet),
+            _ => None,
+        };
+        if let Some(mut rst) = rst {
+            Self::inject_inbound_packet(ctrl, api, net_handle, &mut rst, *addr);
         }
     }
 
@@ -601,7 +643,8 @@ impl WinDivertInterceptor {
                         },
                         false,
                     );
-                    // Drop packet by skipping WinDivertSend
+                    // The SYN is never forwarded; the application is refused at once instead.
+                    Self::reject_blocked_syn(ctrl, api, net_handle, packet, addr);
                     return;
                 }
                 RuleAction::Direct => {
@@ -757,6 +800,14 @@ impl WinDivertInterceptor {
             }
             Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
             return;
+        }
+
+        // A Block rule refuses the datagram with ICMP Port Unreachable, like a closed port. The
+        // spawned forwarder below still records the block; fragments stay a silent drop.
+        if matches!(eval.action, RuleAction::Block) && !is_fragmented {
+            if let Some(mut icmp_reply) = build_forged_ipv4_icmp_port_unreachable(packet) {
+                Self::inject_inbound_packet(ctrl, api, net_handle, &mut icmp_reply, *addr);
+            }
         }
 
         let udp_payload =
@@ -924,6 +975,7 @@ impl WinDivertInterceptor {
                     IpAddr::V6(meta.dst_ip),
                     meta.dst_port,
                 );
+                Self::reject_blocked_syn(ctrl, api, net_handle, packet, addr);
                 return;
             }
             let dst_ip_str = meta.dst_ip.to_string();
@@ -1033,6 +1085,7 @@ impl WinDivertInterceptor {
                         },
                         false,
                     );
+                    Self::reject_blocked_syn(ctrl, api, net_handle, packet, addr);
                     return;
                 }
                 RuleAction::Direct => {
@@ -1151,6 +1204,14 @@ impl WinDivertInterceptor {
             );
             Self::send_packet_guarded(ctrl, api, net_handle, packet, addr);
             return;
+        }
+
+        // A Block rule refuses the datagram with ICMP Port Unreachable, like a closed port. The
+        // spawned forwarder below still records the block; fragments stay a silent drop.
+        if matches!(eval.action, RuleAction::Block) {
+            if let Some(mut icmp6_reply) = build_forged_ipv6_icmpv6_port_unreachable(packet) {
+                Self::inject_inbound_packet(ctrl, api, net_handle, &mut icmp6_reply, *addr);
+            }
         }
 
         let udp_payload =
@@ -1582,13 +1643,30 @@ impl WinDivertInterceptor {
                                 IpAddr::V6(v6_meta.dst_ip),
                                 v6_meta.dst_port,
                             );
+                            if let Some(mut icmp6_reply) =
+                                build_forged_ipv6_icmpv6_port_unreachable(packet)
+                            {
+                                Self::inject_inbound_packet(
+                                    &ctrl_net,
+                                    &api,
+                                    handle,
+                                    &mut icmp6_reply,
+                                    addr,
+                                );
+                            }
                             continue;
                         }
                         if v6_meta.dst_port == quic_port && block_quic {
                             if let Some(mut icmp6_reply) =
                                 build_forged_ipv6_icmpv6_port_unreachable(packet)
                             {
-                                Self::inject_inbound_packet(&api, handle, &mut icmp6_reply, addr);
+                                Self::inject_inbound_packet(
+                                    &ctrl_net,
+                                    &api,
+                                    handle,
+                                    &mut icmp6_reply,
+                                    addr,
+                                );
                             }
                             Self::record_quic_udp_443_blocked(
                                 &ctrl_net,
@@ -1661,7 +1739,13 @@ impl WinDivertInterceptor {
                                     v6_meta.src_port,
                                     &final_resp,
                                 ) {
-                                    Self::inject_inbound_packet(&api, handle, &mut forged, addr);
+                                    Self::inject_inbound_packet(
+                                        &ctrl_net,
+                                        &api,
+                                        handle,
+                                        &mut forged,
+                                        addr,
+                                    );
                                 }
                                 continue;
                             }
@@ -1695,6 +1779,7 @@ impl WinDivertInterceptor {
                                     let h_ptr =
                                         net_handle_async.load(Ordering::Acquire) as *mut c_void;
                                     Self::inject_inbound_packet(
+                                        &ctrl_async,
                                         &api_copy,
                                         h_ptr,
                                         &mut forged,
@@ -1862,6 +1947,17 @@ impl WinDivertInterceptor {
                                 IpAddr::V4(udp_meta.dst_ip),
                                 udp_meta.dst_port,
                             );
+                            if let Some(mut icmp_reply) =
+                                build_forged_ipv4_icmp_port_unreachable(packet)
+                            {
+                                Self::inject_inbound_packet(
+                                    &ctrl_net,
+                                    &api,
+                                    handle,
+                                    &mut icmp_reply,
+                                    addr,
+                                );
+                            }
                             continue;
                         }
 
@@ -1872,25 +1968,13 @@ impl WinDivertInterceptor {
                             if let Some(mut icmp_reply) =
                                 build_forged_ipv4_icmp_port_unreachable(packet)
                             {
-                                let mut reply_addr = addr;
-                                reply_addr.set_outbound(false);
-                                reply_addr.clear_impostor();
-                                let mut send_len: u32 = 0;
-                                unsafe {
-                                    let _ = (api.calc_checksums)(
-                                        icmp_reply.as_mut_ptr() as *mut c_void,
-                                        icmp_reply.len() as u32,
-                                        &mut reply_addr as *mut WinDivertAddress,
-                                        0,
-                                    );
-                                    let _ = (api.send)(
-                                        handle,
-                                        icmp_reply.as_ptr() as *const c_void,
-                                        icmp_reply.len() as u32,
-                                        &mut send_len,
-                                        &reply_addr as *const WinDivertAddress,
-                                    );
-                                }
+                                Self::inject_inbound_packet(
+                                    &ctrl_net,
+                                    &api,
+                                    handle,
+                                    &mut icmp_reply,
+                                    addr,
+                                );
                             }
                             Self::record_quic_udp_443_blocked(
                                 &ctrl_net,
