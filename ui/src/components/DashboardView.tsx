@@ -23,6 +23,7 @@ import {
   Briefcase,
   CheckCircle2,
   Circle,
+  Clock,
   Cpu,
   Gamepad2,
   Globe,
@@ -59,7 +60,9 @@ interface DashboardViewProps {
   proxies?: ProxyNode[];
   rules?: RoutingRule[];
   startingProtection?: boolean;
+  pauseRemainingSec?: number | null;
   onToggleEngine?: () => void;
+  onTemporaryPause?: (minutes: number) => Promise<void> | void;
   onStartAndEnableProtection?: () => Promise<void> | void;
   onApplyUseCase?: (
     useCase: DashboardUseCaseId
@@ -83,7 +86,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   proxies = [],
   rules = [],
   startingProtection = false,
+  pauseRemainingSec = null,
   onToggleEngine,
+  onTemporaryPause,
   onStartAndEnableProtection,
   onApplyUseCase,
   onTestPrimaryProxy,
@@ -230,6 +235,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   ? t('dashboard.health_banner.status_badge_ok')
                   : t('dashboard.health_banner.status_badge_off')}
               </span>
+              {!isEngineRunning &&
+                pauseRemainingSec !== null &&
+                pauseRemainingSec > 0 && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-tf-orange/20 px-2 py-0.5 font-mono text-[10px] font-bold text-tf-orange">
+                    <Clock className="h-3 w-3" />
+                    {t('dashboard.simple.auto_resume_in', {
+                      remaining: `${Math.floor(pauseRemainingSec / 60)}:${String(
+                        pauseRemainingSec % 60
+                      ).padStart(2, '0')}`
+                    })}
+                  </span>
+                )}
             </div>
             <p className="mt-1 max-w-2xl text-xs text-tf-secondary">
               {isEngineRunning
@@ -265,20 +282,46 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {experienceMode === 'simple' &&
             diagnostics.daemonConnected &&
             onToggleEngine && (
-              <button
-                type="button"
-                onClick={onToggleEngine}
-                className={`flex items-center gap-2 rounded-tf-md px-4 py-2 text-xs font-bold transition ${
-                  isEngineRunning
-                    ? 'border border-tf-orange/40 bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
-                    : 'bg-tf-green text-tf-bg hover:opacity-90'
-                }`}
-              >
-                <Power className="h-3.5 w-3.5" />
-                {isEngineRunning
-                  ? t('app.header.engine.pause')
-                  : t('app.header.engine.start')}
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={onToggleEngine}
+                  className={`flex items-center gap-2 rounded-tf-md px-4 py-2 text-xs font-bold transition ${
+                    isEngineRunning
+                      ? 'border border-tf-orange/40 bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
+                      : 'bg-tf-green text-tf-bg hover:opacity-90'
+                  }`}
+                >
+                  <Power className="h-3.5 w-3.5" />
+                  {isEngineRunning
+                    ? t('app.header.engine.pause')
+                    : t('app.header.engine.start')}
+                </button>
+                {isEngineRunning && onTemporaryPause && (
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void onTemporaryPause(15);
+                      }}
+                      className="tf-surface-alt flex items-center gap-1 px-2.5 py-2 text-[11px] font-semibold text-tf-secondary hover:border-tf-orange hover:text-tf-orange"
+                    >
+                      <Clock className="h-3 w-3" />
+                      {t('dashboard.simple.pause_15m')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void onTemporaryPause(60);
+                      }}
+                      className="tf-surface-alt flex items-center gap-1 px-2.5 py-2 text-[11px] font-semibold text-tf-secondary hover:border-tf-orange hover:text-tf-orange"
+                    >
+                      <Clock className="h-3 w-3" />
+                      {t('dashboard.simple.pause_60m')}
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           <button
             onClick={onOpenWizard}

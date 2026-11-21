@@ -35,6 +35,7 @@ import {
 } from 'lucide-react';
 import {
   buildDefaultPacUrl,
+  DEFAULT_PROFILE_DATA,
   SYSTEM_CONSTANTS,
   UI_CONFIG
 } from './config/constants';
@@ -96,6 +97,10 @@ export const App: React.FC = () => {
   const [startingDaemon, setStartingDaemon] = useState(false);
   const [togglingEngine, setTogglingEngine] = useState(false);
   const togglingEngineRef = useRef(false);
+  const [pauseUntilMs, setPauseUntilMs] = useState<number | null>(null);
+  const [pauseRemainingSec, setPauseRemainingSec] = useState<number | null>(
+    null
+  );
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const wizardAutoCheckedRef = useRef(false);
 
@@ -296,12 +301,17 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleToggleEngine = async (targetState: boolean) => {
-    if (togglingEngineRef.current) return;
+  const handleToggleEngine = useCallback(async (targetState: boolean): Promise<boolean> => {
+    if (togglingEngineRef.current) return false;
     togglingEngineRef.current = true;
     setTogglingEngine(true);
     try {
       await routewardClient.toggleEngine(targetState);
+      if (targetState) {
+        setPauseUntilMs(null);
+        setPauseRemainingSec(null);
+      }
+      return true;
     } catch (err) {
       if (err instanceof HttpResponseError) {
         const engineErrorToastMap: Record<string, string> = {
@@ -316,14 +326,51 @@ export const App: React.FC = () => {
           ? engineErrorToastMap[err.errorKey]
           : undefined;
         pushToast(t(key ?? 'app.toast.engine.start_failed'), 'error');
-        return;
+        return false;
       }
       pushToast(t('app.toast.engine.start_failed'), 'error');
+      return false;
     } finally {
       togglingEngineRef.current = false;
       setTogglingEngine(false);
     }
+  }, [pushToast, t]);
+
+  const handleTemporaryPause = async (minutes: number) => {
+    const ok = await handleToggleEngine(false);
+    if (!ok) return;
+    const deadline = Date.now() + minutes * 60 * 1000;
+    setPauseUntilMs(deadline);
+    setPauseRemainingSec(minutes * 60);
+    pushToast(
+      t('app.toast.engine.paused_temporarily', { minutes }),
+      'info'
+    );
   };
+
+  useEffect(() => {
+    if (pauseUntilMs === null) {
+      return;
+    }
+    const tick = () => {
+      const remaining = Math.max(
+        0,
+        Math.ceil((pauseUntilMs - Date.now()) / 1000)
+      );
+      setPauseRemainingSec(remaining);
+      if (remaining <= 0) {
+        setPauseUntilMs(null);
+        setPauseRemainingSec(null);
+        void handleToggleEngine(true).then((resumed) => {
+          if (resumed) {
+            pushToast(t('app.toast.engine.resumed_automatically'), 'success');
+          }
+        });
+      }
+    };
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [pauseUntilMs, handleToggleEngine, pushToast, t]);
 
   useEffect(() => {
     let cancelled = false;
@@ -437,6 +484,30 @@ export const App: React.FC = () => {
       const list = await routewardClient.deleteNamedProfile(profileId);
       setNamedProfiles(list);
       pushToast(t('app.toast.profile.deleted'), 'warning');
+    } catch (err) {
+      pushErrorToast(err, 'app.toast.profile.error');
+    }
+  };
+
+  const handleResetToDefaults = async () => {
+    try {
+      const now = new Date();
+      const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      if (diagnostics.daemonConnected) {
+        try {
+          await routewardClient.saveNamedProfile(undefined, `Backup ${stamp}`);
+        } catch {
+          // Best-effort backup before resetting defaults.
+        }
+      }
+      await routewardClient.importProfileJson(
+        JSON.stringify(DEFAULT_PROFILE_DATA)
+      );
+      if (diagnostics.daemonConnected) {
+        const list = await routewardClient.listNamedProfiles();
+        setNamedProfiles(list);
+      }
+      pushToast(t('app.toast.profile.reset_done'), 'success');
     } catch (err) {
       pushErrorToast(err, 'app.toast.profile.error');
     }
@@ -869,9 +940,11 @@ export const App: React.FC = () => {
             proxies={profile.proxies}
             rules={profile.rules}
             startingProtection={startingDaemon || togglingEngine}
+            pauseRemainingSec={pauseRemainingSec}
             onToggleEngine={() => {
               void handleToggleEngine(!isEngineRunning);
             }}
+            onTemporaryPause={handleTemporaryPause}
             onStartAndEnableProtection={handleStartAndEnableProtection}
             onApplyUseCase={handleApplyUseCase}
             onTestPrimaryProxy={async (proxyId) => {
@@ -1112,6 +1185,7 @@ export const App: React.FC = () => {
             onSaveNamedProfile={handleSaveNamedProfile}
             onSwitchNamedProfile={handleSwitchNamedProfile}
             onDeleteNamedProfile={handleDeleteNamedProfile}
+            onResetToDefaults={handleResetToDefaults}
           />
         )}
       </main>

@@ -161,6 +161,7 @@
         "saved_named": "Saved named profile",
         "switched": "Switched active profile",
         "deleted": "Deleted profile",
+        "reset_done": "Default settings restored (previous profile backed up)",
         "error": "Profile operation failed"
       },
       "foxyproxy": {
@@ -177,7 +178,9 @@
         "not_root": "Root privileges required for transparent interception",
         "nft_missing": "nftables binary (nft) not found",
         "nft_failed": "Failed to configure nftables rules",
-        "start_failed": "Failed to change protection state"
+        "start_failed": "Failed to change protection state",
+        "paused_temporarily": "Protection paused temporarily ({{minutes}} min)",
+        "resumed_automatically": "Protection resumed automatically"
       },
       "daemon": {
         "started": "Privileged service started and connected",
@@ -245,6 +248,9 @@
       "checklist_step_service": "Service running",
       "checklist_step_protection": "Protection active",
       "checklist_step_rules": "Apps or proxy configured",
+      "pause_15m": "Pause 15m",
+      "pause_60m": "Pause 1h",
+      "auto_resume_in": "Auto-resume in {{remaining}}",
       "use_cases_title": "What do you want to do today?",
       "use_cases_subtitle": "Pick a ready-made scenario to configure your apps and leak protection in one click.",
       "uc_privacy_title": "Private Browsing",
@@ -440,7 +446,12 @@
       "status_ok": "Working",
       "status_untested": "Not checked",
       "test_connection": "Check Connection",
-      "in_use_warning": "Used by {{count}} rule(s)"
+      "in_use_warning": "Used by {{count}} rule(s)",
+      "failover_title": "Automatic Backup Proxy Switch",
+      "failover_desc": "If your primary proxy stops responding, RouteWard automatically switches to your other active proxies.",
+      "failover_chain_name": "Automatic Backup Proxy",
+      "failover_enabled": "On",
+      "failover_disabled": "Off"
     },
     "section": {
       "servers": {
@@ -543,6 +554,7 @@
       "target_app_placeholder": "spotify.exe",
       "target_site_label": "Website or domain (e.g. *.example.com)",
       "target_site_placeholder": "*.example.com",
+      "url_preview": "Will match {{domain}} and all its subdomains",
       "quick_edge_chip": "Edge (msedge.exe)",
       "optional_site_label": "Only for these domains (Optional, e.g. meshcore.net, *.meshcore.net)",
       "optional_site_placeholder": "meshcore.net, *.meshcore.net (leave blank for all sites)",
@@ -988,7 +1000,11 @@
       "advanced_tools_title": "Advanced Tools & System Integration",
       "advanced_tools_desc": "Windows system proxy, PAC script, targeted app launcher, and JSON backup.",
       "advanced_tools_show": "Show",
-      "advanced_tools_hide": "Hide"
+      "advanced_tools_hide": "Hide",
+      "reset_title": "Restore Default Settings",
+      "reset_desc": "Restores a clean baseline if a rule breaks an app or website. Your current profile is automatically backed up first.",
+      "reset_button": "Reset Defaults",
+      "reset_confirm": "Confirm Reset"
     },
     "profiles": {
       "title": "Named Profiles (Quick Switch)",

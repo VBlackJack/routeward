@@ -66,6 +66,10 @@ export const UI_CONFIG = {
   LONG_REQUEST_TIMEOUT_MS: 120000,
   /** Auto-dismiss delay for non-error toasts; error toasts stay until dismissed. */
   TOAST_DURATION_MS: 3200,
+  /** Quick temporary pause durations (in minutes) shown in Simple mode. */
+  TEMPORARY_PAUSE_OPTIONS_MINUTES: [15, 60] as const,
+  /** Stable identifier of the automatic backup-proxy failover chain managed in Simple mode. */
+  SIMPLE_FAILOVER_CHAIN_ID: 'chain-simple-failover',
   /** Priority gap used when reordering rules. */
   PRIORITY_STEP: 5,
   /** Connection cache bound used when system constants do not provide one. */

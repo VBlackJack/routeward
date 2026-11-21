@@ -161,6 +161,7 @@
         "saved_named": "Profil nommé enregistré",
         "switched": "Profil actif basculé",
         "deleted": "Profil supprimé",
+        "reset_done": "Réglages par défaut rétablis (ancien profil sauvegardé)",
         "error": "Échec de l'opération sur le profil"
       },
       "foxyproxy": {
@@ -177,7 +178,9 @@
         "not_root": "Privilèges root requis pour l'interception transparente",
         "nft_missing": "Binaire nftables (nft) introuvable",
         "nft_failed": "Échec de la configuration des règles nftables",
-        "start_failed": "Impossible de changer l'état de protection"
+        "start_failed": "Impossible de changer l'état de protection",
+        "paused_temporarily": "Protection mise en pause temporairement ({{minutes}} min)",
+        "resumed_automatically": "Protection réactivée automatiquement"
       },
       "daemon": {
         "started": "Service privilégié démarré et connecté",
@@ -245,6 +248,9 @@
       "checklist_step_service": "Service démarré",
       "checklist_step_protection": "Protection active",
       "checklist_step_rules": "Apps ou proxy configurés",
+      "pause_15m": "Pause 15 min",
+      "pause_60m": "Pause 1 h",
+      "auto_resume_in": "Reprise auto dans {{remaining}}",
       "use_cases_title": "Que voulez-vous faire aujourd'hui ?",
       "use_cases_subtitle": "Choisissez un scénario prêt à l'emploi pour configurer vos applications et votre protection en un clic.",
       "uc_privacy_title": "Navigation Privée",
@@ -440,7 +446,12 @@
       "status_ok": "Fonctionne",
       "status_untested": "Non vérifié",
       "test_connection": "Vérifier la connexion",
-      "in_use_warning": "Utilisé par {{count}} règle(s)"
+      "in_use_warning": "Utilisé par {{count}} règle(s)",
+      "failover_title": "Bascule automatique sur proxy de secours",
+      "failover_desc": "Si votre proxy principal ne répond plus, RouteWard bascule automatiquement vers vos autres proxies actifs.",
+      "failover_chain_name": "Proxy de Secours Automatique",
+      "failover_enabled": "Actif",
+      "failover_disabled": "Désactivé"
     },
     "section": {
       "servers": {
@@ -543,6 +554,7 @@
       "target_app_placeholder": "spotify.exe",
       "target_site_label": "Site web ou domaine (ex. *.exemple.com)",
       "target_site_placeholder": "*.exemple.com",
+      "url_preview": "S'appliquera à {{domain}} et tous ses sous-domaines",
       "quick_edge_chip": "Edge (msedge.exe)",
       "optional_site_label": "Uniquement pour ces domaines (Optionnel, ex. meshcore.net, *.meshcore.net)",
       "optional_site_placeholder": "meshcore.net, *.meshcore.net (laisser vide pour tous les sites)",
@@ -988,7 +1000,11 @@
       "advanced_tools_title": "Outils avancés & intégration système",
       "advanced_tools_desc": "Proxy système Windows, script PAC, lancement ciblé et sauvegarde JSON.",
       "advanced_tools_show": "Afficher",
-      "advanced_tools_hide": "Masquer"
+      "advanced_tools_hide": "Masquer",
+      "reset_title": "Rétablir les réglages par défaut",
+      "reset_desc": "Remet une configuration saine si une règle bloque un site. Votre profil actuel est sauvegardé automatiquement avant.",
+      "reset_button": "Réinitialiser",
+      "reset_confirm": "Confirmer la réinitialisation"
     },
     "profiles": {
       "title": "Profils Nommés (Bascule Rapide)",

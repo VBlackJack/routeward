@@ -29,6 +29,7 @@ import {
   Palette,
   Power,
   Rocket,
+  RotateCcw,
   Save,
   Server,
   Shield,
@@ -87,6 +88,7 @@ interface SettingsViewProps {
   onSaveNamedProfile?: (name: string) => Promise<void>;
   onSwitchNamedProfile?: (profileId: string) => Promise<void>;
   onDeleteNamedProfile?: (profileId: string) => Promise<void>;
+  onResetToDefaults?: () => Promise<void>;
 }
 
 type DiagnosticSubtab = 'overview' | 'dns' | 'logs';
@@ -123,7 +125,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onToggleAutostart,
   onSaveNamedProfile,
   onSwitchNamedProfile,
-  onDeleteNamedProfile
+  onDeleteNamedProfile,
+  onResetToDefaults
 }) => {
   const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -131,6 +134,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [showSimpleDiagnostics, setShowSimpleDiagnostics] = useState(false);
   const [showSimpleAdvancedTools, setShowSimpleAdvancedTools] = useState(false);
   const [armedDeleteProfileId, setArmedDeleteProfileId] = useState<string | null>(null);
+  const [armedResetDefaults, setArmedResetDefaults] = useState(false);
+  const [resettingDefaults, setResettingDefaults] = useState(false);
   const [newProfileName, setNewProfileName] = useState('');
 
   const allShieldsActive =
@@ -587,6 +592,60 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     </div>
                   </div>
                 ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Soft Reset to Defaults */}
+        {onResetToDefaults && (
+          <div className="tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-4">
+            <div className="flex items-start gap-3">
+              <RotateCcw className="mt-0.5 h-4 w-4 shrink-0 text-tf-orange" />
+              <div>
+                <div className="text-xs font-semibold text-tf-primary">
+                  {t('settings.system.reset_title')}
+                </div>
+                <div className="mt-0.5 text-[11px] text-tf-secondary">
+                  {t('settings.system.reset_desc')}
+                </div>
+              </div>
+            </div>
+            {!armedResetDefaults ? (
+              <button
+                type="button"
+                disabled={resettingDefaults}
+                onClick={() => setArmedResetDefaults(true)}
+                className="tf-surface flex shrink-0 items-center gap-1.5 border-tf-orange/50 px-3 py-1.5 text-xs font-semibold text-tf-orange hover:border-tf-orange disabled:opacity-60"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span>{t('settings.system.reset_button')}</span>
+              </button>
+            ) : (
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  disabled={resettingDefaults}
+                  onClick={() => {
+                    setResettingDefaults(true);
+                    void onResetToDefaults()
+                      .catch(() => {})
+                      .finally(() => {
+                        setResettingDefaults(false);
+                        setArmedResetDefaults(false);
+                      });
+                  }}
+                  className="rounded-tf-md bg-tf-red px-3 py-1.5 text-xs font-bold text-tf-bg hover:opacity-90 disabled:opacity-60"
+                >
+                  {t('settings.system.reset_confirm')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setArmedResetDefaults(false)}
+                  className="tf-surface px-3 py-1.5 text-xs font-semibold text-tf-secondary hover:text-tf-primary"
+                >
+                  {t('app.confirm_delete.cancel')}
+                </button>
               </div>
             )}
           </div>

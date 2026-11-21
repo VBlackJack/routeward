@@ -37,6 +37,7 @@ import {
 } from 'lucide-react';
 import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
 import { generateClientId, routewardClient } from '../services/ipc';
+import { normalizeDomainPatterns } from '../services/domain';
 import {
   ConnectionRequest,
   FoxyProxyImportResult,
@@ -419,16 +420,20 @@ export const RulesView: React.FC<RulesViewProps> = ({
         ? splitList(simpleTargetValue)
         : splitList(simpleOptionalApps)
       : splitList(processesText);
+    const normalizedSiteTarget = normalizeDomainPatterns(simpleTargetValue);
+    const normalizedOptionalSites = normalizeDomainPatterns(simpleOptionalDomains);
     const effectiveDomains = isSimpleSubmit
       ? simpleTargetType === 'site'
-        ? splitList(simpleTargetValue)
-        : splitList(simpleOptionalDomains)
+        ? normalizedSiteTarget.patterns
+        : normalizedOptionalSites.patterns
       : splitList(domainsText);
 
     const autoSimpleName =
       effectiveProcesses.length > 0 && effectiveDomains.length > 0
         ? `${effectiveProcesses[0]} (${effectiveDomains.join(', ')})`
-        : simpleTargetValue.trim();
+        : simpleTargetType === 'site' && normalizedSiteTarget.primaryDomain
+          ? normalizedSiteTarget.primaryDomain
+          : simpleTargetValue.trim();
 
     const effectiveName = isSimpleSubmit
       ? ruleName.trim() || autoSimpleName
@@ -1029,6 +1034,17 @@ export const RulesView: React.FC<RulesViewProps> = ({
                     }
                     className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
                   />
+                  {simpleTargetType === 'site' &&
+                    (() => {
+                      const preview = normalizeDomainPatterns(simpleTargetValue);
+                      return preview.normalizedFromUrl && preview.primaryDomain ? (
+                        <p className="mt-1 text-[11px] font-semibold text-tf-green">
+                          {t('rules.simple.url_preview', {
+                            domain: preview.primaryDomain
+                          })}
+                        </p>
+                      ) : null;
+                    })()}
                   {simpleTargetType === 'app' && showAppPicker && (
                     <div className="mt-2 max-h-40 overflow-y-auto rounded-tf-md border border-tf-border bg-tf-surface-alt p-2 text-xs">
                       {loadingApps ? (
@@ -1084,6 +1100,18 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         placeholder={t('rules.simple.optional_site_placeholder')}
                         className="tf-input mt-1 w-full px-3 py-1.5 text-sm font-mono"
                       />
+                      {(() => {
+                        const preview = normalizeDomainPatterns(
+                          simpleOptionalDomains
+                        );
+                        return preview.normalizedFromUrl && preview.primaryDomain ? (
+                          <p className="mt-1 text-[11px] font-semibold text-tf-green">
+                            {t('rules.simple.url_preview', {
+                              domain: preview.primaryDomain
+                            })}
+                          </p>
+                        ) : null;
+                      })()}
                       <p className="mt-1 text-[11px] text-tf-secondary">
                         {t('rules.simple.optional_site_hint')}
                       </p>

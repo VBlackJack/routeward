@@ -86,7 +86,29 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   onRemoveChain
 }) => {
   const { t } = useTranslation();
-  const primaryProxyId = proxies.find((p) => p.enabled)?.id ?? null;
+  const enabledProxies = proxies.filter((p) => p.enabled);
+  const primaryProxyId = enabledProxies[0]?.id ?? null;
+  const simpleFailoverChain = chains.find(
+    (c) =>
+      c.id === UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID ||
+      (c.enabled && c.strategy === 'failover')
+  );
+  const simpleFailoverEnabled = Boolean(simpleFailoverChain?.enabled);
+
+  const handleToggleSimpleFailover = () => {
+    if (simpleFailoverEnabled && simpleFailoverChain) {
+      onRemoveChain(simpleFailoverChain.id);
+      return;
+    }
+    if (enabledProxies.length < 2) return;
+    onAddChain({
+      id: UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID,
+      name: t('proxies.simple.failover_chain_name'),
+      strategy: 'failover',
+      proxyIds: enabledProxies.map((p) => p.id),
+      enabled: true
+    });
+  };
   const importTitleId = useId();
   const proxyTitleId = useId();
   const chainTitleId = useId();
@@ -339,6 +361,41 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             {t('proxies.external_explainer.desc')}
           </p>
         </div>
+
+        {experienceMode === 'simple' && enabledProxies.length >= 2 && (
+          <div className="tf-card flex flex-wrap items-center justify-between gap-4 p-4">
+            <div className="flex items-start gap-3">
+              <Link2 className="mt-0.5 h-5 w-5 shrink-0 text-tf-cyan" />
+              <div>
+                <div className="flex items-center gap-2 text-xs font-bold text-tf-primary">
+                  <span>{t('proxies.simple.failover_title')}</span>
+                  <span
+                    className={`rounded-tf-sm px-2 py-0.5 text-[10px] font-bold ${
+                      simpleFailoverEnabled
+                        ? 'bg-tf-green/20 text-tf-green'
+                        : 'bg-tf-surface-alt text-tf-secondary'
+                    }`}
+                  >
+                    {simpleFailoverEnabled
+                      ? t('proxies.simple.failover_enabled')
+                      : t('proxies.simple.failover_disabled')}
+                  </span>
+                </div>
+                <p className="mt-0.5 text-[11px] text-tf-secondary">
+                  {t('proxies.simple.failover_desc')}
+                </p>
+              </div>
+            </div>
+            <input
+              id={`${formId}-simple-failover`}
+              type="checkbox"
+              aria-label={t('proxies.simple.failover_title')}
+              checked={simpleFailoverEnabled}
+              onChange={handleToggleSimpleFailover}
+              className="h-4 w-4 cursor-pointer accent-tf-accent"
+            />
+          </div>
+        )}
 
         {proxies.length === 0 ? (
           <div className="tf-card p-6 text-center text-xs text-tf-secondary">
