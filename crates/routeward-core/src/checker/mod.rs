@@ -140,6 +140,21 @@ impl ProxyChecker {
         }
     }
 
+    /// Probes the direct (non-proxied) public IP using the configured IP echo endpoint.
+    pub async fn probe_direct_ip(constants: &SystemConstants) -> Option<String> {
+        let chk = &constants.checker;
+        let probe_timeout = Duration::from_millis(chk.probe_timeout_ms);
+        let addr = ProxyConnector::format_host_port(&chk.http_ip_echo_host, chk.http_ip_echo_port);
+        let mut stream = timeout(
+            probe_timeout,
+            ProxyConnector::connect_tcp_marked(&addr, constants.network.linux_fwmark),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        Self::fetch_exit_ip(&mut stream, chk, probe_timeout).await
+    }
+
     async fn try_resolve_exit_ip<S: AsyncTunnelStream>(
         stream: &mut S,
         node: &ProxyNode,

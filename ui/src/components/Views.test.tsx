@@ -1484,7 +1484,7 @@ describe('Core UI view components', () => {
       })
     );
     expect(
-      screen.getByText(i18n.t('dashboard.simple.verify_paused_notice'))
+      await screen.findByText(i18n.t('dashboard.simple.verify_paused_notice'))
     ).toBeInTheDocument();
     fireEvent.click(
       screen.getByRole('button', {
@@ -1545,5 +1545,146 @@ describe('Core UI view components', () => {
     await waitFor(() => expect(onComplete).toHaveBeenCalledWith(true));
     expect(onAddProxy).toHaveBeenCalledTimes(1);
     expect(onEnableProtection).toHaveBeenCalledTimes(1);
+  });
+
+  it('supports Local LAN 1-click pack, Make Primary proxy button, and Before/After IP check', async () => {
+    const onAddRule = vi.fn();
+    render(
+      <RulesView
+        rules={[]}
+        proxies={[]}
+        chains={[]}
+        experienceMode="simple"
+        onEvaluateRule={vi.fn()}
+        onAddRule={onAddRule}
+        onToggleRule={vi.fn()}
+        onReorderRule={vi.fn()}
+        onRemoveRule={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByLabelText(i18n.t('rules.simple.pack_lan_title')));
+    expect(onAddRule).toHaveBeenCalledTimes(1);
+    expect(onAddRule.mock.calls[0][0].id).toBe('rule-pack-local-lan');
+    expect(onAddRule.mock.calls[0][0].action).toEqual({ type: 'direct' });
+    expect(onAddRule.mock.calls[0][0].ipCidrs).toContain('192.168.0.0/16');
+
+    cleanup();
+
+    const p1: ProxyNode = {
+      id: 'p1',
+      name: 'First',
+      protocol: 'socks5',
+      host: 'p1.example.com',
+      port: 1080,
+      auth: null,
+      udpEnabled: true,
+      tls: false,
+      sni: null,
+      enabled: true,
+      lastLatencyMs: 20,
+      exitIp: '198.51.100.77'
+    };
+    const p2: ProxyNode = { ...p1, id: 'p2', name: 'Second', exitIp: null };
+    const onSetPrimaryProxy = vi.fn();
+    const onPasteFromClipboard = vi.fn();
+
+    render(
+      <ProxiesView
+        proxies={[p1, p2]}
+        chains={[]}
+        experienceMode="simple"
+        onTestProxy={vi.fn().mockResolvedValue(undefined)}
+        onTestAllProxies={vi.fn().mockResolvedValue(undefined)}
+        onAddProxy={vi.fn()}
+        onImportUris={vi.fn()}
+        onCopyUri={vi.fn()}
+        onRemoveProxy={vi.fn()}
+        onAddChain={vi.fn()}
+        onRemoveChain={vi.fn()}
+        onSetPrimaryProxy={onSetPrimaryProxy}
+        onPasteFromClipboard={onPasteFromClipboard}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('proxies.simple.set_primary') })
+    );
+    expect(onSetPrimaryProxy).toHaveBeenCalledWith('p2');
+
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: i18n.t('proxies.simple.paste_clipboard_button')
+      })
+    );
+    expect(onPasteFromClipboard).toHaveBeenCalledTimes(1);
+
+    cleanup();
+
+    render(
+      <DashboardView
+        telemetry={{
+          activeConnections: 1,
+          downloadBytesPerSec: 0,
+          uploadBytesPerSec: 0,
+          totalRxBytes: 0,
+          totalTxBytes: 0,
+          proxiedCount: 1,
+          directCount: 0,
+          blockedCount: 0,
+          bandwidthHistory: [],
+          topTalkers: []
+        }}
+        diagnostics={{
+          daemonConnected: true,
+          running: true,
+          osName: 'WINDOWS',
+          interceptionMode: 'hybrid',
+          elevatedPrivileges: true,
+          relayTcpEndpoint: '127.0.0.1:10808',
+          relayHttpEndpoint: '127.0.0.1:10809',
+          dnsEndpoint: '127.0.0.1:5353',
+          fakeIpCidr: '198.18.0.0/15',
+          activeLocale: 'fr'
+        }}
+        dnsCount={0}
+        securityPolicy={{
+          killSwitchEnabled: true,
+          blockUdpOnTcpOnlyProxy: true,
+          strictDnsNoLocalFallback: true
+        }}
+        experienceMode="simple"
+        proxies={[p1]}
+        rules={[]}
+        onTestPrimaryProxy={vi.fn().mockResolvedValue({
+          proxyId: 'p1',
+          reachable: true,
+          latencyMs: 22,
+          udpSupported: true,
+          exitIp: '198.51.100.77'
+        })}
+        onCheckDirectIp={vi.fn().mockResolvedValue('203.0.113.10')}
+        onUpdateSecurityPolicy={vi.fn()}
+        onOpenWizard={vi.fn()}
+        onNavigateRules={vi.fn()}
+        onSwitchToExpert={vi.fn()}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: i18n.t('dashboard.simple.verify_protection_cta')
+      })
+    );
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          i18n.t('dashboard.simple.verify_before_after', {
+            directIp: '203.0.113.10',
+            exitIp: '198.51.100.77'
+          })
+        )
+      ).toBeInTheDocument();
+    });
   });
 });

@@ -22,6 +22,7 @@ import {
   ArrowDown,
   ArrowRight,
   ArrowUp,
+  ClipboardPaste,
   Copy,
   Edit3,
   FileCode2,
@@ -32,6 +33,7 @@ import {
   Power,
   Radar,
   Server,
+  Star,
   X,
   Zap
 } from 'lucide-react';
@@ -68,6 +70,8 @@ interface ProxiesViewProps {
     enabled: boolean,
     chain: ProxyChain | null
   ) => Promise<void> | void;
+  onSetPrimaryProxy?: (proxyId: string) => Promise<void> | void;
+  onPasteFromClipboard?: () => Promise<void> | void;
 }
 
 const PROTOCOLS: ProxyProtocol[] = ['socks5', 'socks4', 'http', 'https'];
@@ -93,7 +97,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   onRemoveProxy,
   onAddChain,
   onRemoveChain,
-  onToggleSimpleFailover
+  onToggleSimpleFailover,
+  onSetPrimaryProxy,
+  onPasteFromClipboard
 }) => {
   const { t } = useTranslation();
   const enabledProxies = proxies.filter((p) => p.enabled);
@@ -411,6 +417,18 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 ? t('proxies.simple.detecting')
                 : t('proxies.simple.detect_button')}
             </button>
+            {onPasteFromClipboard && (
+              <button
+                type="button"
+                onClick={() => {
+                  void onPasteFromClipboard();
+                }}
+                className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-green hover:border-tf-green"
+              >
+                <ClipboardPaste className="h-3.5 w-3.5" />
+                {t('proxies.simple.paste_clipboard_button')}
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setShowImportUri(true)}
@@ -622,7 +640,21 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       ? t('proxies.simple.test_connection')
                       : t('proxies.card.action.test')}
                 </button>
-                <div className="flex items-center gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {onSetPrimaryProxy &&
+                    proxies.length >= 2 &&
+                    primaryProxyId !== proxy.id && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void onSetPrimaryProxy(proxy.id);
+                        }}
+                        className="flex items-center gap-1 rounded bg-tf-cyan/15 px-2 py-1 text-[11px] font-semibold text-tf-cyan transition hover:bg-tf-cyan/25"
+                      >
+                        <Star className="h-3 w-3" />
+                        <span>{t('proxies.simple.set_primary')}</span>
+                      </button>
+                    )}
                   <button
                     type="button"
                     aria-pressed={proxy.enabled}

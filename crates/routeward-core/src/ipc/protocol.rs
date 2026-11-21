@@ -70,6 +70,10 @@ pub enum IpcCommand {
         #[serde(rename = "proxyId")]
         proxy_id: String,
     },
+    SetPrimaryProxy {
+        #[serde(rename = "proxyId")]
+        proxy_id: String,
+    },
     UpsertChain {
         chain: ProxyChain,
     },

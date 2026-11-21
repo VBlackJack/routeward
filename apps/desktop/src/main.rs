@@ -520,6 +520,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bridge.set_tray_callback(Arc::new(move |snapshot| {
                 tray_for_bridge.lock().sync_status(snapshot);
             }));
+            let tray_for_alerts = Arc::clone(&tray);
+            bridge.set_tray_alert_callback(Arc::new(move |title, body| {
+                tray_for_alerts.lock().show_alert(title, body);
+            }));
         }
         (tray, ready)
     };

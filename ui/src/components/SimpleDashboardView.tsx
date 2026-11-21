@@ -21,6 +21,7 @@ import {
   Briefcase,
   CheckCircle2,
   Circle,
+  ClipboardPaste,
   Clock,
   Gamepad2,
   Globe,
@@ -62,6 +63,8 @@ interface SimpleDashboardViewProps {
   onTestPrimaryProxy?: (
     proxyId: string
   ) => Promise<ProxyHealthReport | null | void> | void;
+  onCheckDirectIp?: () => Promise<string | null>;
+  onPasteFromClipboard?: () => Promise<void> | void;
   onNavigateProxy?: () => void;
   onUpdateSecurityPolicy: (partial: Partial<SecurityPolicyConfig>) => void;
   onOpenWizard: () => void;
@@ -83,6 +86,8 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
   onStartAndEnableProtection,
   onApplyUseCase,
   onTestPrimaryProxy,
+  onCheckDirectIp,
+  onPasteFromClipboard,
   onNavigateProxy,
   onUpdateSecurityPolicy,
   onOpenWizard,
@@ -98,6 +103,7 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
   const [showProtectionCheck, setShowProtectionCheck] = useState(false);
   const [verifyingProtection, setVerifyingProtection] = useState(false);
   const [verifiedExitIp, setVerifiedExitIp] = useState<string | null>(null);
+  const [verifiedDirectIp, setVerifiedDirectIp] = useState<string | null>(null);
   const [applyingUseCase, setApplyingUseCase] =
     useState<DashboardUseCaseId | null>(null);
   const [lastAppliedUseCase, setLastAppliedUseCase] =
@@ -132,12 +138,20 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
 
   const handleVerifyProtection = async () => {
     setShowProtectionCheck(true);
-    if (!primaryProxy || !onTestPrimaryProxy) {
-      return;
-    }
     setVerifyingProtection(true);
     try {
-      await handleTestPrimaryProxyClick(primaryProxy.id);
+      const tasks: Array<Promise<unknown>> = [];
+      if (primaryProxy && onTestPrimaryProxy) {
+        tasks.push(handleTestPrimaryProxyClick(primaryProxy.id));
+      }
+      if (onCheckDirectIp) {
+        tasks.push(
+          onCheckDirectIp()
+            .then((ip) => setVerifiedDirectIp(ip))
+            .catch(() => {})
+        );
+      }
+      await Promise.all(tasks);
     } finally {
       setVerifyingProtection(false);
     }
@@ -395,29 +409,54 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
               <div className="text-[11px] text-tf-secondary">
                 {t('dashboard.simple.verify_ip_label')}
               </div>
-              <div
-                className={`mt-1 font-bold ${
-                  verifyingProtection
-                    ? 'text-tf-cyan'
-                    : lastProxyTestStatus === 'failed'
-                      ? 'text-tf-red'
-                      : isEngineRunning
-                        ? 'text-tf-green'
-                        : 'text-tf-orange'
-                }`}
-              >
-                {verifyingProtection
-                  ? t('dashboard.simple.verify_checking')
-                  : !primaryProxy
-                    ? t('dashboard.simple.verify_ip_direct')
-                    : lastProxyTestStatus === 'failed'
-                      ? t('dashboard.simple.verify_ip_unreachable')
-                      : `${t('dashboard.simple.verify_ip_masked')}${
-                          verifiedExitIp || primaryProxy.exitIp
-                            ? ` (${verifiedExitIp || primaryProxy.exitIp})`
-                            : ''
-                        }`}
-              </div>
+              {(() => {
+                const effectiveExitIp = verifiedExitIp || primaryProxy?.exitIp || null;
+                const sameAsDirect =
+                  Boolean(verifiedDirectIp && effectiveExitIp) &&
+                  verifiedDirectIp === effectiveExitIp;
+                return (
+                  <>
+                    <div
+                      className={`mt-1 font-bold ${
+                        verifyingProtection
+                          ? 'text-tf-cyan'
+                          : lastProxyTestStatus === 'failed'
+                            ? 'text-tf-red'
+                            : sameAsDirect
+                              ? 'text-tf-orange'
+                              : isEngineRunning
+                                ? 'text-tf-green'
+                                : 'text-tf-orange'
+                      }`}
+                    >
+                      {verifyingProtection
+                        ? t('dashboard.simple.verify_checking')
+                        : !primaryProxy
+                          ? t('dashboard.simple.verify_ip_direct')
+                          : lastProxyTestStatus === 'failed'
+                            ? t('dashboard.simple.verify_ip_unreachable')
+                            : sameAsDirect && effectiveExitIp
+                              ? t('dashboard.simple.verify_ip_same_warning', {
+                                  exitIp: effectiveExitIp
+                                })
+                              : `${t('dashboard.simple.verify_ip_masked')}${
+                                  effectiveExitIp ? ` (${effectiveExitIp})` : ''
+                                }`}
+                    </div>
+                    {!verifyingProtection &&
+                      verifiedDirectIp &&
+                      effectiveExitIp &&
+                      !sameAsDirect && (
+                        <div className="mt-1 font-mono text-[10px] text-tf-secondary">
+                          {t('dashboard.simple.verify_before_after', {
+                            directIp: verifiedDirectIp,
+                            exitIp: effectiveExitIp
+                          })}
+                        </div>
+                      )}
+                  </>
+                );
+              })()}
             </div>
             <div className="tf-surface-alt p-3 text-xs">
               <div className="text-[11px] text-tf-secondary">
@@ -597,6 +636,18 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
               {testingPrimaryProxy
                 ? t('dashboard.simple.testing_proxy')
                 : t('dashboard.simple.test_proxy_cta')}
+            </button>
+          )}
+          {!primaryProxy && onPasteFromClipboard && (
+            <button
+              type="button"
+              onClick={() => {
+                void onPasteFromClipboard();
+              }}
+              className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-green hover:border-tf-green"
+            >
+              <ClipboardPaste className="h-3.5 w-3.5" />
+              {t('dashboard.simple.paste_clipboard_cta')}
             </button>
           )}
           {onNavigateProxy && (

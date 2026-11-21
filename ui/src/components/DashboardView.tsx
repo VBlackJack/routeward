@@ -64,6 +64,8 @@ interface DashboardViewProps {
   onTestPrimaryProxy?: (
     proxyId: string
   ) => Promise<ProxyHealthReport | null | void> | void;
+  onCheckDirectIp?: () => Promise<string | null>;
+  onPasteFromClipboard?: () => Promise<void> | void;
   onNavigateProxy?: () => void;
   onUpdateSecurityPolicy: (partial: Partial<SecurityPolicyConfig>) => void;
   onOpenWizard: () => void;
@@ -87,6 +89,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onStartAndEnableProtection,
   onApplyUseCase,
   onTestPrimaryProxy,
+  onCheckDirectIp,
+  onPasteFromClipboard,
   onNavigateProxy,
   onUpdateSecurityPolicy,
   onOpenWizard,
@@ -111,6 +115,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         onStartAndEnableProtection={onStartAndEnableProtection}
         onApplyUseCase={onApplyUseCase}
         onTestPrimaryProxy={onTestPrimaryProxy}
+        onCheckDirectIp={onCheckDirectIp}
+        onPasteFromClipboard={onPasteFromClipboard}
         onNavigateProxy={onNavigateProxy}
         onUpdateSecurityPolicy={onUpdateSecurityPolicy}
         onOpenWizard={onOpenWizard}

@@ -174,14 +174,30 @@ export const App: React.FC = () => {
   }, []);
 
   const pushToast = useCallback(
-    (message: string, severity: ToastNotification['severity'] = 'success') => {
+    (
+      message: string,
+      severity: ToastNotification['severity'] = 'success',
+      action?: { label: string; onAction: () => void }
+    ) => {
       const id = generateClientId('toast');
-      setToasts((prev) => [...prev, { id, message, severity }]);
+      setToasts((prev) => [
+        ...prev,
+        {
+          id,
+          message,
+          severity,
+          actionLabel: action?.label,
+          onAction: action?.onAction
+        }
+      ]);
       // Error toasts stay until dismissed (WCAG 2.2.1); other toasts auto-dismiss.
       if (severity !== 'error') {
+        const duration = action
+          ? UI_CONFIG.TOAST_UNDO_DURATION_MS
+          : UI_CONFIG.TOAST_DURATION_MS;
         window.setTimeout(() => {
           dismissToast(id);
-        }, UI_CONFIG.TOAST_DURATION_MS);
+        }, duration);
       }
     },
     [dismissToast]
@@ -754,6 +770,7 @@ export const App: React.FC = () => {
   };
 
   const handleRemoveProxyWithCleanup = async (proxyId: string) => {
+    const removedProxy = profile.proxies.find((p) => p.id === proxyId) ?? null;
     try {
       const remainingEnabled = profile.proxies.filter(
         (p) => p.enabled && p.id !== proxyId
@@ -778,7 +795,61 @@ export const App: React.FC = () => {
         await routewardClient.removeChain(failoverChain.id);
       }
       await routewardClient.removeProxy(proxyId);
-      pushToast(t('app.toast.proxy.deleted'), 'warning');
+      pushToast(
+        t('app.toast.proxy.deleted'),
+        'warning',
+        removedProxy
+          ? {
+              label: t('app.toast.undo'),
+              onAction: () => {
+                runMutation(
+                  () => routewardClient.upsertProxy(removedProxy),
+                  () => pushToast(t('app.toast.undo_applied'), 'info')
+                );
+              }
+            }
+          : undefined
+      );
+    } catch (err) {
+      pushErrorToast(err);
+    }
+  };
+
+  const handleSetPrimaryProxy = async (proxyId: string) => {
+    try {
+      await routewardClient.setPrimaryProxy(proxyId);
+      pushToast(t('app.toast.proxy.primary_changed'), 'success');
+    } catch (err) {
+      pushErrorToast(err);
+    }
+  };
+
+  const handlePasteProxyFromClipboard = async () => {
+    if (!navigator.clipboard || typeof navigator.clipboard.readText !== 'function') {
+      pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
+      return;
+    }
+    try {
+      const raw = (await navigator.clipboard.readText()).trim();
+      if (!raw || !raw.includes('://')) {
+        pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
+        return;
+      }
+      const beforeIds = new Set(profile.proxies.map((p) => p.id));
+      const count = await routewardClient.importProxyUris(raw);
+      if (count > 0) {
+        pushToast(`${t('app.toast.proxy.imported_uris')} (${count})`, 'success');
+        if (diagnostics.daemonConnected) {
+          const added = routewardClient
+            .getProfile()
+            .proxies.find((p) => !beforeIds.has(p.id) && p.enabled);
+          if (added) {
+            void routewardClient.testProxy(added.id).catch(() => {});
+          }
+        }
+      } else {
+        pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
+      }
     } catch (err) {
       pushErrorToast(err);
     }
@@ -1201,6 +1272,8 @@ export const App: React.FC = () => {
                 return null;
               }
             }}
+            onCheckDirectIp={() => routewardClient.getDirectIp()}
+            onPasteFromClipboard={handlePasteProxyFromClipboard}
             onNavigateProxy={() => setActiveTab('proxy')}
             onUpdateSecurityPolicy={(partial) => {
               runMutation(() => routewardClient.updateSecurityPolicy(partial));
@@ -1244,9 +1317,25 @@ export const App: React.FC = () => {
               runMutation(() => routewardClient.reorderRulePriority(id, dir));
             }}
             onRemoveRule={(id) => {
+              const removedRule = profile.rules.find((r) => r.id === id) ?? null;
               runMutation(
                 () => routewardClient.removeRule(id),
-                () => pushToast(t('app.toast.rule.deleted'), 'warning')
+                () =>
+                  pushToast(
+                    t('app.toast.rule.deleted'),
+                    'warning',
+                    removedRule
+                      ? {
+                          label: t('app.toast.undo'),
+                          onAction: () => {
+                            runMutation(
+                              () => routewardClient.upsertRule(removedRule),
+                              () => pushToast(t('app.toast.undo_applied'), 'info')
+                            );
+                          }
+                        }
+                      : undefined
+                  )
               );
             }}
             onImportFoxyProxy={async (jsonText, processPatterns) => {
@@ -1340,6 +1429,8 @@ export const App: React.FC = () => {
               runMutation(() => routewardClient.removeChain(id));
             }}
             onToggleSimpleFailover={handleToggleSimpleFailover}
+            onSetPrimaryProxy={handleSetPrimaryProxy}
+            onPasteFromClipboard={handlePasteProxyFromClipboard}
           />
         )}
 
@@ -1516,6 +1607,18 @@ export const App: React.FC = () => {
                 <CheckCircle2 className="h-4 w-4 text-tf-accent" />
               )}
               <span>{toast.message}</span>
+              {toast.actionLabel && toast.onAction && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    toast.onAction?.();
+                    dismissToast(toast.id);
+                  }}
+                  className="ml-1 rounded-tf-sm bg-tf-accent/20 px-2 py-0.5 text-[11px] font-bold text-tf-accent transition hover:bg-tf-accent/30"
+                >
+                  {toast.actionLabel}
+                </button>
+              )}
               {toast.severity === 'error' && (
                 <button
                   type="button"

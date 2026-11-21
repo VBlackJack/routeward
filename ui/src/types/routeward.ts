@@ -312,6 +312,8 @@ export interface ToastNotification {
   id: string;
   message: string;
   severity: 'success' | 'info' | 'warning' | 'error';
+  actionLabel?: string;
+  onAction?: () => void;
 }
 
 export interface DaemonFullState {

@@ -2025,6 +2025,27 @@ impl RouteWardController {
         self.sync_upstream_proxy_exclusions();
     }
 
+    /// Moves `proxy_id` to the front of the proxy list (making it primary) and enables it.
+    /// Also promotes `proxy_id` to the front of any failover chain that references it.
+    pub fn set_primary_proxy(&self, proxy_id: &str) -> bool {
+        let mut prof = self.profile.write();
+        let Some(pos) = prof.proxies.iter().position(|p| p.id == proxy_id) else {
+            return false;
+        };
+        let mut node = prof.proxies.remove(pos);
+        node.enabled = true;
+        prof.proxies.insert(0, node);
+        for chain in &mut prof.chains {
+            if let Some(cpos) = chain.proxy_ids.iter().position(|id| id == proxy_id) {
+                let id = chain.proxy_ids.remove(cpos);
+                chain.proxy_ids.insert(0, id);
+            }
+        }
+        drop(prof);
+        self.sync_upstream_proxy_exclusions();
+        true
+    }
+
     pub(super) fn sync_upstream_proxy_exclusions(&self) {
         let (mut upstream_endpoints, active_ids): (Vec<(IpAddr, u16)>, Vec<String>) = {
             let prof = self.profile.read();

@@ -908,6 +908,21 @@ export class RouteWardClientService {
     return this.profile;
   }
 
+  public async setPrimaryProxy(proxyId: string): Promise<ProfileConfig> {
+    try {
+      const updated = await this.requestJson<ProfileConfig>(
+        UI_CONFIG.API_ENDPOINTS.PROXIES_SET_PRIMARY,
+        'POST',
+        { proxyId }
+      );
+      this.profile = updated;
+      this.notifyListeners();
+    } catch (err) {
+      this.handleRequestFailure(err);
+    }
+    return this.profile;
+  }
+
   public async importProxyUris(rawText: string): Promise<number> {
     let imported = 0;
     const normalizedText = this.tryDecodeBase64Subscription(rawText);
@@ -1288,6 +1303,18 @@ export class RouteWardClientService {
       );
     } catch {
       return { networkName: null, kind: 'unknown' };
+    }
+  }
+
+  public async getDirectIp(): Promise<string | null> {
+    try {
+      const res = await this.requestJson<{ directIp: string | null }>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_DIRECT_IP,
+        'GET'
+      );
+      return res.directIp ?? null;
+    } catch {
+      return null;
     }
   }
 

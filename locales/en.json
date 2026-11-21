@@ -133,7 +133,9 @@
         "copied_uri": "Proxy URI copied to clipboard",
         "tested": "Proxy health and latency check completed",
         "unreachable": "Proxy did not respond - check address, port, and protocol",
-        "required_for_rule": "Add and enable an external proxy server first to route traffic via proxy"
+        "required_for_rule": "Add and enable an external proxy server first to route traffic via proxy",
+        "primary_changed": "Primary proxy updated",
+        "clipboard_empty": "No proxy link found in clipboard (expected: socks5://, http://, or https://)"
       },
       "connection": {
         "terminated": "Connection socket terminated",
@@ -204,6 +206,8 @@
       "error": {
         "generic": "The operation failed"
       },
+      "undo": "Undo",
+      "undo_applied": "Action undone",
       "dismiss": "Dismiss notification"
     }
   },
@@ -269,6 +273,9 @@
       "verify_ip_masked": "Hidden via proxy",
       "verify_ip_direct": "Direct connection (Filter Mode)",
       "verify_ip_unreachable": "Proxy unreachable",
+      "verify_before_after": "Before (Direct): {{directIp}} -> After (Proxy): {{exitIp}}",
+      "verify_ip_same_warning": "Warning: proxy IP matches your direct IP ({{exitIp}})",
+      "paste_clipboard_cta": "Paste from Clipboard",
       "verify_dns_label": "DNS Protection",
       "verify_killswitch_label": "Anti-leak cutoff",
       "verify_status_ok": "Active",
@@ -464,6 +471,8 @@
       "subtitle": "Add your proxy server or subscription link and verify that it responds cleanly.",
       "add": "Add Proxy",
       "paste_link_button": "Paste Proxy Link",
+      "paste_clipboard_button": "Paste from Clipboard",
+      "set_primary": "Make Primary",
       "empty": "No external proxy configured yet. You can still filter and block apps directly, or add an upstream proxy server above.",
       "show_advanced_options": "Show protocol options (UDP / TLS)",
       "hide_advanced_options": "Hide protocol options",
@@ -606,8 +615,10 @@
       "detected_apps_subtitle": "Pick any running or installed app without typing executable names.",
       "detected_apps_load": "Scan My Apps",
       "detected_apps_search": "Search an app...",
-      "packs_title": "1-Click Protection Packs",
+      "packs_title": "1-Click Protection & Compatibility Packs",
       "packs_subtitle": "Works even without a proxy: turn these protections on or off in one click.",
+      "pack_lan_title": "Router & Printers (Local Network)",
+      "pack_lan_desc": "Always keeps direct access to your router, Wi-Fi printer, and local home devices.",
       "pack_ads_title": "Ads & Trackers",
       "pack_ads_desc": "Blocks common ad networks and tracking domains.",
       "pack_telemetry_title": "OS & App Telemetry",
@@ -1126,6 +1137,10 @@
       "enable": "Enable Protection",
       "open": "Open RouteWard",
       "quit": "Exit"
+    },
+    "alert": {
+      "outage_title": "RouteWard - Proxy Unreachable",
+      "outage_body": "Internet is blocked by the safety cutoff to prevent an IP leak. Right-click here to pause 15 min or open RouteWard."
     }
   }
 }

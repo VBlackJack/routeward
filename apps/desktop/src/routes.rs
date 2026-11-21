@@ -599,6 +599,25 @@ pub async fn handle_api_route(
         }
     }
 
+    if path.starts_with("/api/proxies/set-primary") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        match serde_json::from_str::<ProxyIdRequest>(body_str) {
+            Ok(req) => {
+                return Some(match bridge.set_primary_proxy(req.proxy_id).await {
+                    Ok(prof) => ok_json_response(&prof, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
+            }
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                    .unwrap_or_default();
+                return Some((400, json_ct, json));
+            }
+        }
+    }
+
     if path.starts_with("/api/proxies/remove") {
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
@@ -916,6 +935,14 @@ pub async fn handle_api_route(
         let info = bridge.get_current_network_info().await;
         let json = serde_json::to_vec(&info).unwrap_or_default();
         return Some((200, json_ct, json));
+    }
+
+    if path.starts_with("/api/system/direct-ip") {
+        let direct_ip = bridge.get_direct_ip().await;
+        return Some(ok_json_response(
+            &serde_json::json!({ "directIp": direct_ip }),
+            json_ct,
+        ));
     }
 
     if path.starts_with("/api/system-proxy") {

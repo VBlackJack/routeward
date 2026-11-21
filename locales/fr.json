@@ -133,7 +133,9 @@
         "copied_uri": "URI du proxy copiée dans le presse-papiers",
         "tested": "Test de latence et de santé du proxy terminé",
         "unreachable": "Le proxy n'a pas répondu - vérifiez l'adresse, le port et le protocole",
-        "required_for_rule": "Ajoutez et activez d'abord un serveur proxy externe pour router un flux via proxy"
+        "required_for_rule": "Ajoutez et activez d'abord un serveur proxy externe pour router un flux via proxy",
+        "primary_changed": "Proxy principal mis à jour",
+        "clipboard_empty": "Aucun lien proxy trouvé dans le presse-papiers (attendu : socks5://, http:// ou https://)"
       },
       "connection": {
         "terminated": "Socket de connexion terminé",
@@ -204,6 +206,8 @@
       "error": {
         "generic": "L'opération a échoué"
       },
+      "undo": "Annuler",
+      "undo_applied": "Action annulée",
       "dismiss": "Fermer la notification"
     }
   },
@@ -269,6 +273,9 @@
       "verify_ip_masked": "Masquée via proxy",
       "verify_ip_direct": "Connexion directe (Mode Filtrage)",
       "verify_ip_unreachable": "Proxy injoignable",
+      "verify_before_after": "Avant (Direct) : {{directIp}} -> Après (Proxy) : {{exitIp}}",
+      "verify_ip_same_warning": "Attention : l'IP du proxy est identique à votre IP directe ({{exitIp}})",
+      "paste_clipboard_cta": "Coller du presse-papiers",
       "verify_dns_label": "Protection DNS",
       "verify_killswitch_label": "Coupe-circuit anti-fuite",
       "verify_status_ok": "Actif",
@@ -464,6 +471,8 @@
       "subtitle": "Ajoutez votre serveur proxy ou lien d'abonnement et vérifiez qu'il répond correctement.",
       "add": "Ajouter un Proxy",
       "paste_link_button": "Coller un lien proxy",
+      "paste_clipboard_button": "Coller du presse-papiers",
+      "set_primary": "Passer en principal",
       "empty": "Aucun proxy externe configuré pour le moment. Vous pouvez déjà filtrer et bloquer vos applications en direct, ou ajouter votre serveur proxy ci-dessus.",
       "show_advanced_options": "Afficher les options protocole (UDP / TLS)",
       "hide_advanced_options": "Masquer les options protocole",
@@ -606,8 +615,10 @@
       "detected_apps_subtitle": "Choisissez une application déjà installée ou ouverte sans taper de nom de fichier.",
       "detected_apps_load": "Scanner mes applications",
       "detected_apps_search": "Rechercher une application...",
-      "packs_title": "Packs de blocage en 1 clic",
+      "packs_title": "Packs de protection & compatibilité en 1 clic",
       "packs_subtitle": "Utiles même sans proxy : activez ou désactivez ces protections instantanément.",
+      "pack_lan_title": "Box & Imprimantes (Réseau local)",
+      "pack_lan_desc": "Garde toujours un accès direct à votre box Internet, imprimante Wi-Fi et appareils locaux.",
       "pack_ads_title": "Pubs & Pisteurs",
       "pack_ads_desc": "Bloque les régies publicitaires et domaines de suivi courants.",
       "pack_telemetry_title": "Télémétrie Windows & Apps",
@@ -1126,6 +1137,10 @@
       "enable": "Activer la protection",
       "open": "Ouvrir RouteWard",
       "quit": "Quitter"
+    },
+    "alert": {
+      "outage_title": "RouteWard - Proxy injoignable",
+      "outage_body": "Internet est bloqué par sécurité pour éviter une fuite IP. Faites un clic droit ici pour mettre en pause 15 min ou ouvrir RouteWard."
     }
   }
 }
