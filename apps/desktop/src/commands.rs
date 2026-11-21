@@ -774,6 +774,23 @@ impl DesktopCommandBridge {
         .unwrap_or_default()
     }
 
+    pub async fn detect_existing_proxies(
+        &self,
+    ) -> Vec<routeward_core::system::DetectedProxyCandidate> {
+        tokio::task::spawn_blocking(routeward_core::system::detect_existing_proxies)
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn get_current_network_info(&self) -> routeward_core::system::CurrentNetworkInfo {
+        tokio::task::spawn_blocking(routeward_core::system::detect_current_network)
+            .await
+            .unwrap_or(routeward_core::system::CurrentNetworkInfo {
+                network_name: None,
+                kind: "unknown".to_string(),
+            })
+    }
+
     pub async fn launch_process_with_proxy(
         &self,
         executable_path: &str,

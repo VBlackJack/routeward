@@ -36,7 +36,8 @@ import {
   ShieldAlert,
   ShieldCheck,
   Upload,
-  Wand2
+  Wand2,
+  Wifi
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { buildDefaultPacUrl } from '../config/constants';
@@ -89,6 +90,9 @@ interface SettingsViewProps {
   onSwitchNamedProfile?: (profileId: string) => Promise<void>;
   onDeleteNamedProfile?: (profileId: string) => Promise<void>;
   onResetToDefaults?: () => Promise<void>;
+  currentNetworkName?: string | null;
+  networkProfileRules?: Record<string, string>;
+  onSetNetworkProfileRule?: (networkName: string, profileId: string | null) => void;
 }
 
 type DiagnosticSubtab = 'overview' | 'dns' | 'logs';
@@ -126,7 +130,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onSaveNamedProfile,
   onSwitchNamedProfile,
   onDeleteNamedProfile,
-  onResetToDefaults
+  onResetToDefaults,
+  currentNetworkName = null,
+  networkProfileRules = {},
+  onSetNetworkProfileRule
 }) => {
   const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -137,6 +144,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [armedResetDefaults, setArmedResetDefaults] = useState(false);
   const [resettingDefaults, setResettingDefaults] = useState(false);
   const [newProfileName, setNewProfileName] = useState('');
+  const [selectedAutoProfileId, setSelectedAutoProfileId] = useState('');
 
   const allShieldsActive =
     securityPolicy.killSwitchEnabled &&
@@ -592,6 +600,84 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     </div>
                   </div>
                 ))}
+              </div>
+            )}
+
+            {onSetNetworkProfileRule && profiles.length > 0 && (
+              <div className="space-y-2 border-t border-tf-border pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="flex items-center gap-1.5 text-xs font-bold text-tf-primary">
+                      <Wifi className="h-3.5 w-3.5 text-tf-cyan" />
+                      <span>{t('settings.profiles.auto_network_title')}</span>
+                    </div>
+                    <div className="text-[11px] text-tf-secondary">
+                      {currentNetworkName
+                        ? t('settings.profiles.auto_network_current', {
+                            name: currentNetworkName
+                          })
+                        : t('settings.profiles.auto_network_unknown')}
+                    </div>
+                  </div>
+                  {currentNetworkName && (
+                    <div className="flex items-center gap-2">
+                      <select
+                        id="settings-auto-network-profile"
+                        value={selectedAutoProfileId || profiles[0]?.profileId || ''}
+                        onChange={(e) => setSelectedAutoProfileId(e.target.value)}
+                        aria-label={t('settings.profiles.auto_network_title')}
+                        className="tf-input px-2.5 py-1 text-xs"
+                      >
+                        {profiles.map((p) => (
+                          <option key={p.profileId} value={p.profileId}>
+                            {p.name}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const targetId =
+                            selectedAutoProfileId || profiles[0]?.profileId;
+                          if (targetId) {
+                            onSetNetworkProfileRule(currentNetworkName, targetId);
+                          }
+                        }}
+                        className="tf-btn-accent px-3 py-1 text-xs"
+                      >
+                        {t('settings.profiles.auto_network_assign')}
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {Object.keys(networkProfileRules).length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {Object.entries(networkProfileRules).map(([netName, profId]) => {
+                      const matchedProfile = profiles.find(
+                        (p) => p.profileId === profId
+                      );
+                      return (
+                        <span
+                          key={netName}
+                          className="inline-flex items-center gap-2 rounded-tf-md border border-tf-border bg-tf-surface px-2.5 py-1 text-[11px]"
+                        >
+                          <span className="font-mono text-tf-cyan">{netName}</span>
+                          <span className="text-tf-secondary">-&gt;</span>
+                          <span className="font-semibold text-tf-primary">
+                            {matchedProfile ? matchedProfile.name : profId}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => onSetNetworkProfileRule(netName, null)}
+                            className="text-tf-secondary hover:text-tf-red"
+                          >
+                            {t('settings.profiles.auto_network_remove')}
+                          </button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
           </div>

@@ -198,6 +198,19 @@ export interface SystemApplicationEntry {
   running: boolean;
 }
 
+export interface DetectedProxyCandidate {
+  name: string;
+  protocol: ProxyProtocol;
+  host: string;
+  port: number;
+  source: string;
+}
+
+export interface CurrentNetworkInfo {
+  networkName: string | null;
+  kind: string;
+}
+
 export interface PacStatus {
   enabled: boolean;
   pacUrl: string;

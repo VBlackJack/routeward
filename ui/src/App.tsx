@@ -100,6 +100,22 @@ export const App: React.FC = () => {
   const [pacUrl, setPacUrl] = useState(buildDefaultPacUrl());
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [namedProfiles, setNamedProfiles] = useState<ProfileSummary[]>([]);
+  const [currentNetworkName, setCurrentNetworkName] = useState<string | null>(
+    null
+  );
+  const [networkProfileRules, setNetworkProfileRules] = useState<
+    Record<string, string>
+  >(() => {
+    try {
+      const raw = window.localStorage.getItem(
+        UI_CONFIG.STORAGE_KEYS.NETWORK_PROFILE_RULES
+      );
+      return raw ? (JSON.parse(raw) as Record<string, string>) : {};
+    } catch {
+      return {};
+    }
+  });
+  const lastAutoSwitchedNetworkRef = useRef<string | null>(null);
   const [startingDaemon, setStartingDaemon] = useState(false);
   const [togglingEngine, setTogglingEngine] = useState(false);
   const togglingEngineRef = useRef(false);
@@ -411,6 +427,70 @@ export const App: React.FC = () => {
       cancelled = true;
     };
   }, [diagnostics.daemonConnected, profile.profileId, profile.name]);
+
+  const handleSetNetworkProfileRule = (
+    networkName: string,
+    profileId: string | null
+  ) => {
+    setNetworkProfileRules((prev) => {
+      const next = { ...prev };
+      if (profileId === null) {
+        delete next[networkName];
+      } else {
+        next[networkName] = profileId;
+      }
+      window.localStorage.setItem(
+        UI_CONFIG.STORAGE_KEYS.NETWORK_PROFILE_RULES,
+        JSON.stringify(next)
+      );
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const pollNetwork = () => {
+      void routewardClient.getCurrentNetworkInfo().then((info) => {
+        if (cancelled) return;
+        setCurrentNetworkName(info.networkName);
+        if (
+          info.networkName &&
+          diagnostics.daemonConnected &&
+          lastAutoSwitchedNetworkRef.current !== info.networkName
+        ) {
+          const targetProfileId = networkProfileRules[info.networkName];
+          if (targetProfileId && targetProfileId !== profile.profileId) {
+            lastAutoSwitchedNetworkRef.current = info.networkName;
+            void routewardClient
+              .switchNamedProfile(targetProfileId)
+              .then((switched) => {
+                if (cancelled) return;
+                pushToast(
+                  `${t('app.toast.profile.auto_switched')}: ${switched.name}`,
+                  'info'
+                );
+              })
+              .catch(() => {});
+          }
+        }
+      });
+    };
+    pollNetwork();
+    const timer = window.setInterval(
+      pollNetwork,
+      UI_CONFIG.NETWORK_POLL_INTERVAL_MS
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    diagnostics.daemonConnected,
+    networkProfileRules,
+    profile.profileId,
+    pushToast,
+    t
+  ]);
 
   const handleToggleSystemProxy = async () => {
     const next = !systemProxyEnabled;
@@ -1264,6 +1344,9 @@ export const App: React.FC = () => {
             onSwitchNamedProfile={handleSwitchNamedProfile}
             onDeleteNamedProfile={handleDeleteNamedProfile}
             onResetToDefaults={handleResetToDefaults}
+            currentNetworkName={currentNetworkName}
+            networkProfileRules={networkProfileRules}
+            onSetNetworkProfileRule={handleSetNetworkProfileRule}
           />
         )}
       </main>

@@ -167,6 +167,7 @@
         "exported": "Profile exported to JSON",
         "saved_named": "Saved named profile",
         "switched": "Switched active profile",
+        "auto_switched": "Automatically switched profile for this network",
         "deleted": "Deleted profile",
         "reset_done": "Default settings restored (previous profile backed up)",
         "error": "Profile operation failed"
@@ -470,7 +471,11 @@
       "failover_desc": "If your primary proxy stops responding, RouteWard automatically switches to your other active proxies.",
       "failover_chain_name": "Automatic Backup Proxy",
       "failover_enabled": "On",
-      "failover_disabled": "Off"
+      "failover_disabled": "Off",
+      "detect_button": "Detect Existing Proxy",
+      "detecting": "Scanning...",
+      "detect_empty": "No local or system proxy was detected on this computer.",
+      "detect_import": "Import"
     },
     "section": {
       "servers": {
@@ -1048,7 +1053,12 @@
       "proxies_count_one": "{{count}} proxy",
       "proxies_count_other": "{{count}} proxies",
       "rules_count_one": "{{count}} rule",
-      "rules_count_other": "{{count}} rules"
+      "rules_count_other": "{{count}} rules",
+      "auto_network_title": "Auto-Switch by Network (Wi-Fi)",
+      "auto_network_current": "Current network: {{name}}",
+      "auto_network_unknown": "No Wi-Fi network name detected right now",
+      "auto_network_assign": "Link",
+      "auto_network_remove": "Remove"
     },
     "diagnostics": {
       "title": "Technical Diagnostics",

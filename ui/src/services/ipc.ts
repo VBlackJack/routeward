@@ -23,7 +23,9 @@ import {
 import {
   AutostartStatus,
   ConnectionRequest,
+  CurrentNetworkInfo,
   DaemonFullState,
+  DetectedProxyCandidate,
   FakeIpEntry,
   FoxyProxyImportResult,
   InterceptionMode,
@@ -1264,6 +1266,28 @@ export class RouteWardClientService {
       );
     } catch {
       return [];
+    }
+  }
+
+  public async detectExistingProxies(): Promise<DetectedProxyCandidate[]> {
+    try {
+      return await this.requestJson<DetectedProxyCandidate[]>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_DETECT_PROXIES,
+        'GET'
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  public async getCurrentNetworkInfo(): Promise<CurrentNetworkInfo> {
+    try {
+      return await this.requestJson<CurrentNetworkInfo>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_NETWORK_INFO,
+        'GET'
+      );
+    } catch {
+      return { networkName: null, kind: 'unknown' };
     }
   }
 

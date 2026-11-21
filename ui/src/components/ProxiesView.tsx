@@ -29,6 +29,7 @@ import {
   Link2,
   Lock,
   Plus,
+  Radar,
   Server,
   X,
   Zap
@@ -41,6 +42,7 @@ import { generateClientId, routewardClient } from '../services/ipc';
 import { parseSingleProxyUri } from '../services/uri';
 import {
   ChainStrategy,
+  DetectedProxyCandidate,
   ProxyChain,
   ProxyNode,
   ProxyProtocol,
@@ -52,6 +54,7 @@ interface ProxiesViewProps {
   chains: ProxyChain[];
   rules?: RoutingRule[];
   experienceMode?: ExperienceMode;
+  onDetectExistingProxies?: () => Promise<DetectedProxyCandidate[]>;
   onTestProxy: (id: string) => Promise<void>;
   onTestAllProxies: () => Promise<void>;
   onAddProxy: (node: ProxyNode) => void;
@@ -76,6 +79,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   chains,
   rules = [],
   experienceMode = 'expert',
+  onDetectExistingProxies,
   onTestProxy,
   onTestAllProxies,
   onAddProxy,
@@ -114,6 +118,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const chainTitleId = useId();
   const formId = useId();
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [detectingProxies, setDetectingProxies] = useState(false);
+  const [detectedCandidates, setDetectedCandidates] = useState<
+    DetectedProxyCandidate[] | null
+  >(null);
   const [armedDeleteId, setArmedDeleteId] = useState<string | null>(null);
   const [showAddProxy, setShowAddProxy] = useState(false);
   const [showImportUri, setShowImportUri] = useState(false);
@@ -147,6 +155,50 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [chainStrategy, setChainStrategy] =
     useState<ChainStrategy>('sequence');
   const [selectedHops, setSelectedHops] = useState<string[]>([]);
+
+  const handleDetectExisting = async () => {
+    if (detectingProxies) return;
+    setDetectingProxies(true);
+    try {
+      const detector =
+        onDetectExistingProxies ?? (() => routewardClient.detectExistingProxies());
+      const found = await detector();
+      setDetectedCandidates(found);
+    } finally {
+      setDetectingProxies(false);
+    }
+  };
+
+  const handleImportDetectedCandidate = (cand: DetectedProxyCandidate) => {
+    const effectiveTls = cand.protocol === 'https';
+    onAddProxy({
+      id: generateClientId('proxy'),
+      name: cand.name,
+      protocol: cand.protocol,
+      host: cand.host,
+      port: cand.port,
+      auth: null,
+      udpEnabled: cand.protocol === 'socks5',
+      tls: effectiveTls,
+      tlsSkipVerify: false,
+      sni: effectiveTls ? cand.host : null,
+      enabled: true,
+      lastLatencyMs: null,
+      exitIp: null
+    });
+    setDetectedCandidates((prev) =>
+      prev
+        ? prev.filter(
+            (item) =>
+              !(
+                item.protocol === cand.protocol &&
+                item.host === cand.host &&
+                item.port === cand.port
+              )
+          )
+        : null
+    );
+  };
 
   const handleSingleTest = async (id: string) => {
     setTestingId(id);
@@ -333,6 +385,19 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             )}
             <button
               type="button"
+              disabled={detectingProxies}
+              onClick={() => {
+                void handleDetectExisting();
+              }}
+              className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-cyan hover:border-tf-cyan disabled:opacity-60"
+            >
+              <Radar className="h-3.5 w-3.5" />
+              {detectingProxies
+                ? t('proxies.simple.detecting')
+                : t('proxies.simple.detect_button')}
+            </button>
+            <button
+              type="button"
               onClick={() => setShowImportUri(true)}
               className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-primary hover:border-tf-accent"
             >
@@ -361,6 +426,37 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             {t('proxies.external_explainer.desc')}
           </p>
         </div>
+
+        {detectedCandidates !== null && (
+          <div className="tf-card space-y-2.5 p-4 text-xs">
+            {detectedCandidates.length === 0 ? (
+              <p className="text-tf-secondary">
+                {t('proxies.simple.detect_empty')}
+              </p>
+            ) : (
+              detectedCandidates.map((cand) => (
+                <div
+                  key={`${cand.protocol}-${cand.host}-${cand.port}`}
+                  className="tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-3"
+                >
+                  <div>
+                    <div className="font-bold text-tf-primary">{cand.name}</div>
+                    <div className="font-mono text-[11px] text-tf-cyan">
+                      {cand.protocol.toUpperCase()} - {cand.host}:{cand.port}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleImportDetectedCandidate(cand)}
+                    className="tf-btn-accent px-3 py-1 text-xs"
+                  >
+                    {t('proxies.simple.detect_import')}
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        )}
 
         {experienceMode === 'simple' && enabledProxies.length >= 2 && (
           <div className="tf-card flex flex-wrap items-center justify-between gap-4 p-4">

@@ -167,6 +167,7 @@
         "exported": "Profil exporté au format JSON",
         "saved_named": "Profil nommé enregistré",
         "switched": "Profil actif basculé",
+        "auto_switched": "Profil basculé automatiquement pour ce réseau",
         "deleted": "Profil supprimé",
         "reset_done": "Réglages par défaut rétablis (ancien profil sauvegardé)",
         "error": "Échec de l'opération sur le profil"
@@ -470,7 +471,11 @@
       "failover_desc": "Si votre proxy principal ne répond plus, RouteWard bascule automatiquement vers vos autres proxies actifs.",
       "failover_chain_name": "Proxy de Secours Automatique",
       "failover_enabled": "Actif",
-      "failover_disabled": "Désactivé"
+      "failover_disabled": "Désactivé",
+      "detect_button": "Détecter un proxy existant",
+      "detecting": "Recherche...",
+      "detect_empty": "Aucun proxy local ou système détecté sur cet ordinateur.",
+      "detect_import": "Importer"
     },
     "section": {
       "servers": {
@@ -1048,7 +1053,12 @@
       "proxies_count_one": "{{count}} proxy",
       "proxies_count_other": "{{count}} proxies",
       "rules_count_one": "{{count}} règle",
-      "rules_count_other": "{{count}} règles"
+      "rules_count_other": "{{count}} règles",
+      "auto_network_title": "Bascule automatique selon le réseau (Wi-Fi)",
+      "auto_network_current": "Réseau actuel : {{name}}",
+      "auto_network_unknown": "Aucun nom de réseau Wi-Fi détecté actuellement",
+      "auto_network_assign": "Associer",
+      "auto_network_remove": "Retirer"
     },
     "diagnostics": {
       "title": "Diagnostics Techniques",

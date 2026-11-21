@@ -49,6 +49,9 @@ describe('App navigation and accessible modals', () => {
     vi.spyOn(routewardClient, 'listNamedProfiles').mockImplementation(
       () => new Promise(() => {})
     );
+    vi.spyOn(routewardClient, 'getCurrentNetworkInfo').mockImplementation(
+      () => new Promise(() => {})
+    );
   });
 
   afterEach(() => {

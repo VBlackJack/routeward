@@ -34,8 +34,10 @@ export const UI_CONFIG = {
     LOCALE: 'routeward_locale',
     PROFILE: 'routeward_active_profile',
     EXPERIENCE_MODE: 'routeward_ux_mode',
-    WIZARD_COMPLETED: 'routeward_wizard_done'
+    WIZARD_COMPLETED: 'routeward_wizard_done',
+    NETWORK_PROFILE_RULES: 'routeward_network_profiles'
   },
+  NETWORK_POLL_INTERVAL_MS: 15000,
   TELEMETRY_REFRESH_INTERVAL_MS: 1000,
   /** Locale keys of the byte unit labels, from bytes up to gigabytes. */
   BYTE_UNIT_KEYS: [
@@ -165,6 +167,8 @@ export const UI_CONFIG = {
     SYSTEM_PAC: '/api/system/pac',
     SYSTEM_AUTOSTART: '/api/system/autostart',
     SYSTEM_APPS: '/api/system/apps',
+    SYSTEM_DETECT_PROXIES: '/api/system/detect-proxies',
+    SYSTEM_NETWORK_INFO: '/api/system/network-info',
     IMPORT_FOXYPROXY: '/api/import/foxyproxy',
     PROFILES_LIST: '/api/profiles',
     PROFILES_SAVE: '/api/profiles/save',
