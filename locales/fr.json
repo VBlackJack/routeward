@@ -3,6 +3,11 @@
     "titlebar": {
       "close": "Fermer"
     },
+    "dropzone": {
+      "title": "Déposez votre fichier ici",
+      "subtitle": "Profil RouteWard (.json), export FoxyProxy (.json) ou liste de liens proxy (.txt)",
+      "unsupported": "Type de fichier non pris en charge (utilisez .json ou .txt)"
+    },
     "confirm_delete": {
       "confirm": "Confirmer",
       "cancel": "Annuler"
@@ -133,7 +138,9 @@
         "copied_uri": "URI du proxy copiée dans le presse-papiers",
         "tested": "Test de latence et de santé du proxy terminé",
         "unreachable": "Le proxy n'a pas répondu - vérifiez l'adresse, le port et le protocole",
-        "required_for_rule": "Ajoutez et activez d'abord un serveur proxy externe pour router un flux via proxy"
+        "required_for_rule": "Ajoutez et activez d'abord un serveur proxy externe pour router un flux via proxy",
+        "primary_changed": "Proxy principal mis à jour",
+        "clipboard_empty": "Aucun lien proxy trouvé dans le presse-papiers (attendu : socks5://, http:// ou https://)"
       },
       "connection": {
         "terminated": "Socket de connexion terminé",
@@ -204,6 +211,8 @@
       "error": {
         "generic": "L'opération a échoué"
       },
+      "undo": "Annuler",
+      "undo_applied": "Action annulée",
       "dismiss": "Fermer la notification"
     }
   },
@@ -262,12 +271,18 @@
       "troubleshoot_cta": "Une app ne marche plus ?",
       "verify_protection_cta": "Vérifier ma protection",
       "verify_panel_title": "Bilan de votre protection",
+      "verify_checking": "Vérification en cours...",
+      "verify_paused_notice": "La protection est actuellement en pause. Activez-la pour protéger vos applications.",
+      "verify_close": "Fermer le bilan",
       "verify_ip_label": "Adresse IP",
       "verify_ip_masked": "Masquée via proxy",
       "verify_ip_direct": "Connexion directe (Mode Filtrage)",
       "verify_ip_unreachable": "Proxy injoignable",
+      "verify_before_after": "Avant (Direct) : {{directIp}} -> Après (Proxy) : {{exitIp}}",
+      "verify_ip_same_warning": "Attention : l'IP du proxy est identique à votre IP directe ({{exitIp}})",
+      "paste_clipboard_cta": "Coller du presse-papiers",
       "verify_dns_label": "Protection DNS",
-      "verify_killswitch_label": "Coupe-circuit (Kill-Switch)",
+      "verify_killswitch_label": "Coupe-circuit anti-fuite",
       "verify_status_ok": "Actif",
       "verify_status_off": "Désactivé",
       "verify_fix_all": "Tout activer",
@@ -280,7 +295,7 @@
       "uc_gaming_title": "Jeux & Appels Vidéo",
       "uc_gaming_desc": "Garde les jeux en direct pour une latence minimale tout en protégeant vos navigateurs.",
       "uc_strict_title": "Verrouillage Anti-Fuite Maximal",
-      "uc_strict_desc": "Active Kill-Switch, DNS anti-fuite, garde UDP et blocage des contournements DNS chiffrés."
+      "uc_strict_desc": "Active toutes les protections anti-fuite (coupe-circuit, DNS protégé et blocage des fuites réseau)."
     },
     "tooltips": {
       "active_connections": "Nombre de programmes sur votre ordinateur qui échangent actuellement des données avec Internet.",
@@ -373,6 +388,8 @@
       "count_connections_one": "{{count}} connexion",
       "count_connections_other": "{{count}} connexions",
       "no_apps": "Aucune activité d'application ne correspond à votre filtre.",
+      "empty_paused_cta": "Activer la protection pour voir l'activité",
+      "empty_refresh_cta": "Actualiser les applications actives",
       "switch_expert_cta": "Afficher les sockets bruts et PIDs (Avancé)"
     },
     "toolbar": {
@@ -459,10 +476,15 @@
       "subtitle": "Ajoutez votre serveur proxy ou lien d'abonnement et vérifiez qu'il répond correctement.",
       "add": "Ajouter un Proxy",
       "paste_link_button": "Coller un lien proxy",
+      "paste_clipboard_button": "Coller du presse-papiers",
+      "set_primary": "Passer en principal",
       "empty": "Aucun proxy externe configuré pour le moment. Vous pouvez déjà filtrer et bloquer vos applications en direct, ou ajouter votre serveur proxy ci-dessus.",
       "show_advanced_options": "Afficher les options protocole (UDP / TLS)",
       "hide_advanced_options": "Masquer les options protocole",
       "active_badge": "Principal",
+      "disabled_badge": "Désactivé",
+      "toggle_enable": "Activer",
+      "toggle_disable": "Désactiver",
       "status_ok": "Fonctionne",
       "status_untested": "Non vérifié",
       "test_connection": "Vérifier la connexion",
@@ -472,6 +494,8 @@
       "failover_chain_name": "Proxy de Secours Automatique",
       "failover_enabled": "Actif",
       "failover_disabled": "Désactivé",
+      "failover_applied_toast": "Secours automatique activé sur vos règles proxy",
+      "failover_disabled_toast": "Secours automatique désactivé (retour au proxy principal)",
       "detect_button": "Détecter un proxy existant",
       "detecting": "Recherche...",
       "detect_empty": "Aucun proxy local ou système détecté sur cet ordinateur.",
@@ -576,30 +600,42 @@
       "type_site": "Site Web",
       "target_app_label": "Nom de l'application (ex. firefox.exe ou spotify)",
       "target_app_placeholder": "spotify.exe",
-      "target_site_label": "Site web ou domaine (ex. *.exemple.com)",
-      "target_site_placeholder": "*.exemple.com",
+      "target_site_label": "Adresse du site web (ex. exemple.com ou collez un lien)",
+      "target_site_placeholder": "exemple.com ou https://www.exemple.com",
       "url_preview": "S'appliquera à {{domain}} et tous ses sous-domaines",
       "quick_edge_chip": "Edge (msedge.exe)",
-      "optional_site_label": "Uniquement pour ces domaines (Optionnel, ex. meshcore.net, *.meshcore.net)",
-      "optional_site_placeholder": "meshcore.net, *.meshcore.net (laisser vide pour tous les sites)",
-      "optional_site_hint": "Astuce : laissez vide pour tout le trafic de l'application, ou saisissez des motifs comme *.meshcore.net pour ne router via proxy que ces domaines.",
+      "optional_site_label": "Uniquement pour ces sites (Optionnel)",
+      "optional_site_placeholder": "exemple.com (laisser vide pour tous les sites)",
+      "optional_site_hint": "Astuce : laissez vide pour toute l'application, ou collez un site (ex. exemple.com) pour ne cibler que celui-ci.",
       "optional_app_label": "Uniquement pour ces applications (Optionnel, ex. msedge.exe)",
       "optional_app_placeholder": "msedge.exe (laisser vide pour toutes les apps)",
       "action_label": "Comment doit-elle se connecter ?",
+      "action_badge_proxy": "Via Proxy",
+      "action_badge_direct": "Connexion normale",
+      "action_badge_block": "Bloqué",
+      "action_badge_chain": "Via Proxy (Secours)",
       "show_advanced_options": "Afficher les champs avancés (priorité, CIDR, ports)",
       "hide_advanced_options": "Revenir au formulaire simple",
       "detected_apps_title": "Applications sur cet ordinateur",
       "detected_apps_subtitle": "Choisissez une application déjà installée ou ouverte sans taper de nom de fichier.",
       "detected_apps_load": "Scanner mes applications",
       "detected_apps_search": "Rechercher une application...",
-      "packs_title": "Packs de blocage en 1 clic",
+      "packs_title": "Packs de protection & compatibilité en 1 clic",
       "packs_subtitle": "Utiles même sans proxy : activez ou désactivez ces protections instantanément.",
+      "pack_lan_title": "Box & Imprimantes (Réseau local)",
+      "pack_lan_desc": "Garde toujours un accès direct à votre box Internet, imprimante Wi-Fi et appareils locaux.",
       "pack_ads_title": "Pubs & Pisteurs",
       "pack_ads_desc": "Bloque les régies publicitaires et domaines de suivi courants.",
       "pack_telemetry_title": "Télémétrie Windows & Apps",
       "pack_telemetry_desc": "Bloque les rapports de diagnostic et collecteurs en arrière-plan.",
       "pack_social_title": "Mode Focus (Réseaux sociaux)",
-      "pack_social_desc": "Bloque temporairement TikTok, Instagram, X, Facebook et Reddit."
+      "pack_social_desc": "Bloque temporairement TikTok, Instagram, X, Facebook et Reddit.",
+      "shadowed_warning": "Masquée par \"{{blocker}}\"",
+      "promote_first": "Faire passer en premier",
+      "tester_title": "Par où passe un site ?",
+      "tester_placeholder": "Collez un site web (ex. https://www.exemple.com)",
+      "tester_button": "Vérifier",
+      "tester_rule_label": "Règle appliquée : {{name}}"
     },
     "header": {
       "title": "Règles de Routage par Processus et Destination",
@@ -633,8 +669,9 @@
     "visual_apps": {
       "section_title": "Mes Applications - Routage Visuel en 1 Clic",
       "section_subtitle": "Choisissez comment chaque catégorie d'application doit se connecter à Internet, sans avoir à connaître les noms de fichiers .exe ou les ports.",
+      "status_default": "Par défaut : Connexion normale",
       "action_proxy": "Via Proxy Externe",
-      "action_direct": "Direct (Filtrage Seul)",
+      "action_direct": "Connexion normale",
       "action_block": "Bloquer Internet",
       "browsers": {
         "name": "Navigateurs Web",
@@ -925,7 +962,9 @@
       "step2_title": "2. Quel serveur Proxy souhaitez-vous utiliser ?",
       "step2_use_existing": "Utiliser le serveur proxy externe configuré",
       "step2_no_proxy_title": "Aucun proxy externe configuré - Mode Filtrage Direct prêt",
-      "step2_no_proxy_desc": "RouteWard n'embarque pas de serveur proxy interne. Poursuivez sans URI pour filtrer pisteurs et règles locales en direct, ou collez l'URI de votre propre proxy externe ci-dessous.",
+      "step2_no_proxy_desc": "RouteWard n'embarque pas de serveur proxy interne. Poursuivez sans proxy pour filtrer pisteurs et règles locales en direct, ou ajoutez votre propre proxy externe ci-dessous.",
+      "step2_skip_direct_cta": "Continuer sans proxy (Filtrage Direct)",
+      "step2_detect_button": "Détecter un proxy existant",
       "step2_paste_uri": "Ou collez un lien de connexion (socks5://, http://, https:// ou abonnement Base64) :",
       "step2_uri_placeholder": "socks5://user:pass@proxy.example.com:1080#MonProxyExterne",
       "step2_tab_link": "Coller un lien",
@@ -943,6 +982,7 @@
       "step3_summary_title": "Résumé de votre configuration",
       "step3_summary_with_proxy": "Votre objectif sera appliqué avec votre proxy externe.",
       "step3_summary_direct": "Mode Filtrage Direct : blocage des pisteurs et règles locales sans proxy externe.",
+      "step3_enable_now": "Activer la protection immédiatement en appliquant",
       "step3_simple_title": "Mode Simple (Recommandé pour débuter)",
       "step3_simple_desc": "Explications claires, sélecteur d'applications par icônes et diagnostic visuel rassurant.",
       "step3_expert_title": "Mode Expert (SysAdmin Linux / Windows)",
@@ -1026,7 +1066,7 @@
       "pac_disabled": "PAC Inactif",
       "pac_copy": "Copier l'URL",
       "autostart_title": "Démarrer l'application avec Windows",
-      "autostart_desc": "Ajoute RouteWard Desktop dans HKCU Run pour démarrer avec la barre système.",
+      "autostart_desc": "Lance RouteWard automatiquement dans la barre système à l'ouverture de votre session Windows.",
       "autostart_enabled": "Activé",
       "autostart_disabled": "Désactivé",
       "launcher_title": "Lancer un Programme via Proxy",
@@ -1084,6 +1124,16 @@
       "allow_app_direct": "Laisser passer l'app en Direct",
       "allow_site_direct": "Laisser passer ce site",
       "close": "Fermer"
+    },
+    "reasons": {
+      "blocked_by_rule": "Bloqué par une règle de protection active.",
+      "killswitch": "Bloqué par le coupe-circuit anti-fuite car le proxy ne répondait plus.",
+      "auth": "Le serveur proxy a refusé l'identifiant ou le mot de passe.",
+      "timeout": "Le serveur proxy a mis trop de temps à répondre.",
+      "unreachable": "Impossible de joindre le serveur proxy configuré.",
+      "dns": "L'adresse du site n'a pas pu être résolue par le DNS protégé.",
+      "udp": "Cette app utilise un protocole (UDP/QUIC) bloqué par la protection anti-fuite.",
+      "generic": "Connexion bloquée ou interrompue par la protection."
     }
   },
   "tray": {
@@ -1094,9 +1144,15 @@
     },
     "menu": {
       "pause": "Mettre en pause",
+      "pause_15m": "Pause 15 minutes",
       "enable": "Activer la protection",
+      "start_service": "Démarrer le service",
       "open": "Ouvrir RouteWard",
       "quit": "Quitter"
+    },
+    "alert": {
+      "outage_title": "RouteWard - Proxy injoignable",
+      "outage_body": "Internet est bloqué par sécurité pour éviter une fuite IP. Faites un clic droit ici pour mettre en pause 15 min ou ouvrir RouteWard."
     }
   }
 }

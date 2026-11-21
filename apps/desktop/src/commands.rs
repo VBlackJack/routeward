@@ -43,7 +43,7 @@ use routeward_core::telemetry::{
     ConnectionStatus, LogEntry, LogLevel, TelemetryEvent, TelemetrySnapshot, TrackedConnection,
 };
 use serde::de::DeserializeOwned;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -52,8 +52,12 @@ const COMPONENT_DESKTOP_BRIDGE: &str = "DesktopBridge";
 const BRIDGE_EVENT_CHANNEL_CAPACITY: usize = 256;
 const DAEMON_START_POLL_ATTEMPTS: usize = 16;
 const DAEMON_START_POLL_INTERVAL_MS: u64 = 250;
+const OUTAGE_ALERT_COOLDOWN_SECS: u64 = 60;
+const TRAY_KEY_OUTAGE_TITLE: &str = "tray.alert.outage_title";
+const TRAY_KEY_OUTAGE_BODY: &str = "tray.alert.outage_body";
 
 type TrayNotifyCallback = Arc<dyn Fn(TrayStatusSnapshot) + Send + Sync>;
+type TrayAlertCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 
 /// A failed system operation (registry tools, process spawn): the localized message plus the
 /// stable i18n key the UI uses to translate it again in its own locale.
@@ -110,6 +114,9 @@ pub struct DesktopCommandBridge {
     event_tx: tokio::sync::broadcast::Sender<IpcStreamEvent>,
     daemon_start_guard: Arc<DaemonStartGuard>,
     tray_notify: Arc<Mutex<Option<TrayNotifyCallback>>>,
+    tray_alert: Arc<Mutex<Option<TrayAlertCallback>>>,
+    pause_timer_generation: Arc<AtomicU64>,
+    last_outage_alert_epoch_secs: Arc<AtomicU64>,
 }
 
 impl DesktopCommandBridge {
@@ -175,6 +182,9 @@ impl DesktopCommandBridge {
             event_tx,
             daemon_start_guard: Arc::new(DaemonStartGuard::default()),
             tray_notify: Arc::new(Mutex::new(None)),
+            tray_alert: Arc::new(Mutex::new(None)),
+            pause_timer_generation: Arc::new(AtomicU64::new(0)),
+            last_outage_alert_epoch_secs: Arc::new(AtomicU64::new(0)),
         };
 
         bridge.log_info(format!(
@@ -247,6 +257,51 @@ impl DesktopCommandBridge {
     pub fn set_tray_callback(&self, cb: TrayNotifyCallback) {
         *self.tray_notify.lock() = Some(cb);
         self.notify_tray();
+    }
+
+    pub fn set_tray_alert_callback(&self, cb: TrayAlertCallback) {
+        *self.tray_alert.lock() = Some(cb);
+    }
+
+    fn maybe_notify_proxy_outage(&self, conn: &TrackedConnection) {
+        if conn.status != ConnectionStatus::Blocked {
+            return;
+        }
+        let Some(detail) = conn.error_detail.as_deref() else {
+            return;
+        };
+        let lower = detail.to_ascii_lowercase();
+        let is_outage = lower.contains("kill-switch")
+            || lower.contains("killswitch")
+            || lower.contains("unreachable")
+            || lower.contains("timeout")
+            || lower.contains("upstream")
+            || lower.contains("proxy");
+        if !is_outage {
+            return;
+        }
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let prev = self.last_outage_alert_epoch_secs.load(Ordering::SeqCst);
+        if prev != 0 && now_secs.saturating_sub(prev) < OUTAGE_ALERT_COOLDOWN_SECS {
+            return;
+        }
+        if self
+            .last_outage_alert_epoch_secs
+            .compare_exchange(prev, now_secs, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let cb = self.tray_alert.lock().clone();
+        if let Some(cb) = cb {
+            cb(
+                self.i18n.t(TRAY_KEY_OUTAGE_TITLE),
+                self.i18n.t(TRAY_KEY_OUTAGE_BODY),
+            );
+        }
     }
 
     fn notify_tray(&self) {
@@ -473,6 +528,9 @@ impl DesktopCommandBridge {
                     st.logs.clear();
                 }
             }
+        }
+        if let TelemetryEvent::ConnectionUpdated(conn) = &event {
+            self.maybe_notify_proxy_outage(conn);
         }
         let _ = self.event_tx.send(IpcStreamEvent::Event(event));
     }
@@ -791,6 +849,10 @@ impl DesktopCommandBridge {
             })
     }
 
+    pub async fn get_direct_ip(&self) -> Option<String> {
+        routeward_core::checker::ProxyChecker::probe_direct_ip(&self.constants).await
+    }
+
     pub async fn launch_process_with_proxy(
         &self,
         executable_path: &str,
@@ -924,6 +986,14 @@ impl DesktopCommandBridge {
         outcome.map(|_| profile)
     }
 
+    pub async fn set_primary_proxy(&self, proxy_id: String) -> Result<ProfileConfig, IpcCallError> {
+        let outcome = self
+            .call_daemon_detailed::<serde_json::Value>(IpcCommand::SetPrimaryProxy { proxy_id })
+            .await;
+        let profile = self.refresh_state().await.profile;
+        outcome.map(|_| profile)
+    }
+
     pub async fn upsert_chain(&self, chain: ProxyChain) -> Result<ProfileConfig, IpcCallError> {
         let outcome = self
             .call_daemon_detailed::<serde_json::Value>(IpcCommand::UpsertChain { chain })
@@ -961,6 +1031,7 @@ impl DesktopCommandBridge {
     }
 
     pub async fn toggle_engine(&self, start: bool) -> Result<SystemDiagnostics, IpcCallError> {
+        self.pause_timer_generation.fetch_add(1, Ordering::SeqCst);
         match self
             .call_daemon_detailed::<SystemDiagnostics>(IpcCommand::ToggleEngine { start })
             .await
@@ -978,6 +1049,25 @@ impl DesktopCommandBridge {
                 Err(err)
             }
         }
+    }
+
+    /// Pauses protection for `duration`, then automatically re-enables it unless cancelled by a manual toggle.
+    pub async fn pause_engine_for(&self, duration: Duration) -> Result<(), IpcCallError> {
+        self.toggle_engine(false).await?;
+        let expected_gen = self.pause_timer_generation.load(Ordering::SeqCst);
+        let bridge = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            if bridge.pause_timer_generation.load(Ordering::SeqCst) == expected_gen
+                && bridge.is_daemon_connected()
+                && !bridge.get_diagnostics().running
+            {
+                if let Err(err) = bridge.toggle_engine(true).await {
+                    bridge.log_warn(format!("Timed tray auto-resume failed: {err}"));
+                }
+            }
+        });
+        Ok(())
     }
 
     pub async fn set_interception_mode(

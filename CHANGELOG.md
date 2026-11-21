@@ -5,6 +5,16 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+### Added
+- Windows System Tray: added dynamic colored status dot badges on the tray icon (green Protected, orange Paused, gray Offline), 1-click **Start Service** when offline, **Pause for 15 minutes** with cancellable auto-resume, and debounced native Windows warning notifications (`NIF_INFO`) when a proxy outage triggers the kill-switch.
+- Desktop UI (Simple mode): added **Undo** buttons in deletion toasts (rules and proxies), 1-click **Paste from Clipboard** proxy import on Home and My Proxy, **Make Primary** proxy promotion (`SetPrimaryProxy` IPC + `/api/proxies/set-primary`), a 1-click **Router & Printers (Local Network)** compatibility pack, a Before/After IP check (`/api/system/direct-ip`) inside **Verify My Protection**, a plain-language **"Where does a website go?"** site tester, shadowed-rule warnings with 1-click **Move First**, and window-wide drag-and-drop import for `.json` profiles, FoxyProxy exports, and `.txt` proxy lists.
+
+### Changed
+- Desktop UI (Simple mode): extracted `SimpleDashboardView.tsx`, decluttered the Home banner, made the 3-step readiness checklist clickable, added a close button and paused-state notice to the Protection Check panel, assigned higher default priority (`8`) to site-specific rules so website exceptions win over generic browser rules, humanized error messages in `TroubleshootModal`, displayed friendly application names in Activity, and wired Simple mode failover so all simple proxy rules actually route through `chain-simple-failover`.
+
+### Fixed
+- Desktop UI: visual application cards in `RulesView` no longer appear active/blocked before any rule exists, and newly entered proxies in `QuickSetupWizardModal` can be tested before applying without creating duplicates.
+
 ## [v2026.1121.00] - 2026-11-21
 
 ### Added

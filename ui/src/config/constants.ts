@@ -53,6 +53,7 @@ export const UI_CONFIG = {
   ACCENT_PRESSED_LIGHTNESS_DELTA: -18,
   DEFAULT_PROXY_PORT: 1080,
   DEFAULT_RULE_PRIORITY: 50,
+  DEFAULT_SITE_RULE_PRIORITY: 8,
   DEFAULT_TEST_PORT: 443,
   TOKEN_HEADER: 'X-RouteWard-Token',
   SSE_RECONNECT_DELAY_MS: 1500,
@@ -68,18 +69,37 @@ export const UI_CONFIG = {
   LONG_REQUEST_TIMEOUT_MS: 120000,
   /** Auto-dismiss delay for non-error toasts; error toasts stay until dismissed. */
   TOAST_DURATION_MS: 3200,
+  /** Extended auto-dismiss delay for toasts that carry an Undo action. */
+  TOAST_UNDO_DURATION_MS: 6000,
   /** Quick temporary pause durations (in minutes) shown in Simple mode. */
   TEMPORARY_PAUSE_OPTIONS_MINUTES: [15, 60] as const,
   /** Stable identifier of the automatic backup-proxy failover chain managed in Simple mode. */
   SIMPLE_FAILOVER_CHAIN_ID: 'chain-simple-failover',
   /** Priority for high-priority quick unblock rules created from troubleshooting. */
   TROUBLESHOOT_RULE_PRIORITY: 6,
-  /** 1-click protection packs offered in Simple mode (works even without a proxy). */
+  /** 1-click protection and compatibility packs offered in Simple mode (works even without a proxy). */
   SIMPLE_PROTECTION_PACKS: [
+    {
+      id: 'rule-pack-local-lan',
+      titleKey: 'rules.simple.pack_lan_title',
+      descKey: 'rules.simple.pack_lan_desc',
+      actionType: 'direct' as const,
+      priority: 5,
+      processPatterns: [] as readonly string[],
+      domainPatterns: ['localhost', '*.local', '*.lan'] as readonly string[],
+      ipCidrs: [
+        '127.0.0.0/8',
+        '10.0.0.0/8',
+        '172.16.0.0/12',
+        '192.168.0.0/16',
+        '169.254.0.0/16'
+      ] as readonly string[]
+    },
     {
       id: 'rule-pack-ads-trackers',
       titleKey: 'rules.simple.pack_ads_title',
       descKey: 'rules.simple.pack_ads_desc',
+      actionType: 'block' as const,
       priority: 13,
       processPatterns: [] as readonly string[],
       domainPatterns: [
@@ -90,12 +110,14 @@ export const UI_CONFIG = {
         '*.adsrvr.org',
         '*.taboola.com',
         '*.outbrain.com'
-      ] as readonly string[]
+      ] as readonly string[],
+      ipCidrs: [] as readonly string[]
     },
     {
       id: 'rule-pack-telemetry',
       titleKey: 'rules.simple.pack_telemetry_title',
       descKey: 'rules.simple.pack_telemetry_desc',
+      actionType: 'block' as const,
       priority: 12,
       processPatterns: [
         'CompatTelRunner.exe',
@@ -106,12 +128,14 @@ export const UI_CONFIG = {
         '*.telemetry.*',
         '*.events.data.microsoft.com',
         '*.sentry.io'
-      ] as readonly string[]
+      ] as readonly string[],
+      ipCidrs: [] as readonly string[]
     },
     {
       id: 'rule-pack-social-focus',
       titleKey: 'rules.simple.pack_social_title',
       descKey: 'rules.simple.pack_social_desc',
+      actionType: 'block' as const,
       priority: 14,
       processPatterns: [] as readonly string[],
       domainPatterns: [
@@ -125,7 +149,8 @@ export const UI_CONFIG = {
         '*.facebook.com',
         'reddit.com',
         '*.reddit.com'
-      ] as readonly string[]
+      ] as readonly string[],
+      ipCidrs: [] as readonly string[]
     }
   ] as const,
   /** Priority gap used when reordering rules. */
@@ -153,6 +178,7 @@ export const UI_CONFIG = {
     RULES_EVALUATE: '/api/rules/evaluate',
     PROXIES_UPSERT: '/api/proxies/upsert',
     PROXIES_REMOVE: '/api/proxies/remove',
+    PROXIES_SET_PRIMARY: '/api/proxies/set-primary',
     PROXIES_TEST: '/api/proxies/test',
     PROXIES_TEST_ALL: '/api/proxies/test-all',
     CHAINS_UPSERT: '/api/chains/upsert',
@@ -169,6 +195,7 @@ export const UI_CONFIG = {
     SYSTEM_APPS: '/api/system/apps',
     SYSTEM_DETECT_PROXIES: '/api/system/detect-proxies',
     SYSTEM_NETWORK_INFO: '/api/system/network-info',
+    SYSTEM_DIRECT_IP: '/api/system/direct-ip',
     IMPORT_FOXYPROXY: '/api/import/foxyproxy',
     PROFILES_LIST: '/api/profiles',
     PROFILES_SAVE: '/api/profiles/save',

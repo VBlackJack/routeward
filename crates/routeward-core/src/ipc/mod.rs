@@ -320,6 +320,19 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
             }
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
+        IpcCommand::SetPrimaryProxy { proxy_id } => {
+            if !controller.set_primary_proxy(&proxy_id) {
+                return IpcResponse::error_with_key(
+                    Some(id),
+                    Some(crate::error::ERR_KEY_PROXY_NOT_FOUND.to_string()),
+                    "Proxy not found",
+                );
+            }
+            if let Err(err) = controller.save_profile_default() {
+                return keyed_error_response(id, &err);
+            }
+            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
+        }
         IpcCommand::UpsertChain { chain } => {
             controller.upsert_chain(chain);
             if let Err(err) = controller.save_profile_default() {

@@ -21,6 +21,7 @@ import {
   Briefcase,
   CheckCircle2,
   Gamepad2,
+  Radar,
   Shield,
   Sparkles,
   Terminal,
@@ -30,7 +31,9 @@ import {
 import { ModalContainer } from './ModalContainer';
 import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
 import { generateClientId } from '../services/ipc';
+import { resolveSimpleProxyAction } from '../services/friendly';
 import {
+  DetectedProxyCandidate,
   ProxyChain,
   ProxyHealthReport,
   ProxyNode,
@@ -56,6 +59,8 @@ interface QuickSetupWizardModalProps {
   onTestProxy?: (
     proxyId: string
   ) => Promise<ProxyHealthReport | null | void> | void;
+  onDetectExistingProxies?: () => Promise<DetectedProxyCandidate[]>;
+  onEnableProtection?: () => Promise<unknown> | void;
   onAddRule: (rule: RoutingRule) => Promise<unknown> | void;
   onSelectMode: (mode: ExperienceMode) => void;
   onComplete: (hasEnabledProxy?: boolean) => void;
@@ -73,6 +78,8 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   onImportUris,
   onAddProxy,
   onTestProxy,
+  onDetectExistingProxies,
+  onEnableProtection,
   onAddRule,
   onSelectMode,
   onComplete,
@@ -101,22 +108,121 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   const [existingTestFeedback, setExistingTestFeedback] = useState<
     { ok: true; ms: number } | { ok: false } | null
   >(null);
+  const [detectingProxies, setDetectingProxies] = useState(false);
+  const [detectedCandidates, setDetectedCandidates] = useState<
+    DetectedProxyCandidate[] | null
+  >(null);
+  const [persistedProxyList, setPersistedProxyList] = useState<ProxyNode[] | null>(
+    null
+  );
+  const [enableProtectionNow, setEnableProtectionNow] = useState(true);
   const [selectedMode, setSelectedMode] = useState<ExperienceMode>(currentMode);
   const [applying, setApplying] = useState(false);
 
-  const enabledExistingProxies = proxies.filter((p) => p.enabled);
+  const effectiveExistingProxies = persistedProxyList ?? proxies;
+  const enabledExistingProxies = effectiveExistingProxies.filter((p) => p.enabled);
 
   const hasPlannedProxy =
     enabledExistingProxies.length > 0 ||
     (proxyInputMode === 'link' && Boolean(customUri.trim())) ||
     (proxyInputMode === 'manual' && Boolean(manualHost.trim()));
 
-  const handleTestExistingProxy = async () => {
-    const target = enabledExistingProxies[0];
-    if (!target || !onTestProxy || testingExisting) return;
+  const persistCurrentProxyInput = async (): Promise<ProxyNode[] | null> => {
+    if (proxyInputMode === 'link' && customUri.trim()) {
+      const importResult = await onImportUris(customUri.trim());
+      if (Array.isArray(importResult)) {
+        setPersistedProxyList(importResult);
+        setCustomUri('');
+        return importResult;
+      }
+      return effectiveExistingProxies;
+    }
+    if (proxyInputMode === 'manual' && manualHost.trim()) {
+      const parsedPort = Number(manualPort.trim());
+      if (
+        !Number.isInteger(parsedPort) ||
+        parsedPort < 1 ||
+        parsedPort > UI_CONFIG.MAX_PORT
+      ) {
+        setManualPortError(t('proxies.modal.add_proxy.port_error'));
+        setStep(2);
+        return null;
+      }
+      const cleanHost = manualHost.trim();
+      const cleanUser = manualUsername.trim();
+      const effectiveTls = manualProtocol === 'https';
+      const newNode: ProxyNode = {
+        id: generateClientId('proxy'),
+        name:
+          manualName.trim() ||
+          `${manualProtocol.toUpperCase()} ${cleanHost}:${parsedPort}`,
+        protocol: manualProtocol,
+        host: cleanHost,
+        port: parsedPort,
+        auth:
+          cleanUser || manualPassword
+            ? {
+                username: cleanUser,
+                ...(manualPassword ? { password: manualPassword } : {}),
+                hasPassword: Boolean(manualPassword)
+              }
+            : null,
+        udpEnabled: manualProtocol === 'socks5',
+        tls: effectiveTls,
+        tlsSkipVerify: false,
+        sni: effectiveTls ? cleanHost : null,
+        enabled: true,
+        lastLatencyMs: null,
+        exitIp: null
+      };
+      if (onAddProxy) {
+        const addResult = await onAddProxy(newNode);
+        const nextList = Array.isArray(addResult)
+          ? addResult
+          : [...effectiveExistingProxies, newNode];
+        setPersistedProxyList(nextList);
+        setManualHost('');
+        return nextList;
+      }
+      const authPrefix = cleanUser
+        ? `${encodeURIComponent(cleanUser)}${manualPassword ? `:${encodeURIComponent(manualPassword)}` : ''}@`
+        : '';
+      const fallbackUri = `${manualProtocol}://${authPrefix}${cleanHost}:${parsedPort}#${encodeURIComponent(newNode.name)}`;
+      const importResult = await onImportUris(fallbackUri);
+      if (Array.isArray(importResult)) {
+        setPersistedProxyList(importResult);
+        setManualHost('');
+        return importResult;
+      }
+      return effectiveExistingProxies;
+    }
+    return effectiveExistingProxies;
+  };
+
+  const handleTestProxyInWizard = async () => {
+    if (!onTestProxy || testingExisting) return;
     setTestingExisting(true);
     setExistingTestFeedback(null);
     try {
+      let currentList = effectiveExistingProxies;
+      const hasDraftInput =
+        (proxyInputMode === 'link' && Boolean(customUri.trim())) ||
+        (proxyInputMode === 'manual' && Boolean(manualHost.trim()));
+      if (hasDraftInput) {
+        const persisted = await persistCurrentProxyInput();
+        if (!persisted) {
+          return;
+        }
+        currentList = persisted;
+      }
+      const enabledList = currentList.filter((p) => p.enabled);
+      const target = hasDraftInput
+        ? enabledList[enabledList.length - 1]
+        : enabledList[0];
+      if (!target) {
+        setExistingTestFeedback({ ok: false });
+        return;
+      }
       const report = await Promise.resolve(onTestProxy(target.id));
       if (report && typeof report === 'object' && 'reachable' in report) {
         if (report.reachable) {
@@ -134,74 +240,41 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
     }
   };
 
+  const handleDetectInWizard = async () => {
+    if (!onDetectExistingProxies || detectingProxies) return;
+    setDetectingProxies(true);
+    try {
+      const found = await onDetectExistingProxies();
+      setDetectedCandidates(found);
+    } finally {
+      setDetectingProxies(false);
+    }
+  };
+
+  const handlePickDetectedCandidate = (cand: DetectedProxyCandidate) => {
+    setProxyInputMode('manual');
+    setManualName(cand.name);
+    setManualProtocol(cand.protocol);
+    setManualHost(cand.host);
+    setManualPort(String(cand.port));
+    setManualPortError(null);
+    setDetectedCandidates(null);
+  };
+
   const applySelectedGoalRules = async () => {
     if (applying) return;
     setApplying(true);
     try {
-      let postImportProxies = proxies;
-      if (proxyInputMode === 'link' && customUri.trim()) {
-        const importResult = await onImportUris(customUri.trim());
-        if (Array.isArray(importResult)) {
-          postImportProxies = importResult;
-        }
-      } else if (proxyInputMode === 'manual' && manualHost.trim()) {
-        const parsedPort = Number(manualPort.trim());
-        if (
-          !Number.isInteger(parsedPort) ||
-          parsedPort < 1 ||
-          parsedPort > UI_CONFIG.MAX_PORT
-        ) {
-          setManualPortError(t('proxies.modal.add_proxy.port_error'));
-          setStep(2);
-          return;
-        }
-        const cleanHost = manualHost.trim();
-        const cleanUser = manualUsername.trim();
-        const effectiveTls = manualProtocol === 'https';
-        const newNode: ProxyNode = {
-          id: generateClientId('proxy'),
-          name:
-            manualName.trim() ||
-            `${manualProtocol.toUpperCase()} ${cleanHost}:${parsedPort}`,
-          protocol: manualProtocol,
-          host: cleanHost,
-          port: parsedPort,
-          auth:
-            cleanUser || manualPassword
-              ? {
-                  username: cleanUser,
-                  ...(manualPassword ? { password: manualPassword } : {}),
-                  hasPassword: Boolean(manualPassword)
-                }
-              : null,
-          udpEnabled: manualProtocol === 'socks5',
-          tls: effectiveTls,
-          tlsSkipVerify: false,
-          sni: effectiveTls ? cleanHost : null,
-          enabled: true,
-          lastLatencyMs: null,
-          exitIp: null
-        };
-        if (onAddProxy) {
-          const addResult = await onAddProxy(newNode);
-          if (Array.isArray(addResult)) {
-            postImportProxies = addResult;
-          } else {
-            postImportProxies = [...proxies, newNode];
-          }
-        } else {
-          const authPrefix = cleanUser
-            ? `${encodeURIComponent(cleanUser)}${manualPassword ? `:${encodeURIComponent(manualPassword)}` : ''}@`
-            : '';
-          const fallbackUri = `${manualProtocol}://${authPrefix}${cleanHost}:${parsedPort}#${encodeURIComponent(newNode.name)}`;
-          const importResult = await onImportUris(fallbackUri);
-          if (Array.isArray(importResult)) {
-            postImportProxies = importResult;
-          }
-        }
+      const postImportProxies = await persistCurrentProxyInput();
+      if (!postImportProxies) {
+        return;
       }
 
       const enabledProxies = postImportProxies.filter((p) => p.enabled);
+      const simpleProxyAction = resolveSimpleProxyAction(
+        postImportProxies,
+        chains
+      );
       const primaryProxyId = enabledProxies[0]?.id;
       const hasEnabledProxy = Boolean(primaryProxyId);
       const enabledChains = hasEnabledProxy
@@ -262,7 +335,12 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
           | 'block';
         let targetId: string | undefined;
         if (actType === 'proxy') {
-          targetId = primaryProxyId;
+          if (simpleProxyAction) {
+            actType = simpleProxyAction.type;
+            targetId = simpleProxyAction.targetId;
+          } else {
+            targetId = primaryProxyId;
+          }
         } else if (actType === 'chain') {
           if (enabledChains[0]?.id) {
             targetId = enabledChains[0].id;
@@ -293,6 +371,9 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
       }
 
       onSelectMode(selectedMode);
+      if (enableProtectionNow && onEnableProtection) {
+        await onEnableProtection();
+      }
       onComplete(hasEnabledProxy);
       onClose();
     } catch (err) {
@@ -422,7 +503,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
                         type="button"
                         disabled={testingExisting}
                         onClick={() => {
-                          void handleTestExistingProxy();
+                          void handleTestProxyInWizard();
                         }}
                         className="tf-surface flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold text-tf-cyan hover:border-tf-cyan disabled:opacity-60"
                       >
@@ -451,8 +532,21 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
               </div>
             ) : (
               <div className="rounded-tf-md border border-tf-cyan/30 bg-tf-cyan/10 p-3.5 text-xs">
-                <div className="font-bold text-tf-primary">
-                  {t('wizard.modal.step2_no_proxy_title')}
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="font-bold text-tf-primary">
+                    {t('wizard.modal.step2_no_proxy_title')}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCustomUri('');
+                      setManualHost('');
+                      setStep(3);
+                    }}
+                    className="rounded-tf-md bg-tf-green/20 px-2.5 py-1 text-[11px] font-bold text-tf-green hover:bg-tf-green/30"
+                  >
+                    {t('wizard.modal.step2_skip_direct_cta')}
+                  </button>
                 </div>
                 <p className="mt-1 text-[11px] text-tf-secondary">
                   {t('wizard.modal.step2_no_proxy_desc')}
@@ -460,7 +554,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
               </div>
             )}
 
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <button
                 type="button"
                 aria-pressed={proxyInputMode === 'link'}
@@ -485,7 +579,51 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
               >
                 {t('wizard.modal.step2_tab_manual')}
               </button>
+              {onDetectExistingProxies && (
+                <button
+                  type="button"
+                  disabled={detectingProxies}
+                  onClick={() => {
+                    void handleDetectInWizard();
+                  }}
+                  className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan disabled:opacity-60"
+                >
+                  <Radar className="h-3.5 w-3.5" />
+                  {detectingProxies
+                    ? t('proxies.simple.detecting')
+                    : t('wizard.modal.step2_detect_button')}
+                </button>
+              )}
             </div>
+
+            {detectedCandidates !== null && (
+              <div className="tf-surface-alt space-y-2 p-3 text-xs">
+                {detectedCandidates.length === 0 ? (
+                  <p className="text-[11px] text-tf-secondary">
+                    {t('proxies.simple.detect_empty')}
+                  </p>
+                ) : (
+                  detectedCandidates.map((cand) => (
+                    <div
+                      key={`${cand.protocol}-${cand.host}-${cand.port}`}
+                      className="flex items-center justify-between gap-2 rounded bg-tf-surface px-2.5 py-1.5"
+                    >
+                      <span className="font-mono text-[11px] text-tf-cyan">
+                        {cand.name} ({cand.protocol.toUpperCase()} {cand.host}:
+                        {cand.port})
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handlePickDetectedCandidate(cand)}
+                        className="tf-btn-accent px-2.5 py-1 text-[11px]"
+                      >
+                        {t('proxies.simple.detect_import')}
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
 
             {proxyInputMode === 'link' ? (
               <div>
@@ -620,6 +758,40 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
                 </div>
               </div>
             )}
+
+            {onTestProxy &&
+              !enabledExistingProxies[0] &&
+              ((proxyInputMode === 'link' && Boolean(customUri.trim())) ||
+                (proxyInputMode === 'manual' && Boolean(manualHost.trim()))) && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-tf-md border border-tf-border bg-tf-surface-alt p-2.5 text-xs">
+                  <button
+                    type="button"
+                    disabled={testingExisting}
+                    onClick={() => {
+                      void handleTestProxyInWizard();
+                    }}
+                    className="tf-surface flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan disabled:opacity-60"
+                  >
+                    <Activity className="h-3.5 w-3.5" />
+                    {testingExisting
+                      ? t('dashboard.simple.testing_proxy')
+                      : t('wizard.modal.step2_test_button')}
+                  </button>
+                  {existingTestFeedback && (
+                    <span
+                      className={`text-[11px] font-semibold ${
+                        existingTestFeedback.ok ? 'text-tf-green' : 'text-tf-red'
+                      }`}
+                    >
+                      {existingTestFeedback.ok
+                        ? t('wizard.modal.step2_test_ok', {
+                            ms: existingTestFeedback.ms
+                          })
+                        : t('wizard.modal.step2_test_failed')}
+                    </span>
+                  )}
+                </div>
+              )}
           </div>
         )}
 
@@ -685,6 +857,21 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
                   ? t('wizard.modal.step3_summary_with_proxy')
                   : t('wizard.modal.step3_summary_direct')}
               </p>
+              {onEnableProtection && (
+                <label
+                  htmlFor={`${manualFormId}-enable-now`}
+                  className="mt-2.5 flex cursor-pointer items-center gap-2 border-t border-tf-border pt-2.5 text-xs font-semibold text-tf-primary"
+                >
+                  <input
+                    id={`${manualFormId}-enable-now`}
+                    type="checkbox"
+                    checked={enableProtectionNow}
+                    onChange={(e) => setEnableProtectionNow(e.target.checked)}
+                    className="h-4 w-4 cursor-pointer accent-tf-accent"
+                  />
+                  <span>{t('wizard.modal.step3_enable_now')}</span>
+                </label>
+              )}
             </div>
           </div>
         )}

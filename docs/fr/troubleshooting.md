@@ -204,3 +204,10 @@ Au démarrage du moteur sous Windows, RouteWard journalise une ligne `INFO` du t
 
 **Solution** :
 Redémarrer les applications listées (ou recharger la page, ou rouvrir la session) pour que leurs nouvelles connexions passent par RouteWard.
+
+## 14. Dépannage Rapide Débutant (App bloquée, site ignoré ou imprimante locale inaccessible)
+
+- **Internet se coupe quand RouteWard est réduit dans la barre système** : RouteWard affiche une notification Windows native lorsque le proxy ne répond plus et que le coupe-circuit protège votre vraie IP. Faites un clic droit sur l'icône colorée dans la barre système et choisissez **Pause 15 minutes** (ou ouvrez RouteWard et cliquez sur **Passer en principal** sur un autre proxy).
+- **Une application ou un site précis ne fonctionne plus** : cliquez sur **Une app ne marche plus ?** sur l'Accueil en Mode Simple pour l'autoriser en Direct en 1 clic.
+- **Une règle d'exclusion de site semble ignorée** : utilisez le champ **Par où passe un site ?** dans **Mes Apps & Sites**. Si une règle plus large passe devant, RouteWard affiche un avertissement avec un bouton **Faire passer en premier** en 1 clic.
+- **Box Internet (`192.168.x.x`) ou imprimante Wi-Fi inaccessible** : activez le pack en 1 clic **Box & Imprimantes (Réseau local)** dans **Mes Apps & Sites**.

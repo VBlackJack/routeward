@@ -520,6 +520,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bridge.set_tray_callback(Arc::new(move |snapshot| {
                 tray_for_bridge.lock().sync_status(snapshot);
             }));
+            let tray_for_alerts = Arc::clone(&tray);
+            bridge.set_tray_alert_callback(Arc::new(move |title, body| {
+                tray_for_alerts.lock().show_alert(title, body);
+            }));
         }
         (tray, ready)
     };
@@ -676,12 +680,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     window.set_minimized(false);
                     window.set_focus();
                 }
+                DesktopWindowCommand::StartDaemon => {
+                    let b = Arc::clone(&bridge_for_loop);
+                    rt_for_loop.spawn(async move {
+                        match b.start_privileged_daemon().await {
+                            Ok(state) => {
+                                if state.diagnostics.daemon_connected && !state.diagnostics.running
+                                {
+                                    if let Err(err) = b.toggle_engine(true).await {
+                                        b.log_warn(format!(
+                                            "Tray auto-enable after daemon start failed: {err}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                b.log_warn(format!("Tray daemon start failed: {err:?}"));
+                            }
+                        }
+                    });
+                }
                 DesktopWindowCommand::ToggleEngine => {
                     let b = Arc::clone(&bridge_for_loop);
                     rt_for_loop.spawn(async move {
                         let running = b.get_diagnostics().running;
                         if let Err(err) = b.toggle_engine(!running).await {
                             b.log_warn(format!("Tray engine toggle failed: {err}"));
+                        }
+                    });
+                }
+                DesktopWindowCommand::PauseEngineMinutes(minutes) => {
+                    let b = Arc::clone(&bridge_for_loop);
+                    rt_for_loop.spawn(async move {
+                        if let Err(err) = b
+                            .pause_engine_for(std::time::Duration::from_secs(minutes * 60))
+                            .await
+                        {
+                            b.log_warn(format!("Tray timed pause failed: {err}"));
                         }
                     });
                 }

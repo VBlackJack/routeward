@@ -22,6 +22,7 @@ import {
   ArrowDown,
   ArrowRight,
   ArrowUp,
+  ClipboardPaste,
   Copy,
   Edit3,
   FileCode2,
@@ -29,8 +30,10 @@ import {
   Link2,
   Lock,
   Plus,
+  Power,
   Radar,
   Server,
+  Star,
   X,
   Zap
 } from 'lucide-react';
@@ -63,6 +66,12 @@ interface ProxiesViewProps {
   onRemoveProxy: (id: string) => void;
   onAddChain: (chain: ProxyChain) => void;
   onRemoveChain: (id: string) => void;
+  onToggleSimpleFailover?: (
+    enabled: boolean,
+    chain: ProxyChain | null
+  ) => Promise<void> | void;
+  onSetPrimaryProxy?: (proxyId: string) => Promise<void> | void;
+  onPasteFromClipboard?: () => Promise<void> | void;
 }
 
 const PROTOCOLS: ProxyProtocol[] = ['socks5', 'socks4', 'http', 'https'];
@@ -87,7 +96,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   onCopyUri,
   onRemoveProxy,
   onAddChain,
-  onRemoveChain
+  onRemoveChain,
+  onToggleSimpleFailover,
+  onSetPrimaryProxy,
+  onPasteFromClipboard
 }) => {
   const { t } = useTranslation();
   const enabledProxies = proxies.filter((p) => p.enabled);
@@ -101,17 +113,26 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
 
   const handleToggleSimpleFailover = () => {
     if (simpleFailoverEnabled && simpleFailoverChain) {
-      onRemoveChain(simpleFailoverChain.id);
+      if (onToggleSimpleFailover) {
+        void onToggleSimpleFailover(false, simpleFailoverChain);
+      } else {
+        onRemoveChain(simpleFailoverChain.id);
+      }
       return;
     }
     if (enabledProxies.length < 2) return;
-    onAddChain({
+    const nextChain: ProxyChain = {
       id: UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID,
       name: t('proxies.simple.failover_chain_name'),
       strategy: 'failover',
       proxyIds: enabledProxies.map((p) => p.id),
       enabled: true
-    });
+    };
+    if (onToggleSimpleFailover) {
+      void onToggleSimpleFailover(true, nextChain);
+    } else {
+      onAddChain(nextChain);
+    }
   };
   const importTitleId = useId();
   const proxyTitleId = useId();
@@ -396,6 +417,18 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 ? t('proxies.simple.detecting')
                 : t('proxies.simple.detect_button')}
             </button>
+            {onPasteFromClipboard && (
+              <button
+                type="button"
+                onClick={() => {
+                  void onPasteFromClipboard();
+                }}
+                className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-green hover:border-tf-green"
+              >
+                <ClipboardPaste className="h-3.5 w-3.5" />
+                {t('proxies.simple.paste_clipboard_button')}
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setShowImportUri(true)}
@@ -502,7 +535,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
           {proxies.map((proxy) => (
             <div
               key={proxy.id}
-              className="tf-card flex flex-col justify-between p-4"
+              className={`tf-card flex flex-col justify-between p-4 ${
+                !proxy.enabled ? 'opacity-70' : ''
+              }`}
             >
               <div>
                 <div className="flex items-start justify-between gap-2">
@@ -514,6 +549,11 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     {primaryProxyId === proxy.id && (
                       <span className="rounded bg-tf-green/20 px-2 py-0.5 text-[10px] font-bold text-tf-green">
                         {t('proxies.simple.active_badge')}
+                      </span>
+                    )}
+                    {!proxy.enabled && (
+                      <span className="rounded bg-tf-surface-alt px-2 py-0.5 text-[10px] font-bold text-tf-secondary">
+                        {t('proxies.simple.disabled_badge')}
                       </span>
                     )}
                   </div>
@@ -600,7 +640,45 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       ? t('proxies.simple.test_connection')
                       : t('proxies.card.action.test')}
                 </button>
-                <div className="flex items-center gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {onSetPrimaryProxy &&
+                    proxies.length >= 2 &&
+                    primaryProxyId !== proxy.id && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void onSetPrimaryProxy(proxy.id);
+                        }}
+                        className="flex items-center gap-1 rounded bg-tf-cyan/15 px-2 py-1 text-[11px] font-semibold text-tf-cyan transition hover:bg-tf-cyan/25"
+                      >
+                        <Star className="h-3 w-3" />
+                        <span>{t('proxies.simple.set_primary')}</span>
+                      </button>
+                    )}
+                  <button
+                    type="button"
+                    aria-pressed={proxy.enabled}
+                    onClick={() =>
+                      onAddProxy({ ...proxy, enabled: !proxy.enabled })
+                    }
+                    className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-semibold transition ${
+                      proxy.enabled
+                        ? 'bg-tf-green/15 text-tf-green hover:bg-tf-green/25'
+                        : 'bg-tf-surface-alt text-tf-secondary hover:text-tf-primary'
+                    }`}
+                    title={
+                      proxy.enabled
+                        ? t('proxies.simple.toggle_disable')
+                        : t('proxies.simple.toggle_enable')
+                    }
+                  >
+                    <Power className="h-3 w-3" />
+                    <span>
+                      {proxy.enabled
+                        ? t('proxies.simple.toggle_disable')
+                        : t('proxies.simple.toggle_enable')}
+                    </span>
+                  </button>
                   <button
                     type="button"
                     onClick={() => openEditProxyModal(proxy)}
@@ -626,10 +704,18 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     title={t('proxies.card.action.delete')}
                     ariaLabel={t('proxies.card.action.delete')}
                     warningText={(() => {
+                      const referencingChainIds = new Set(
+                        chains
+                          .filter((c) => c.proxyIds.includes(proxy.id))
+                          .map((c) => c.id)
+                      );
                       const refCount = rules.filter(
                         (r) =>
-                          r.action.type === 'proxy' &&
-                          r.action.targetId === proxy.id
+                          (r.action.type === 'proxy' &&
+                            r.action.targetId === proxy.id) ||
+                          (r.action.type === 'chain' &&
+                            Boolean(r.action.targetId) &&
+                            referencingChainIds.has(r.action.targetId!))
                       ).length;
                       return refCount > 0
                         ? t('proxies.simple.in_use_warning', { count: refCount })

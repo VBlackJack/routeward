@@ -49,9 +49,11 @@ import {
   InterceptionMode,
   PortRange,
   ProfileSummary,
+  ProxyChain,
   ToastNotification,
   TransportProtocol
 } from './types/routeward';
+import { resolveSimpleProxyAction } from './services/friendly';
 import {
   DashboardUseCaseId,
   DashboardView
@@ -123,6 +125,8 @@ export const App: React.FC = () => {
   const [pauseRemainingSec, setPauseRemainingSec] = useState<number | null>(
     null
   );
+  const [draggingFile, setDraggingFile] = useState(false);
+  const dragDepthRef = useRef(0);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const wizardAutoCheckedRef = useRef(false);
 
@@ -172,14 +176,30 @@ export const App: React.FC = () => {
   }, []);
 
   const pushToast = useCallback(
-    (message: string, severity: ToastNotification['severity'] = 'success') => {
+    (
+      message: string,
+      severity: ToastNotification['severity'] = 'success',
+      action?: { label: string; onAction: () => void }
+    ) => {
       const id = generateClientId('toast');
-      setToasts((prev) => [...prev, { id, message, severity }]);
+      setToasts((prev) => [
+        ...prev,
+        {
+          id,
+          message,
+          severity,
+          actionLabel: action?.label,
+          onAction: action?.onAction
+        }
+      ]);
       // Error toasts stay until dismissed (WCAG 2.2.1); other toasts auto-dismiss.
       if (severity !== 'error') {
+        const duration = action
+          ? UI_CONFIG.TOAST_UNDO_DURATION_MS
+          : UI_CONFIG.TOAST_DURATION_MS;
         window.setTimeout(() => {
           dismissToast(id);
-        }, UI_CONFIG.TOAST_DURATION_MS);
+        }, duration);
       }
     },
     [dismissToast]
@@ -609,6 +629,10 @@ export const App: React.FC = () => {
             c.proxyIds.some((pid) => enabledProxies.some((p) => p.id === pid))
         )
       : [];
+    const simpleProxyAction = resolveSimpleProxyAction(
+      profile.proxies,
+      profile.chains
+    );
     const primaryProxyId = enabledProxies[0]?.id;
     let skippedProxyRule = false;
 
@@ -622,7 +646,12 @@ export const App: React.FC = () => {
         | 'block';
       let targetId: string | undefined;
       if (actType === 'proxy') {
-        targetId = primaryProxyId;
+        if (simpleProxyAction) {
+          actType = simpleProxyAction.type;
+          targetId = simpleProxyAction.targetId;
+        } else {
+          targetId = primaryProxyId;
+        }
       } else if (actType === 'chain') {
         if (enabledChains[0]?.id) {
           targetId = enabledChains[0].id;
@@ -703,6 +732,131 @@ export const App: React.FC = () => {
     );
   };
 
+  const handleToggleSimpleFailover = async (
+    enabled: boolean,
+    chain: ProxyChain | null
+  ) => {
+    if (!chain) return;
+    try {
+      if (enabled) {
+        await routewardClient.upsertChain(chain);
+        const rulesToMigrate = profile.rules.filter(
+          (r) => r.action.type === 'proxy'
+        );
+        for (const rule of rulesToMigrate) {
+          await routewardClient.upsertRule({
+            ...rule,
+            action: { type: 'chain', targetId: chain.id }
+          });
+        }
+        pushToast(t('proxies.simple.failover_applied_toast'), 'success');
+      } else {
+        const primaryProxyId = profile.proxies.find((p) => p.enabled)?.id;
+        const rulesToRestore = profile.rules.filter(
+          (r) => r.action.type === 'chain' && r.action.targetId === chain.id
+        );
+        for (const rule of rulesToRestore) {
+          await routewardClient.upsertRule({
+            ...rule,
+            action: primaryProxyId
+              ? { type: 'proxy', targetId: primaryProxyId }
+              : { type: 'direct' }
+          });
+        }
+        await routewardClient.removeChain(chain.id);
+        pushToast(t('proxies.simple.failover_disabled_toast'), 'info');
+      }
+    } catch (err) {
+      pushErrorToast(err);
+    }
+  };
+
+  const handleRemoveProxyWithCleanup = async (proxyId: string) => {
+    const removedProxy = profile.proxies.find((p) => p.id === proxyId) ?? null;
+    try {
+      const remainingEnabled = profile.proxies.filter(
+        (p) => p.enabled && p.id !== proxyId
+      );
+      const failoverChain = profile.chains.find(
+        (c) => c.id === UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID
+      );
+      if (failoverChain && remainingEnabled.length < 2) {
+        const fallbackId = remainingEnabled[0]?.id;
+        const rulesUsingFailover = profile.rules.filter(
+          (r) =>
+            r.action.type === 'chain' && r.action.targetId === failoverChain.id
+        );
+        for (const rule of rulesUsingFailover) {
+          await routewardClient.upsertRule({
+            ...rule,
+            action: fallbackId
+              ? { type: 'proxy', targetId: fallbackId }
+              : { type: 'direct' }
+          });
+        }
+        await routewardClient.removeChain(failoverChain.id);
+      }
+      await routewardClient.removeProxy(proxyId);
+      pushToast(
+        t('app.toast.proxy.deleted'),
+        'warning',
+        removedProxy
+          ? {
+              label: t('app.toast.undo'),
+              onAction: () => {
+                runMutation(
+                  () => routewardClient.upsertProxy(removedProxy),
+                  () => pushToast(t('app.toast.undo_applied'), 'info')
+                );
+              }
+            }
+          : undefined
+      );
+    } catch (err) {
+      pushErrorToast(err);
+    }
+  };
+
+  const handleSetPrimaryProxy = async (proxyId: string) => {
+    try {
+      await routewardClient.setPrimaryProxy(proxyId);
+      pushToast(t('app.toast.proxy.primary_changed'), 'success');
+    } catch (err) {
+      pushErrorToast(err);
+    }
+  };
+
+  const handlePasteProxyFromClipboard = async () => {
+    if (!navigator.clipboard || typeof navigator.clipboard.readText !== 'function') {
+      pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
+      return;
+    }
+    try {
+      const raw = (await navigator.clipboard.readText()).trim();
+      if (!raw || !raw.includes('://')) {
+        pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
+        return;
+      }
+      const beforeIds = new Set(profile.proxies.map((p) => p.id));
+      const count = await routewardClient.importProxyUris(raw);
+      if (count > 0) {
+        pushToast(`${t('app.toast.proxy.imported_uris')} (${count})`, 'success');
+        if (diagnostics.daemonConnected) {
+          const added = routewardClient
+            .getProfile()
+            .proxies.find((p) => !beforeIds.has(p.id) && p.enabled);
+          if (added) {
+            void routewardClient.testProxy(added.id).catch(() => {});
+          }
+        }
+      } else {
+        pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
+      }
+    } catch (err) {
+      pushErrorToast(err);
+    }
+  };
+
   const handleApplyUseCase = async (
     useCase: DashboardUseCaseId
   ): Promise<boolean> => {
@@ -739,6 +893,73 @@ export const App: React.FC = () => {
           .catch((err: unknown) => {
             pushErrorToast(err, 'app.toast.profile.import_error');
           });
+      }
+    };
+    reader.onerror = () => {
+      pushToast(t('app.toast.profile.import_error'), 'error');
+    };
+    reader.readAsText(file);
+  };
+
+  const handleDroppedFile = (file: File) => {
+    const lowerName = file.name.toLowerCase();
+    const isJson = lowerName.endsWith('.json') || file.type === 'application/json';
+    const isText =
+      lowerName.endsWith('.txt') ||
+      lowerName.endsWith('.uri') ||
+      file.type === 'text/plain';
+    if (!isJson && !isText) {
+      pushToast(t('app.dropzone.unsupported'), 'warning');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') return;
+      const content = reader.result.trim();
+      if (!content) return;
+      if (isText) {
+        runMutation(
+          () => routewardClient.importProxyUris(content),
+          (count) => {
+            if (count > 0) {
+              pushToast(`${t('app.toast.proxy.imported_uris')} (${count})`);
+            } else {
+              pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
+            }
+          }
+        );
+        return;
+      }
+      try {
+        const parsed = JSON.parse(content) as Record<string, unknown>;
+        const isFoxyProxy =
+          Array.isArray(parsed?.data) ||
+          Boolean(parsed?.proxyPatterns) ||
+          (typeof parsed?.mode === 'string' && !parsed?.profileId);
+        if (isFoxyProxy) {
+          void routewardClient
+            .importFoxyProxyJson(content, [])
+            .then((res) => {
+              pushToast(
+                `${t('app.toast.foxyproxy.imported')} (${res.rules.length})`,
+                'success'
+              );
+            })
+            .catch((err: unknown) => {
+              pushErrorToast(err, 'app.toast.foxyproxy.import_error');
+            });
+        } else {
+          void routewardClient
+            .importProfileJson(content)
+            .then(() => {
+              pushToast(t('app.toast.profile.imported'));
+            })
+            .catch((err: unknown) => {
+              pushErrorToast(err, 'app.toast.profile.import_error');
+            });
+        }
+      } catch {
+        pushToast(t('app.toast.profile.import_error'), 'error');
       }
     };
     reader.onerror = () => {
@@ -797,7 +1018,52 @@ export const App: React.FC = () => {
       : t('app.header.status.paused');
 
   return (
-    <div className="flex min-h-screen flex-col bg-tf-bg text-tf-primary">
+    <div
+      className="relative flex min-h-screen flex-col bg-tf-bg text-tf-primary"
+      onDragEnter={(e) => {
+        if (e.dataTransfer?.types?.includes('Files')) {
+          e.preventDefault();
+          dragDepthRef.current += 1;
+          setDraggingFile(true);
+        }
+      }}
+      onDragOver={(e) => {
+        if (e.dataTransfer?.types?.includes('Files')) {
+          e.preventDefault();
+        }
+      }}
+      onDragLeave={(e) => {
+        if (e.dataTransfer?.types?.includes('Files')) {
+          e.preventDefault();
+          dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+          if (dragDepthRef.current === 0) {
+            setDraggingFile(false);
+          }
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        dragDepthRef.current = 0;
+        setDraggingFile(false);
+        const dropped = e.dataTransfer?.files?.[0];
+        if (dropped) {
+          handleDroppedFile(dropped);
+        }
+      }}
+    >
+      {draggingFile && (
+        <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm">
+          <div className="tf-card flex max-w-md flex-col items-center gap-2 border-2 border-dashed border-tf-accent p-8 text-center shadow-2xl">
+            <Sparkles className="h-8 w-8 text-tf-accent" />
+            <div className="text-base font-bold text-tf-primary">
+              {t('app.dropzone.title')}
+            </div>
+            <p className="text-xs text-tf-secondary">
+              {t('app.dropzone.subtitle')}
+            </p>
+          </div>
+        </div>
+      )}
       {/* Minimal Header (Logo + Status on Left; Mode, Quick Help, Protection CTA on Right) */}
       <header className="border-b border-tf-border bg-tf-surface px-6 py-3">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4">
@@ -886,24 +1152,26 @@ export const App: React.FC = () => {
               </button>
             )}
 
-            {/* Primary Enable / Pause Protection CTA */}
-            <button
-              type="button"
-              disabled={!diagnostics.daemonConnected || togglingEngine}
-              onClick={() => {
-                void handleToggleEngine(!isEngineRunning);
-              }}
-              className={`flex items-center gap-2 rounded-tf-md px-3.5 py-1.5 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                isEngineRunning
-                  ? 'border border-tf-orange bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
-                  : 'bg-tf-green text-tf-bg hover:opacity-90'
-              }`}
-            >
-              <Power className="h-3.5 w-3.5" />
-              {isEngineRunning
-                ? t('app.header.engine.pause')
-                : t('app.header.engine.start')}
-            </button>
+            {/* Primary Enable / Pause Protection CTA (hidden on Simple Home where hero CTA leads) */}
+            {!(experienceMode === 'simple' && activeTab === 'home') && (
+              <button
+                type="button"
+                disabled={!diagnostics.daemonConnected || togglingEngine}
+                onClick={() => {
+                  void handleToggleEngine(!isEngineRunning);
+                }}
+                className={`flex items-center gap-2 rounded-tf-md px-3.5 py-1.5 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                  isEngineRunning
+                    ? 'border border-tf-orange bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
+                    : 'bg-tf-green text-tf-bg hover:opacity-90'
+                }`}
+              >
+                <Power className="h-3.5 w-3.5" />
+                {isEngineRunning
+                  ? t('app.header.engine.pause')
+                  : t('app.header.engine.start')}
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -1118,6 +1386,8 @@ export const App: React.FC = () => {
                 return null;
               }
             }}
+            onCheckDirectIp={() => routewardClient.getDirectIp()}
+            onPasteFromClipboard={handlePasteProxyFromClipboard}
             onNavigateProxy={() => setActiveTab('proxy')}
             onUpdateSecurityPolicy={(partial) => {
               runMutation(() => routewardClient.updateSecurityPolicy(partial));
@@ -1161,9 +1431,25 @@ export const App: React.FC = () => {
               runMutation(() => routewardClient.reorderRulePriority(id, dir));
             }}
             onRemoveRule={(id) => {
+              const removedRule = profile.rules.find((r) => r.id === id) ?? null;
               runMutation(
                 () => routewardClient.removeRule(id),
-                () => pushToast(t('app.toast.rule.deleted'), 'warning')
+                () =>
+                  pushToast(
+                    t('app.toast.rule.deleted'),
+                    'warning',
+                    removedRule
+                      ? {
+                          label: t('app.toast.undo'),
+                          onAction: () => {
+                            runMutation(
+                              () => routewardClient.upsertRule(removedRule),
+                              () => pushToast(t('app.toast.undo_applied'), 'info')
+                            );
+                          }
+                        }
+                      : undefined
+                  )
               );
             }}
             onImportFoxyProxy={async (jsonText, processPatterns) => {
@@ -1217,9 +1503,19 @@ export const App: React.FC = () => {
               }
             }}
             onAddProxy={(node) => {
+              const isNewProxy = !profile.proxies.some((p) => p.id === node.id);
               runMutation(
                 () => routewardClient.upsertProxy(node),
-                () => pushToast(t('app.toast.proxy.added'))
+                () => {
+                  pushToast(t('app.toast.proxy.added'));
+                  if (
+                    isNewProxy &&
+                    node.enabled &&
+                    diagnostics.daemonConnected
+                  ) {
+                    void routewardClient.testProxy(node.id).catch(() => {});
+                  }
+                }
               );
             }}
             onImportUris={(text) => {
@@ -1238,10 +1534,7 @@ export const App: React.FC = () => {
               pushToast(t('app.toast.proxy.copied_uri'), 'info');
             }}
             onRemoveProxy={(id) => {
-              runMutation(
-                () => routewardClient.removeProxy(id),
-                () => pushToast(t('app.toast.proxy.deleted'), 'warning')
-              );
+              void handleRemoveProxyWithCleanup(id);
             }}
             onAddChain={(chain) => {
               runMutation(() => routewardClient.upsertChain(chain));
@@ -1249,6 +1542,9 @@ export const App: React.FC = () => {
             onRemoveChain={(id) => {
               runMutation(() => routewardClient.removeChain(id));
             }}
+            onToggleSimpleFailover={handleToggleSimpleFailover}
+            onSetPrimaryProxy={handleSetPrimaryProxy}
+            onPasteFromClipboard={handlePasteProxyFromClipboard}
           />
         )}
 
@@ -1256,7 +1552,16 @@ export const App: React.FC = () => {
           <ConnectionsView
             connections={connections}
             proxies={profile.proxies}
+            chains={profile.chains}
             experienceMode={experienceMode}
+            engineRunning={isEngineRunning}
+            onEnableProtection={() => {
+              if (diagnostics.daemonConnected) {
+                void handleToggleEngine(true);
+              } else if (diagnostics.osName === 'WINDOWS') {
+                void handleStartAndEnableProtection();
+              }
+            }}
             onScanOsSockets={async () => {
               try {
                 await routewardClient.scanRealOsSockets();
@@ -1416,6 +1721,18 @@ export const App: React.FC = () => {
                 <CheckCircle2 className="h-4 w-4 text-tf-accent" />
               )}
               <span>{toast.message}</span>
+              {toast.actionLabel && toast.onAction && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    toast.onAction?.();
+                    dismissToast(toast.id);
+                  }}
+                  className="ml-1 rounded-tf-sm bg-tf-accent/20 px-2 py-0.5 text-[11px] font-bold text-tf-accent transition hover:bg-tf-accent/30"
+                >
+                  {toast.actionLabel}
+                </button>
+              )}
               {toast.severity === 'error' && (
                 <button
                   type="button"
@@ -1503,6 +1820,12 @@ export const App: React.FC = () => {
             return routewardClient.getProfile().proxies;
           }}
           onTestProxy={(proxyId) => routewardClient.testProxy(proxyId)}
+          onDetectExistingProxies={() => routewardClient.detectExistingProxies()}
+          onEnableProtection={async () => {
+            if (diagnostics.daemonConnected && !diagnostics.running) {
+              await handleToggleEngine(true);
+            }
+          }}
           onAddRule={(rule) => routewardClient.upsertRule(rule)}
           onSelectMode={(mode) => handleSetExperienceMode(mode)}
           onError={(err) => pushErrorToast(err)}

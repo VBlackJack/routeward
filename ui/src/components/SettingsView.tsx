@@ -662,7 +662,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           className="inline-flex items-center gap-2 rounded-tf-md border border-tf-border bg-tf-surface px-2.5 py-1 text-[11px]"
                         >
                           <span className="font-mono text-tf-cyan">{netName}</span>
-                          <span className="text-tf-secondary">-&gt;</span>
+                          <span className="text-tf-secondary">→</span>
                           <span className="font-semibold text-tf-primary">
                             {matchedProfile ? matchedProfile.name : profId}
                           </span>
