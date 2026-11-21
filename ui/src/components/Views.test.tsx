@@ -26,6 +26,7 @@ import { ProxiesView } from './ProxiesView';
 import { QuickSetupWizardModal } from './QuickSetupWizardModal';
 import { RulesView } from './RulesView';
 import { SettingsView } from './SettingsView';
+import { TroubleshootModal } from './TroubleshootModal';
 import {
   FakeIpEntry,
   LogEntry,
@@ -1303,5 +1304,66 @@ describe('Core UI view components', () => {
     expect(createdRuleIds).toContain('rule-visual-app-gaming');
     expect(createdRuleIds).toContain('rule-wiz-preset-privacy-browsers');
     expect(createdRuleIds).toContain('rule-wiz-preset-rfc1918-direct');
+  });
+
+  it('TroubleshootModal unblocks failed apps in 1 click and RulesView toggles 1-click protection packs', () => {
+    const onAllowAppDirect = vi.fn();
+    const onAllowSiteDirect = vi.fn();
+    const failedConn: TrackedConnection = {
+      id: 'c-fail-1',
+      pid: 777,
+      processName: 'bank-app.exe',
+      processPath: 'C:\\Apps\\bank-app.exe',
+      targetHost: '198.51.100.2',
+      resolvedDomain: 'secure.mybank.fr',
+      targetPort: 443,
+      protocol: 'tcp',
+      matchedRule: 'KillSwitch',
+      routeLabel: 'BLOCKED',
+      latencyMs: 0,
+      rxBytes: 0,
+      txBytes: 0,
+      status: 'blocked',
+      startedAt: '2026-11-21T10:00:00Z',
+      errorDetail: 'Kill-switch blocked connection: proxy unreachable'
+    };
+
+    render(
+      <TroubleshootModal
+        connections={[failedConn]}
+        onAllowAppDirect={onAllowAppDirect}
+        onAllowSiteDirect={onAllowSiteDirect}
+        onClose={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText('bank-app.exe')).toBeInTheDocument();
+    expect(screen.getByText('secure.mybank.fr')).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('troubleshoot.modal.allow_app_direct') })
+    );
+    expect(onAllowAppDirect).toHaveBeenCalledWith(failedConn);
+
+    cleanup();
+
+    const onAddRule = vi.fn();
+    render(
+      <RulesView
+        rules={[]}
+        proxies={[]}
+        chains={[]}
+        experienceMode="simple"
+        onEvaluateRule={vi.fn()}
+        onAddRule={onAddRule}
+        onToggleRule={vi.fn()}
+        onReorderRule={vi.fn()}
+        onRemoveRule={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByLabelText(i18n.t('rules.simple.pack_ads_title')));
+    expect(onAddRule).toHaveBeenCalledTimes(1);
+    expect(onAddRule.mock.calls[0][0].id).toBe('rule-pack-ads-trackers');
+    expect(onAddRule.mock.calls[0][0].action).toEqual({ type: 'block' });
   });
 });

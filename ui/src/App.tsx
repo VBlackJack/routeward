@@ -72,6 +72,7 @@ import {
   QuickSetupWizardModal
 } from './components/QuickSetupWizardModal';
 import { GlossaryModal } from './components/GlossaryModal';
+import { TroubleshootModal } from './components/TroubleshootModal';
 
 export const App: React.FC = () => {
   const { t, i18n } = useTranslation();
@@ -89,6 +90,11 @@ export const App: React.FC = () => {
   const [showLauncherModal, setShowLauncherModal] = useState(false);
   const [showWizardModal, setShowWizardModal] = useState(false);
   const [showGlossaryModal, setShowGlossaryModal] = useState(false);
+  const [showTroubleshootModal, setShowTroubleshootModal] = useState(false);
+  const [outageDismissedForKey, setOutageDismissedForKey] = useState<string | null>(
+    null
+  );
+  const [proxyOutageDetected, setProxyOutageDetected] = useState(false);
   const [systemProxyEnabled, setSystemProxyEnabled] = useState(false);
   const [pacEnabled, setPacEnabled] = useState(false);
   const [pacUrl, setPacUrl] = useState(buildDefaultPacUrl());
@@ -668,6 +674,24 @@ export const App: React.FC = () => {
   };
 
   const isEngineRunning = diagnostics.daemonConnected && diagnostics.running;
+  const activePrimaryProxy = profile.proxies.find((p) => p.enabled) ?? null;
+  const recentKillSwitchFailure = connections.find(
+    (c) =>
+      c.status === 'blocked' &&
+      Boolean(c.errorDetail) &&
+      /kill-?switch|upstream|proxy|timeout|unreachable/i.test(c.errorDetail || '')
+  );
+  const outageKey =
+    proxyOutageDetected && activePrimaryProxy
+      ? `probe:${activePrimaryProxy.id}`
+      : recentKillSwitchFailure
+        ? `conn:${recentKillSwitchFailure.id}`
+        : null;
+  const showProxyOutageBanner =
+    isEngineRunning &&
+    Boolean(activePrimaryProxy) &&
+    Boolean(outageKey) &&
+    outageKey !== outageDismissedForKey;
 
   const navItems: Array<{
     id: NavTabId;
@@ -876,6 +900,56 @@ export const App: React.FC = () => {
         </div>
       )}
 
+      {showProxyOutageBanner && outageKey && (
+        <div
+          role="alert"
+          className="border-b border-tf-orange/50 bg-tf-orange/15 px-6 py-2.5"
+        >
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2.5">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-tf-orange" />
+              <div>
+                <span className="font-bold text-tf-orange">
+                  {t('app.outage_banner.title')}
+                </span>{' '}
+                <span className="text-tf-primary">
+                  - {t('app.outage_banner.desc')}
+                </span>
+              </div>
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  void handleTemporaryPause(15);
+                  setOutageDismissedForKey(outageKey);
+                }}
+                className="tf-btn-accent px-3 py-1 text-xs"
+              >
+                {t('app.outage_banner.pause_15m')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('proxy')}
+                className="tf-surface-alt px-2.5 py-1 text-xs font-semibold text-tf-primary hover:border-tf-accent"
+              >
+                {t('app.outage_banner.check_proxy')}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setOutageDismissedForKey(outageKey);
+                  setProxyOutageDetected(false);
+                }}
+                className="rounded px-2 py-1 text-xs text-tf-secondary hover:text-tf-primary"
+              >
+                {t('app.outage_banner.dismiss')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Navigation Tabs */}
       <nav className="border-b border-tf-border bg-tf-surface/60 px-6">
         <div
@@ -951,12 +1025,15 @@ export const App: React.FC = () => {
               try {
                 const report = await routewardClient.testProxy(proxyId);
                 if (report?.reachable) {
+                  setProxyOutageDetected(false);
                   pushToast(t('app.toast.proxy.tested'), 'success');
                 } else {
+                  setProxyOutageDetected(true);
                   pushToast(t('app.toast.proxy.unreachable'), 'error');
                 }
                 return report;
               } catch (err) {
+                setProxyOutageDetected(true);
                 pushErrorToast(err);
                 return null;
               }
@@ -966,6 +1043,7 @@ export const App: React.FC = () => {
               runMutation(() => routewardClient.updateSecurityPolicy(partial));
             }}
             onOpenWizard={() => setShowWizardModal(true)}
+            onOpenTroubleshoot={() => setShowTroubleshootModal(true)}
             onNavigateRules={() => setActiveTab('apps')}
             onSwitchToExpert={() => handleSetExperienceMode('expert')}
           />
@@ -1276,6 +1354,56 @@ export const App: React.FC = () => {
 
       {showGlossaryModal && (
         <GlossaryModal onClose={() => setShowGlossaryModal(false)} />
+      )}
+
+      {showTroubleshootModal && (
+        <TroubleshootModal
+          connections={connections}
+          onAllowAppDirect={(conn) => {
+            runMutation(
+              () =>
+                routewardClient.upsertRule({
+                  id: generateClientId('rule-unblock-app'),
+                  name: `${conn.processName} (DIRECT)`,
+                  enabled: true,
+                  priority: UI_CONFIG.TROUBLESHOOT_RULE_PRIORITY,
+                  processPatterns: [conn.processName],
+                  domainPatterns: [],
+                  ipCidrs: [],
+                  portRanges: [],
+                  protocol: 'any',
+                  action: { type: 'direct' }
+                }),
+              () => {
+                pushToast(t('app.toast.rule.created'), 'success');
+                setShowTroubleshootModal(false);
+              }
+            );
+          }}
+          onAllowSiteDirect={(conn) => {
+            const domain = conn.resolvedDomain || conn.targetHost;
+            runMutation(
+              () =>
+                routewardClient.upsertRule({
+                  id: generateClientId('rule-unblock-site'),
+                  name: `${domain} (DIRECT)`,
+                  enabled: true,
+                  priority: UI_CONFIG.TROUBLESHOOT_RULE_PRIORITY,
+                  processPatterns: [],
+                  domainPatterns: [domain],
+                  ipCidrs: [],
+                  portRanges: [],
+                  protocol: 'any',
+                  action: { type: 'direct' }
+                }),
+              () => {
+                pushToast(t('app.toast.rule.created'), 'success');
+                setShowTroubleshootModal(false);
+              }
+            );
+          }}
+          onClose={() => setShowTroubleshootModal(false)}
+        />
       )}
 
       {showWizardModal && (

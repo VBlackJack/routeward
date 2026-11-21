@@ -70,6 +70,62 @@ export const UI_CONFIG = {
   TEMPORARY_PAUSE_OPTIONS_MINUTES: [15, 60] as const,
   /** Stable identifier of the automatic backup-proxy failover chain managed in Simple mode. */
   SIMPLE_FAILOVER_CHAIN_ID: 'chain-simple-failover',
+  /** Priority for high-priority quick unblock rules created from troubleshooting. */
+  TROUBLESHOOT_RULE_PRIORITY: 6,
+  /** 1-click protection packs offered in Simple mode (works even without a proxy). */
+  SIMPLE_PROTECTION_PACKS: [
+    {
+      id: 'rule-pack-ads-trackers',
+      titleKey: 'rules.simple.pack_ads_title',
+      descKey: 'rules.simple.pack_ads_desc',
+      priority: 13,
+      processPatterns: [] as readonly string[],
+      domainPatterns: [
+        '*.doubleclick.net',
+        '*.googlesyndication.com',
+        '*.google-analytics.com',
+        '*.adservice.google.com',
+        '*.adsrvr.org',
+        '*.taboola.com',
+        '*.outbrain.com'
+      ] as readonly string[]
+    },
+    {
+      id: 'rule-pack-telemetry',
+      titleKey: 'rules.simple.pack_telemetry_title',
+      descKey: 'rules.simple.pack_telemetry_desc',
+      priority: 12,
+      processPatterns: [
+        'CompatTelRunner.exe',
+        'DiagTrack',
+        'crashpad_handler.exe'
+      ] as readonly string[],
+      domainPatterns: [
+        '*.telemetry.*',
+        '*.events.data.microsoft.com',
+        '*.sentry.io'
+      ] as readonly string[]
+    },
+    {
+      id: 'rule-pack-social-focus',
+      titleKey: 'rules.simple.pack_social_title',
+      descKey: 'rules.simple.pack_social_desc',
+      priority: 14,
+      processPatterns: [] as readonly string[],
+      domainPatterns: [
+        'tiktok.com',
+        '*.tiktok.com',
+        'instagram.com',
+        '*.instagram.com',
+        'x.com',
+        '*.x.com',
+        'facebook.com',
+        '*.facebook.com',
+        'reddit.com',
+        '*.reddit.com'
+      ] as readonly string[]
+    }
+  ] as const,
   /** Priority gap used when reordering rules. */
   PRIORITY_STEP: 5,
   /** Connection cache bound used when system constants do not provide one. */

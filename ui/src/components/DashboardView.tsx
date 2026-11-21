@@ -27,6 +27,7 @@ import {
   Cpu,
   Gamepad2,
   Globe,
+  LifeBuoy,
   Lock,
   Power,
   Server,
@@ -73,6 +74,7 @@ interface DashboardViewProps {
   onNavigateProxy?: () => void;
   onUpdateSecurityPolicy: (partial: Partial<SecurityPolicyConfig>) => void;
   onOpenWizard: () => void;
+  onOpenTroubleshoot?: () => void;
   onNavigateRules: () => void;
   onSwitchToExpert: () => void;
 }
@@ -95,6 +97,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onNavigateProxy,
   onUpdateSecurityPolicy,
   onOpenWizard,
+  onOpenTroubleshoot,
   onNavigateRules,
   onSwitchToExpert
 }) => {
@@ -103,6 +106,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [lastProxyTestStatus, setLastProxyTestStatus] = useState<
     'ok' | 'failed' | null
   >(null);
+  const [showProtectionCheck, setShowProtectionCheck] = useState(false);
+  const [verifyingProtection, setVerifyingProtection] = useState(false);
+  const [verifiedExitIp, setVerifiedExitIp] = useState<string | null>(null);
   const [applyingUseCase, setApplyingUseCase] =
     useState<DashboardUseCaseId | null>(null);
   const [lastAppliedUseCase, setLastAppliedUseCase] =
@@ -122,6 +128,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       const report = await Promise.resolve(onTestPrimaryProxy(proxyId));
       if (report && typeof report === 'object' && 'reachable' in report) {
         setLastProxyTestStatus(report.reachable ? 'ok' : 'failed');
+        if (report.exitIp) {
+          setVerifiedExitIp(report.exitIp);
+        }
       } else if (report === null) {
         setLastProxyTestStatus('failed');
       }
@@ -129,6 +138,19 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       setLastProxyTestStatus('failed');
     } finally {
       setTestingPrimaryProxy(false);
+    }
+  };
+
+  const handleVerifyProtection = async () => {
+    setShowProtectionCheck(true);
+    if (!primaryProxy || !onTestPrimaryProxy) {
+      return;
+    }
+    setVerifyingProtection(true);
+    try {
+      await handleTestPrimaryProxyClick(primaryProxy.id);
+    } finally {
+      setVerifyingProtection(false);
     }
   };
 
@@ -337,8 +359,117 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <Sparkles className="h-3.5 w-3.5 text-tf-accent" />
             {t('dashboard.health_banner.choose_apps_cta')}
           </button>
+          {experienceMode === 'simple' && (
+            <button
+              type="button"
+              disabled={verifyingProtection}
+              onClick={() => {
+                void handleVerifyProtection();
+              }}
+              className="tf-surface-alt flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-tf-cyan hover:border-tf-cyan disabled:opacity-60"
+            >
+              <ShieldCheck className="h-3.5 w-3.5" />
+              {verifyingProtection
+                ? t('dashboard.simple.testing_proxy')
+                : t('dashboard.simple.verify_protection_cta')}
+            </button>
+          )}
+          {experienceMode === 'simple' && onOpenTroubleshoot && (
+            <button
+              type="button"
+              onClick={onOpenTroubleshoot}
+              className="tf-surface-alt flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-tf-orange hover:border-tf-orange"
+            >
+              <LifeBuoy className="h-3.5 w-3.5" />
+              {t('dashboard.simple.troubleshoot_cta')}
+            </button>
+          )}
         </div>
       </div>
+
+      {experienceMode === 'simple' && showProtectionCheck && (
+        <div className="tf-card space-y-3 border-l-4 border-l-tf-cyan p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-tf-cyan">
+              {t('dashboard.simple.verify_panel_title')}
+            </h3>
+            {(!securityPolicy.killSwitchEnabled ||
+              !securityPolicy.strictDnsNoLocalFallback) && (
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateSecurityPolicy({
+                    killSwitchEnabled: true,
+                    strictDnsNoLocalFallback: true,
+                    blockUdpOnTcpOnlyProxy: true,
+                    blockQuicUdp443: true,
+                    blockEncryptedDnsBypass: true
+                  })
+                }
+                className="tf-btn-accent px-3 py-1 text-[11px] font-bold"
+              >
+                {t('dashboard.simple.verify_fix_all')}
+              </button>
+            )}
+          </div>
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+            <div className="tf-surface-alt p-3 text-xs">
+              <div className="text-[11px] text-tf-secondary">
+                {t('dashboard.simple.verify_ip_label')}
+              </div>
+              <div
+                className={`mt-1 font-bold ${
+                  lastProxyTestStatus === 'failed'
+                    ? 'text-tf-red'
+                    : 'text-tf-green'
+                }`}
+              >
+                {!primaryProxy
+                  ? t('dashboard.simple.verify_ip_direct')
+                  : lastProxyTestStatus === 'failed'
+                    ? t('dashboard.simple.verify_ip_unreachable')
+                    : `${t('dashboard.simple.verify_ip_masked')}${
+                        verifiedExitIp || primaryProxy.exitIp
+                          ? ` (${verifiedExitIp || primaryProxy.exitIp})`
+                          : ''
+                      }`}
+              </div>
+            </div>
+            <div className="tf-surface-alt p-3 text-xs">
+              <div className="text-[11px] text-tf-secondary">
+                {t('dashboard.simple.verify_dns_label')}
+              </div>
+              <div
+                className={`mt-1 font-bold ${
+                  securityPolicy.strictDnsNoLocalFallback
+                    ? 'text-tf-green'
+                    : 'text-tf-orange'
+                }`}
+              >
+                {securityPolicy.strictDnsNoLocalFallback
+                  ? t('dashboard.simple.verify_status_ok')
+                  : t('dashboard.simple.verify_status_off')}
+              </div>
+            </div>
+            <div className="tf-surface-alt p-3 text-xs">
+              <div className="text-[11px] text-tf-secondary">
+                {t('dashboard.simple.verify_killswitch_label')}
+              </div>
+              <div
+                className={`mt-1 font-bold ${
+                  securityPolicy.killSwitchEnabled
+                    ? 'text-tf-green'
+                    : 'text-tf-orange'
+                }`}
+              >
+                {securityPolicy.killSwitchEnabled
+                  ? t('dashboard.simple.verify_status_ok')
+                  : t('dashboard.simple.verify_status_off')}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {experienceMode === 'simple' ? (
         <>

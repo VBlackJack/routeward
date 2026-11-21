@@ -48,6 +48,13 @@
       "not_elevated_title": "Daemon Running Without Elevated Privileges",
       "not_elevated_desc": "The connected daemon process is not running with Administrator or root privileges. Kernel/OS packet interception requires elevation."
     },
+    "outage_banner": {
+      "title": "Your proxy stopped responding - Internet is blocked for safety",
+      "desc": "Kill-Switch is preventing your real IP from leaking. Pause for 15 minutes or check your proxy.",
+      "pause_15m": "Pause 15m",
+      "check_proxy": "Check Proxy",
+      "dismiss": "Dismiss"
+    },
     "header": {
       "brand": {
         "title": "RouteWard",
@@ -251,6 +258,18 @@
       "pause_15m": "Pause 15m",
       "pause_60m": "Pause 1h",
       "auto_resume_in": "Auto-resume in {{remaining}}",
+      "troubleshoot_cta": "App not working?",
+      "verify_protection_cta": "Verify My Protection",
+      "verify_panel_title": "Your Protection Check",
+      "verify_ip_label": "IP Address",
+      "verify_ip_masked": "Hidden via proxy",
+      "verify_ip_direct": "Direct connection (Filter Mode)",
+      "verify_ip_unreachable": "Proxy unreachable",
+      "verify_dns_label": "DNS Protection",
+      "verify_killswitch_label": "Kill-Switch",
+      "verify_status_ok": "Active",
+      "verify_status_off": "Off",
+      "verify_fix_all": "Enable All",
       "use_cases_title": "What do you want to do today?",
       "use_cases_subtitle": "Pick a ready-made scenario to configure your apps and leak protection in one click.",
       "uc_privacy_title": "Private Browsing",
@@ -563,7 +582,19 @@
       "optional_app_placeholder": "msedge.exe (leave blank for all apps)",
       "action_label": "How should it connect?",
       "show_advanced_options": "Show advanced rule fields (priority, CIDR, ports)",
-      "hide_advanced_options": "Back to simple form"
+      "hide_advanced_options": "Back to simple form",
+      "detected_apps_title": "Apps on This Computer",
+      "detected_apps_subtitle": "Pick any running or installed app without typing executable names.",
+      "detected_apps_load": "Scan My Apps",
+      "detected_apps_search": "Search an app...",
+      "packs_title": "1-Click Protection Packs",
+      "packs_subtitle": "Works even without a proxy: turn these protections on or off in one click.",
+      "pack_ads_title": "Ads & Trackers",
+      "pack_ads_desc": "Blocks common ad networks and tracking domains.",
+      "pack_telemetry_title": "OS & App Telemetry",
+      "pack_telemetry_desc": "Blocks diagnostic telemetry and background crash reporters.",
+      "pack_social_title": "Focus Mode (Social Media)",
+      "pack_social_desc": "Temporarily blocks TikTok, Instagram, X, Facebook, and Reddit."
     },
     "header": {
       "title": "Process & Destination Routing Rules",
@@ -1033,6 +1064,16 @@
       "kb": "KB",
       "mb": "MB",
       "gb": "GB"
+    }
+  },
+  "troubleshoot": {
+    "modal": {
+      "title": "App or website not working?",
+      "subtitle": "Here are the latest blocked or failed connections. Allow an app Directly in 1 click to unblock it immediately.",
+      "empty": "No blocked or failed connections were detected recently.",
+      "allow_app_direct": "Allow App Directly",
+      "allow_site_direct": "Allow This Site",
+      "close": "Close"
     }
   },
   "tray": {

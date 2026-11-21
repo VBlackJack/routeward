@@ -48,6 +48,13 @@
       "not_elevated_title": "Démon Lancé Sans Privilèges Élevés",
       "not_elevated_desc": "Le démon connecté tourne sans privilèges Administrateur ou root. L'interception transparente des paquets système requiert l'élévation."
     },
+    "outage_banner": {
+      "title": "Votre proxy ne répond plus - Internet est bloqué par sécurité",
+      "desc": "Le coupe-circuit empêche votre vraie IP de fuiter. Mettez en pause 15 min ou vérifiez votre proxy.",
+      "pause_15m": "Pause 15 min",
+      "check_proxy": "Changer de proxy",
+      "dismiss": "Masquer"
+    },
     "header": {
       "brand": {
         "title": "RouteWard",
@@ -251,6 +258,18 @@
       "pause_15m": "Pause 15 min",
       "pause_60m": "Pause 1 h",
       "auto_resume_in": "Reprise auto dans {{remaining}}",
+      "troubleshoot_cta": "Une app ne marche plus ?",
+      "verify_protection_cta": "Vérifier ma protection",
+      "verify_panel_title": "Bilan de votre protection",
+      "verify_ip_label": "Adresse IP",
+      "verify_ip_masked": "Masquée via proxy",
+      "verify_ip_direct": "Connexion directe (Mode Filtrage)",
+      "verify_ip_unreachable": "Proxy injoignable",
+      "verify_dns_label": "Protection DNS",
+      "verify_killswitch_label": "Coupe-circuit (Kill-Switch)",
+      "verify_status_ok": "Actif",
+      "verify_status_off": "Désactivé",
+      "verify_fix_all": "Tout activer",
       "use_cases_title": "Que voulez-vous faire aujourd'hui ?",
       "use_cases_subtitle": "Choisissez un scénario prêt à l'emploi pour configurer vos applications et votre protection en un clic.",
       "uc_privacy_title": "Navigation Privée",
@@ -563,7 +582,19 @@
       "optional_app_placeholder": "msedge.exe (laisser vide pour toutes les apps)",
       "action_label": "Comment doit-elle se connecter ?",
       "show_advanced_options": "Afficher les champs avancés (priorité, CIDR, ports)",
-      "hide_advanced_options": "Revenir au formulaire simple"
+      "hide_advanced_options": "Revenir au formulaire simple",
+      "detected_apps_title": "Applications sur cet ordinateur",
+      "detected_apps_subtitle": "Choisissez une application déjà installée ou ouverte sans taper de nom de fichier.",
+      "detected_apps_load": "Scanner mes applications",
+      "detected_apps_search": "Rechercher une application...",
+      "packs_title": "Packs de blocage en 1 clic",
+      "packs_subtitle": "Utiles même sans proxy : activez ou désactivez ces protections instantanément.",
+      "pack_ads_title": "Pubs & Pisteurs",
+      "pack_ads_desc": "Bloque les régies publicitaires et domaines de suivi courants.",
+      "pack_telemetry_title": "Télémétrie Windows & Apps",
+      "pack_telemetry_desc": "Bloque les rapports de diagnostic et collecteurs en arrière-plan.",
+      "pack_social_title": "Mode Focus (Réseaux sociaux)",
+      "pack_social_desc": "Bloque temporairement TikTok, Instagram, X, Facebook et Reddit."
     },
     "header": {
       "title": "Règles de Routage par Processus et Destination",
@@ -1033,6 +1064,16 @@
       "kb": "Ko",
       "mb": "Mo",
       "gb": "Go"
+    }
+  },
+  "troubleshoot": {
+    "modal": {
+      "title": "Une app ou un site ne marche plus ?",
+      "subtitle": "Voici les dernières connexions bloquées ou en erreur. Autorisez une app en Direct en 1 clic pour la débloquer immédiatement.",
+      "empty": "Aucune connexion bloquée ou en erreur n'a été détectée récemment.",
+      "allow_app_direct": "Laisser passer l'app en Direct",
+      "allow_site_direct": "Laisser passer ce site",
+      "close": "Fermer"
     }
   },
   "tray": {
