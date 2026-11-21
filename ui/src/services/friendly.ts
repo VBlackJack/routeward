@@ -15,7 +15,12 @@
  */
 
 import { UI_CONFIG } from '../config/constants';
-import { ProxyChain, ProxyNode, RuleAction } from '../types/routeward';
+import {
+  ProxyChain,
+  ProxyNode,
+  RoutingRule,
+  RuleAction
+} from '../types/routeward';
 
 const FRIENDLY_APP_MAP: Record<string, string> = {
   'msedge.exe': 'Microsoft Edge',
@@ -120,4 +125,45 @@ export function resolveSimpleProxyAction(
     return { type: 'chain', targetId: failoverChain.id };
   }
   return { type: 'proxy', targetId: enabledProxies[0].id };
+}
+
+/**
+ * Returns the first earlier enabled rule that would shadow `rule` with a different action
+ * (for example, a broad browser rule at priority 10 overriding a site-specific rule at priority 50).
+ */
+export function findShadowingRule(
+  rule: RoutingRule,
+  allRules: RoutingRule[]
+): RoutingRule | null {
+  if (!rule.enabled) {
+    return null;
+  }
+  const ordered = [...allRules]
+    .filter((r) => r.enabled)
+    .sort((a, b) => a.priority - b.priority);
+
+  const targetIdx = ordered.findIndex((r) => r.id === rule.id);
+  if (targetIdx <= 0) {
+    return null;
+  }
+
+  const ruleProcs = new Set(rule.processPatterns.map((p) => p.toLowerCase()));
+  for (let i = 0; i < targetIdx; i += 1) {
+    const candidate = ordered[i];
+    if (candidate.action.type === rule.action.type) {
+      continue;
+    }
+    if (candidate.domainPatterns.length > 0 || candidate.ipCidrs.length > 0) {
+      continue;
+    }
+    const candidateMatchesAllProcs = candidate.processPatterns.length === 0;
+    const processesOverlap =
+      candidateMatchesAllProcs ||
+      ruleProcs.size === 0 ||
+      candidate.processPatterns.some((p) => ruleProcs.has(p.toLowerCase()));
+    if (processesOverlap && (rule.domainPatterns.length > 0 || candidateMatchesAllProcs)) {
+      return candidate;
+    }
+  }
+  return null;
 }

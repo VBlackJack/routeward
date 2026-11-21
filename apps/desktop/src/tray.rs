@@ -183,6 +183,7 @@ const TRAY_KEY_STATUS_PAUSED: &str = "tray.status.paused";
 const TRAY_KEY_MENU_PAUSE: &str = "tray.menu.pause";
 const TRAY_KEY_MENU_PAUSE_15M: &str = "tray.menu.pause_15m";
 const TRAY_KEY_MENU_ENABLE: &str = "tray.menu.enable";
+const TRAY_KEY_MENU_START_SERVICE: &str = "tray.menu.start_service";
 const TRAY_KEY_MENU_OPEN: &str = "tray.menu.open";
 const TRAY_KEY_MENU_QUIT: &str = "tray.menu.quit";
 
@@ -196,7 +197,9 @@ pub fn build_tray_labels(snapshot: &TrayStatusSnapshot) -> TrayMenuLabels {
     } else {
         TRAY_KEY_STATUS_PAUSED
     };
-    let toggle_key = if snapshot.daemon_connected && snapshot.running {
+    let toggle_key = if !snapshot.daemon_connected {
+        TRAY_KEY_MENU_START_SERVICE
+    } else if snapshot.running {
         TRAY_KEY_MENU_PAUSE
     } else {
         TRAY_KEY_MENU_ENABLE
@@ -207,7 +210,7 @@ pub fn build_tray_labels(snapshot: &TrayStatusSnapshot) -> TrayMenuLabels {
         status_line,
         open_app: i18n.t(TRAY_KEY_MENU_OPEN),
         toggle_engine: i18n.t(toggle_key),
-        toggle_enabled: snapshot.daemon_connected,
+        toggle_enabled: true,
         pause_15m: i18n.t(TRAY_KEY_MENU_PAUSE_15M),
         pause_15m_enabled: snapshot.daemon_connected && snapshot.running,
         quit_app: i18n.t(TRAY_KEY_MENU_QUIT),
@@ -383,7 +386,13 @@ impl TrayWindowState {
 
             match cmd_id {
                 IDM_SHOW => (self.command_cb)(DesktopWindowCommand::ShowWindow),
-                IDM_TOGGLE => (self.command_cb)(DesktopWindowCommand::ToggleEngine),
+                IDM_TOGGLE => {
+                    if snap.daemon_connected {
+                        (self.command_cb)(DesktopWindowCommand::ToggleEngine);
+                    } else {
+                        (self.command_cb)(DesktopWindowCommand::StartDaemon);
+                    }
+                }
                 IDM_PAUSE_15M => {
                     (self.command_cb)(DesktopWindowCommand::PauseEngineMinutes(TRAY_PAUSE_MINUTES))
                 }
@@ -675,8 +684,9 @@ mod tests {
             active_profile_id: "default".to_string(),
             profiles: Vec::new(),
         });
-        assert!(!offline.toggle_enabled);
+        assert!(offline.toggle_enabled);
         assert!(!offline.pause_15m_enabled);
+        assert_eq!(offline.toggle_engine, "Démarrer le service");
         assert!(offline.status_line.contains("arrêté"));
 
         let protected_en = build_tray_labels(&TrayStatusSnapshot {

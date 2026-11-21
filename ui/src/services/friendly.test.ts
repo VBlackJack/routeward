@@ -16,8 +16,9 @@
 
 import { describe, expect, it } from 'vitest';
 import { UI_CONFIG } from '../config/constants';
-import { ProxyChain, ProxyNode } from '../types/routeward';
+import { ProxyChain, ProxyNode, RoutingRule } from '../types/routeward';
 import {
+  findShadowingRule,
   getFriendlyAppName,
   getHumanErrorKey,
   resolveSimpleProxyAction
@@ -88,5 +89,42 @@ describe('friendly beginner helpers', () => {
       targetId: 'p1'
     });
     expect(resolveSimpleProxyAction([sampleProxy('p1', false)], [failover])).toBeNull();
+  });
+
+  it('detects when a broad earlier rule shadows a site-specific rule with a different action', () => {
+    const broadBrowser: RoutingRule = {
+      id: 'r-browsers',
+      name: 'Web Browsers',
+      enabled: true,
+      priority: 10,
+      processPatterns: ['msedge.exe', 'firefox.exe'],
+      domainPatterns: [],
+      ipCidrs: [],
+      portRanges: [],
+      protocol: 'any',
+      action: { type: 'proxy', targetId: 'p1' }
+    };
+    const siteDirect: RoutingRule = {
+      id: 'r-bank',
+      name: 'mybank.fr',
+      enabled: true,
+      priority: 50,
+      processPatterns: [],
+      domainPatterns: ['mybank.fr'],
+      ipCidrs: [],
+      portRanges: [],
+      protocol: 'any',
+      action: { type: 'direct' }
+    };
+
+    expect(findShadowingRule(siteDirect, [broadBrowser, siteDirect])?.id).toBe(
+      'r-browsers'
+    );
+    expect(
+      findShadowingRule({ ...siteDirect, priority: 8 }, [
+        broadBrowser,
+        { ...siteDirect, priority: 8 }
+      ])
+    ).toBeNull();
   });
 });

@@ -125,6 +125,8 @@ export const App: React.FC = () => {
   const [pauseRemainingSec, setPauseRemainingSec] = useState<number | null>(
     null
   );
+  const [draggingFile, setDraggingFile] = useState(false);
+  const dragDepthRef = useRef(0);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const wizardAutoCheckedRef = useRef(false);
 
@@ -899,6 +901,73 @@ export const App: React.FC = () => {
     reader.readAsText(file);
   };
 
+  const handleDroppedFile = (file: File) => {
+    const lowerName = file.name.toLowerCase();
+    const isJson = lowerName.endsWith('.json') || file.type === 'application/json';
+    const isText =
+      lowerName.endsWith('.txt') ||
+      lowerName.endsWith('.uri') ||
+      file.type === 'text/plain';
+    if (!isJson && !isText) {
+      pushToast(t('app.dropzone.unsupported'), 'warning');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') return;
+      const content = reader.result.trim();
+      if (!content) return;
+      if (isText) {
+        runMutation(
+          () => routewardClient.importProxyUris(content),
+          (count) => {
+            if (count > 0) {
+              pushToast(`${t('app.toast.proxy.imported_uris')} (${count})`);
+            } else {
+              pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
+            }
+          }
+        );
+        return;
+      }
+      try {
+        const parsed = JSON.parse(content) as Record<string, unknown>;
+        const isFoxyProxy =
+          Array.isArray(parsed?.data) ||
+          Boolean(parsed?.proxyPatterns) ||
+          (typeof parsed?.mode === 'string' && !parsed?.profileId);
+        if (isFoxyProxy) {
+          void routewardClient
+            .importFoxyProxyJson(content, [])
+            .then((res) => {
+              pushToast(
+                `${t('app.toast.foxyproxy.imported')} (${res.rules.length})`,
+                'success'
+              );
+            })
+            .catch((err: unknown) => {
+              pushErrorToast(err, 'app.toast.foxyproxy.import_error');
+            });
+        } else {
+          void routewardClient
+            .importProfileJson(content)
+            .then(() => {
+              pushToast(t('app.toast.profile.imported'));
+            })
+            .catch((err: unknown) => {
+              pushErrorToast(err, 'app.toast.profile.import_error');
+            });
+        }
+      } catch {
+        pushToast(t('app.toast.profile.import_error'), 'error');
+      }
+    };
+    reader.onerror = () => {
+      pushToast(t('app.toast.profile.import_error'), 'error');
+    };
+    reader.readAsText(file);
+  };
+
   const securityPolicy = profile.securityPolicy || {
     killSwitchEnabled: true,
     blockUdpOnTcpOnlyProxy: true,
@@ -949,7 +1018,52 @@ export const App: React.FC = () => {
       : t('app.header.status.paused');
 
   return (
-    <div className="flex min-h-screen flex-col bg-tf-bg text-tf-primary">
+    <div
+      className="relative flex min-h-screen flex-col bg-tf-bg text-tf-primary"
+      onDragEnter={(e) => {
+        if (e.dataTransfer?.types?.includes('Files')) {
+          e.preventDefault();
+          dragDepthRef.current += 1;
+          setDraggingFile(true);
+        }
+      }}
+      onDragOver={(e) => {
+        if (e.dataTransfer?.types?.includes('Files')) {
+          e.preventDefault();
+        }
+      }}
+      onDragLeave={(e) => {
+        if (e.dataTransfer?.types?.includes('Files')) {
+          e.preventDefault();
+          dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+          if (dragDepthRef.current === 0) {
+            setDraggingFile(false);
+          }
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        dragDepthRef.current = 0;
+        setDraggingFile(false);
+        const dropped = e.dataTransfer?.files?.[0];
+        if (dropped) {
+          handleDroppedFile(dropped);
+        }
+      }}
+    >
+      {draggingFile && (
+        <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm">
+          <div className="tf-card flex max-w-md flex-col items-center gap-2 border-2 border-dashed border-tf-accent p-8 text-center shadow-2xl">
+            <Sparkles className="h-8 w-8 text-tf-accent" />
+            <div className="text-base font-bold text-tf-primary">
+              {t('app.dropzone.title')}
+            </div>
+            <p className="text-xs text-tf-secondary">
+              {t('app.dropzone.subtitle')}
+            </p>
+          </div>
+        </div>
+      )}
       {/* Minimal Header (Logo + Status on Left; Mode, Quick Help, Protection CTA on Right) */}
       <header className="border-b border-tf-border bg-tf-surface px-6 py-3">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4">

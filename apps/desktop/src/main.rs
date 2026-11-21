@@ -680,6 +680,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     window.set_minimized(false);
                     window.set_focus();
                 }
+                DesktopWindowCommand::StartDaemon => {
+                    let b = Arc::clone(&bridge_for_loop);
+                    rt_for_loop.spawn(async move {
+                        match b.start_privileged_daemon().await {
+                            Ok(state) => {
+                                if state.diagnostics.daemon_connected && !state.diagnostics.running
+                                {
+                                    if let Err(err) = b.toggle_engine(true).await {
+                                        b.log_warn(format!(
+                                            "Tray auto-enable after daemon start failed: {err}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                b.log_warn(format!("Tray daemon start failed: {err:?}"));
+                            }
+                        }
+                    });
+                }
                 DesktopWindowCommand::ToggleEngine => {
                     let b = Arc::clone(&bridge_for_loop);
                     rt_for_loop.spawn(async move {

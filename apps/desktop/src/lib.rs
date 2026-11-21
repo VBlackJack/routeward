@@ -133,6 +133,7 @@ pub enum DesktopWindowCommand {
     Close,
     DragWindow,
     ShowWindow,
+    StartDaemon,
     ToggleEngine,
     PauseEngineMinutes(u64),
     SwitchProfile(usize),

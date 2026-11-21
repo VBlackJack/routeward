@@ -3,6 +3,11 @@
     "titlebar": {
       "close": "Fermer"
     },
+    "dropzone": {
+      "title": "Déposez votre fichier ici",
+      "subtitle": "Profil RouteWard (.json), export FoxyProxy (.json) ou liste de liens proxy (.txt)",
+      "unsupported": "Type de fichier non pris en charge (utilisez .json ou .txt)"
+    },
     "confirm_delete": {
       "confirm": "Confirmer",
       "cancel": "Annuler"
@@ -624,7 +629,13 @@
       "pack_telemetry_title": "Télémétrie Windows & Apps",
       "pack_telemetry_desc": "Bloque les rapports de diagnostic et collecteurs en arrière-plan.",
       "pack_social_title": "Mode Focus (Réseaux sociaux)",
-      "pack_social_desc": "Bloque temporairement TikTok, Instagram, X, Facebook et Reddit."
+      "pack_social_desc": "Bloque temporairement TikTok, Instagram, X, Facebook et Reddit.",
+      "shadowed_warning": "Masquée par \"{{blocker}}\"",
+      "promote_first": "Faire passer en premier",
+      "tester_title": "Par où passe un site ?",
+      "tester_placeholder": "Collez un site web (ex. https://www.exemple.com)",
+      "tester_button": "Vérifier",
+      "tester_rule_label": "Règle appliquée : {{name}}"
     },
     "header": {
       "title": "Règles de Routage par Processus et Destination",
@@ -1135,6 +1146,7 @@
       "pause": "Mettre en pause",
       "pause_15m": "Pause 15 minutes",
       "enable": "Activer la protection",
+      "start_service": "Démarrer le service",
       "open": "Ouvrir RouteWard",
       "quit": "Quitter"
     },

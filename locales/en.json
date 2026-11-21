@@ -3,6 +3,11 @@
     "titlebar": {
       "close": "Close"
     },
+    "dropzone": {
+      "title": "Drop your file here",
+      "subtitle": "RouteWard profile (.json), FoxyProxy export (.json), or proxy links (.txt)",
+      "unsupported": "Unsupported file type (use .json or .txt)"
+    },
     "confirm_delete": {
       "confirm": "Confirm",
       "cancel": "Cancel"
@@ -624,7 +629,13 @@
       "pack_telemetry_title": "OS & App Telemetry",
       "pack_telemetry_desc": "Blocks diagnostic telemetry and background crash reporters.",
       "pack_social_title": "Focus Mode (Social Media)",
-      "pack_social_desc": "Temporarily blocks TikTok, Instagram, X, Facebook, and Reddit."
+      "pack_social_desc": "Temporarily blocks TikTok, Instagram, X, Facebook, and Reddit.",
+      "shadowed_warning": "Overridden by \"{{blocker}}\"",
+      "promote_first": "Move First",
+      "tester_title": "Where does a website go?",
+      "tester_placeholder": "Paste a website (e.g. https://www.example.com)",
+      "tester_button": "Check",
+      "tester_rule_label": "Applied rule: {{name}}"
     },
     "header": {
       "title": "Process & Destination Routing Rules",
@@ -1135,6 +1146,7 @@
       "pause": "Pause Protection",
       "pause_15m": "Pause for 15 minutes",
       "enable": "Enable Protection",
+      "start_service": "Start Service",
       "open": "Open RouteWard",
       "quit": "Exit"
     },
