@@ -906,6 +906,18 @@ pub async fn handle_api_route(
         return Some((200, json_ct, json));
     }
 
+    if path.starts_with("/api/system/detect-proxies") {
+        let detected = bridge.detect_existing_proxies().await;
+        let json = serde_json::to_vec(&detected).unwrap_or_default();
+        return Some((200, json_ct, json));
+    }
+
+    if path.starts_with("/api/system/network-info") {
+        let info = bridge.get_current_network_info().await;
+        let json = serde_json::to_vec(&info).unwrap_or_default();
+        return Some((200, json_ct, json));
+    }
+
     if path.starts_with("/api/system-proxy") {
         if method != "POST" {
             let enabled = bridge.get_system_proxy_status().await;

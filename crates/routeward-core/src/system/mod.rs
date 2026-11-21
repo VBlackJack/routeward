@@ -14,9 +14,14 @@
  * limitations under the License.
  */
 
+pub mod discovery;
 pub mod purge;
 pub mod user_state;
 pub mod windows_service;
+
+pub use discovery::{
+    detect_current_network, detect_existing_proxies, CurrentNetworkInfo, DetectedProxyCandidate,
+};
 
 #[cfg(windows)]
 use crate::error::ERR_KEY_SYSTEM_REGISTRY_WRITE;

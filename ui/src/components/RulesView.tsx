@@ -33,11 +33,11 @@ import {
   Shield,
   ShieldAlert,
   Sparkles,
-  Trash2,
   Upload
 } from 'lucide-react';
 import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
 import { generateClientId, routewardClient } from '../services/ipc';
+import { normalizeDomainPatterns } from '../services/domain';
 import {
   ConnectionRequest,
   FoxyProxyImportResult,
@@ -52,6 +52,7 @@ import {
 } from '../types/routeward';
 import { ExperienceMode } from './QuickSetupWizardModal';
 import { ModalContainer } from './ModalContainer';
+import { ConfirmDeleteButton } from './ConfirmDeleteButton';
 
 interface RulesViewProps {
   rules: RoutingRule[];
@@ -162,6 +163,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
   // Add / Edit Rule & Presets modal state
   const [showModal, setShowModal] = useState(false);
   const [showPresets, setShowPresets] = useState(false);
+  const [armedDeleteRuleId, setArmedDeleteRuleId] = useState<string | null>(null);
   const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
   const [editingRuleEnabled, setEditingRuleEnabled] = useState(true);
   const [editingRequiresAdvanced, setEditingRequiresAdvanced] = useState(false);
@@ -188,6 +190,8 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const [showAppPicker, setShowAppPicker] = useState(false);
   const [loadingApps, setLoadingApps] = useState(false);
   const [systemApps, setSystemApps] = useState<SystemApplicationEntry[]>([]);
+  const [detectedAppSearch, setDetectedAppSearch] = useState('');
+  const [detectedAppsLoaded, setDetectedAppsLoaded] = useState(false);
 
   // FoxyProxy import modal state
   const [showFoxyProxyModal, setShowFoxyProxyModal] = useState(false);
@@ -195,18 +199,72 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const [foxyProcessFilter, setFoxyProcessFilter] = useState('msedge.exe');
   const [foxySubmitting, setFoxySubmitting] = useState(false);
 
-  const loadSystemApps = async () => {
-    setShowAppPicker((prev) => !prev);
-    if (systemApps.length > 0 || loadingApps) return;
+  const fetchSystemAppsList = async () => {
+    if (loadingApps) return;
     setLoadingApps(true);
     try {
       const fetcher =
         onListSystemApps ?? (() => routewardClient.listSystemApplications());
       const apps = await fetcher();
       setSystemApps(apps);
+      setDetectedAppsLoaded(true);
     } finally {
       setLoadingApps(false);
     }
+  };
+
+  const loadSystemApps = async () => {
+    setShowAppPicker((prev) => !prev);
+    if (systemApps.length > 0 || loadingApps) return;
+    await fetchSystemAppsList();
+  };
+
+  const handleSetDetectedAppAction = (
+    app: SystemApplicationEntry,
+    chosenAction: 'proxy' | 'direct' | 'block'
+  ) => {
+    if (chosenAction === 'proxy' && !primaryEnabledProxyId) {
+      onMissingProxy?.();
+      return;
+    }
+    const slug = app.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    onAddRule({
+      id: `rule-app-${slug}`,
+      name: app.name,
+      enabled: true,
+      priority: UI_CONFIG.DEFAULT_RULE_PRIORITY - 10,
+      processPatterns: [app.name],
+      domainPatterns: [],
+      ipCidrs: [],
+      portRanges: [],
+      protocol: 'any',
+      action:
+        chosenAction === 'proxy'
+          ? { type: 'proxy', targetId: primaryEnabledProxyId }
+          : { type: chosenAction }
+    });
+  };
+
+  const handleToggleProtectionPack = (
+    pack: (typeof UI_CONFIG.SIMPLE_PROTECTION_PACKS)[number]
+  ) => {
+    const existing = rules.find((r) => r.id === pack.id);
+    if (existing) {
+      onToggleRule(existing.id);
+      return;
+    }
+    onAddRule({
+      id: pack.id,
+      name: t(pack.titleKey),
+      enabled: true,
+      priority: pack.priority,
+      processPatterns: [...pack.processPatterns],
+      domainPatterns: [...pack.domainPatterns],
+      ipCidrs: [],
+      portRanges: [],
+      protocol: 'any',
+      action: { type: 'block' }
+    });
   };
 
   const appendProcessPattern = (appName: string, mode: 'simple' | 'advanced') => {
@@ -418,16 +476,20 @@ export const RulesView: React.FC<RulesViewProps> = ({
         ? splitList(simpleTargetValue)
         : splitList(simpleOptionalApps)
       : splitList(processesText);
+    const normalizedSiteTarget = normalizeDomainPatterns(simpleTargetValue);
+    const normalizedOptionalSites = normalizeDomainPatterns(simpleOptionalDomains);
     const effectiveDomains = isSimpleSubmit
       ? simpleTargetType === 'site'
-        ? splitList(simpleTargetValue)
-        : splitList(simpleOptionalDomains)
+        ? normalizedSiteTarget.patterns
+        : normalizedOptionalSites.patterns
       : splitList(domainsText);
 
     const autoSimpleName =
       effectiveProcesses.length > 0 && effectiveDomains.length > 0
         ? `${effectiveProcesses[0]} (${effectiveDomains.join(', ')})`
-        : simpleTargetValue.trim();
+        : simpleTargetType === 'site' && normalizedSiteTarget.primaryDomain
+          ? normalizedSiteTarget.primaryDomain
+          : simpleTargetValue.trim();
 
     const effectiveName = isSimpleSubmit
       ? ruleName.trim() || autoSimpleName
@@ -649,6 +711,162 @@ export const RulesView: React.FC<RulesViewProps> = ({
         </div>
       </div>
 
+      {/* 1-Click Protection Packs & Detected PC Apps (Simple mode) */}
+      {experienceMode === 'simple' && (
+        <>
+          <div className="tf-card space-y-4 p-5">
+            <div>
+              <h3 className="text-sm font-bold text-tf-primary">
+                {t('rules.simple.packs_title')}
+              </h3>
+              <p className="text-xs text-tf-secondary">
+                {t('rules.simple.packs_subtitle')}
+              </p>
+            </div>
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+              {UI_CONFIG.SIMPLE_PROTECTION_PACKS.map((pack) => {
+                const existing = rules.find((r) => r.id === pack.id);
+                const active = Boolean(existing?.enabled);
+                return (
+                  <div
+                    key={pack.id}
+                    className={`tf-surface-alt flex items-start justify-between gap-3 p-4 ${
+                      active ? 'border-tf-green/50 bg-tf-green/5' : ''
+                    }`}
+                  >
+                    <div className="space-y-1">
+                      <div className="text-xs font-bold text-tf-primary">
+                        {t(pack.titleKey)}
+                      </div>
+                      <p className="text-[11px] leading-relaxed text-tf-secondary">
+                        {t(pack.descKey)}
+                      </p>
+                    </div>
+                    <input
+                      id={`${formId}-pack-${pack.id}`}
+                      type="checkbox"
+                      aria-label={t(pack.titleKey)}
+                      checked={active}
+                      onChange={() => handleToggleProtectionPack(pack)}
+                      className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-tf-accent"
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="tf-card space-y-4 p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-bold text-tf-primary">
+                  {t('rules.simple.detected_apps_title')}
+                </h3>
+                <p className="text-xs text-tf-secondary">
+                  {t('rules.simple.detected_apps_subtitle')}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={loadingApps}
+                onClick={() => {
+                  void fetchSystemAppsList();
+                }}
+                className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan disabled:opacity-60"
+              >
+                <FolderSearch className="h-3.5 w-3.5" />
+                {loadingApps
+                  ? t('rules.modal.add.pick_app_loading')
+                  : t('rules.simple.detected_apps_load')}
+              </button>
+            </div>
+
+            {detectedAppsLoaded && (
+              <>
+                <input
+                  id="simple-detected-apps-search"
+                  type="text"
+                  value={detectedAppSearch}
+                  onChange={(e) => setDetectedAppSearch(e.target.value)}
+                  placeholder={t('rules.simple.detected_apps_search')}
+                  aria-label={t('rules.simple.detected_apps_search')}
+                  className="tf-input w-full px-3 py-1.5 text-xs"
+                />
+                {systemApps.length === 0 ? (
+                  <p className="py-3 text-center text-xs text-tf-secondary">
+                    {t('rules.modal.add.pick_app_empty')}
+                  </p>
+                ) : (
+                  <div className="grid max-h-64 grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
+                    {systemApps
+                      .filter((app) =>
+                        !detectedAppSearch.trim()
+                          ? true
+                          : app.name
+                              .toLowerCase()
+                              .includes(detectedAppSearch.trim().toLowerCase())
+                      )
+                      .slice(0, 24)
+                      .map((app) => (
+                        <div
+                          key={`${app.name}-${app.executablePath}`}
+                          className="tf-surface-alt flex flex-wrap items-center justify-between gap-2 p-2.5 text-xs"
+                        >
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="truncate font-semibold text-tf-primary">
+                              {app.name}
+                            </span>
+                            <span
+                              className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                                app.running
+                                  ? 'bg-tf-green/20 text-tf-green'
+                                  : 'bg-tf-surface text-tf-secondary'
+                              }`}
+                            >
+                              {app.running
+                                ? t('rules.modal.add.pick_app_running')
+                                : t('rules.modal.add.pick_app_installed')}
+                            </span>
+                          </div>
+                          <div className="flex shrink-0 items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleSetDetectedAppAction(app, 'proxy')
+                              }
+                              className="rounded bg-tf-accent/20 px-2 py-1 text-[10px] font-bold text-tf-accent hover:bg-tf-accent/30"
+                            >
+                              {t('connections.simple.route_proxy')}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleSetDetectedAppAction(app, 'direct')
+                              }
+                              className="rounded bg-tf-green/20 px-2 py-1 text-[10px] font-bold text-tf-green hover:bg-tf-green/30"
+                            >
+                              {t('connections.simple.route_direct')}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleSetDetectedAppAction(app, 'block')
+                              }
+                              className="rounded bg-tf-red/20 px-2 py-1 text-[10px] font-bold text-tf-red hover:bg-tf-red/30"
+                            >
+                              {t('connections.simple.route_blocked')}
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </>
+      )}
+
       {/* Live Rule Simulator (Expert Mode) */}
       {experienceMode === 'expert' && (
         <form onSubmit={handleRunSimulator} className="tf-card space-y-3 p-4">
@@ -771,21 +989,23 @@ export const RulesView: React.FC<RulesViewProps> = ({
                       <button
                         type="button"
                         onClick={() => openEditRuleModal(rule)}
-                        className="rounded p-1 text-tf-secondary hover:text-tf-accent"
+                        className="rounded p-1.5 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-accent"
                         title={t('rules.table.controls.edit')}
                         aria-label={`${t('rules.table.controls.edit')}: ${rule.name}`}
                       >
                         <Edit3 className="h-3.5 w-3.5" />
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => onRemoveRule(rule.id)}
-                        className="rounded p-1 text-tf-secondary hover:text-tf-red"
+                      <ConfirmDeleteButton
+                        armed={armedDeleteRuleId === rule.id}
                         title={t('rules.table.controls.delete')}
-                        aria-label={`${t('rules.table.controls.delete')}: ${rule.name}`}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
+                        ariaLabel={`${t('rules.table.controls.delete')}: ${rule.name}`}
+                        onArm={() => setArmedDeleteRuleId(rule.id)}
+                        onConfirm={() => {
+                          setArmedDeleteRuleId(null);
+                          onRemoveRule(rule.id);
+                        }}
+                        onCancel={() => setArmedDeleteRuleId(null)}
+                      />
                     </div>
                   </div>
                 );
@@ -904,20 +1124,23 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         <button
                           type="button"
                           onClick={() => openEditRuleModal(rule)}
-                          className="rounded p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-accent"
+                          className="rounded p-1.5 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-accent"
                           title={t('rules.table.controls.edit')}
                           aria-label={`${t('rules.table.controls.edit')}: ${rule.name}`}
                         >
                           <Edit3 className="h-3.5 w-3.5" />
                         </button>
-                        <button
-                          onClick={() => onRemoveRule(rule.id)}
-                          className="rounded p-1 text-tf-secondary hover:text-tf-red"
+                        <ConfirmDeleteButton
+                          armed={armedDeleteRuleId === rule.id}
                           title={t('rules.table.controls.delete')}
-                          aria-label={`${t('rules.table.controls.delete')}: ${rule.name}`}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                          ariaLabel={`${t('rules.table.controls.delete')}: ${rule.name}`}
+                          onArm={() => setArmedDeleteRuleId(rule.id)}
+                          onConfirm={() => {
+                            setArmedDeleteRuleId(null);
+                            onRemoveRule(rule.id);
+                          }}
+                          onCancel={() => setArmedDeleteRuleId(null)}
+                        />
                       </div>
                     </td>
                   </tr>
@@ -1023,6 +1246,17 @@ export const RulesView: React.FC<RulesViewProps> = ({
                     }
                     className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
                   />
+                  {simpleTargetType === 'site' &&
+                    (() => {
+                      const preview = normalizeDomainPatterns(simpleTargetValue);
+                      return preview.normalizedFromUrl && preview.primaryDomain ? (
+                        <p className="mt-1 text-[11px] font-semibold text-tf-green">
+                          {t('rules.simple.url_preview', {
+                            domain: preview.primaryDomain
+                          })}
+                        </p>
+                      ) : null;
+                    })()}
                   {simpleTargetType === 'app' && showAppPicker && (
                     <div className="mt-2 max-h-40 overflow-y-auto rounded-tf-md border border-tf-border bg-tf-surface-alt p-2 text-xs">
                       {loadingApps ? (
@@ -1078,6 +1312,18 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         placeholder={t('rules.simple.optional_site_placeholder')}
                         className="tf-input mt-1 w-full px-3 py-1.5 text-sm font-mono"
                       />
+                      {(() => {
+                        const preview = normalizeDomainPatterns(
+                          simpleOptionalDomains
+                        );
+                        return preview.normalizedFromUrl && preview.primaryDomain ? (
+                          <p className="mt-1 text-[11px] font-semibold text-tf-green">
+                            {t('rules.simple.url_preview', {
+                              domain: preview.primaryDomain
+                            })}
+                          </p>
+                        ) : null;
+                      })()}
                       <p className="mt-1 text-[11px] text-tf-secondary">
                         {t('rules.simple.optional_site_hint')}
                       </p>

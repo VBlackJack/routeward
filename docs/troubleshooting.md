@@ -2,6 +2,15 @@
 
 # Troubleshooting
 
+## 0. Quick Recovery in the Desktop App (Simple Mode)
+
+If an app or website stops loading while protection is active:
+
+- **Unblock in 1 click**: on the **Home** tab, click **App not working?** to list the latest blocked or failed connections and allow the affected app or website **Directly**.
+- **Pause briefly without forgetting**: use **Pause 15m** or **Pause 1h** on the **Home** tab; protection resumes automatically when the timer ends.
+- **Proxy outage alert**: if the Kill-Switch blocks traffic because your upstream proxy is unreachable, an alert banner offers 1-click **Pause 15m** or **Check Proxy**.
+- **Restore a clean baseline**: in **Settings**, click **Restore Default Settings**. RouteWard backs up your current profile automatically before resetting.
+
 ## 1. Windows Firewall and Reflected Inbound Packets (`TCP 10810`)
 
 **Symptom**:

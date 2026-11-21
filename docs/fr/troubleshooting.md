@@ -2,6 +2,15 @@
 
 # Dépannage (Troubleshooting)
 
+## 0. Dépannage Rapide dans l'Application Bureau (Mode Simple)
+
+Si une application ou un site web ne charge plus lorsque la protection est active :
+
+- **Débloquer en 1 clic** : depuis l'onglet **Accueil**, cliquez sur **Une app ne marche plus ?** pour voir les dernières connexions bloquées ou en erreur et autoriser l'application ou le site en **Direct**.
+- **Mettre en pause temporairement** : utilisez **Pause 15 min** ou **Pause 1 h** depuis **Accueil** ; la protection se réactive automatiquement à la fin du délai.
+- **Alerte coupure proxy** : si le Kill-Switch bloque Internet parce que votre proxy ne répond plus, une bannière propose directement **Pause 15 min** ou **Changer de proxy**.
+- **Revenir à une base saine** : dans **Réglages**, cliquez sur **Rétablir les réglages par défaut**. RouteWard sauvegarde automatiquement votre profil actuel avant de réinitialiser.
+
 ## 1. Pare-feu Windows et Paquets Réfléchis Entrants (`TCP 10810`)
 
 **Symptôme** :

@@ -3,6 +3,10 @@
     "titlebar": {
       "close": "Close"
     },
+    "confirm_delete": {
+      "confirm": "Confirm",
+      "cancel": "Cancel"
+    },
     "launcher": {
       "button": "Run App via Proxy",
       "modal": {
@@ -34,12 +38,22 @@
     "daemon_banner": {
       "disconnected_title": "Privileged RouteWard Daemon Disconnected",
       "disconnected_desc": "The desktop bridge cannot reach the background daemon (start 'routeward daemon' as Administrator or root). Automatic reconnection is active.",
+      "simple_disconnected_title": "Protection Service Stopped",
+      "simple_disconnected_desc": "Start the service in one click to turn on filtering and protection for your apps.",
+      "simple_disconnected_non_windows": "The background service is not running yet. Start RouteWard as administrator (root) to turn on protection.",
       "reconnecting_badge": "Auto-Reconnecting",
       "retry_button": "Retry Now",
       "start_button": "Start Service",
       "starting_button": "Starting...",
       "not_elevated_title": "Daemon Running Without Elevated Privileges",
       "not_elevated_desc": "The connected daemon process is not running with Administrator or root privileges. Kernel/OS packet interception requires elevation."
+    },
+    "outage_banner": {
+      "title": "Your proxy stopped responding - Internet is blocked for safety",
+      "desc": "Kill-Switch is preventing your real IP from leaking. Pause for 15 minutes or check your proxy.",
+      "pause_15m": "Pause 15m",
+      "check_proxy": "Check Proxy",
+      "dismiss": "Dismiss"
     },
     "header": {
       "brand": {
@@ -50,7 +64,9 @@
         "running": "Interceptor Active",
         "stopped": "Interceptor Paused",
         "start": "Enable Protection",
-        "pause": "Pause"
+        "pause": "Pause",
+        "start_protection": "Start Protection",
+        "starting_protection": "Starting..."
       },
       "status": {
         "protected": "Protected",
@@ -112,9 +128,11 @@
       },
       "proxy": {
         "added": "Upstream proxy added to profile",
+        "deleted": "Proxy server removed",
         "imported_uris": "Imported proxy servers from URI list",
         "copied_uri": "Proxy URI copied to clipboard",
         "tested": "Proxy health and latency check completed",
+        "unreachable": "Proxy did not respond - check address, port, and protocol",
         "required_for_rule": "Add and enable an external proxy server first to route traffic via proxy"
       },
       "connection": {
@@ -149,7 +167,9 @@
         "exported": "Profile exported to JSON",
         "saved_named": "Saved named profile",
         "switched": "Switched active profile",
+        "auto_switched": "Automatically switched profile for this network",
         "deleted": "Deleted profile",
+        "reset_done": "Default settings restored (previous profile backed up)",
         "error": "Profile operation failed"
       },
       "foxyproxy": {
@@ -166,7 +186,9 @@
         "not_root": "Root privileges required for transparent interception",
         "nft_missing": "nftables binary (nft) not found",
         "nft_failed": "Failed to configure nftables rules",
-        "start_failed": "Failed to change protection state"
+        "start_failed": "Failed to change protection state",
+        "paused_temporarily": "Protection paused temporarily ({{minutes}} min)",
+        "resumed_automatically": "Protection resumed automatically"
       },
       "daemon": {
         "started": "Privileged service started and connected",
@@ -225,6 +247,30 @@
       "configure_proxy_cta": "Set up a Proxy",
       "add_optional_proxy_cta": "Add External Proxy (Optional)",
       "test_proxy_cta": "Check Connection",
+      "testing_proxy": "Checking...",
+      "proxy_status_ok": "Working",
+      "proxy_status_failed": "Unreachable",
+      "proxy_status_untested": "Not checked",
+      "use_case_applied_badge": "Applied",
+      "checklist_title": "3 Steps to Get Ready",
+      "checklist_step_service": "Service running",
+      "checklist_step_protection": "Protection active",
+      "checklist_step_rules": "Apps or proxy configured",
+      "pause_15m": "Pause 15m",
+      "pause_60m": "Pause 1h",
+      "auto_resume_in": "Auto-resume in {{remaining}}",
+      "troubleshoot_cta": "App not working?",
+      "verify_protection_cta": "Verify My Protection",
+      "verify_panel_title": "Your Protection Check",
+      "verify_ip_label": "IP Address",
+      "verify_ip_masked": "Hidden via proxy",
+      "verify_ip_direct": "Direct connection (Filter Mode)",
+      "verify_ip_unreachable": "Proxy unreachable",
+      "verify_dns_label": "DNS Protection",
+      "verify_killswitch_label": "Kill-Switch",
+      "verify_status_ok": "Active",
+      "verify_status_off": "Off",
+      "verify_fix_all": "Enable All",
       "use_cases_title": "What do you want to do today?",
       "use_cases_subtitle": "Pick a ready-made scenario to configure your apps and leak protection in one click.",
       "uc_privacy_title": "Private Browsing",
@@ -412,10 +458,24 @@
       "title": "My Proxy Server",
       "subtitle": "Add your proxy server or subscription link and verify that it responds cleanly.",
       "add": "Add Proxy",
+      "paste_link_button": "Paste Proxy Link",
       "empty": "No external proxy configured yet. You can still filter and block apps directly, or add an upstream proxy server above.",
       "show_advanced_options": "Show protocol options (UDP / TLS)",
       "hide_advanced_options": "Hide protocol options",
-      "active_badge": "Primary"
+      "active_badge": "Primary",
+      "status_ok": "Working",
+      "status_untested": "Not checked",
+      "test_connection": "Check Connection",
+      "in_use_warning": "Used by {{count}} rule(s)",
+      "failover_title": "Automatic Backup Proxy Switch",
+      "failover_desc": "If your primary proxy stops responding, RouteWard automatically switches to your other active proxies.",
+      "failover_chain_name": "Automatic Backup Proxy",
+      "failover_enabled": "On",
+      "failover_disabled": "Off",
+      "detect_button": "Detect Existing Proxy",
+      "detecting": "Scanning...",
+      "detect_empty": "No local or system proxy was detected on this computer.",
+      "detect_import": "Import"
     },
     "section": {
       "servers": {
@@ -463,11 +523,15 @@
       "add_proxy": {
         "title": "Configure Upstream Proxy",
         "edit_title": "Edit Upstream Proxy",
+        "quick_paste_label": "Tip: paste a full proxy link directly (optional)",
+        "quick_paste_placeholder": "socks5://user:pass@proxy.example.com:1080#MyProxy",
+        "quick_paste_applied": "Fields auto-filled from your proxy link",
         "name_label": "Display Name",
         "protocol_label": "Protocol",
         "host_label": "Server Host / IP",
         "host_placeholder": "proxy.example.com",
         "port_label": "Port",
+        "port_error": "Port must be a number between 1 and 65535",
         "username_label": "Username (Optional)",
         "password_label": "Password (Optional)",
         "password_unchanged_placeholder": "Unchanged (stored in daemon)",
@@ -514,6 +578,7 @@
       "target_app_placeholder": "spotify.exe",
       "target_site_label": "Website or domain (e.g. *.example.com)",
       "target_site_placeholder": "*.example.com",
+      "url_preview": "Will match {{domain}} and all its subdomains",
       "quick_edge_chip": "Edge (msedge.exe)",
       "optional_site_label": "Only for these domains (Optional, e.g. meshcore.net, *.meshcore.net)",
       "optional_site_placeholder": "meshcore.net, *.meshcore.net (leave blank for all sites)",
@@ -522,7 +587,19 @@
       "optional_app_placeholder": "msedge.exe (leave blank for all apps)",
       "action_label": "How should it connect?",
       "show_advanced_options": "Show advanced rule fields (priority, CIDR, ports)",
-      "hide_advanced_options": "Back to simple form"
+      "hide_advanced_options": "Back to simple form",
+      "detected_apps_title": "Apps on This Computer",
+      "detected_apps_subtitle": "Pick any running or installed app without typing executable names.",
+      "detected_apps_load": "Scan My Apps",
+      "detected_apps_search": "Search an app...",
+      "packs_title": "1-Click Protection Packs",
+      "packs_subtitle": "Works even without a proxy: turn these protections on or off in one click.",
+      "pack_ads_title": "Ads & Trackers",
+      "pack_ads_desc": "Blocks common ad networks and tracking domains.",
+      "pack_telemetry_title": "OS & App Telemetry",
+      "pack_telemetry_desc": "Blocks diagnostic telemetry and background crash reporters.",
+      "pack_social_title": "Focus Mode (Social Media)",
+      "pack_social_desc": "Temporarily blocks TikTok, Instagram, X, Facebook, and Reddit."
     },
     "header": {
       "title": "Process & Destination Routing Rules",
@@ -760,11 +837,11 @@
     "proxy": {
       "not_found": "Specified proxy identifier was not found",
       "chain_empty": "Proxy chain must contain at least one upstream hop",
-      "handshake_failed": "Upstream proxy protocol handshake failed",
-      "connection_timeout": "Timed out while connecting to upstream proxy",
-      "auth_rejected": "Upstream proxy rejected authentication credentials",
+      "handshake_failed": "Proxy handshake failed (check SOCKS5 / HTTP protocol, address, and port)",
+      "connection_timeout": "Timed out: proxy did not respond (check address, port, and Internet access)",
+      "auth_rejected": "Username or password was rejected by the proxy server",
       "udp_not_supported": "Upstream proxy does not support SOCKS5 UDP ASSOCIATE",
-      "invalid_uri": "Invalid proxy URI format"
+      "invalid_uri": "Invalid proxy link format (expected: socks5://, http://, or https://host:port)"
     },
     "rule": {
       "blocked_by_policy": "Connection blocked by routing policy rule"
@@ -851,7 +928,21 @@
       "step2_no_proxy_desc": "RouteWard does not embed a built-in proxy server. Continue without a URI to filter trackers and local rules directly, or paste your own external SOCKS5/HTTP/HTTPS proxy URI below.",
       "step2_paste_uri": "Or paste a connection link (socks5://, http://, https:// or Base64 subscription):",
       "step2_uri_placeholder": "socks5://user:pass@proxy.example.com:1080#MyExternalProxy",
+      "step2_tab_link": "Paste a link",
+      "step2_tab_manual": "Enter host & port",
+      "step2_manual_name": "Proxy name (optional)",
+      "step2_manual_host": "Server address (host or IP)",
+      "step2_manual_port": "Port",
+      "step2_manual_protocol": "Protocol",
+      "step2_manual_user": "Username (optional)",
+      "step2_manual_pass": "Password (optional)",
+      "step2_test_button": "Test Connection",
+      "step2_test_ok": "Connection succeeded ({{ms}} ms)",
+      "step2_test_failed": "Could not reach this proxy. Check the address, port, and protocol.",
       "step3_title": "3. Preferred Interface Experience",
+      "step3_summary_title": "Summary of your setup",
+      "step3_summary_with_proxy": "Your goal will be applied using your external proxy.",
+      "step3_summary_direct": "Direct Filter Mode: tracker blocking and local rules without an external proxy.",
       "step3_simple_title": "Simple Mode (Recommended for most users)",
       "step3_simple_desc": "Plain-language explanations, visual app cards, and a reassuring protection summary.",
       "step3_expert_title": "Expert Mode (Linux / Windows SysAdmin)",
@@ -941,7 +1032,15 @@
       "launcher_title": "Launch One Program via Proxy",
       "launcher_desc": "Start an executable with ALL_PROXY and HTTPS_PROXY pre-configured.",
       "profile_title": "Profile Backup (JSON)",
-      "profile_desc": "Import or export all your proxies, rules, and preferences."
+      "profile_desc": "Import or export all your proxies, rules, and preferences.",
+      "advanced_tools_title": "Advanced Tools & System Integration",
+      "advanced_tools_desc": "Windows system proxy, PAC script, targeted app launcher, and JSON backup.",
+      "advanced_tools_show": "Show",
+      "advanced_tools_hide": "Hide",
+      "reset_title": "Restore Default Settings",
+      "reset_desc": "Restores a clean baseline if a rule breaks an app or website. Your current profile is automatically backed up first.",
+      "reset_button": "Reset Defaults",
+      "reset_confirm": "Confirm Reset"
     },
     "profiles": {
       "title": "Named Profiles (Quick Switch)",
@@ -954,7 +1053,12 @@
       "proxies_count_one": "{{count}} proxy",
       "proxies_count_other": "{{count}} proxies",
       "rules_count_one": "{{count}} rule",
-      "rules_count_other": "{{count}} rules"
+      "rules_count_other": "{{count}} rules",
+      "auto_network_title": "Auto-Switch by Network (Wi-Fi)",
+      "auto_network_current": "Current network: {{name}}",
+      "auto_network_unknown": "No Wi-Fi network name detected right now",
+      "auto_network_assign": "Link",
+      "auto_network_remove": "Remove"
     },
     "diagnostics": {
       "title": "Technical Diagnostics",
@@ -970,6 +1074,16 @@
       "kb": "KB",
       "mb": "MB",
       "gb": "GB"
+    }
+  },
+  "troubleshoot": {
+    "modal": {
+      "title": "App or website not working?",
+      "subtitle": "Here are the latest blocked or failed connections. Allow an app Directly in 1 click to unblock it immediately.",
+      "empty": "No blocked or failed connections were detected recently.",
+      "allow_app_direct": "Allow App Directly",
+      "allow_site_direct": "Allow This Site",
+      "close": "Close"
     }
   },
   "tray": {

@@ -23,15 +23,18 @@ import { ModalContainer } from './ModalContainer';
 
 interface ProcessLauncherModalProps {
   relayEndpoint: string;
+  relayHttpEndpoint?: string;
   onLaunch: (executable: string, args: string[]) => Promise<void>;
   onClose: () => void;
 }
 
 export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
   relayEndpoint,
+  relayHttpEndpoint,
   onLaunch,
   onClose
 }) => {
+  const effectiveHttpEndpoint = relayHttpEndpoint || relayEndpoint;
   const { t } = useTranslation();
   const titleId = useId();
   const exeInputId = useId();
@@ -151,7 +154,7 @@ export const ProcessLauncherModal: React.FC<ProcessLauncherModalProps> = ({
             </div>
             <div>
               HTTP_PROXY / HTTPS_PROXY ={' '}
-              <span className="text-tf-cyan">http://{relayEndpoint}</span>
+              <span className="text-tf-cyan">http://{effectiveHttpEndpoint}</span>
             </div>
           </div>
 

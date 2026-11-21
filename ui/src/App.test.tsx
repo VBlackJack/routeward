@@ -37,6 +37,21 @@ describe('App navigation and accessible modals', () => {
     window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.EXPERIENCE_MODE, 'simple');
     window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED, 'true');
     vi.spyOn(routewardClient, 'startRealtimeStream').mockImplementation(() => {});
+    vi.spyOn(routewardClient, 'getPacStatus').mockImplementation(
+      () => new Promise(() => {})
+    );
+    vi.spyOn(routewardClient, 'getAutostartStatus').mockImplementation(
+      () => new Promise(() => {})
+    );
+    vi.spyOn(routewardClient, 'getSystemProxyStatus').mockImplementation(
+      () => new Promise(() => {})
+    );
+    vi.spyOn(routewardClient, 'listNamedProfiles').mockImplementation(
+      () => new Promise(() => {})
+    );
+    vi.spyOn(routewardClient, 'getCurrentNetworkInfo').mockImplementation(
+      () => new Promise(() => {})
+    );
   });
 
   afterEach(() => {
@@ -235,5 +250,49 @@ describe('App navigation and accessible modals', () => {
     expect(screen.queryByText(i18n.t('app.toast.proxy.added'))).not.toBeInTheDocument();
     resolveUpsert(routewardClient.getProfile());
     expect(await screen.findByText(i18n.t('app.toast.proxy.added'))).toBeInTheDocument();
+  });
+
+  it('starts the service and enables protection in one click from Home when disconnected on Windows', async () => {
+    window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.LOCALE, 'en');
+    await i18n.changeLanguage('en');
+    vi.spyOn(routewardClient, 'getDiagnostics').mockReturnValue({
+      daemonConnected: false,
+      running: false,
+      osName: 'WINDOWS',
+      interceptionMode: 'hybrid',
+      elevatedPrivileges: false,
+      relayTcpEndpoint: '127.0.0.1:10808',
+      relayHttpEndpoint: '127.0.0.1:10809',
+      dnsEndpoint: '127.0.0.1:5353',
+      fakeIpCidr: '198.18.0.0/15',
+      activeLocale: 'en'
+    });
+    const startDaemonSpy = vi
+      .spyOn(routewardClient, 'startDaemon')
+      .mockResolvedValue({ connected: true });
+    const toggleEngineSpy = vi
+      .spyOn(routewardClient, 'toggleEngine')
+      .mockResolvedValue({
+        daemonConnected: true,
+        running: true,
+        osName: 'WINDOWS',
+        interceptionMode: 'hybrid',
+        elevatedPrivileges: true,
+        relayTcpEndpoint: '127.0.0.1:10808',
+        relayHttpEndpoint: '127.0.0.1:10809',
+        dnsEndpoint: '127.0.0.1:5353',
+        fakeIpCidr: '198.18.0.0/15',
+        activeLocale: 'en'
+      });
+
+    renderApp();
+
+    const startProtectionBtn = screen.getByRole('button', {
+      name: i18n.t('app.header.engine.start_protection')
+    });
+    fireEvent.click(startProtectionBtn);
+
+    await waitFor(() => expect(startDaemonSpy).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(toggleEngineSpy).toHaveBeenCalledWith(true));
   });
 });

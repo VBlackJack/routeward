@@ -43,10 +43,12 @@ for (const entry of expired) {
 
 let rawReport;
 try {
-  rawReport = execFileSync('npm', ['audit', '--json'], {
+  const isWindows = process.platform === 'win32';
+  const command = isWindows ? process.env.ComSpec || 'cmd.exe' : 'npm';
+  const args = isWindows ? ['/d', '/s', '/c', 'npm audit --json'] : ['audit', '--json'];
+  rawReport = execFileSync(command, args, {
     cwd: uiRoot,
     encoding: 'utf8',
-    shell: process.platform === 'win32',
     stdio: ['ignore', 'pipe', 'inherit'],
   });
 } catch (error) {

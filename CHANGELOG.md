@@ -5,8 +5,19 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+### Added
+- Desktop UI (Simple mode): added 1-click **Start Protection** on Home when the Windows service is stopped, a 3-step readiness checklist, temporary pause buttons (`15m` / `1h`) with automatic resume countdown, a 1-click **Verify My Protection** check, a guided **"App not working?"** troubleshooter to unblock failed apps or sites in Direct mode, and a dismissible proxy outage alert banner.
+- Desktop UI (My Proxy & Wizard): exposed proxy link pasting directly in Simple mode (both button and quick-paste auto-fill in the Add Proxy form), added manual host/port input and live connection testing in the 3-step wizard, added a 1-click **Automatic Backup Proxy Switch** (failover) toggle when two or more proxies are active, and added **Detect Existing Proxy** (`/api/system/detect-proxies`) to discover Windows registry, environment, Tor, or local SSH/HTTP proxies.
+- Desktop UI (My Apps & Settings): added automatic URL normalization for website rules (pasting `https://www.example.com/login` expands to `example.com, *.example.com`), a searchable running/installed PC apps panel, 1-click protection packs (Ads & Trackers, OS & App Telemetry, Focus Mode), 2-step inline delete confirmations (with in-use warnings on proxies), a **Restore Default Settings** safety reset with automatic profile backup, an expandable **Advanced Tools** accordion in Simple mode, and Wi-Fi network-based automatic profile switching (`/api/system/network-info`).
+
 ### Changed
 - Windows: the portable ZIP bundles WinDivert 2.2.2 (unmodified `WinDivert.dll` and `WinDivert64.sys`, LGPLv3, with `THIRD_PARTY_NOTICES.txt` and the upstream license), so it intercepts traffic as soon as it is extracted. It also ships `fetch-windivert.ps1`.
+- Desktop UI: improved keyboard `:focus-visible` outlines, icon button hitboxes, actionable proxy error messages, and inline port validation (`1-65535`).
+
+### Fixed
+- Desktop UI: `ProcessLauncherModal` now displays the actual HTTP relay port (`relayHttpEndpoint`) for `HTTP_PROXY` / `HTTPS_PROXY` instead of the SOCKS5 port.
+- Desktop UI: the Quick Setup Wizard `Gaming` goal now creates the gaming direct rule consistently with the Home scenario card.
+- Tooling: `ui/scripts/audit.mjs` no longer emits Node `DEP0190` on Windows, and `App.test.tsx` no longer emits React `act(...)` warnings.
 
 ## [v2026.1120.01] - 2026-11-20
 

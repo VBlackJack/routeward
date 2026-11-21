@@ -29,26 +29,32 @@ import {
   Link2,
   Lock,
   Plus,
+  Radar,
   Server,
-  Trash2,
   X,
   Zap
 } from 'lucide-react';
 import { ModalContainer } from './ModalContainer';
+import { ConfirmDeleteButton } from './ConfirmDeleteButton';
 import { ExperienceMode } from './QuickSetupWizardModal';
 import { UI_CONFIG } from '../config/constants';
 import { generateClientId, routewardClient } from '../services/ipc';
+import { parseSingleProxyUri } from '../services/uri';
 import {
   ChainStrategy,
+  DetectedProxyCandidate,
   ProxyChain,
   ProxyNode,
-  ProxyProtocol
+  ProxyProtocol,
+  RoutingRule
 } from '../types/routeward';
 
 interface ProxiesViewProps {
   proxies: ProxyNode[];
   chains: ProxyChain[];
+  rules?: RoutingRule[];
   experienceMode?: ExperienceMode;
+  onDetectExistingProxies?: () => Promise<DetectedProxyCandidate[]>;
   onTestProxy: (id: string) => Promise<void>;
   onTestAllProxies: () => Promise<void>;
   onAddProxy: (node: ProxyNode) => void;
@@ -71,7 +77,9 @@ const STRATEGIES: ChainStrategy[] = [
 export const ProxiesView: React.FC<ProxiesViewProps> = ({
   proxies,
   chains,
+  rules = [],
   experienceMode = 'expert',
+  onDetectExistingProxies,
   onTestProxy,
   onTestAllProxies,
   onAddProxy,
@@ -82,12 +90,39 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   onRemoveChain
 }) => {
   const { t } = useTranslation();
-  const primaryProxyId = proxies.find((p) => p.enabled)?.id ?? null;
+  const enabledProxies = proxies.filter((p) => p.enabled);
+  const primaryProxyId = enabledProxies[0]?.id ?? null;
+  const simpleFailoverChain = chains.find(
+    (c) =>
+      c.id === UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID ||
+      (c.enabled && c.strategy === 'failover')
+  );
+  const simpleFailoverEnabled = Boolean(simpleFailoverChain?.enabled);
+
+  const handleToggleSimpleFailover = () => {
+    if (simpleFailoverEnabled && simpleFailoverChain) {
+      onRemoveChain(simpleFailoverChain.id);
+      return;
+    }
+    if (enabledProxies.length < 2) return;
+    onAddChain({
+      id: UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID,
+      name: t('proxies.simple.failover_chain_name'),
+      strategy: 'failover',
+      proxyIds: enabledProxies.map((p) => p.id),
+      enabled: true
+    });
+  };
   const importTitleId = useId();
   const proxyTitleId = useId();
   const chainTitleId = useId();
   const formId = useId();
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [detectingProxies, setDetectingProxies] = useState(false);
+  const [detectedCandidates, setDetectedCandidates] = useState<
+    DetectedProxyCandidate[] | null
+  >(null);
+  const [armedDeleteId, setArmedDeleteId] = useState<string | null>(null);
   const [showAddProxy, setShowAddProxy] = useState(false);
   const [showImportUri, setShowImportUri] = useState(false);
   const [showAddChain, setShowAddChain] = useState(false);
@@ -97,10 +132,15 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [editingProxyId, setEditingProxyId] = useState<string | null>(null);
   const [existingHasPassword, setExistingHasPassword] = useState(false);
   const [replacingPassword, setReplacingPassword] = useState(true);
+  const [quickPasteText, setQuickPasteText] = useState('');
+  const [quickPasteApplied, setQuickPasteApplied] = useState(false);
   const [name, setName] = useState('');
   const [protocol, setProtocol] = useState<ProxyProtocol>('socks5');
   const [host, setHost] = useState('');
-  const [port, setPort] = useState<number>(UI_CONFIG.DEFAULT_PROXY_PORT);
+  const [portInput, setPortInput] = useState<string>(
+    String(UI_CONFIG.DEFAULT_PROXY_PORT)
+  );
+  const [portError, setPortError] = useState<string | null>(null);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [udpEnabled, setUdpEnabled] = useState(true);
@@ -116,20 +156,91 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     useState<ChainStrategy>('sequence');
   const [selectedHops, setSelectedHops] = useState<string[]>([]);
 
+  const handleDetectExisting = async () => {
+    if (detectingProxies) return;
+    setDetectingProxies(true);
+    try {
+      const detector =
+        onDetectExistingProxies ?? (() => routewardClient.detectExistingProxies());
+      const found = await detector();
+      setDetectedCandidates(found);
+    } finally {
+      setDetectingProxies(false);
+    }
+  };
+
+  const handleImportDetectedCandidate = (cand: DetectedProxyCandidate) => {
+    const effectiveTls = cand.protocol === 'https';
+    onAddProxy({
+      id: generateClientId('proxy'),
+      name: cand.name,
+      protocol: cand.protocol,
+      host: cand.host,
+      port: cand.port,
+      auth: null,
+      udpEnabled: cand.protocol === 'socks5',
+      tls: effectiveTls,
+      tlsSkipVerify: false,
+      sni: effectiveTls ? cand.host : null,
+      enabled: true,
+      lastLatencyMs: null,
+      exitIp: null
+    });
+    setDetectedCandidates((prev) =>
+      prev
+        ? prev.filter(
+            (item) =>
+              !(
+                item.protocol === cand.protocol &&
+                item.host === cand.host &&
+                item.port === cand.port
+              )
+          )
+        : null
+    );
+  };
+
   const handleSingleTest = async (id: string) => {
     setTestingId(id);
     await onTestProxy(id);
     setTestingId(null);
   };
 
+  const applyParsedUriToForm = (raw: string): boolean => {
+    const trimmed = raw.trim();
+    if (!trimmed.includes('://')) return false;
+    const parsed = parseSingleProxyUri(trimmed);
+    if (!parsed) return false;
+    setName((prev) => (prev.trim() ? prev : parsed.name));
+    setProtocol(parsed.protocol);
+    setHost(parsed.host);
+    setPortInput(String(parsed.port));
+    setPortError(null);
+    setUsername(parsed.auth?.username || '');
+    if (parsed.auth?.password) {
+      setReplacingPassword(true);
+      setPassword(parsed.auth.password);
+    } else if (!editingProxyId) {
+      setPassword('');
+    }
+    setUdpEnabled(parsed.udpEnabled);
+    setTls(parsed.tls);
+    setTlsSkipVerify(Boolean(parsed.tlsSkipVerify));
+    setQuickPasteApplied(true);
+    return true;
+  };
+
   const openNewProxyModal = () => {
     setEditingProxyId(null);
     setExistingHasPassword(false);
     setReplacingPassword(true);
+    setQuickPasteText('');
+    setQuickPasteApplied(false);
     setName('');
     setProtocol('socks5');
     setHost('');
-    setPort(UI_CONFIG.DEFAULT_PROXY_PORT);
+    setPortInput(String(UI_CONFIG.DEFAULT_PROXY_PORT));
+    setPortError(null);
     setUsername('');
     setPassword('');
     setUdpEnabled(true);
@@ -143,10 +254,13 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setEditingProxyId(proxy.id);
     setExistingHasPassword(hasPw);
     setReplacingPassword(!hasPw);
+    setQuickPasteText('');
+    setQuickPasteApplied(false);
     setName(proxy.name);
     setProtocol(proxy.protocol);
     setHost(proxy.host);
-    setPort(proxy.port);
+    setPortInput(String(proxy.port));
+    setPortError(null);
     setUsername(proxy.auth?.username || '');
     setPassword('');
     setUdpEnabled(proxy.udpEnabled);
@@ -158,6 +272,16 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const handleCreateProxy = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim() || !host.trim()) return;
+    const parsedPort = Number(portInput.trim());
+    if (
+      !Number.isInteger(parsedPort) ||
+      parsedPort < 1 ||
+      parsedPort > UI_CONFIG.MAX_PORT
+    ) {
+      setPortError(t('proxies.modal.add_proxy.port_error'));
+      return;
+    }
+    setPortError(null);
     const cleanUser = username.trim();
     const shouldSendNewPassword = replacingPassword && password.length > 0;
     const authPayload =
@@ -181,7 +305,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       name: name.trim(),
       protocol,
       host: host.trim(),
-      port,
+      port: parsedPort,
       auth: authPayload,
       udpEnabled: protocol === 'socks5' ? udpEnabled : false,
       tls: effectiveTls,
@@ -251,23 +375,37 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {experienceMode === 'expert' && (
-              <>
-                <button
-                  onClick={onTestAllProxies}
-                  className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-cyan hover:border-tf-cyan"
-                >
-                  <Activity className="h-3.5 w-3.5" />
-                  {t('proxies.section.servers.test_all')}
-                </button>
-                <button
-                  onClick={() => setShowImportUri(true)}
-                  className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-primary hover:border-tf-accent"
-                >
-                  <FileCode2 className="h-3.5 w-3.5 text-tf-accent" />
-                  {t('proxies.section.servers.import_uri')}
-                </button>
-              </>
+              <button
+                onClick={onTestAllProxies}
+                className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-cyan hover:border-tf-cyan"
+              >
+                <Activity className="h-3.5 w-3.5" />
+                {t('proxies.section.servers.test_all')}
+              </button>
             )}
+            <button
+              type="button"
+              disabled={detectingProxies}
+              onClick={() => {
+                void handleDetectExisting();
+              }}
+              className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-cyan hover:border-tf-cyan disabled:opacity-60"
+            >
+              <Radar className="h-3.5 w-3.5" />
+              {detectingProxies
+                ? t('proxies.simple.detecting')
+                : t('proxies.simple.detect_button')}
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowImportUri(true)}
+              className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-tf-primary hover:border-tf-accent"
+            >
+              <FileCode2 className="h-3.5 w-3.5 text-tf-accent" />
+              {experienceMode === 'simple'
+                ? t('proxies.simple.paste_link_button')
+                : t('proxies.section.servers.import_uri')}
+            </button>
             <button
               onClick={openNewProxyModal}
               className="tf-btn-accent flex items-center gap-1.5 px-3.5 py-1.5 text-xs"
@@ -288,6 +426,72 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             {t('proxies.external_explainer.desc')}
           </p>
         </div>
+
+        {detectedCandidates !== null && (
+          <div className="tf-card space-y-2.5 p-4 text-xs">
+            {detectedCandidates.length === 0 ? (
+              <p className="text-tf-secondary">
+                {t('proxies.simple.detect_empty')}
+              </p>
+            ) : (
+              detectedCandidates.map((cand) => (
+                <div
+                  key={`${cand.protocol}-${cand.host}-${cand.port}`}
+                  className="tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-3"
+                >
+                  <div>
+                    <div className="font-bold text-tf-primary">{cand.name}</div>
+                    <div className="font-mono text-[11px] text-tf-cyan">
+                      {cand.protocol.toUpperCase()} - {cand.host}:{cand.port}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleImportDetectedCandidate(cand)}
+                    className="tf-btn-accent px-3 py-1 text-xs"
+                  >
+                    {t('proxies.simple.detect_import')}
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {experienceMode === 'simple' && enabledProxies.length >= 2 && (
+          <div className="tf-card flex flex-wrap items-center justify-between gap-4 p-4">
+            <div className="flex items-start gap-3">
+              <Link2 className="mt-0.5 h-5 w-5 shrink-0 text-tf-cyan" />
+              <div>
+                <div className="flex items-center gap-2 text-xs font-bold text-tf-primary">
+                  <span>{t('proxies.simple.failover_title')}</span>
+                  <span
+                    className={`rounded-tf-sm px-2 py-0.5 text-[10px] font-bold ${
+                      simpleFailoverEnabled
+                        ? 'bg-tf-green/20 text-tf-green'
+                        : 'bg-tf-surface-alt text-tf-secondary'
+                    }`}
+                  >
+                    {simpleFailoverEnabled
+                      ? t('proxies.simple.failover_enabled')
+                      : t('proxies.simple.failover_disabled')}
+                  </span>
+                </div>
+                <p className="mt-0.5 text-[11px] text-tf-secondary">
+                  {t('proxies.simple.failover_desc')}
+                </p>
+              </div>
+            </div>
+            <input
+              id={`${formId}-simple-failover`}
+              type="checkbox"
+              aria-label={t('proxies.simple.failover_title')}
+              checked={simpleFailoverEnabled}
+              onChange={handleToggleSimpleFailover}
+              className="h-4 w-4 cursor-pointer accent-tf-accent"
+            />
+          </div>
+        )}
 
         {proxies.length === 0 ? (
           <div className="tf-card p-6 text-center text-xs text-tf-secondary">
@@ -323,17 +527,19 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 </div>
 
                 <div className="mt-3 flex flex-wrap gap-1.5 text-[10px]">
-                  <span
-                    className={`rounded px-2 py-0.5 font-semibold ${
-                      proxy.udpEnabled
-                        ? 'bg-tf-cyan/20 text-tf-cyan'
-                        : 'bg-tf-surface-alt text-tf-secondary'
-                    }`}
-                  >
-                    {proxy.udpEnabled
-                      ? t('proxies.card.badge.udp_ready')
-                      : t('proxies.card.badge.tcp_only')}
-                  </span>
+                  {experienceMode === 'expert' && (
+                    <span
+                      className={`rounded px-2 py-0.5 font-semibold ${
+                        proxy.udpEnabled
+                          ? 'bg-tf-cyan/20 text-tf-cyan'
+                          : 'bg-tf-surface-alt text-tf-secondary'
+                      }`}
+                    >
+                      {proxy.udpEnabled
+                        ? t('proxies.card.badge.udp_ready')
+                        : t('proxies.card.badge.tcp_only')}
+                    </span>
+                  )}
                   {proxy.tls && (
                     <span
                       className={`flex items-center gap-1 rounded px-2 py-0.5 font-semibold ${
@@ -360,11 +566,15 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   )}
                   {proxy.lastLatencyMs !== null ? (
                     <span className="rounded bg-tf-green/20 px-2 py-0.5 font-mono font-bold text-tf-green">
-                      {proxy.lastLatencyMs} ms
+                      {experienceMode === 'simple'
+                        ? `${t('proxies.simple.status_ok')} (${proxy.lastLatencyMs} ms)`
+                        : `${proxy.lastLatencyMs} ms`}
                     </span>
                   ) : (
                     <span className="rounded bg-tf-surface-alt px-2 py-0.5 text-tf-secondary">
-                      {t('proxies.card.badge.untested')}
+                      {experienceMode === 'simple'
+                        ? t('proxies.simple.status_untested')
+                        : t('proxies.card.badge.untested')}
                     </span>
                   )}
                 </div>
@@ -381,18 +591,20 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 <button
                   onClick={() => handleSingleTest(proxy.id)}
                   disabled={testingId === proxy.id}
-                  className="flex items-center gap-1 text-xs font-semibold text-tf-accent hover:underline"
+                  className="flex items-center gap-1 text-xs font-semibold text-tf-accent hover:underline disabled:opacity-60"
                 >
                   <Zap className="h-3.5 w-3.5" />
                   {testingId === proxy.id
                     ? t('proxies.card.action.testing')
-                    : t('proxies.card.action.test')}
+                    : experienceMode === 'simple'
+                      ? t('proxies.simple.test_connection')
+                      : t('proxies.card.action.test')}
                 </button>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5">
                   <button
                     type="button"
                     onClick={() => openEditProxyModal(proxy)}
-                    className="flex items-center gap-1 text-xs text-tf-secondary hover:text-tf-primary"
+                    className="flex items-center gap-1 rounded p-1.5 text-xs text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary"
                     title={t('proxies.card.action.edit')}
                     aria-label={t('proxies.card.action.edit')}
                   >
@@ -402,22 +614,34 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     <button
                       type="button"
                       onClick={() => handleCopyNodeUri(proxy)}
-                      className="flex items-center gap-1 text-xs text-tf-secondary hover:text-tf-primary"
+                      className="flex items-center gap-1 rounded p-1.5 text-xs text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary"
                       title={t('proxies.card.action.copy_uri')}
                       aria-label={t('proxies.card.action.copy_uri')}
                     >
                       <Copy className="h-3.5 w-3.5" />
                     </button>
                   )}
-                  <button
-                    type="button"
-                    onClick={() => onRemoveProxy(proxy.id)}
-                    className="text-xs text-tf-secondary hover:text-tf-red"
+                  <ConfirmDeleteButton
+                    armed={armedDeleteId === `proxy:${proxy.id}`}
                     title={t('proxies.card.action.delete')}
-                    aria-label={t('proxies.card.action.delete')}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
+                    ariaLabel={t('proxies.card.action.delete')}
+                    warningText={(() => {
+                      const refCount = rules.filter(
+                        (r) =>
+                          r.action.type === 'proxy' &&
+                          r.action.targetId === proxy.id
+                      ).length;
+                      return refCount > 0
+                        ? t('proxies.simple.in_use_warning', { count: refCount })
+                        : undefined;
+                    })()}
+                    onArm={() => setArmedDeleteId(`proxy:${proxy.id}`)}
+                    onConfirm={() => {
+                      setArmedDeleteId(null);
+                      onRemoveProxy(proxy.id);
+                    }}
+                    onCancel={() => setArmedDeleteId(null)}
+                  />
                 </div>
               </div>
             </div>
@@ -470,15 +694,17 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                         count: chain.proxyIds.length
                       })}
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => onRemoveChain(chain.id)}
+                    <ConfirmDeleteButton
+                      armed={armedDeleteId === `chain:${chain.id}`}
                       title={t('proxies.section.chains.delete')}
-                      aria-label={t('proxies.section.chains.delete')}
-                      className="text-tf-secondary hover:text-tf-red"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
+                      ariaLabel={t('proxies.section.chains.delete')}
+                      onArm={() => setArmedDeleteId(`chain:${chain.id}`)}
+                      onConfirm={() => {
+                        setArmedDeleteId(null);
+                        onRemoveChain(chain.id);
+                      }}
+                      onCancel={() => setArmedDeleteId(null)}
+                    />
                   </div>
                 </div>
 
@@ -570,6 +796,35 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 ? t('proxies.modal.add_proxy.edit_title')
                 : t('proxies.modal.add_proxy.title')}
             </h3>
+            {!editingProxyId && (
+              <div className="rounded-tf-md border border-tf-border bg-tf-surface-alt p-3">
+                <label
+                  htmlFor={`${formId}-quick-uri`}
+                  className="block text-[11px] font-semibold text-tf-cyan"
+                >
+                  {t('proxies.modal.add_proxy.quick_paste_label')}
+                </label>
+                <input
+                  id={`${formId}-quick-uri`}
+                  type="text"
+                  value={quickPasteText}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setQuickPasteText(val);
+                    if (applyParsedUriToForm(val)) {
+                      setQuickPasteText('');
+                    }
+                  }}
+                  placeholder={t('proxies.modal.add_proxy.quick_paste_placeholder')}
+                  className="tf-input mt-1 w-full px-2.5 py-1.5 font-mono text-xs"
+                />
+                {quickPasteApplied && (
+                  <p className="mt-1 text-[11px] font-semibold text-tf-green">
+                    {t('proxies.modal.add_proxy.quick_paste_applied')}
+                  </p>
+                )}
+              </div>
+            )}
             <div>
               <label htmlFor={`${formId}-f1`} className="block text-xs text-tf-secondary">
                 {t('proxies.modal.add_proxy.name_label')}
@@ -607,7 +862,13 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   type="text"
                   required
                   value={host}
-                  onChange={(e) => setHost(e.target.value)}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (!editingProxyId && val.includes('://') && applyParsedUriToForm(val)) {
+                      return;
+                    }
+                    setHost(val);
+                  }}
                   placeholder={t('proxies.modal.add_proxy.host_placeholder')}
                   className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
                 />
@@ -618,13 +879,23 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 </label>
                 <input id={`${formId}-f4`}
                   type="number"
+                  min={1}
+                  max={UI_CONFIG.MAX_PORT}
                   required
-                  value={port}
-                  onChange={(e) => setPort(Number(e.target.value))}
+                  value={portInput}
+                  onChange={(e) => {
+                    setPortInput(e.target.value);
+                    setPortError(null);
+                  }}
                   className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
                 />
               </div>
             </div>
+            {portError && (
+              <p role="alert" className="text-xs font-semibold text-tf-red">
+                {portError}
+              </p>
+            )}
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label htmlFor={`${formId}-f5`} className="block text-xs text-tf-secondary">

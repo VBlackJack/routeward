@@ -56,12 +56,19 @@ describe('ProcessLauncherModal', () => {
     render(
       <ProcessLauncherModal
         relayEndpoint="127.0.0.1:10808"
+        relayHttpEndpoint="127.0.0.1:10809"
         onLaunch={onLaunch}
         onClose={onClose}
       />
     );
     return { onLaunch, onClose };
   }
+
+  it('displays the distinct SOCKS5 and HTTP relay ports in the environment preview', () => {
+    renderModal();
+    expect(screen.getByText('socks5h://127.0.0.1:10808')).toBeInTheDocument();
+    expect(screen.getByText('http://127.0.0.1:10809')).toBeInTheDocument();
+  });
 
   it('offers a labelled multi-line arguments field with help text', () => {
     renderModal();

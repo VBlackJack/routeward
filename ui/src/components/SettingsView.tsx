@@ -29,14 +29,15 @@ import {
   Palette,
   Power,
   Rocket,
+  RotateCcw,
   Save,
   Server,
   Shield,
   ShieldAlert,
   ShieldCheck,
-  Trash2,
   Upload,
-  Wand2
+  Wand2,
+  Wifi
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { buildDefaultPacUrl } from '../config/constants';
@@ -53,6 +54,7 @@ import { DnsView } from './DnsView';
 import { HelpTooltip } from './HelpTooltip';
 import { LogsView } from './LogsView';
 import { ExperienceMode } from './QuickSetupWizardModal';
+import { ConfirmDeleteButton } from './ConfirmDeleteButton';
 
 interface SettingsViewProps {
   diagnostics: SystemDiagnostics;
@@ -87,6 +89,10 @@ interface SettingsViewProps {
   onSaveNamedProfile?: (name: string) => Promise<void>;
   onSwitchNamedProfile?: (profileId: string) => Promise<void>;
   onDeleteNamedProfile?: (profileId: string) => Promise<void>;
+  onResetToDefaults?: () => Promise<void>;
+  currentNetworkName?: string | null;
+  networkProfileRules?: Record<string, string>;
+  onSetNetworkProfileRule?: (networkName: string, profileId: string | null) => void;
 }
 
 type DiagnosticSubtab = 'overview' | 'dns' | 'logs';
@@ -123,13 +129,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onToggleAutostart,
   onSaveNamedProfile,
   onSwitchNamedProfile,
-  onDeleteNamedProfile
+  onDeleteNamedProfile,
+  onResetToDefaults,
+  currentNetworkName = null,
+  networkProfileRules = {},
+  onSetNetworkProfileRule
 }) => {
   const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [diagSubtab, setDiagSubtab] = useState<DiagnosticSubtab>('overview');
   const [showSimpleDiagnostics, setShowSimpleDiagnostics] = useState(false);
+  const [showSimpleAdvancedTools, setShowSimpleAdvancedTools] = useState(false);
+  const [armedDeleteProfileId, setArmedDeleteProfileId] = useState<string | null>(null);
+  const [armedResetDefaults, setArmedResetDefaults] = useState(false);
+  const [resettingDefaults, setResettingDefaults] = useState(false);
   const [newProfileName, setNewProfileName] = useState('');
+  const [selectedAutoProfileId, setSelectedAutoProfileId] = useState('');
 
   const allShieldsActive =
     securityPolicy.killSwitchEnabled &&
@@ -450,136 +465,37 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </p>
         </div>
 
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          {/* Windows System Proxy */}
-          <div className="tf-surface-alt flex items-center justify-between p-4">
-            <div>
-              <div className="text-xs font-semibold text-tf-primary">
-                {t('settings.system.system_proxy_label')}
-              </div>
-              <div className="mt-0.5 text-[11px] text-tf-secondary">
-                {t('app.system_proxy.tooltip')}
-              </div>
+        {/* Windows Logon Autostart (Always visible) */}
+        <div className="tf-surface-alt flex items-center justify-between gap-3 p-4">
+          <div>
+            <div className="text-xs font-semibold text-tf-primary">
+              {t('settings.system.autostart_title')}
             </div>
+            <div className="mt-0.5 text-[11px] text-tf-secondary">
+              {t('settings.system.autostart_desc')}
+            </div>
+          </div>
+          {onToggleAutostart && (
             <button
               type="button"
-              aria-pressed={systemProxyEnabled}
-              onClick={onToggleSystemProxy}
-              className={`rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
-                systemProxyEnabled
-                  ? 'border border-tf-cyan bg-tf-cyan/20 text-tf-cyan'
+              aria-pressed={autostartEnabled}
+              onClick={() => {
+                void onToggleAutostart();
+              }}
+              className={`flex shrink-0 items-center gap-1.5 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
+                autostartEnabled
+                  ? 'border border-tf-accent bg-tf-accent/20 text-tf-accent'
                   : 'tf-surface text-tf-secondary hover:text-tf-primary'
               }`}
             >
-              {systemProxyEnabled
-                ? t('app.system_proxy.active')
-                : t('app.system_proxy.inactive')}
+              <Power className="h-3.5 w-3.5" />
+              <span>
+                {autostartEnabled
+                  ? t('settings.system.autostart_enabled')
+                  : t('settings.system.autostart_disabled')}
+              </span>
             </button>
-          </div>
-
-          {/* Process Launcher */}
-          <div className="tf-surface-alt flex items-center justify-between p-4">
-            <div>
-              <div className="text-xs font-semibold text-tf-primary">
-                {t('settings.system.launcher_title')}
-              </div>
-              <div className="mt-0.5 text-[11px] text-tf-secondary">
-                {t('settings.system.launcher_desc')}
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={onOpenLauncher}
-              className="tf-surface flex items-center gap-1.5 border-tf-cyan/50 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan"
-            >
-              <Rocket className="h-3.5 w-3.5" />
-              <span>{t('app.launcher.button')}</span>
-            </button>
-          </div>
-
-          {/* Windows PAC Auto-Config (Edge & Browsers) */}
-          <div className="tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-4">
-            <div className="min-w-0 flex-1">
-              <div className="text-xs font-semibold text-tf-primary">
-                {t('settings.system.pac_title')}
-              </div>
-              <div className="mt-0.5 text-[11px] text-tf-secondary">
-                {t('settings.system.pac_desc')}
-              </div>
-              <div className="mt-1.5 flex items-center gap-2">
-                <code className="truncate rounded bg-tf-bg px-2 py-0.5 font-mono text-[11px] text-tf-cyan">
-                  {pacUrl}
-                </code>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!navigator.clipboard) {
-                      return;
-                    }
-                    navigator.clipboard
-                      .writeText(pacUrl)
-                      .then(() => onCopyPacUrl?.(pacUrl))
-                      .catch(() => {});
-                  }}
-                  className="inline-flex shrink-0 items-center gap-1 rounded px-2 py-0.5 text-[11px] font-semibold text-tf-secondary hover:bg-tf-surface hover:text-tf-primary"
-                >
-                  <Copy className="h-3 w-3" />
-                  <span>{t('settings.system.pac_copy')}</span>
-                </button>
-              </div>
-            </div>
-            {onTogglePac && (
-              <button
-                type="button"
-                aria-pressed={pacEnabled}
-                onClick={() => {
-                  void onTogglePac();
-                }}
-                className={`shrink-0 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
-                  pacEnabled
-                    ? 'border border-tf-green bg-tf-green/20 text-tf-green'
-                    : 'tf-surface text-tf-secondary hover:text-tf-primary'
-                }`}
-              >
-                {pacEnabled
-                  ? t('settings.system.pac_enabled')
-                  : t('settings.system.pac_disabled')}
-              </button>
-            )}
-          </div>
-
-          {/* Windows Logon Autostart */}
-          <div className="tf-surface-alt flex items-center justify-between gap-3 p-4">
-            <div>
-              <div className="text-xs font-semibold text-tf-primary">
-                {t('settings.system.autostart_title')}
-              </div>
-              <div className="mt-0.5 text-[11px] text-tf-secondary">
-                {t('settings.system.autostart_desc')}
-              </div>
-            </div>
-            {onToggleAutostart && (
-              <button
-                type="button"
-                aria-pressed={autostartEnabled}
-                onClick={() => {
-                  void onToggleAutostart();
-                }}
-                className={`flex shrink-0 items-center gap-1.5 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
-                  autostartEnabled
-                    ? 'border border-tf-accent bg-tf-accent/20 text-tf-accent'
-                    : 'tf-surface text-tf-secondary hover:text-tf-primary'
-                }`}
-              >
-                <Power className="h-3.5 w-3.5" />
-                <span>
-                  {autostartEnabled
-                    ? t('settings.system.autostart_enabled')
-                    : t('settings.system.autostart_disabled')}
-                </span>
-              </button>
-            )}
-          </div>
+          )}
         </div>
 
         {/* Named Profiles Manager */}
@@ -669,97 +585,356 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       {!prof.active &&
                         prof.profileId !== 'default' &&
                         onDeleteNamedProfile && (
-                          <button
-                            type="button"
-                            onClick={() => {
+                          <ConfirmDeleteButton
+                            armed={armedDeleteProfileId === prof.profileId}
+                            title={t('settings.profiles.delete_button')}
+                            ariaLabel={`${t('settings.profiles.delete_button')}: ${prof.name}`}
+                            onArm={() => setArmedDeleteProfileId(prof.profileId)}
+                            onConfirm={() => {
+                              setArmedDeleteProfileId(null);
                               void onDeleteNamedProfile(prof.profileId);
                             }}
-                            title={t('settings.profiles.delete_button')}
-                            aria-label={`${t('settings.profiles.delete_button')}: ${prof.name}`}
-                            className="rounded p-1 text-tf-secondary hover:text-tf-red"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
+                            onCancel={() => setArmedDeleteProfileId(null)}
+                          />
                         )}
                     </div>
                   </div>
                 ))}
               </div>
             )}
+
+            {onSetNetworkProfileRule && profiles.length > 0 && (
+              <div className="space-y-2 border-t border-tf-border pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="flex items-center gap-1.5 text-xs font-bold text-tf-primary">
+                      <Wifi className="h-3.5 w-3.5 text-tf-cyan" />
+                      <span>{t('settings.profiles.auto_network_title')}</span>
+                    </div>
+                    <div className="text-[11px] text-tf-secondary">
+                      {currentNetworkName
+                        ? t('settings.profiles.auto_network_current', {
+                            name: currentNetworkName
+                          })
+                        : t('settings.profiles.auto_network_unknown')}
+                    </div>
+                  </div>
+                  {currentNetworkName && (
+                    <div className="flex items-center gap-2">
+                      <select
+                        id="settings-auto-network-profile"
+                        value={selectedAutoProfileId || profiles[0]?.profileId || ''}
+                        onChange={(e) => setSelectedAutoProfileId(e.target.value)}
+                        aria-label={t('settings.profiles.auto_network_title')}
+                        className="tf-input px-2.5 py-1 text-xs"
+                      >
+                        {profiles.map((p) => (
+                          <option key={p.profileId} value={p.profileId}>
+                            {p.name}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const targetId =
+                            selectedAutoProfileId || profiles[0]?.profileId;
+                          if (targetId) {
+                            onSetNetworkProfileRule(currentNetworkName, targetId);
+                          }
+                        }}
+                        className="tf-btn-accent px-3 py-1 text-xs"
+                      >
+                        {t('settings.profiles.auto_network_assign')}
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {Object.keys(networkProfileRules).length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {Object.entries(networkProfileRules).map(([netName, profId]) => {
+                      const matchedProfile = profiles.find(
+                        (p) => p.profileId === profId
+                      );
+                      return (
+                        <span
+                          key={netName}
+                          className="inline-flex items-center gap-2 rounded-tf-md border border-tf-border bg-tf-surface px-2.5 py-1 text-[11px]"
+                        >
+                          <span className="font-mono text-tf-cyan">{netName}</span>
+                          <span className="text-tf-secondary">-&gt;</span>
+                          <span className="font-semibold text-tf-primary">
+                            {matchedProfile ? matchedProfile.name : profId}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => onSetNetworkProfileRule(netName, null)}
+                            className="text-tf-secondary hover:text-tf-red"
+                          >
+                            {t('settings.profiles.auto_network_remove')}
+                          </button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
-        {/* Expert-only Interception Mode + Profile Backup */}
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          {experienceMode === 'expert' && (
-            <div className="tf-surface-alt flex items-center justify-between p-4">
-              <label
-                htmlFor="settings-interception-mode"
-                className="text-xs font-semibold text-tf-primary"
-              >
-                {t('settings.system.interception_mode_label')}
-              </label>
-              <select
-                id="settings-interception-mode"
-                value={diagnostics.interceptionMode}
-                onChange={(e) =>
-                  onSetInterceptionMode(e.target.value as InterceptionMode)
-                }
-                className="rounded-tf-md border border-tf-border bg-tf-surface px-2.5 py-1.5 text-xs text-tf-primary focus:border-tf-accent focus:outline-none"
-              >
-                <option value="hybrid">{t('app.header.mode.hybrid')}</option>
-                <option value="driver">{t('app.header.mode.driver')}</option>
-                <option value="relay">{t('app.header.mode.relay')}</option>
-              </select>
+        {/* Soft Reset to Defaults */}
+        {onResetToDefaults && (
+          <div className="tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-4">
+            <div className="flex items-start gap-3">
+              <RotateCcw className="mt-0.5 h-4 w-4 shrink-0 text-tf-orange" />
+              <div>
+                <div className="text-xs font-semibold text-tf-primary">
+                  {t('settings.system.reset_title')}
+                </div>
+                <div className="mt-0.5 text-[11px] text-tf-secondary">
+                  {t('settings.system.reset_desc')}
+                </div>
+              </div>
             </div>
-          )}
+            {!armedResetDefaults ? (
+              <button
+                type="button"
+                disabled={resettingDefaults}
+                onClick={() => setArmedResetDefaults(true)}
+                className="tf-surface flex shrink-0 items-center gap-1.5 border-tf-orange/50 px-3 py-1.5 text-xs font-semibold text-tf-orange hover:border-tf-orange disabled:opacity-60"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span>{t('settings.system.reset_button')}</span>
+              </button>
+            ) : (
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  disabled={resettingDefaults}
+                  onClick={() => {
+                    setResettingDefaults(true);
+                    void onResetToDefaults()
+                      .catch(() => {})
+                      .finally(() => {
+                        setResettingDefaults(false);
+                        setArmedResetDefaults(false);
+                      });
+                  }}
+                  className="rounded-tf-md bg-tf-red px-3 py-1.5 text-xs font-bold text-tf-bg hover:opacity-90 disabled:opacity-60"
+                >
+                  {t('settings.system.reset_confirm')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setArmedResetDefaults(false)}
+                  className="tf-surface px-3 py-1.5 text-xs font-semibold text-tf-secondary hover:text-tf-primary"
+                >
+                  {t('app.confirm_delete.cancel')}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
-          <div
-            className={`tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-4 ${
-              experienceMode !== 'expert' ? 'md:col-span-2' : ''
-            }`}
-          >
+        {/* Advanced System Tools (collapsed in Simple mode, always expanded in Expert mode) */}
+        {experienceMode === 'simple' && (
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-tf-border pt-3">
             <div>
               <div className="text-xs font-semibold text-tf-primary">
-                {t('settings.system.profile_title')}
+                {t('settings.system.advanced_tools_title')}
               </div>
-              <div className="mt-0.5 text-[11px] text-tf-secondary">
-                {t('settings.system.profile_desc')}
+              <div className="text-[11px] text-tf-secondary">
+                {t('settings.system.advanced_tools_desc')}
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              <input name="settings-profile-import-file"
-                ref={fileInputRef}
-                type="file"
-                accept="application/json,.json"
-                className="hidden"
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) {
-                    onImportProfile(file);
-                  }
-                  e.target.value = '';
-                }}
-              />
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="tf-surface flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-primary hover:border-tf-accent"
-              >
-                <Upload className="h-3.5 w-3.5" />
-                <span>{t('app.header.profile.import')}</span>
-              </button>
-              <button
-                type="button"
-                onClick={onExportProfile}
-                className="tf-surface flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-primary hover:border-tf-accent"
-              >
-                <Download className="h-3.5 w-3.5" />
-                <span>{t('app.header.profile.export')}</span>
-              </button>
-            </div>
+            <button
+              type="button"
+              aria-expanded={showSimpleAdvancedTools}
+              onClick={() => setShowSimpleAdvancedTools((prev) => !prev)}
+              className="tf-surface-alt px-3 py-1.5 text-xs font-semibold text-tf-secondary hover:border-tf-accent hover:text-tf-primary"
+            >
+              {showSimpleAdvancedTools
+                ? t('settings.system.advanced_tools_hide')
+                : t('settings.system.advanced_tools_show')}
+            </button>
           </div>
-        </div>
+        )}
+
+        {(experienceMode === 'expert' || showSimpleAdvancedTools) && (
+          <>
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              {/* Windows System Proxy */}
+              <div className="tf-surface-alt flex items-center justify-between p-4">
+                <div>
+                  <div className="text-xs font-semibold text-tf-primary">
+                    {t('settings.system.system_proxy_label')}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-tf-secondary">
+                    {t('app.system_proxy.tooltip')}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  aria-pressed={systemProxyEnabled}
+                  onClick={onToggleSystemProxy}
+                  className={`rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
+                    systemProxyEnabled
+                      ? 'border border-tf-cyan bg-tf-cyan/20 text-tf-cyan'
+                      : 'tf-surface text-tf-secondary hover:text-tf-primary'
+                  }`}
+                >
+                  {systemProxyEnabled
+                    ? t('app.system_proxy.active')
+                    : t('app.system_proxy.inactive')}
+                </button>
+              </div>
+
+              {/* Process Launcher */}
+              <div className="tf-surface-alt flex items-center justify-between p-4">
+                <div>
+                  <div className="text-xs font-semibold text-tf-primary">
+                    {t('settings.system.launcher_title')}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-tf-secondary">
+                    {t('settings.system.launcher_desc')}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={onOpenLauncher}
+                  className="tf-surface flex items-center gap-1.5 border-tf-cyan/50 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan"
+                >
+                  <Rocket className="h-3.5 w-3.5" />
+                  <span>{t('app.launcher.button')}</span>
+                </button>
+              </div>
+
+              {/* Windows PAC Auto-Config (Edge & Browsers) */}
+              <div className="tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-4 md:col-span-2">
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-semibold text-tf-primary">
+                    {t('settings.system.pac_title')}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-tf-secondary">
+                    {t('settings.system.pac_desc')}
+                  </div>
+                  <div className="mt-1.5 flex items-center gap-2">
+                    <code className="truncate rounded bg-tf-bg px-2 py-0.5 font-mono text-[11px] text-tf-cyan">
+                      {pacUrl}
+                    </code>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!navigator.clipboard) {
+                          return;
+                        }
+                        navigator.clipboard
+                          .writeText(pacUrl)
+                          .then(() => onCopyPacUrl?.(pacUrl))
+                          .catch(() => {});
+                      }}
+                      className="inline-flex shrink-0 items-center gap-1 rounded px-2 py-0.5 text-[11px] font-semibold text-tf-secondary hover:bg-tf-surface hover:text-tf-primary"
+                    >
+                      <Copy className="h-3 w-3" />
+                      <span>{t('settings.system.pac_copy')}</span>
+                    </button>
+                  </div>
+                </div>
+                {onTogglePac && (
+                  <button
+                    type="button"
+                    aria-pressed={pacEnabled}
+                    onClick={() => {
+                      void onTogglePac();
+                    }}
+                    className={`shrink-0 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
+                      pacEnabled
+                        ? 'border border-tf-green bg-tf-green/20 text-tf-green'
+                        : 'tf-surface text-tf-secondary hover:text-tf-primary'
+                    }`}
+                  >
+                    {pacEnabled
+                      ? t('settings.system.pac_enabled')
+                      : t('settings.system.pac_disabled')}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Expert-only Interception Mode + Profile Backup */}
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              {experienceMode === 'expert' && (
+                <div className="tf-surface-alt flex items-center justify-between p-4">
+                  <label
+                    htmlFor="settings-interception-mode"
+                    className="text-xs font-semibold text-tf-primary"
+                  >
+                    {t('settings.system.interception_mode_label')}
+                  </label>
+                  <select
+                    id="settings-interception-mode"
+                    value={diagnostics.interceptionMode}
+                    onChange={(e) =>
+                      onSetInterceptionMode(e.target.value as InterceptionMode)
+                    }
+                    className="rounded-tf-md border border-tf-border bg-tf-surface px-2.5 py-1.5 text-xs text-tf-primary focus:border-tf-accent"
+                  >
+                    <option value="hybrid">{t('app.header.mode.hybrid')}</option>
+                    <option value="driver">{t('app.header.mode.driver')}</option>
+                    <option value="relay">{t('app.header.mode.relay')}</option>
+                  </select>
+                </div>
+              )}
+
+              <div
+                className={`tf-surface-alt flex flex-wrap items-center justify-between gap-3 p-4 ${
+                  experienceMode !== 'expert' ? 'md:col-span-2' : ''
+                }`}
+              >
+                <div>
+                  <div className="text-xs font-semibold text-tf-primary">
+                    {t('settings.system.profile_title')}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-tf-secondary">
+                    {t('settings.system.profile_desc')}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input name="settings-profile-import-file"
+                    ref={fileInputRef}
+                    type="file"
+                    accept="application/json,.json"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) {
+                        onImportProfile(file);
+                      }
+                      e.target.value = '';
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="tf-surface flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-primary hover:border-tf-accent"
+                  >
+                    <Upload className="h-3.5 w-3.5" />
+                    <span>{t('app.header.profile.import')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onExportProfile}
+                    className="tf-surface flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-primary hover:border-tf-accent"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>{t('app.header.profile.export')}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
       </div>
 
       {/* 4. Technical Diagnostics (Overview + Fake-IP DNS + Event Logs) */}
