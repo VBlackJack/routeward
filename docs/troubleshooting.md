@@ -204,3 +204,10 @@ At engine start on Windows, RouteWard logs one `INFO` line such as `N connection
 
 **Fix**:
 Restart the listed applications (or reload the page or reconnect the session) so that their new connections go through RouteWard.
+
+## 14. Beginner Quick Fixes (App Blocked, Website Ignored, or Local Printer Unreachable)
+
+- **Internet stops while RouteWard is minimized to the tray**: RouteWard displays a native Windows warning notification when the upstream proxy stops responding and the kill-switch protects your real IP. Right-click the colored tray icon and choose **Pause for 15 minutes** (or open RouteWard and switch to another proxy using **Make Primary**).
+- **A specific app or website stopped working**: Click **App not working?** on Home in Simple mode to allow that app or website directly in one click.
+- **A website exclusion rule seems ignored**: Check the **Where does a website go?** bar in **My Apps & Sites**. If a broader rule overrides it, RouteWard flags the rule with a 1-click **Move First** button.
+- **Home router (`192.168.x.x`) or Wi-Fi printer cannot be reached**: Enable the 1-click **Router & Printers (Local Network)** pack in **My Apps & Sites**.
