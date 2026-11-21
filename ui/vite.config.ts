@@ -31,6 +31,8 @@ export default defineConfig({
     globals: true
   },
   build: {
+    // routeward-desktop embeds a single app.js + app.css bundle via include_bytes!.
+    chunkSizeWarningLimit: 700,
     rollupOptions: {
       output: {
         entryFileNames: 'assets/app.js',

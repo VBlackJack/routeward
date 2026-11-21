@@ -49,9 +49,11 @@ import {
   InterceptionMode,
   PortRange,
   ProfileSummary,
+  ProxyChain,
   ToastNotification,
   TransportProtocol
 } from './types/routeward';
+import { resolveSimpleProxyAction } from './services/friendly';
 import {
   DashboardUseCaseId,
   DashboardView
@@ -609,6 +611,10 @@ export const App: React.FC = () => {
             c.proxyIds.some((pid) => enabledProxies.some((p) => p.id === pid))
         )
       : [];
+    const simpleProxyAction = resolveSimpleProxyAction(
+      profile.proxies,
+      profile.chains
+    );
     const primaryProxyId = enabledProxies[0]?.id;
     let skippedProxyRule = false;
 
@@ -622,7 +628,12 @@ export const App: React.FC = () => {
         | 'block';
       let targetId: string | undefined;
       if (actType === 'proxy') {
-        targetId = primaryProxyId;
+        if (simpleProxyAction) {
+          actType = simpleProxyAction.type;
+          targetId = simpleProxyAction.targetId;
+        } else {
+          targetId = primaryProxyId;
+        }
       } else if (actType === 'chain') {
         if (enabledChains[0]?.id) {
           targetId = enabledChains[0].id;
@@ -701,6 +712,76 @@ export const App: React.FC = () => {
       ),
       skippedProxyRule ? 'info' : 'success'
     );
+  };
+
+  const handleToggleSimpleFailover = async (
+    enabled: boolean,
+    chain: ProxyChain | null
+  ) => {
+    if (!chain) return;
+    try {
+      if (enabled) {
+        await routewardClient.upsertChain(chain);
+        const rulesToMigrate = profile.rules.filter(
+          (r) => r.action.type === 'proxy'
+        );
+        for (const rule of rulesToMigrate) {
+          await routewardClient.upsertRule({
+            ...rule,
+            action: { type: 'chain', targetId: chain.id }
+          });
+        }
+        pushToast(t('proxies.simple.failover_applied_toast'), 'success');
+      } else {
+        const primaryProxyId = profile.proxies.find((p) => p.enabled)?.id;
+        const rulesToRestore = profile.rules.filter(
+          (r) => r.action.type === 'chain' && r.action.targetId === chain.id
+        );
+        for (const rule of rulesToRestore) {
+          await routewardClient.upsertRule({
+            ...rule,
+            action: primaryProxyId
+              ? { type: 'proxy', targetId: primaryProxyId }
+              : { type: 'direct' }
+          });
+        }
+        await routewardClient.removeChain(chain.id);
+        pushToast(t('proxies.simple.failover_disabled_toast'), 'info');
+      }
+    } catch (err) {
+      pushErrorToast(err);
+    }
+  };
+
+  const handleRemoveProxyWithCleanup = async (proxyId: string) => {
+    try {
+      const remainingEnabled = profile.proxies.filter(
+        (p) => p.enabled && p.id !== proxyId
+      );
+      const failoverChain = profile.chains.find(
+        (c) => c.id === UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID
+      );
+      if (failoverChain && remainingEnabled.length < 2) {
+        const fallbackId = remainingEnabled[0]?.id;
+        const rulesUsingFailover = profile.rules.filter(
+          (r) =>
+            r.action.type === 'chain' && r.action.targetId === failoverChain.id
+        );
+        for (const rule of rulesUsingFailover) {
+          await routewardClient.upsertRule({
+            ...rule,
+            action: fallbackId
+              ? { type: 'proxy', targetId: fallbackId }
+              : { type: 'direct' }
+          });
+        }
+        await routewardClient.removeChain(failoverChain.id);
+      }
+      await routewardClient.removeProxy(proxyId);
+      pushToast(t('app.toast.proxy.deleted'), 'warning');
+    } catch (err) {
+      pushErrorToast(err);
+    }
   };
 
   const handleApplyUseCase = async (
@@ -886,24 +967,26 @@ export const App: React.FC = () => {
               </button>
             )}
 
-            {/* Primary Enable / Pause Protection CTA */}
-            <button
-              type="button"
-              disabled={!diagnostics.daemonConnected || togglingEngine}
-              onClick={() => {
-                void handleToggleEngine(!isEngineRunning);
-              }}
-              className={`flex items-center gap-2 rounded-tf-md px-3.5 py-1.5 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                isEngineRunning
-                  ? 'border border-tf-orange bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
-                  : 'bg-tf-green text-tf-bg hover:opacity-90'
-              }`}
-            >
-              <Power className="h-3.5 w-3.5" />
-              {isEngineRunning
-                ? t('app.header.engine.pause')
-                : t('app.header.engine.start')}
-            </button>
+            {/* Primary Enable / Pause Protection CTA (hidden on Simple Home where hero CTA leads) */}
+            {!(experienceMode === 'simple' && activeTab === 'home') && (
+              <button
+                type="button"
+                disabled={!diagnostics.daemonConnected || togglingEngine}
+                onClick={() => {
+                  void handleToggleEngine(!isEngineRunning);
+                }}
+                className={`flex items-center gap-2 rounded-tf-md px-3.5 py-1.5 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                  isEngineRunning
+                    ? 'border border-tf-orange bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
+                    : 'bg-tf-green text-tf-bg hover:opacity-90'
+                }`}
+              >
+                <Power className="h-3.5 w-3.5" />
+                {isEngineRunning
+                  ? t('app.header.engine.pause')
+                  : t('app.header.engine.start')}
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -1217,9 +1300,19 @@ export const App: React.FC = () => {
               }
             }}
             onAddProxy={(node) => {
+              const isNewProxy = !profile.proxies.some((p) => p.id === node.id);
               runMutation(
                 () => routewardClient.upsertProxy(node),
-                () => pushToast(t('app.toast.proxy.added'))
+                () => {
+                  pushToast(t('app.toast.proxy.added'));
+                  if (
+                    isNewProxy &&
+                    node.enabled &&
+                    diagnostics.daemonConnected
+                  ) {
+                    void routewardClient.testProxy(node.id).catch(() => {});
+                  }
+                }
               );
             }}
             onImportUris={(text) => {
@@ -1238,10 +1331,7 @@ export const App: React.FC = () => {
               pushToast(t('app.toast.proxy.copied_uri'), 'info');
             }}
             onRemoveProxy={(id) => {
-              runMutation(
-                () => routewardClient.removeProxy(id),
-                () => pushToast(t('app.toast.proxy.deleted'), 'warning')
-              );
+              void handleRemoveProxyWithCleanup(id);
             }}
             onAddChain={(chain) => {
               runMutation(() => routewardClient.upsertChain(chain));
@@ -1249,6 +1339,7 @@ export const App: React.FC = () => {
             onRemoveChain={(id) => {
               runMutation(() => routewardClient.removeChain(id));
             }}
+            onToggleSimpleFailover={handleToggleSimpleFailover}
           />
         )}
 
@@ -1256,7 +1347,16 @@ export const App: React.FC = () => {
           <ConnectionsView
             connections={connections}
             proxies={profile.proxies}
+            chains={profile.chains}
             experienceMode={experienceMode}
+            engineRunning={isEngineRunning}
+            onEnableProtection={() => {
+              if (diagnostics.daemonConnected) {
+                void handleToggleEngine(true);
+              } else if (diagnostics.osName === 'WINDOWS') {
+                void handleStartAndEnableProtection();
+              }
+            }}
             onScanOsSockets={async () => {
               try {
                 await routewardClient.scanRealOsSockets();
@@ -1503,6 +1603,12 @@ export const App: React.FC = () => {
             return routewardClient.getProfile().proxies;
           }}
           onTestProxy={(proxyId) => routewardClient.testProxy(proxyId)}
+          onDetectExistingProxies={() => routewardClient.detectExistingProxies()}
+          onEnableProtection={async () => {
+            if (diagnostics.daemonConnected && !diagnostics.running) {
+              await handleToggleEngine(true);
+            }
+          }}
           onAddRule={(rule) => routewardClient.upsertRule(rule)}
           onSelectMode={(mode) => handleSetExperienceMode(mode)}
           onError={(err) => pushErrorToast(err)}

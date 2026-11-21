@@ -1366,4 +1366,184 @@ describe('Core UI view components', () => {
     expect(onAddRule.mock.calls[0][0].id).toBe('rule-pack-ads-trackers');
     expect(onAddRule.mock.calls[0][0].action).toEqual({ type: 'block' });
   });
+
+  it('keeps unconfigured visual app cards neutral, wires simple failover on rules, and supports clickable dashboard checklist', async () => {
+    const onAddRule = vi.fn();
+    const failoverChain: ProxyChain = {
+      id: 'chain-simple-failover',
+      name: 'Backup',
+      strategy: 'failover',
+      proxyIds: ['p1', 'p2'],
+      enabled: true
+    };
+    const p1: ProxyNode = {
+      id: 'p1',
+      name: 'Primary',
+      protocol: 'socks5',
+      host: 'p1.example.com',
+      port: 1080,
+      auth: null,
+      udpEnabled: true,
+      tls: false,
+      sni: null,
+      enabled: true,
+      lastLatencyMs: 25,
+      exitIp: null
+    };
+    const p2: ProxyNode = { ...p1, id: 'p2', name: 'Backup' };
+
+    render(
+      <RulesView
+        rules={[]}
+        proxies={[p1, p2]}
+        chains={[failoverChain]}
+        experienceMode="simple"
+        onEvaluateRule={vi.fn()}
+        onAddRule={onAddRule}
+        onToggleRule={vi.fn()}
+        onReorderRule={vi.fn()}
+        onRemoveRule={vi.fn()}
+      />
+    );
+
+    // No visual app card should appear pressed before any rule exists
+    const blockButtons = screen.getAllByRole('button', {
+      name: i18n.t('rules.visual_apps.action_block')
+    });
+    for (const btn of blockButtons) {
+      expect(btn).toHaveAttribute('aria-pressed', 'false');
+    }
+
+    // Clicking "Via Proxy" when simple failover is active routes via the failover chain
+    const proxyButtons = screen.getAllByRole('button', {
+      name: i18n.t('rules.visual_apps.action_proxy')
+    });
+    fireEvent.click(proxyButtons[0]);
+    expect(onAddRule).toHaveBeenCalledTimes(1);
+    expect(onAddRule.mock.calls[0][0].action).toEqual({
+      type: 'chain',
+      targetId: 'chain-simple-failover'
+    });
+
+    cleanup();
+
+    // DashboardView simple mode: clickable checklist step + closable protection check panel
+    const onNavigateRules = vi.fn();
+    render(
+      <DashboardView
+        telemetry={{
+          activeConnections: 0,
+          downloadBytesPerSec: 0,
+          uploadBytesPerSec: 0,
+          totalRxBytes: 0,
+          totalTxBytes: 0,
+          proxiedCount: 0,
+          directCount: 0,
+          blockedCount: 0,
+          bandwidthHistory: [],
+          topTalkers: []
+        }}
+        diagnostics={{
+          daemonConnected: true,
+          running: false,
+          osName: 'WINDOWS',
+          interceptionMode: 'hybrid',
+          elevatedPrivileges: true,
+          relayTcpEndpoint: '127.0.0.1:10808',
+          relayHttpEndpoint: '127.0.0.1:10809',
+          dnsEndpoint: '127.0.0.1:5353',
+          fakeIpCidr: '198.18.0.0/15',
+          activeLocale: 'fr'
+        }}
+        dnsCount={0}
+        securityPolicy={{
+          killSwitchEnabled: true,
+          blockUdpOnTcpOnlyProxy: true,
+          strictDnsNoLocalFallback: true
+        }}
+        experienceMode="simple"
+        proxies={[]}
+        rules={[]}
+        onUpdateSecurityPolicy={vi.fn()}
+        onOpenWizard={vi.fn()}
+        onNavigateRules={onNavigateRules}
+        onSwitchToExpert={vi.fn()}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: `3. ${i18n.t('dashboard.simple.checklist_step_rules')}`
+      })
+    );
+    expect(onNavigateRules).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: i18n.t('dashboard.simple.verify_protection_cta')
+      })
+    );
+    expect(
+      screen.getByText(i18n.t('dashboard.simple.verify_paused_notice'))
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: i18n.t('dashboard.simple.verify_close')
+      })
+    );
+    expect(
+      screen.queryByText(i18n.t('dashboard.simple.verify_panel_title'))
+    ).not.toBeInTheDocument();
+  });
+
+  it('wizard enables protection on finish and supports testing a newly entered proxy without duplicating it', async () => {
+    const onAddProxy = vi.fn().mockImplementation(async (node: ProxyNode) => [node]);
+    const onTestProxy = vi.fn().mockResolvedValue({
+      proxyId: 'any',
+      reachable: true,
+      latencyMs: 33,
+      udpSupported: true
+    });
+    const onEnableProtection = vi.fn().mockResolvedValue(undefined);
+    const onAddRule = vi.fn().mockResolvedValue(undefined);
+    const onComplete = vi.fn();
+
+    render(
+      <QuickSetupWizardModal
+        proxies={[]}
+        chains={[]}
+        currentMode="simple"
+        onImportUris={vi.fn()}
+        onAddProxy={onAddProxy}
+        onTestProxy={onTestProxy}
+        onEnableProtection={onEnableProtection}
+        onAddRule={onAddRule}
+        onSelectMode={vi.fn()}
+        onComplete={onComplete}
+        onClose={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.next') }));
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('wizard.modal.step2_tab_manual') })
+    );
+    fireEvent.change(
+      screen.getByLabelText(i18n.t('wizard.modal.step2_manual_host')),
+      { target: { value: 'proxy.test.example' } }
+    );
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('wizard.modal.step2_test_button') })
+    );
+
+    await waitFor(() => expect(onTestProxy).toHaveBeenCalledTimes(1));
+    expect(onAddProxy).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.next') }));
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.finish') }));
+
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(true));
+    expect(onAddProxy).toHaveBeenCalledTimes(1);
+    expect(onEnableProtection).toHaveBeenCalledTimes(1);
+  });
 });

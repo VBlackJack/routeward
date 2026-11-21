@@ -134,6 +134,7 @@ pub enum DesktopWindowCommand {
     DragWindow,
     ShowWindow,
     ToggleEngine,
+    PauseEngineMinutes(u64),
     SwitchProfile(usize),
     ApplyTheme(WindowThemeAppearance),
     Quit,

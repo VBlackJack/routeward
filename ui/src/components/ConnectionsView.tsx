@@ -32,7 +32,12 @@ import {
 } from 'lucide-react';
 import { formatBytes, generateClientId } from '../services/ipc';
 import {
+  getFriendlyAppName,
+  resolveSimpleProxyAction
+} from '../services/friendly';
+import {
   ConnectionStatus,
+  ProxyChain,
   ProxyNode,
   RoutingRule,
   TrackedConnection
@@ -42,7 +47,10 @@ import { ExperienceMode } from './QuickSetupWizardModal';
 interface ConnectionsViewProps {
   connections: TrackedConnection[];
   proxies: ProxyNode[];
+  chains?: ProxyChain[];
   experienceMode?: ExperienceMode;
+  engineRunning?: boolean;
+  onEnableProtection?: () => void;
   onScanOsSockets: () => void;
   onClearClosed: () => void;
   onTerminateConnection: (connectionId: string) => void;
@@ -69,7 +77,10 @@ interface AppActivityGroup {
 export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
   connections,
   proxies,
+  chains = [],
   experienceMode = 'expert',
+  engineRunning = true,
+  onEnableProtection,
   onScanOsSockets,
   onClearClosed,
   onTerminateConnection,
@@ -171,8 +182,8 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
     conn: TrackedConnection,
     actionType: 'proxy' | 'direct' | 'block'
   ) => {
-    const primaryProxyId = proxies.find((p) => p.enabled)?.id;
-    if (actionType === 'proxy' && !primaryProxyId) {
+    const simpleProxyAction = resolveSimpleProxyAction(proxies, chains);
+    if (actionType === 'proxy' && !simpleProxyAction) {
       onMissingProxy?.();
       return;
     }
@@ -187,8 +198,8 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
       portRanges: [],
       protocol: 'any',
       action:
-        actionType === 'proxy' && primaryProxyId
-          ? { type: 'proxy', targetId: primaryProxyId }
+        actionType === 'proxy' && simpleProxyAction
+          ? simpleProxyAction
           : { type: actionType === 'proxy' ? 'direct' : actionType }
     });
   };
@@ -329,32 +340,59 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
         </div>
 
         {groupedApps.length === 0 ? (
-          <div className="tf-card p-6 text-center text-xs text-tf-secondary">
-            {t('connections.simple.no_apps')}
+          <div className="tf-card flex flex-col items-center gap-3 p-6 text-center text-xs text-tf-secondary">
+            <span>{t('connections.simple.no_apps')}</span>
+            {!engineRunning && onEnableProtection ? (
+              <button
+                type="button"
+                onClick={onEnableProtection}
+                className="tf-btn-accent px-4 py-2 text-xs font-bold"
+              >
+                {t('connections.simple.empty_paused_cta')}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={onScanOsSockets}
+                className="tf-surface-alt flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-tf-cyan hover:border-tf-cyan"
+              >
+                <Radar className="h-3.5 w-3.5" />
+                {t('connections.simple.empty_refresh_cta')}
+              </button>
+            )}
           </div>
         ) : (
           <div className="space-y-2.5">
-            {groupedApps.map((group) => (
-              <div
-                key={group.processName}
-                className="tf-card flex flex-wrap items-center justify-between gap-4 p-4"
-              >
-                <div className="space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-sm font-bold text-tf-primary">
-                      {group.processName}
-                    </span>
-                    <span className="rounded bg-tf-surface-alt px-2 py-0.5 text-[11px] font-medium text-tf-secondary">
-                      {t('connections.simple.count_connections', { count: group.count })}
-                    </span>
-                    <span className="font-mono text-[11px] text-tf-cyan">
-                      {formatBytes(group.totalBytes)}
-                    </span>
+            {groupedApps.map((group) => {
+              const friendly = getFriendlyAppName(group.processName);
+              return (
+                <div
+                  key={group.processName}
+                  className="tf-card flex flex-wrap items-center justify-between gap-4 p-4"
+                >
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-bold text-tf-primary">
+                        {friendly.displayName}
+                      </span>
+                      {friendly.technicalName && (
+                        <span className="rounded bg-tf-surface-alt px-1.5 py-0.5 font-mono text-[10px] text-tf-secondary">
+                          {friendly.technicalName}
+                        </span>
+                      )}
+                      <span className="rounded bg-tf-surface-alt px-2 py-0.5 text-[11px] font-medium text-tf-secondary">
+                        {t('connections.simple.count_connections', {
+                          count: group.count
+                        })}
+                      </span>
+                      <span className="font-mono text-[11px] text-tf-cyan">
+                        {formatBytes(group.totalBytes)}
+                      </span>
+                    </div>
+                    <div className="text-xs text-tf-secondary">
+                      {group.domains.join(', ')}
+                    </div>
                   </div>
-                  <div className="text-xs text-tf-secondary">
-                    {group.domains.join(', ')}
-                  </div>
-                </div>
 
                 <div className="flex flex-wrap items-center gap-2">
                   <button
@@ -402,9 +440,10 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                     <Ban className="h-3.5 w-3.5" />
                     {t('connections.simple.route_blocked')}
                   </button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 

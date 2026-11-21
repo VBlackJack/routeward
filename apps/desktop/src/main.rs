@@ -685,6 +685,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
                 }
+                DesktopWindowCommand::PauseEngineMinutes(minutes) => {
+                    let b = Arc::clone(&bridge_for_loop);
+                    rt_for_loop.spawn(async move {
+                        if let Err(err) = b
+                            .pause_engine_for(std::time::Duration::from_secs(minutes * 60))
+                            .await
+                        {
+                            b.log_warn(format!("Tray timed pause failed: {err}"));
+                        }
+                    });
+                }
                 DesktopWindowCommand::SwitchProfile(idx) => {
                     let b = Arc::clone(&bridge_for_loop);
                     rt_for_loop.spawn(async move {

@@ -38,6 +38,7 @@ import {
 import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
 import { generateClientId, routewardClient } from '../services/ipc';
 import { normalizeDomainPatterns } from '../services/domain';
+import { resolveSimpleProxyAction } from '../services/friendly';
 import {
   ConnectionRequest,
   FoxyProxyImportResult,
@@ -223,7 +224,8 @@ export const RulesView: React.FC<RulesViewProps> = ({
     app: SystemApplicationEntry,
     chosenAction: 'proxy' | 'direct' | 'block'
   ) => {
-    if (chosenAction === 'proxy' && !primaryEnabledProxyId) {
+    const simpleProxyAction = resolveSimpleProxyAction(proxies, chains);
+    if (chosenAction === 'proxy' && !simpleProxyAction) {
       onMissingProxy?.();
       return;
     }
@@ -239,9 +241,9 @@ export const RulesView: React.FC<RulesViewProps> = ({
       portRanges: [],
       protocol: 'any',
       action:
-        chosenAction === 'proxy'
-          ? { type: 'proxy', targetId: primaryEnabledProxyId }
-          : { type: chosenAction }
+        chosenAction === 'proxy' && simpleProxyAction
+          ? simpleProxyAction
+          : { type: chosenAction === 'proxy' ? 'direct' : chosenAction }
     });
   };
 
@@ -424,7 +426,8 @@ export const RulesView: React.FC<RulesViewProps> = ({
     appCard: (typeof SYSTEM_CONSTANTS.visualAppCatalog)[number],
     chosenAction: 'proxy' | 'direct' | 'block'
   ) => {
-    if (chosenAction === 'proxy' && !primaryEnabledProxyId) {
+    const simpleProxyAction = resolveSimpleProxyAction(proxies, chains);
+    if (chosenAction === 'proxy' && !simpleProxyAction) {
       onMissingProxy?.();
       return;
     }
@@ -439,9 +442,9 @@ export const RulesView: React.FC<RulesViewProps> = ({
       portRanges: [],
       protocol: 'any',
       action:
-        chosenAction === 'proxy'
-          ? { type: 'proxy', targetId: primaryEnabledProxyId }
-          : { type: chosenAction }
+        chosenAction === 'proxy' && simpleProxyAction
+          ? simpleProxyAction
+          : { type: chosenAction === 'proxy' ? 'direct' : chosenAction }
     });
   };
 
@@ -498,14 +501,23 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
     let resolvedAction: RuleAction;
     if (actionType === 'proxy') {
-      const targetId = enabledProxies.some((p) => p.id === actionTargetId)
-        ? actionTargetId
-        : primaryEnabledProxyId;
-      if (!targetId) {
-        onMissingProxy?.();
-        return;
+      if (isSimpleSubmit) {
+        const simpleProxyAction = resolveSimpleProxyAction(proxies, chains);
+        if (!simpleProxyAction) {
+          onMissingProxy?.();
+          return;
+        }
+        resolvedAction = simpleProxyAction;
+      } else {
+        const targetId = enabledProxies.some((p) => p.id === actionTargetId)
+          ? actionTargetId
+          : primaryEnabledProxyId;
+        if (!targetId) {
+          onMissingProxy?.();
+          return;
+        }
+        resolvedAction = { type: 'proxy', targetId };
       }
-      resolvedAction = { type: 'proxy', targetId };
     } else if (actionType === 'chain') {
       const targetId = enabledChains.some((c) => c.id === actionTargetId)
         ? actionTargetId
@@ -638,17 +650,16 @@ export const RulesView: React.FC<RulesViewProps> = ({
             const existingRule = rules.find(
               (r) => r.id === `rule-visual-${appCard.id}`
             );
-            const rawAction = existingRule?.enabled
-              ? existingRule.action.type
-              : (appCard.defaultAction as 'proxy' | 'direct' | 'block');
-            const activeAction: 'proxy' | 'direct' | 'block' =
-              rawAction === 'chain'
-                ? hasEnabledProxy
-                  ? 'proxy'
-                  : 'direct'
-                : rawAction === 'proxy' && !hasEnabledProxy
-                  ? 'direct'
-                  : rawAction;
+            const activeAction: 'proxy' | 'direct' | 'block' | null =
+              existingRule?.enabled
+                ? existingRule.action.type === 'chain'
+                  ? hasEnabledProxy
+                    ? 'proxy'
+                    : 'direct'
+                  : existingRule.action.type === 'proxy' && !hasEnabledProxy
+                    ? 'direct'
+                    : existingRule.action.type
+                : null;
 
             return (
               <div
@@ -659,21 +670,27 @@ export const RulesView: React.FC<RulesViewProps> = ({
                   <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-tf-md bg-tf-accent/15 text-tf-accent">
                     <Icon className="h-5 w-5" />
                   </div>
-                  <div>
+                  <div className="min-w-0 flex-1">
                     <div className="text-xs font-bold text-tf-primary">
                       {t(`${appCard.i18nKey}.name`)}
                     </div>
                     <div className="mt-0.5 text-[11px] text-tf-secondary">
                       {t(`${appCard.i18nKey}.desc`)}
                     </div>
+                    {activeAction === null && (
+                      <div className="mt-1 inline-block rounded bg-tf-bg px-1.5 py-0.5 text-[10px] font-medium text-tf-secondary">
+                        {t('rules.visual_apps.status_default')}
+                      </div>
+                    )}
                   </div>
                 </div>
 
                 <div className="grid grid-cols-3 gap-1.5 pt-1">
                   <button
                     type="button"
+                    aria-pressed={activeAction === 'proxy'}
                     onClick={() => handleSetVisualAppAction(appCard, 'proxy')}
-                    className={`rounded px-2 py-1.5 text-[11px] font-bold transition ${
+                    className={`rounded px-2 py-2 text-[11px] font-bold transition ${
                       activeAction === 'proxy'
                         ? 'bg-tf-accent text-tf-bg'
                         : 'bg-tf-bg text-tf-secondary hover:text-tf-primary'
@@ -683,8 +700,9 @@ export const RulesView: React.FC<RulesViewProps> = ({
                   </button>
                   <button
                     type="button"
+                    aria-pressed={activeAction === 'direct'}
                     onClick={() => handleSetVisualAppAction(appCard, 'direct')}
-                    className={`rounded px-2 py-1.5 text-[11px] font-bold transition ${
+                    className={`rounded px-2 py-2 text-[11px] font-bold transition ${
                       activeAction === 'direct'
                         ? 'bg-tf-green text-tf-bg'
                         : 'bg-tf-bg text-tf-secondary hover:text-tf-primary'
@@ -694,8 +712,9 @@ export const RulesView: React.FC<RulesViewProps> = ({
                   </button>
                   <button
                     type="button"
+                    aria-pressed={activeAction === 'block'}
                     onClick={() => handleSetVisualAppAction(appCard, 'block')}
-                    className={`flex items-center justify-center gap-1 rounded px-2 py-1.5 text-[11px] font-bold transition ${
+                    className={`flex items-center justify-center gap-1 rounded px-2 py-2 text-[11px] font-bold transition ${
                       activeAction === 'block'
                         ? 'bg-tf-red text-tf-bg'
                         : 'bg-tf-bg text-tf-secondary hover:text-tf-primary'
@@ -807,58 +826,97 @@ export const RulesView: React.FC<RulesViewProps> = ({
                               .includes(detectedAppSearch.trim().toLowerCase())
                       )
                       .slice(0, 24)
-                      .map((app) => (
-                        <div
-                          key={`${app.name}-${app.executablePath}`}
-                          className="tf-surface-alt flex flex-wrap items-center justify-between gap-2 p-2.5 text-xs"
-                        >
-                          <div className="flex min-w-0 items-center gap-2">
-                            <span className="truncate font-semibold text-tf-primary">
-                              {app.name}
-                            </span>
-                            <span
-                              className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold ${
-                                app.running
-                                  ? 'bg-tf-green/20 text-tf-green'
-                                  : 'bg-tf-surface text-tf-secondary'
-                              }`}
-                            >
-                              {app.running
-                                ? t('rules.modal.add.pick_app_running')
-                                : t('rules.modal.add.pick_app_installed')}
-                            </span>
+                      .map((app) => {
+                        const slug = app.name
+                          .toLowerCase()
+                          .replace(/[^a-z0-9]+/g, '-');
+                        const appRule = rules.find(
+                          (r) =>
+                            r.enabled &&
+                            (r.id === `rule-app-${slug}` ||
+                              (r.domainPatterns.length === 0 &&
+                                r.processPatterns.some(
+                                  (p) =>
+                                    p.toLowerCase() === app.name.toLowerCase()
+                                )))
+                        );
+                        const activeAppAction:
+                          | 'proxy'
+                          | 'direct'
+                          | 'block'
+                          | null = appRule
+                          ? appRule.action.type === 'chain'
+                            ? 'proxy'
+                            : appRule.action.type
+                          : null;
+                        return (
+                          <div
+                            key={`${app.name}-${app.executablePath}`}
+                            className="tf-surface-alt flex flex-wrap items-center justify-between gap-2 p-2.5 text-xs"
+                          >
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="truncate font-semibold text-tf-primary">
+                                {app.name}
+                              </span>
+                              <span
+                                className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                                  app.running
+                                    ? 'bg-tf-green/20 text-tf-green'
+                                    : 'bg-tf-surface text-tf-secondary'
+                                }`}
+                              >
+                                {app.running
+                                  ? t('rules.modal.add.pick_app_running')
+                                  : t('rules.modal.add.pick_app_installed')}
+                              </span>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1">
+                              <button
+                                type="button"
+                                aria-pressed={activeAppAction === 'proxy'}
+                                onClick={() =>
+                                  handleSetDetectedAppAction(app, 'proxy')
+                                }
+                                className={`rounded px-2.5 py-1.5 text-[11px] font-bold transition ${
+                                  activeAppAction === 'proxy'
+                                    ? 'bg-tf-accent text-tf-bg'
+                                    : 'bg-tf-accent/20 text-tf-accent hover:bg-tf-accent/30'
+                                }`}
+                              >
+                                {t('connections.simple.route_proxy')}
+                              </button>
+                              <button
+                                type="button"
+                                aria-pressed={activeAppAction === 'direct'}
+                                onClick={() =>
+                                  handleSetDetectedAppAction(app, 'direct')
+                                }
+                                className={`rounded px-2.5 py-1.5 text-[11px] font-bold transition ${
+                                  activeAppAction === 'direct'
+                                    ? 'bg-tf-green text-tf-bg'
+                                    : 'bg-tf-green/20 text-tf-green hover:bg-tf-green/30'
+                                }`}
+                              >
+                                {t('connections.simple.route_direct')}
+                              </button>
+                              <button
+                                type="button"
+                                aria-pressed={activeAppAction === 'block'}
+                                onClick={() =>
+                                  handleSetDetectedAppAction(app, 'block')
+                                }
+                                className={`rounded px-2.5 py-1.5 text-[11px] font-bold transition ${
+                                  activeAppAction === 'block'
+                                    ? 'bg-tf-red text-tf-bg'
+                                    : 'bg-tf-red/20 text-tf-red hover:bg-tf-red/30'
+                                }`}
+                              >
+                                {t('connections.simple.route_blocked')}
+                              </button>
+                            </div>
                           </div>
-                          <div className="flex shrink-0 items-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleSetDetectedAppAction(app, 'proxy')
-                              }
-                              className="rounded bg-tf-accent/20 px-2 py-1 text-[10px] font-bold text-tf-accent hover:bg-tf-accent/30"
-                            >
-                              {t('connections.simple.route_proxy')}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleSetDetectedAppAction(app, 'direct')
-                              }
-                              className="rounded bg-tf-green/20 px-2 py-1 text-[10px] font-bold text-tf-green hover:bg-tf-green/30"
-                            >
-                              {t('connections.simple.route_direct')}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleSetDetectedAppAction(app, 'block')
-                              }
-                              className="rounded bg-tf-red/20 px-2 py-1 text-[10px] font-bold text-tf-red hover:bg-tf-red/30"
-                            >
-                              {t('connections.simple.route_blocked')}
-                            </button>
-                          </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                   </div>
                 )}
               </>
@@ -984,7 +1042,13 @@ export const RulesView: React.FC<RulesViewProps> = ({
                               : 'bg-tf-accent/20 text-tf-accent'
                         }`}
                       >
-                        {t(`rules.table.action.${rule.action.type}`)}
+                        {rule.action.type === 'block'
+                          ? t('rules.simple.action_badge_block')
+                          : rule.action.type === 'direct'
+                            ? t('rules.simple.action_badge_direct')
+                            : rule.action.type === 'chain'
+                              ? t('rules.simple.action_badge_chain')
+                              : t('rules.simple.action_badge_proxy')}
                       </span>
                       <button
                         type="button"

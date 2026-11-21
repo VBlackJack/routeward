@@ -17,6 +17,7 @@
 import React, { useId, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CheckCircle2, Globe, LifeBuoy, ShieldAlert, X } from 'lucide-react';
+import { getFriendlyAppName, getHumanErrorKey } from '../services/friendly';
 import { TrackedConnection } from '../types/routeward';
 import { ModalContainer } from './ModalContainer';
 
@@ -95,6 +96,8 @@ export const TroubleshootModal: React.FC<TroubleshootModalProps> = ({
           ) : (
             recentIssues.map((conn) => {
               const target = conn.resolvedDomain || conn.targetHost;
+              const friendly = getFriendlyAppName(conn.processName);
+              const reasonKey = getHumanErrorKey(conn.errorDetail);
               return (
                 <div
                   key={conn.id}
@@ -104,17 +107,20 @@ export const TroubleshootModal: React.FC<TroubleshootModalProps> = ({
                     <div className="flex flex-wrap items-center gap-2">
                       <ShieldAlert className="h-4 w-4 shrink-0 text-tf-red" />
                       <span className="text-xs font-bold text-tf-primary">
-                        {conn.processName}
+                        {friendly.displayName}
                       </span>
+                      {friendly.technicalName && (
+                        <span className="rounded bg-tf-surface px-1.5 py-0.5 font-mono text-[10px] text-tf-secondary">
+                          {friendly.technicalName}
+                        </span>
+                      )}
                       <span className="truncate font-mono text-[11px] text-tf-cyan">
                         {target}
                       </span>
                     </div>
-                    {conn.errorDetail && (
-                      <p className="text-[11px] text-tf-orange">
-                        {conn.errorDetail}
-                      </p>
-                    )}
+                    <p className="text-[11px] text-tf-orange">
+                      {t(reasonKey)}
+                    </p>
                   </div>
                   <div className="flex shrink-0 flex-wrap items-center gap-1.5">
                     <button

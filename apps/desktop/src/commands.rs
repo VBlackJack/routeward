@@ -43,7 +43,7 @@ use routeward_core::telemetry::{
     ConnectionStatus, LogEntry, LogLevel, TelemetryEvent, TelemetrySnapshot, TrackedConnection,
 };
 use serde::de::DeserializeOwned;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -110,6 +110,7 @@ pub struct DesktopCommandBridge {
     event_tx: tokio::sync::broadcast::Sender<IpcStreamEvent>,
     daemon_start_guard: Arc<DaemonStartGuard>,
     tray_notify: Arc<Mutex<Option<TrayNotifyCallback>>>,
+    pause_timer_generation: Arc<AtomicU64>,
 }
 
 impl DesktopCommandBridge {
@@ -175,6 +176,7 @@ impl DesktopCommandBridge {
             event_tx,
             daemon_start_guard: Arc::new(DaemonStartGuard::default()),
             tray_notify: Arc::new(Mutex::new(None)),
+            pause_timer_generation: Arc::new(AtomicU64::new(0)),
         };
 
         bridge.log_info(format!(
@@ -961,6 +963,7 @@ impl DesktopCommandBridge {
     }
 
     pub async fn toggle_engine(&self, start: bool) -> Result<SystemDiagnostics, IpcCallError> {
+        self.pause_timer_generation.fetch_add(1, Ordering::SeqCst);
         match self
             .call_daemon_detailed::<SystemDiagnostics>(IpcCommand::ToggleEngine { start })
             .await
@@ -978,6 +981,25 @@ impl DesktopCommandBridge {
                 Err(err)
             }
         }
+    }
+
+    /// Pauses protection for `duration`, then automatically re-enables it unless cancelled by a manual toggle.
+    pub async fn pause_engine_for(&self, duration: Duration) -> Result<(), IpcCallError> {
+        self.toggle_engine(false).await?;
+        let expected_gen = self.pause_timer_generation.load(Ordering::SeqCst);
+        let bridge = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            if bridge.pause_timer_generation.load(Ordering::SeqCst) == expected_gen
+                && bridge.is_daemon_connected()
+                && !bridge.get_diagnostics().running
+            {
+                if let Err(err) = bridge.toggle_engine(true).await {
+                    bridge.log_warn(format!("Timed tray auto-resume failed: {err}"));
+                }
+            }
+        });
+        Ok(())
     }
 
     pub async fn set_interception_mode(

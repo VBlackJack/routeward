@@ -52,8 +52,10 @@ const IDM_STATUS: u32 = 1000;
 const IDM_SHOW: u32 = 1001;
 const IDM_TOGGLE: u32 = 1002;
 const IDM_QUIT: u32 = 1003;
+const IDM_PAUSE_15M: u32 = 1004;
 const IDM_PROFILE_BASE: u32 = 2000;
 const MAX_TRAY_PROFILES: usize = 20;
+const TRAY_PAUSE_MINUTES: u64 = 15;
 
 fn to_wide_null(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(once(0)).collect()
@@ -82,6 +84,8 @@ pub struct TrayMenuLabels {
     pub open_app: String,
     pub toggle_engine: String,
     pub toggle_enabled: bool,
+    pub pause_15m: String,
+    pub pause_15m_enabled: bool,
     pub quit_app: String,
 }
 
@@ -89,6 +93,7 @@ const TRAY_KEY_STATUS_OFFLINE: &str = "tray.status.offline";
 const TRAY_KEY_STATUS_PROTECTED: &str = "tray.status.protected";
 const TRAY_KEY_STATUS_PAUSED: &str = "tray.status.paused";
 const TRAY_KEY_MENU_PAUSE: &str = "tray.menu.pause";
+const TRAY_KEY_MENU_PAUSE_15M: &str = "tray.menu.pause_15m";
 const TRAY_KEY_MENU_ENABLE: &str = "tray.menu.enable";
 const TRAY_KEY_MENU_OPEN: &str = "tray.menu.open";
 const TRAY_KEY_MENU_QUIT: &str = "tray.menu.quit";
@@ -115,6 +120,8 @@ pub fn build_tray_labels(snapshot: &TrayStatusSnapshot) -> TrayMenuLabels {
         open_app: i18n.t(TRAY_KEY_MENU_OPEN),
         toggle_engine: i18n.t(toggle_key),
         toggle_enabled: snapshot.daemon_connected,
+        pause_15m: i18n.t(TRAY_KEY_MENU_PAUSE_15M),
+        pause_15m_enabled: snapshot.daemon_connected && snapshot.running,
         quit_app: i18n.t(TRAY_KEY_MENU_QUIT),
     }
 }
@@ -174,6 +181,7 @@ impl TrayWindowState {
             let status_w = to_wide_null(&labels.status_line);
             let open_w = to_wide_null(&labels.open_app);
             let toggle_w = to_wide_null(&labels.toggle_engine);
+            let pause_15m_w = to_wide_null(&labels.pause_15m);
             let quit_w = to_wide_null(&labels.quit_app);
 
             AppendMenuW(
@@ -190,6 +198,14 @@ impl TrayWindowState {
                 MF_STRING | MF_GRAYED
             };
             AppendMenuW(menu, toggle_flags, IDM_TOGGLE as usize, toggle_w.as_ptr());
+            if labels.pause_15m_enabled {
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    IDM_PAUSE_15M as usize,
+                    pause_15m_w.as_ptr(),
+                );
+            }
             if snap.daemon_connected && !snap.profiles.is_empty() {
                 AppendMenuW(menu, MF_SEPARATOR, 0, null());
                 for (idx, (pid, pname)) in snap.profiles.iter().take(MAX_TRAY_PROFILES).enumerate()
@@ -231,6 +247,9 @@ impl TrayWindowState {
             match cmd_id {
                 IDM_SHOW => (self.command_cb)(DesktopWindowCommand::ShowWindow),
                 IDM_TOGGLE => (self.command_cb)(DesktopWindowCommand::ToggleEngine),
+                IDM_PAUSE_15M => {
+                    (self.command_cb)(DesktopWindowCommand::PauseEngineMinutes(TRAY_PAUSE_MINUTES))
+                }
                 IDM_QUIT => (self.command_cb)(DesktopWindowCommand::Quit),
                 id if id >= IDM_PROFILE_BASE
                     && id < IDM_PROFILE_BASE + MAX_TRAY_PROFILES as u32 =>
@@ -483,6 +502,7 @@ mod tests {
             profiles: Vec::new(),
         });
         assert!(!offline.toggle_enabled);
+        assert!(!offline.pause_15m_enabled);
         assert!(offline.status_line.contains("arrêté"));
 
         let protected_en = build_tray_labels(&TrayStatusSnapshot {
@@ -493,7 +513,9 @@ mod tests {
             profiles: Vec::new(),
         });
         assert!(protected_en.toggle_enabled);
+        assert!(protected_en.pause_15m_enabled);
         assert!(protected_en.status_line.contains("Protected"));
         assert_eq!(protected_en.toggle_engine, "Pause Protection");
+        assert_eq!(protected_en.pause_15m, "Pause for 15 minutes");
     }
 }
