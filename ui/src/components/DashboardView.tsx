@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Activity,
   ArrowDownLeft,
   ArrowUpRight,
   Briefcase,
+  CheckCircle2,
+  Circle,
   Cpu,
   Gamepad2,
   Globe,
@@ -36,6 +38,7 @@ import {
 } from 'lucide-react';
 import { formatBytes, formatSampleTime } from '../services/format';
 import {
+  ProxyHealthReport,
   ProxyNode,
   RoutingRule,
   SecurityPolicyConfig,
@@ -55,9 +58,15 @@ interface DashboardViewProps {
   experienceMode: ExperienceMode;
   proxies?: ProxyNode[];
   rules?: RoutingRule[];
+  startingProtection?: boolean;
   onToggleEngine?: () => void;
-  onApplyUseCase?: (useCase: DashboardUseCaseId) => void;
-  onTestPrimaryProxy?: (proxyId: string) => void;
+  onStartAndEnableProtection?: () => Promise<void> | void;
+  onApplyUseCase?: (
+    useCase: DashboardUseCaseId
+  ) => Promise<boolean | void> | boolean | void;
+  onTestPrimaryProxy?: (
+    proxyId: string
+  ) => Promise<ProxyHealthReport | null | void> | void;
   onNavigateProxy?: () => void;
   onUpdateSecurityPolicy: (partial: Partial<SecurityPolicyConfig>) => void;
   onOpenWizard: () => void;
@@ -73,7 +82,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   experienceMode,
   proxies = [],
   rules = [],
+  startingProtection = false,
   onToggleEngine,
+  onStartAndEnableProtection,
   onApplyUseCase,
   onTestPrimaryProxy,
   onNavigateProxy,
@@ -83,9 +94,73 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onSwitchToExpert
 }) => {
   const { t } = useTranslation();
+  const [testingPrimaryProxy, setTestingPrimaryProxy] = useState(false);
+  const [lastProxyTestStatus, setLastProxyTestStatus] = useState<
+    'ok' | 'failed' | null
+  >(null);
+  const [applyingUseCase, setApplyingUseCase] =
+    useState<DashboardUseCaseId | null>(null);
+  const [lastAppliedUseCase, setLastAppliedUseCase] =
+    useState<DashboardUseCaseId | null>(null);
 
   const isEngineRunning = diagnostics.daemonConnected && diagnostics.running;
   const primaryProxy = proxies.find((p) => p.enabled) ?? null;
+
+  useEffect(() => {
+    setLastProxyTestStatus(null);
+  }, [primaryProxy?.id]);
+
+  const handleTestPrimaryProxyClick = async (proxyId: string) => {
+    if (!onTestPrimaryProxy || testingPrimaryProxy) return;
+    setTestingPrimaryProxy(true);
+    try {
+      const report = await Promise.resolve(onTestPrimaryProxy(proxyId));
+      if (report && typeof report === 'object' && 'reachable' in report) {
+        setLastProxyTestStatus(report.reachable ? 'ok' : 'failed');
+      } else if (report === null) {
+        setLastProxyTestStatus('failed');
+      }
+    } catch {
+      setLastProxyTestStatus('failed');
+    } finally {
+      setTestingPrimaryProxy(false);
+    }
+  };
+
+  const handleApplyUseCaseClick = async (id: DashboardUseCaseId) => {
+    if (!onApplyUseCase || applyingUseCase) return;
+    let maybePromise: Promise<boolean | void> | boolean | void;
+    try {
+      maybePromise = onApplyUseCase(id);
+    } catch {
+      return;
+    }
+    if (
+      maybePromise &&
+      typeof (maybePromise as Promise<boolean | void>).then === 'function'
+    ) {
+      setApplyingUseCase(id);
+      try {
+        const result = await maybePromise;
+        if (result !== false) {
+          setLastAppliedUseCase(id);
+        }
+      } catch {
+        // Error toast is handled by caller; do not mark scenario as applied.
+      } finally {
+        setApplyingUseCase(null);
+      }
+    } else if (maybePromise !== false) {
+      setLastAppliedUseCase(id);
+    }
+  };
+
+  const stepServiceReady = diagnostics.daemonConnected;
+  const stepProtectionReady = isEngineRunning;
+  const stepConfigReady = rules.length > 0 || Boolean(primaryProxy);
+  const showReadinessChecklist =
+    experienceMode === 'simple' &&
+    !(stepServiceReady && stepProtectionReady && stepConfigReady);
   const protectedRuleCount = rules.filter(
     (r) =>
       r.enabled &&
@@ -140,7 +215,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <h2 className="text-sm font-bold text-tf-primary">
                 {isEngineRunning
                   ? t('dashboard.health_banner.protected_title')
-                  : t('dashboard.health_banner.paused_title')}
+                  : !diagnostics.daemonConnected && experienceMode === 'simple'
+                    ? t('app.daemon_banner.simple_disconnected_title')
+                    : t('dashboard.health_banner.paused_title')}
               </h2>
               <span
                 className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${
@@ -157,29 +234,52 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <p className="mt-1 max-w-2xl text-xs text-tf-secondary">
               {isEngineRunning
                 ? t('dashboard.health_banner.protected_desc')
-                : t('dashboard.health_banner.paused_desc')}
+                : !diagnostics.daemonConnected && experienceMode === 'simple'
+                  ? diagnostics.osName === 'WINDOWS'
+                    ? t('app.daemon_banner.simple_disconnected_desc')
+                    : t('app.daemon_banner.simple_disconnected_non_windows')
+                  : t('dashboard.health_banner.paused_desc')}
             </p>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {experienceMode === 'simple' && onToggleEngine && (
-            <button
-              type="button"
-              disabled={!diagnostics.daemonConnected}
-              onClick={onToggleEngine}
-              className={`flex items-center gap-2 rounded-tf-md px-4 py-2 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                isEngineRunning
-                  ? 'border border-tf-orange/40 bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
-                  : 'bg-tf-green text-tf-bg hover:opacity-90'
-              }`}
-            >
-              <Power className="h-3.5 w-3.5" />
-              {isEngineRunning
-                ? t('app.header.engine.pause')
-                : t('app.header.engine.start')}
-            </button>
-          )}
+          {experienceMode === 'simple' &&
+            !diagnostics.daemonConnected &&
+            diagnostics.osName === 'WINDOWS' &&
+            onStartAndEnableProtection && (
+              <button
+                type="button"
+                disabled={startingProtection}
+                onClick={() => {
+                  void onStartAndEnableProtection();
+                }}
+                className="flex items-center gap-2 rounded-tf-md bg-tf-green px-4 py-2 text-xs font-bold text-tf-bg transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Power className="h-3.5 w-3.5" />
+                {startingProtection
+                  ? t('app.header.engine.starting_protection')
+                  : t('app.header.engine.start_protection')}
+              </button>
+            )}
+          {experienceMode === 'simple' &&
+            diagnostics.daemonConnected &&
+            onToggleEngine && (
+              <button
+                type="button"
+                onClick={onToggleEngine}
+                className={`flex items-center gap-2 rounded-tf-md px-4 py-2 text-xs font-bold transition ${
+                  isEngineRunning
+                    ? 'border border-tf-orange/40 bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
+                    : 'bg-tf-green text-tf-bg hover:opacity-90'
+                }`}
+              >
+                <Power className="h-3.5 w-3.5" />
+                {isEngineRunning
+                  ? t('app.header.engine.pause')
+                  : t('app.header.engine.start')}
+              </button>
+            )}
           <button
             onClick={onOpenWizard}
             className="tf-btn-accent flex items-center gap-2 px-3.5 py-2 text-xs"
@@ -199,6 +299,49 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
       {experienceMode === 'simple' ? (
         <>
+          {/* Beginner 3-Step Readiness Checklist (auto-hides once all 3 steps are done) */}
+          {showReadinessChecklist && (
+            <div className="tf-card p-4">
+              <div className="text-xs font-bold uppercase tracking-wider text-tf-accent">
+                {t('dashboard.simple.checklist_title')}
+              </div>
+              <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                {[
+                  {
+                    done: stepServiceReady,
+                    label: t('dashboard.simple.checklist_step_service')
+                  },
+                  {
+                    done: stepProtectionReady,
+                    label: t('dashboard.simple.checklist_step_protection')
+                  },
+                  {
+                    done: stepConfigReady,
+                    label: t('dashboard.simple.checklist_step_rules')
+                  }
+                ].map((item, idx) => (
+                  <div
+                    key={idx}
+                    className={`flex items-center gap-2 rounded-tf-md border px-3 py-2 text-xs font-semibold ${
+                      item.done
+                        ? 'border-tf-green/40 bg-tf-green/10 text-tf-green'
+                        : 'border-tf-border bg-tf-surface-alt text-tf-secondary'
+                    }`}
+                  >
+                    {item.done ? (
+                      <CheckCircle2 className="h-4 w-4 shrink-0 text-tf-green" />
+                    ) : (
+                      <Circle className="h-4 w-4 shrink-0 text-tf-secondary" />
+                    )}
+                    <span>
+                      {idx + 1}. {item.label}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Active Proxy Status Summary Card */}
           <div className="tf-card flex flex-wrap items-center justify-between gap-4 p-5">
             <div className="flex items-center gap-3.5">
@@ -218,9 +361,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       {primaryProxy.protocol.toUpperCase()} - {primaryProxy.host}:
                       {primaryProxy.port}
                     </span>
-                    {primaryProxy.lastLatencyMs !== null && (
+                    {lastProxyTestStatus === 'failed' ? (
+                      <span className="rounded-tf-sm bg-tf-red/15 px-2 py-0.5 text-[11px] font-bold text-tf-red">
+                        {t('dashboard.simple.proxy_status_failed')}
+                      </span>
+                    ) : primaryProxy.lastLatencyMs !== null ? (
                       <span className="rounded-tf-sm bg-tf-green/15 px-2 py-0.5 font-mono text-[11px] font-semibold text-tf-green">
-                        {primaryProxy.lastLatencyMs} ms
+                        {t('dashboard.simple.proxy_status_ok')} (
+                        {primaryProxy.lastLatencyMs} ms)
+                      </span>
+                    ) : (
+                      <span className="rounded-tf-sm bg-tf-surface-alt px-2 py-0.5 text-[11px] text-tf-secondary">
+                        {t('dashboard.simple.proxy_status_untested')}
                       </span>
                     )}
                     {primaryProxy.exitIp && (
@@ -246,11 +398,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {primaryProxy && onTestPrimaryProxy && (
                 <button
                   type="button"
-                  onClick={() => onTestPrimaryProxy(primaryProxy.id)}
-                  className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan"
+                  disabled={testingPrimaryProxy}
+                  onClick={() => {
+                    void handleTestPrimaryProxyClick(primaryProxy.id);
+                  }}
+                  className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-cyan hover:border-tf-cyan disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   <Activity className="h-3.5 w-3.5" />
-                  {t('dashboard.simple.test_proxy_cta')}
+                  {testingPrimaryProxy
+                    ? t('dashboard.simple.testing_proxy')
+                    : t('dashboard.simple.test_proxy_cta')}
                 </button>
               )}
               {onNavigateProxy && (
@@ -349,14 +506,28 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 ]
               ).map((card) => {
                 const CardIcon = card.icon;
+                const isApplied = lastAppliedUseCase === card.id;
+                const isApplying = applyingUseCase === card.id;
                 return (
                   <button
                     key={card.id}
                     type="button"
-                    onClick={() => onApplyUseCase?.(card.id)}
-                    className="tf-surface-alt flex flex-col items-start gap-2 rounded-tf-md p-4 text-left transition hover:border-tf-accent"
+                    disabled={applyingUseCase !== null}
+                    onClick={() => {
+                      void handleApplyUseCaseClick(card.id);
+                    }}
+                    className={`tf-surface-alt flex flex-col items-start gap-2 rounded-tf-md p-4 text-left transition hover:border-tf-accent disabled:opacity-60 ${
+                      isApplied ? 'border-tf-green bg-tf-green/10' : ''
+                    }`}
                   >
-                    <CardIcon className={`h-5 w-5 ${card.color}`} />
+                    <div className="flex w-full items-center justify-between gap-2">
+                      <CardIcon className={`h-5 w-5 ${card.color}`} />
+                      {isApplied && !isApplying && (
+                        <span className="rounded-full bg-tf-green/20 px-2 py-0.5 text-[10px] font-bold text-tf-green">
+                          {t('dashboard.simple.use_case_applied_badge')}
+                        </span>
+                      )}
+                    </div>
                     <div className="text-xs font-bold text-tf-primary">
                       {card.title}
                     </div>

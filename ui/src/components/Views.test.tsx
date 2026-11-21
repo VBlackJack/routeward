@@ -108,6 +108,12 @@ describe('Core UI view components', () => {
       name: `${i18n.t('rules.table.controls.delete')}: LAN Direct`
     });
     fireEvent.click(deleteBtn);
+    expect(onRemoveRule).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: `${i18n.t('app.confirm_delete.confirm')}: ${i18n.t('rules.table.controls.delete')}: LAN Direct`
+      })
+    );
     expect(onRemoveRule).toHaveBeenCalledWith('rule-2');
   });
 
@@ -258,6 +264,12 @@ describe('Core UI view components', () => {
 
     fireEvent.click(
       screen.getByRole('button', { name: i18n.t('proxies.section.chains.delete') })
+    );
+    expect(onRemoveChain).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: `${i18n.t('app.confirm_delete.confirm')}: ${i18n.t('proxies.section.chains.delete')}`
+      })
     );
     expect(onRemoveChain).toHaveBeenCalledWith('c1');
   });
@@ -1098,5 +1110,198 @@ describe('Core UI view components', () => {
       type: 'proxy',
       targetId: 'imported-ext-1'
     });
+  });
+
+  it('supports beginner proxy link paste, port validation, in-use delete warning, and SettingsView simple accordion', async () => {
+    const onAddProxy = vi.fn();
+    const onRemoveProxy = vi.fn();
+    const existingProxy: ProxyNode = {
+      id: 'p-used',
+      name: 'Work Proxy',
+      protocol: 'socks5',
+      host: 'proxy.example.com',
+      port: 1080,
+      auth: null,
+      udpEnabled: true,
+      tls: false,
+      sni: null,
+      enabled: true,
+      lastLatencyMs: 31,
+      exitIp: null
+    };
+    const ruleUsingProxy: RoutingRule = {
+      id: 'r-uses-p',
+      name: 'Browsers',
+      enabled: true,
+      priority: 10,
+      processPatterns: ['firefox.exe'],
+      domainPatterns: [],
+      ipCidrs: [],
+      portRanges: [],
+      protocol: 'any',
+      action: { type: 'proxy', targetId: 'p-used' }
+    };
+
+    render(
+      <ProxiesView
+        proxies={[existingProxy]}
+        chains={[]}
+        rules={[ruleUsingProxy]}
+        experienceMode="simple"
+        onTestProxy={vi.fn().mockResolvedValue(undefined)}
+        onTestAllProxies={vi.fn().mockResolvedValue(undefined)}
+        onAddProxy={onAddProxy}
+        onImportUris={vi.fn()}
+        onCopyUri={vi.fn()}
+        onRemoveProxy={onRemoveProxy}
+        onAddChain={vi.fn()}
+        onRemoveChain={vi.fn()}
+      />
+    );
+
+    // Simple mode exposes the paste link button and human-friendly status
+    expect(
+      screen.getByRole('button', { name: i18n.t('proxies.simple.paste_link_button') })
+    ).toBeInTheDocument();
+    expect(screen.getByText(`${i18n.t('proxies.simple.status_ok')} (31 ms)`)).toBeInTheDocument();
+
+    // Deleting a referenced proxy shows an inline warning and requires confirmation
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('proxies.card.action.delete') }));
+    expect(onRemoveProxy).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(i18n.t('proxies.simple.in_use_warning', { count: 1 }))
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: `${i18n.t('app.confirm_delete.confirm')}: ${i18n.t('proxies.card.action.delete')}`
+      })
+    );
+    expect(onRemoveProxy).toHaveBeenCalledWith('p-used');
+
+    // Quick-paste URI in Add Proxy modal auto-fills fields and validates ports
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('proxies.simple.add') }));
+    fireEvent.change(
+      screen.getByLabelText(i18n.t('proxies.modal.add_proxy.quick_paste_label')),
+      { target: { value: 'https://alice:pw@edge.example.com:8443#AutoFilled' } }
+    );
+    expect(screen.getByLabelText(i18n.t('proxies.modal.add_proxy.name_label'))).toHaveValue(
+      'AutoFilled'
+    );
+    expect(screen.getByLabelText(i18n.t('proxies.modal.add_proxy.host_label'))).toHaveValue(
+      'edge.example.com'
+    );
+    expect(screen.getByLabelText(i18n.t('proxies.modal.add_proxy.port_label'))).toHaveValue(8443);
+
+    fireEvent.change(screen.getByLabelText(i18n.t('proxies.modal.add_proxy.port_label')), {
+      target: { value: '70000' }
+    });
+    fireEvent.submit(
+      screen.getByLabelText(i18n.t('proxies.modal.add_proxy.port_label')).closest('form')!
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      i18n.t('proxies.modal.add_proxy.port_error')
+    );
+    expect(onAddProxy).not.toHaveBeenCalled();
+
+    cleanup();
+
+    // SettingsView Simple mode collapses advanced system tools until toggled open
+    render(
+      <SettingsView
+        diagnostics={{
+          daemonConnected: true,
+          running: true,
+          osName: 'WINDOWS',
+          interceptionMode: 'hybrid',
+          elevatedPrivileges: true,
+          relayTcpEndpoint: '127.0.0.1:10808',
+          relayHttpEndpoint: '127.0.0.1:10809',
+          dnsEndpoint: '127.0.0.1:10853',
+          fakeIpCidr: '198.18.0.0/15',
+          activeLocale: 'en'
+        }}
+        securityPolicy={{
+          killSwitchEnabled: true,
+          blockUdpOnTcpOnlyProxy: true,
+          strictDnsNoLocalFallback: true
+        }}
+        experienceMode="simple"
+        systemProxyEnabled={false}
+        fakeIps={[]}
+        logs={[]}
+        activePaletteDisplayName="Drakul"
+        activeAccent="Default"
+        language="en"
+        onUpdateSecurityPolicy={vi.fn()}
+        onSetInterceptionMode={vi.fn()}
+        onToggleSystemProxy={vi.fn().mockResolvedValue(undefined)}
+        onOpenThemeForge={vi.fn()}
+        onToggleLanguage={vi.fn()}
+        onOpenWizard={vi.fn()}
+        onOpenGlossary={vi.fn()}
+        onOpenLauncher={vi.fn()}
+        onImportProfile={vi.fn()}
+        onExportProfile={vi.fn()}
+        onAllocateDns={vi.fn()}
+        onFlushDns={vi.fn()}
+        onClearLogs={vi.fn()}
+      />
+    );
+
+    expect(screen.queryByText(i18n.t('settings.system.pac_title'))).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('settings.system.advanced_tools_show') })
+    );
+    expect(screen.getByText(i18n.t('settings.system.pac_title'))).toBeInTheDocument();
+  });
+
+  it('QuickSetupWizardModal supports manual proxy input and gaming goal rule creation', async () => {
+    const onAddProxy = vi.fn().mockImplementation(async (node: ProxyNode) => [node]);
+    const onAddRule = vi.fn().mockResolvedValue(undefined);
+    const onComplete = vi.fn();
+
+    render(
+      <QuickSetupWizardModal
+        proxies={[]}
+        chains={[]}
+        currentMode="simple"
+        onImportUris={vi.fn()}
+        onAddProxy={onAddProxy}
+        onAddRule={onAddRule}
+        onSelectMode={vi.fn()}
+        onComplete={onComplete}
+        onClose={vi.fn()}
+      />
+    );
+
+    // Pick Gaming goal on Step 1
+    fireEvent.click(screen.getByText(i18n.t('wizard.modal.step1_gaming_title')));
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.next') }));
+
+    // Switch to manual host & port on Step 2
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('wizard.modal.step2_tab_manual') })
+    );
+    fireEvent.change(
+      screen.getByLabelText(i18n.t('wizard.modal.step2_manual_host')),
+      { target: { value: 'proxy.game.example' } }
+    );
+    fireEvent.change(
+      screen.getByLabelText(i18n.t('wizard.modal.step2_manual_port')),
+      { target: { value: '1080' } }
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.next') }));
+    expect(
+      screen.getByText(i18n.t('wizard.modal.step3_summary_with_proxy'))
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.finish') }));
+
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(true));
+    expect(onAddProxy).toHaveBeenCalledTimes(1);
+    const createdRuleIds = onAddRule.mock.calls.map((c) => (c[0] as RoutingRule).id);
+    expect(createdRuleIds).toContain('rule-visual-app-gaming');
+    expect(createdRuleIds).toContain('rule-wiz-preset-privacy-browsers');
+    expect(createdRuleIds).toContain('rule-wiz-preset-rfc1918-direct');
   });
 });

@@ -19,6 +19,7 @@ import { useTranslation } from 'react-i18next';
 import {
   Activity,
   AlertTriangle,
+  BookOpen,
   CheckCircle2,
   Home,
   Power,
@@ -249,21 +250,22 @@ export const App: React.FC = () => {
     handleSetLanguage(i18n.language.startsWith('fr') ? 'en' : 'fr');
   };
 
-  const handleStartDaemon = async () => {
-    if (startingDaemon) return;
+  const handleStartDaemon = async (): Promise<boolean> => {
+    if (startingDaemon) return false;
     setStartingDaemon(true);
     try {
       const res = await routewardClient.startDaemon();
       if (res.connected) {
         pushToast(t('app.toast.daemon.started'), 'success');
-      } else {
-        pushToast(t('app.toast.daemon.start_failed'), 'warning');
+        return true;
       }
+      pushToast(t('app.toast.daemon.start_failed'), 'warning');
+      return false;
     } catch (err) {
       if (err instanceof HttpResponseError) {
         if (err.errorKey === 'uac_cancelled') {
           pushToast(t('app.toast.daemon.uac_cancelled'), 'warning');
-          return;
+          return false;
         }
         const errorToastMap: Record<string, string> = {
           access_denied: 'app.toast.daemon.access_denied',
@@ -276,12 +278,21 @@ export const App: React.FC = () => {
         const key = err.errorKey ? errorToastMap[err.errorKey] : undefined;
         if (key) {
           pushToast(t(key), 'error');
-          return;
+          return false;
         }
       }
       pushToast(t('app.toast.daemon.start_failed'), 'error');
+      return false;
     } finally {
       setStartingDaemon(false);
+    }
+  };
+
+  const handleStartAndEnableProtection = async () => {
+    if (startingDaemon || togglingEngineRef.current) return;
+    const connected = await handleStartDaemon();
+    if (connected && !routewardClient.getDiagnostics().running) {
+      await handleToggleEngine(true);
     }
   };
 
@@ -315,25 +326,37 @@ export const App: React.FC = () => {
   };
 
   useEffect(() => {
+    let cancelled = false;
     void routewardClient.getPacStatus().then((res) => {
+      if (cancelled) return;
       setPacEnabled(res.enabled);
       setPacUrl(res.pacUrl);
     });
     void routewardClient.getAutostartStatus().then((res) => {
+      if (cancelled) return;
       setAutostartEnabled(res.enabled);
     });
     void routewardClient.getSystemProxyStatus().then((res) => {
+      if (cancelled) return;
       setSystemProxyEnabled(res.enabled);
     });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
     if (!diagnostics.daemonConnected) {
       return;
     }
+    let cancelled = false;
     void routewardClient.listNamedProfiles().then((list) => {
+      if (cancelled) return;
       setNamedProfiles(list);
     });
+    return () => {
+      cancelled = true;
+    };
   }, [diagnostics.daemonConnected, profile.profileId, profile.name]);
 
   const handleToggleSystemProxy = async () => {
@@ -523,11 +546,15 @@ export const App: React.FC = () => {
     );
   };
 
-  const handleApplyUseCase = async (useCase: DashboardUseCaseId) => {
+  const handleApplyUseCase = async (
+    useCase: DashboardUseCaseId
+  ): Promise<boolean> => {
     try {
       await applyUseCase(useCase);
+      return true;
     } catch (err) {
       pushErrorToast(err);
+      return false;
     }
   };
 
@@ -673,6 +700,17 @@ export const App: React.FC = () => {
               <span>{t('app.help.wizard_button')}</span>
             </button>
 
+            {experienceMode === 'simple' && (
+              <button
+                type="button"
+                onClick={() => setShowGlossaryModal(true)}
+                className="tf-surface-alt flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-tf-secondary hover:border-tf-accent hover:text-tf-primary"
+              >
+                <BookOpen className="h-3.5 w-3.5 text-tf-accent" />
+                <span>{t('app.help.glossary_button')}</span>
+              </button>
+            )}
+
             {/* Primary Enable / Pause Protection CTA */}
             <button
               type="button"
@@ -703,10 +741,17 @@ export const App: React.FC = () => {
               <AlertTriangle className="h-4 w-4 shrink-0 text-tf-red" />
               <div>
                 <span className="font-bold text-tf-red">
-                  {t('app.daemon_banner.disconnected_title')}
+                  {experienceMode === 'simple'
+                    ? t('app.daemon_banner.simple_disconnected_title')
+                    : t('app.daemon_banner.disconnected_title')}
                 </span>{' '}
                 <span className="text-tf-primary">
-                  - {t('app.daemon_banner.disconnected_desc')}
+                  -{' '}
+                  {experienceMode === 'simple'
+                    ? diagnostics.osName === 'WINDOWS'
+                      ? t('app.daemon_banner.simple_disconnected_desc')
+                      : t('app.daemon_banner.simple_disconnected_non_windows')
+                    : t('app.daemon_banner.disconnected_desc')}
                 </span>
               </div>
             </div>
@@ -823,15 +868,25 @@ export const App: React.FC = () => {
             experienceMode={experienceMode}
             proxies={profile.proxies}
             rules={profile.rules}
+            startingProtection={startingDaemon || togglingEngine}
             onToggleEngine={() => {
               void handleToggleEngine(!isEngineRunning);
             }}
+            onStartAndEnableProtection={handleStartAndEnableProtection}
             onApplyUseCase={handleApplyUseCase}
-            onTestPrimaryProxy={(proxyId) => {
-              runMutation(
-                () => routewardClient.testProxy(proxyId),
-                () => pushToast(t('app.toast.proxy.tested'))
-              );
+            onTestPrimaryProxy={async (proxyId) => {
+              try {
+                const report = await routewardClient.testProxy(proxyId);
+                if (report?.reachable) {
+                  pushToast(t('app.toast.proxy.tested'), 'success');
+                } else {
+                  pushToast(t('app.toast.proxy.unreachable'), 'error');
+                }
+                return report;
+              } catch (err) {
+                pushErrorToast(err);
+                return null;
+              }
             }}
             onNavigateProxy={() => setActiveTab('proxy')}
             onUpdateSecurityPolicy={(partial) => {
@@ -908,11 +963,16 @@ export const App: React.FC = () => {
           <ProxiesView
             proxies={profile.proxies}
             chains={profile.chains}
+            rules={profile.rules}
             experienceMode={experienceMode}
             onTestProxy={async (id) => {
               try {
-                await routewardClient.testProxy(id);
-                pushToast(t('app.toast.proxy.tested'));
+                const report = await routewardClient.testProxy(id);
+                if (report?.reachable) {
+                  pushToast(t('app.toast.proxy.tested'), 'success');
+                } else {
+                  pushToast(t('app.toast.proxy.unreachable'), 'error');
+                }
               } catch (err) {
                 pushErrorToast(err);
               }
@@ -947,7 +1007,10 @@ export const App: React.FC = () => {
               pushToast(t('app.toast.proxy.copied_uri'), 'info');
             }}
             onRemoveProxy={(id) => {
-              runMutation(() => routewardClient.removeProxy(id));
+              runMutation(
+                () => routewardClient.removeProxy(id),
+                () => pushToast(t('app.toast.proxy.deleted'), 'warning')
+              );
             }}
             onAddChain={(chain) => {
               runMutation(() => routewardClient.upsertChain(chain));
@@ -1150,6 +1213,11 @@ export const App: React.FC = () => {
             await routewardClient.importProxyUris(text);
             return routewardClient.getProfile().proxies;
           }}
+          onAddProxy={async (node) => {
+            await routewardClient.upsertProxy(node);
+            return routewardClient.getProfile().proxies;
+          }}
+          onTestProxy={(proxyId) => routewardClient.testProxy(proxyId)}
           onAddRule={(rule) => routewardClient.upsertRule(rule)}
           onSelectMode={(mode) => handleSetExperienceMode(mode)}
           onError={(err) => pushErrorToast(err)}
@@ -1180,6 +1248,7 @@ export const App: React.FC = () => {
       {showLauncherModal && (
         <ProcessLauncherModal
           relayEndpoint={diagnostics.relayTcpEndpoint}
+          relayHttpEndpoint={diagnostics.relayHttpEndpoint}
           onLaunch={async (exe, args) => {
             try {
               await routewardClient.launchProcessWithProxy(exe, args);

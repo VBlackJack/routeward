@@ -3,6 +3,10 @@
     "titlebar": {
       "close": "Fermer"
     },
+    "confirm_delete": {
+      "confirm": "Confirmer",
+      "cancel": "Annuler"
+    },
     "launcher": {
       "button": "Lancer App via Proxy",
       "modal": {
@@ -34,6 +38,9 @@
     "daemon_banner": {
       "disconnected_title": "Démon Privilégié RouteWard Déconnecté",
       "disconnected_desc": "Le pont de l'interface ne parvient pas à joindre le démon (lancez 'routeward daemon' en Administrateur ou root). Reconnexion automatique active.",
+      "simple_disconnected_title": "Service de protection arrêté",
+      "simple_disconnected_desc": "Démarrez le service en un clic pour activer le filtrage et la protection de vos applications.",
+      "simple_disconnected_non_windows": "Le service de fond n'est pas encore lancé. Démarrez RouteWard en administrateur (root) pour activer la protection.",
       "reconnecting_badge": "Reconnexion auto",
       "retry_button": "Réessayer",
       "start_button": "Démarrer le Service",
@@ -50,7 +57,9 @@
         "running": "Intercepteur Actif",
         "stopped": "Intercepteur en Pause",
         "start": "Activer la protection",
-        "pause": "Mettre en pause"
+        "pause": "Mettre en pause",
+        "start_protection": "Démarrer la protection",
+        "starting_protection": "Démarrage..."
       },
       "status": {
         "protected": "Protégé",
@@ -112,9 +121,11 @@
       },
       "proxy": {
         "added": "Serveur proxy ajouté au profil",
+        "deleted": "Serveur proxy supprimé",
         "imported_uris": "Serveurs proxies importés depuis la liste d'URI",
         "copied_uri": "URI du proxy copiée dans le presse-papiers",
         "tested": "Test de latence et de santé du proxy terminé",
+        "unreachable": "Le proxy n'a pas répondu - vérifiez l'adresse, le port et le protocole",
         "required_for_rule": "Ajoutez et activez d'abord un serveur proxy externe pour router un flux via proxy"
       },
       "connection": {
@@ -225,6 +236,15 @@
       "configure_proxy_cta": "Configurer un Proxy",
       "add_optional_proxy_cta": "Ajouter un Proxy Externe (Optionnel)",
       "test_proxy_cta": "Vérifier la Connexion",
+      "testing_proxy": "Vérification...",
+      "proxy_status_ok": "Fonctionne",
+      "proxy_status_failed": "Injoignable",
+      "proxy_status_untested": "Non vérifié",
+      "use_case_applied_badge": "Appliqué",
+      "checklist_title": "3 étapes pour être prêt",
+      "checklist_step_service": "Service démarré",
+      "checklist_step_protection": "Protection active",
+      "checklist_step_rules": "Apps ou proxy configurés",
       "use_cases_title": "Que voulez-vous faire aujourd'hui ?",
       "use_cases_subtitle": "Choisissez un scénario prêt à l'emploi pour configurer vos applications et votre protection en un clic.",
       "uc_privacy_title": "Navigation Privée",
@@ -412,10 +432,15 @@
       "title": "Mon Serveur Proxy",
       "subtitle": "Ajoutez votre serveur proxy ou lien d'abonnement et vérifiez qu'il répond correctement.",
       "add": "Ajouter un Proxy",
+      "paste_link_button": "Coller un lien proxy",
       "empty": "Aucun proxy externe configuré pour le moment. Vous pouvez déjà filtrer et bloquer vos applications en direct, ou ajouter votre serveur proxy ci-dessus.",
       "show_advanced_options": "Afficher les options protocole (UDP / TLS)",
       "hide_advanced_options": "Masquer les options protocole",
-      "active_badge": "Principal"
+      "active_badge": "Principal",
+      "status_ok": "Fonctionne",
+      "status_untested": "Non vérifié",
+      "test_connection": "Vérifier la connexion",
+      "in_use_warning": "Utilisé par {{count}} règle(s)"
     },
     "section": {
       "servers": {
@@ -463,11 +488,15 @@
       "add_proxy": {
         "title": "Configurer un Serveur Proxy",
         "edit_title": "Modifier le Serveur Proxy",
+        "quick_paste_label": "Astuce : collez directement un lien proxy (optionnel)",
+        "quick_paste_placeholder": "socks5://user:pass@proxy.example.com:1080#MonProxy",
+        "quick_paste_applied": "Champs pré-remplis depuis votre lien proxy",
         "name_label": "Nom d'affichage",
         "protocol_label": "Protocole",
         "host_label": "Hôte / Adresse IP",
         "host_placeholder": "proxy.example.com",
         "port_label": "Port",
+        "port_error": "Le port doit être un nombre entre 1 et 65535",
         "username_label": "Identifiant (Optionnel)",
         "password_label": "Mot de passe (Optionnel)",
         "password_unchanged_placeholder": "Inchangé (conservé par le démon)",
@@ -760,11 +789,11 @@
     "proxy": {
       "not_found": "L'identifiant de proxy spécifié est introuvable",
       "chain_empty": "La chaîne de proxies doit contenir au moins un saut",
-      "handshake_failed": "Échec de la négociation protocolaire avec le proxy",
-      "connection_timeout": "Délai d'attente dépassé lors de la connexion au proxy",
-      "auth_rejected": "Le serveur proxy a rejeté les identifiants d'authentification",
+      "handshake_failed": "Échec de la négociation avec le proxy (vérifiez le protocole SOCKS5 / HTTP, l'adresse et le port)",
+      "connection_timeout": "Délai d'attente dépassé : le proxy ne répond pas (vérifiez l'adresse, le port et votre connexion)",
+      "auth_rejected": "Identifiant ou mot de passe refusé par le serveur proxy",
       "udp_not_supported": "Le serveur proxy en amont ne supporte pas SOCKS5 UDP ASSOCIATE",
-      "invalid_uri": "Format d'URI de proxy invalide"
+      "invalid_uri": "Format de lien proxy invalide (attendu : socks5://, http:// ou https://hote:port)"
     },
     "rule": {
       "blocked_by_policy": "Connexion bloquée par une règle de routage"
@@ -851,7 +880,21 @@
       "step2_no_proxy_desc": "RouteWard n'embarque pas de serveur proxy interne. Poursuivez sans URI pour filtrer pisteurs et règles locales en direct, ou collez l'URI de votre propre proxy externe ci-dessous.",
       "step2_paste_uri": "Ou collez un lien de connexion (socks5://, http://, https:// ou abonnement Base64) :",
       "step2_uri_placeholder": "socks5://user:pass@proxy.example.com:1080#MonProxyExterne",
+      "step2_tab_link": "Coller un lien",
+      "step2_tab_manual": "Saisir adresse & port",
+      "step2_manual_name": "Nom du proxy (optionnel)",
+      "step2_manual_host": "Adresse du serveur (hôte ou IP)",
+      "step2_manual_port": "Port",
+      "step2_manual_protocol": "Protocole",
+      "step2_manual_user": "Identifiant (optionnel)",
+      "step2_manual_pass": "Mot de passe (optionnel)",
+      "step2_test_button": "Tester la connexion",
+      "step2_test_ok": "Connexion réussie ({{ms}} ms)",
+      "step2_test_failed": "Impossible de joindre ce proxy. Vérifiez l'adresse, le port et le protocole.",
       "step3_title": "3. Niveau d'interface préféré",
+      "step3_summary_title": "Résumé de votre configuration",
+      "step3_summary_with_proxy": "Votre objectif sera appliqué avec votre proxy externe.",
+      "step3_summary_direct": "Mode Filtrage Direct : blocage des pisteurs et règles locales sans proxy externe.",
       "step3_simple_title": "Mode Simple (Recommandé pour débuter)",
       "step3_simple_desc": "Explications claires, sélecteur d'applications par icônes et diagnostic visuel rassurant.",
       "step3_expert_title": "Mode Expert (SysAdmin Linux / Windows)",
@@ -941,7 +984,11 @@
       "launcher_title": "Lancer un Programme via Proxy",
       "launcher_desc": "Démarre un exécutable avec ALL_PROXY et HTTPS_PROXY préconfigurés.",
       "profile_title": "Sauvegarde de Profil (JSON)",
-      "profile_desc": "Importez ou exportez tous vos proxies, règles et préférences."
+      "profile_desc": "Importez ou exportez tous vos proxies, règles et préférences.",
+      "advanced_tools_title": "Outils avancés & intégration système",
+      "advanced_tools_desc": "Proxy système Windows, script PAC, lancement ciblé et sauvegarde JSON.",
+      "advanced_tools_show": "Afficher",
+      "advanced_tools_hide": "Masquer"
     },
     "profiles": {
       "title": "Profils Nommés (Bascule Rapide)",

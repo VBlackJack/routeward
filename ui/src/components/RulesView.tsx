@@ -33,7 +33,6 @@ import {
   Shield,
   ShieldAlert,
   Sparkles,
-  Trash2,
   Upload
 } from 'lucide-react';
 import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
@@ -52,6 +51,7 @@ import {
 } from '../types/routeward';
 import { ExperienceMode } from './QuickSetupWizardModal';
 import { ModalContainer } from './ModalContainer';
+import { ConfirmDeleteButton } from './ConfirmDeleteButton';
 
 interface RulesViewProps {
   rules: RoutingRule[];
@@ -162,6 +162,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
   // Add / Edit Rule & Presets modal state
   const [showModal, setShowModal] = useState(false);
   const [showPresets, setShowPresets] = useState(false);
+  const [armedDeleteRuleId, setArmedDeleteRuleId] = useState<string | null>(null);
   const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
   const [editingRuleEnabled, setEditingRuleEnabled] = useState(true);
   const [editingRequiresAdvanced, setEditingRequiresAdvanced] = useState(false);
@@ -771,21 +772,23 @@ export const RulesView: React.FC<RulesViewProps> = ({
                       <button
                         type="button"
                         onClick={() => openEditRuleModal(rule)}
-                        className="rounded p-1 text-tf-secondary hover:text-tf-accent"
+                        className="rounded p-1.5 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-accent"
                         title={t('rules.table.controls.edit')}
                         aria-label={`${t('rules.table.controls.edit')}: ${rule.name}`}
                       >
                         <Edit3 className="h-3.5 w-3.5" />
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => onRemoveRule(rule.id)}
-                        className="rounded p-1 text-tf-secondary hover:text-tf-red"
+                      <ConfirmDeleteButton
+                        armed={armedDeleteRuleId === rule.id}
                         title={t('rules.table.controls.delete')}
-                        aria-label={`${t('rules.table.controls.delete')}: ${rule.name}`}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
+                        ariaLabel={`${t('rules.table.controls.delete')}: ${rule.name}`}
+                        onArm={() => setArmedDeleteRuleId(rule.id)}
+                        onConfirm={() => {
+                          setArmedDeleteRuleId(null);
+                          onRemoveRule(rule.id);
+                        }}
+                        onCancel={() => setArmedDeleteRuleId(null)}
+                      />
                     </div>
                   </div>
                 );
@@ -904,20 +907,23 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         <button
                           type="button"
                           onClick={() => openEditRuleModal(rule)}
-                          className="rounded p-1 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-accent"
+                          className="rounded p-1.5 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-accent"
                           title={t('rules.table.controls.edit')}
                           aria-label={`${t('rules.table.controls.edit')}: ${rule.name}`}
                         >
                           <Edit3 className="h-3.5 w-3.5" />
                         </button>
-                        <button
-                          onClick={() => onRemoveRule(rule.id)}
-                          className="rounded p-1 text-tf-secondary hover:text-tf-red"
+                        <ConfirmDeleteButton
+                          armed={armedDeleteRuleId === rule.id}
                           title={t('rules.table.controls.delete')}
-                          aria-label={`${t('rules.table.controls.delete')}: ${rule.name}`}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                          ariaLabel={`${t('rules.table.controls.delete')}: ${rule.name}`}
+                          onArm={() => setArmedDeleteRuleId(rule.id)}
+                          onConfirm={() => {
+                            setArmedDeleteRuleId(null);
+                            onRemoveRule(rule.id);
+                          }}
+                          onCancel={() => setArmedDeleteRuleId(null)}
+                        />
                       </div>
                     </td>
                   </tr>

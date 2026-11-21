@@ -17,6 +17,7 @@
 import React, { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  Activity,
   Briefcase,
   CheckCircle2,
   Gamepad2,
@@ -27,16 +28,22 @@ import {
   X
 } from 'lucide-react';
 import { ModalContainer } from './ModalContainer';
-import { SYSTEM_CONSTANTS } from '../config/constants';
+import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
+import { generateClientId } from '../services/ipc';
 import {
   ProxyChain,
+  ProxyHealthReport,
   ProxyNode,
+  ProxyProtocol,
   RoutingRule,
   TransportProtocol
 } from '../types/routeward';
 
 export type ExperienceMode = 'simple' | 'expert';
 type GoalProfile = 'privacy' | 'work' | 'gaming';
+type WizardProxyInputMode = 'link' | 'manual';
+
+const WIZARD_PROTOCOLS: ProxyProtocol[] = ['socks5', 'http', 'https', 'socks4'];
 
 interface QuickSetupWizardModalProps {
   proxies: ProxyNode[];
@@ -45,6 +52,10 @@ interface QuickSetupWizardModalProps {
   onImportUris: (
     uriText: string
   ) => Promise<ProxyNode[] | number | void> | void;
+  onAddProxy?: (proxy: ProxyNode) => Promise<ProxyNode[] | void> | void;
+  onTestProxy?: (
+    proxyId: string
+  ) => Promise<ProxyHealthReport | null | void> | void;
   onAddRule: (rule: RoutingRule) => Promise<unknown> | void;
   onSelectMode: (mode: ExperienceMode) => void;
   onComplete: (hasEnabledProxy?: boolean) => void;
@@ -60,6 +71,8 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   chains,
   currentMode,
   onImportUris,
+  onAddProxy,
+  onTestProxy,
   onAddRule,
   onSelectMode,
   onComplete,
@@ -69,23 +82,122 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   const { t } = useTranslation();
   const titleId = useId();
   const uriTextareaId = useId();
+  const manualFormId = useId();
   const [step, setStep] = useState(1);
   const [goal, setGoal] = useState<GoalProfile>('privacy');
+  const [proxyInputMode, setProxyInputMode] =
+    useState<WizardProxyInputMode>('link');
   const [customUri, setCustomUri] = useState('');
+  const [manualName, setManualName] = useState('');
+  const [manualProtocol, setManualProtocol] = useState<ProxyProtocol>('socks5');
+  const [manualHost, setManualHost] = useState('');
+  const [manualPort, setManualPort] = useState<string>(
+    String(UI_CONFIG.DEFAULT_PROXY_PORT)
+  );
+  const [manualUsername, setManualUsername] = useState('');
+  const [manualPassword, setManualPassword] = useState('');
+  const [manualPortError, setManualPortError] = useState<string | null>(null);
+  const [testingExisting, setTestingExisting] = useState(false);
+  const [existingTestFeedback, setExistingTestFeedback] = useState<
+    { ok: true; ms: number } | { ok: false } | null
+  >(null);
   const [selectedMode, setSelectedMode] = useState<ExperienceMode>(currentMode);
   const [applying, setApplying] = useState(false);
 
   const enabledExistingProxies = proxies.filter((p) => p.enabled);
+
+  const hasPlannedProxy =
+    enabledExistingProxies.length > 0 ||
+    (proxyInputMode === 'link' && Boolean(customUri.trim())) ||
+    (proxyInputMode === 'manual' && Boolean(manualHost.trim()));
+
+  const handleTestExistingProxy = async () => {
+    const target = enabledExistingProxies[0];
+    if (!target || !onTestProxy || testingExisting) return;
+    setTestingExisting(true);
+    setExistingTestFeedback(null);
+    try {
+      const report = await Promise.resolve(onTestProxy(target.id));
+      if (report && typeof report === 'object' && 'reachable' in report) {
+        if (report.reachable) {
+          setExistingTestFeedback({ ok: true, ms: report.latencyMs ?? 0 });
+        } else {
+          setExistingTestFeedback({ ok: false });
+        }
+      } else {
+        setExistingTestFeedback({ ok: false });
+      }
+    } catch {
+      setExistingTestFeedback({ ok: false });
+    } finally {
+      setTestingExisting(false);
+    }
+  };
 
   const applySelectedGoalRules = async () => {
     if (applying) return;
     setApplying(true);
     try {
       let postImportProxies = proxies;
-      if (customUri.trim()) {
+      if (proxyInputMode === 'link' && customUri.trim()) {
         const importResult = await onImportUris(customUri.trim());
         if (Array.isArray(importResult)) {
           postImportProxies = importResult;
+        }
+      } else if (proxyInputMode === 'manual' && manualHost.trim()) {
+        const parsedPort = Number(manualPort.trim());
+        if (
+          !Number.isInteger(parsedPort) ||
+          parsedPort < 1 ||
+          parsedPort > UI_CONFIG.MAX_PORT
+        ) {
+          setManualPortError(t('proxies.modal.add_proxy.port_error'));
+          setStep(2);
+          return;
+        }
+        const cleanHost = manualHost.trim();
+        const cleanUser = manualUsername.trim();
+        const effectiveTls = manualProtocol === 'https';
+        const newNode: ProxyNode = {
+          id: generateClientId('proxy'),
+          name:
+            manualName.trim() ||
+            `${manualProtocol.toUpperCase()} ${cleanHost}:${parsedPort}`,
+          protocol: manualProtocol,
+          host: cleanHost,
+          port: parsedPort,
+          auth:
+            cleanUser || manualPassword
+              ? {
+                  username: cleanUser,
+                  ...(manualPassword ? { password: manualPassword } : {}),
+                  hasPassword: Boolean(manualPassword)
+                }
+              : null,
+          udpEnabled: manualProtocol === 'socks5',
+          tls: effectiveTls,
+          tlsSkipVerify: false,
+          sni: effectiveTls ? cleanHost : null,
+          enabled: true,
+          lastLatencyMs: null,
+          exitIp: null
+        };
+        if (onAddProxy) {
+          const addResult = await onAddProxy(newNode);
+          if (Array.isArray(addResult)) {
+            postImportProxies = addResult;
+          } else {
+            postImportProxies = [...proxies, newNode];
+          }
+        } else {
+          const authPrefix = cleanUser
+            ? `${encodeURIComponent(cleanUser)}${manualPassword ? `:${encodeURIComponent(manualPassword)}` : ''}@`
+            : '';
+          const fallbackUri = `${manualProtocol}://${authPrefix}${cleanHost}:${parsedPort}#${encodeURIComponent(newNode.name)}`;
+          const importResult = await onImportUris(fallbackUri);
+          if (Array.isArray(importResult)) {
+            postImportProxies = importResult;
+          }
         }
       }
 
@@ -103,6 +215,26 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
       const findPreset = (id: string) =>
         SYSTEM_CONSTANTS.rulePresets.find((p) => p.id === id);
 
+      if (goal === 'gaming') {
+        const gamingApp = SYSTEM_CONSTANTS.visualAppCatalog.find(
+          (c) => c.id === 'app-gaming'
+        );
+        if (gamingApp) {
+          await onAddRule({
+            id: `rule-visual-${gamingApp.id}`,
+            name: t(`${gamingApp.i18nKey}.name`),
+            enabled: true,
+            priority: gamingApp.priority,
+            processPatterns: [...gamingApp.processPatterns],
+            domainPatterns: [],
+            ipCidrs: [],
+            portRanges: [],
+            protocol: 'any',
+            action: { type: 'direct' }
+          });
+        }
+      }
+
       const presetsToApply: string[] =
         goal === 'privacy'
           ? [
@@ -115,7 +247,10 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
                 ...(hasEnabledProxy ? ['preset-dev-toolchains'] : []),
                 'preset-rfc1918-direct'
               ]
-            : ['preset-rfc1918-direct'];
+            : [
+                ...(hasEnabledProxy ? ['preset-privacy-browsers'] : []),
+                'preset-rfc1918-direct'
+              ];
 
       for (const pid of presetsToApply) {
         const preset = findPreset(pid);
@@ -271,16 +406,48 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
             </h3>
 
             {enabledExistingProxies[0] ? (
-              <div className="tf-surface-alt flex items-center justify-between p-3.5 text-xs">
-                <div>
-                  <div className="font-bold text-tf-primary">
-                    {t('wizard.modal.step2_use_existing')}
+              <div className="tf-surface-alt space-y-2 p-3.5 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <div className="font-bold text-tf-primary">
+                      {t('wizard.modal.step2_use_existing')}
+                    </div>
+                    <div className="mt-0.5 font-mono text-[11px] text-tf-cyan">
+                      {`${enabledExistingProxies[0].name} (${enabledExistingProxies[0].protocol.toUpperCase()} - ${enabledExistingProxies[0].host}:${enabledExistingProxies[0].port})`}
+                    </div>
                   </div>
-                  <div className="mt-0.5 font-mono text-[11px] text-tf-cyan">
-                    {`${enabledExistingProxies[0].name} (${enabledExistingProxies[0].protocol.toUpperCase()} - ${enabledExistingProxies[0].host}:${enabledExistingProxies[0].port})`}
+                  <div className="flex items-center gap-2">
+                    {onTestProxy && (
+                      <button
+                        type="button"
+                        disabled={testingExisting}
+                        onClick={() => {
+                          void handleTestExistingProxy();
+                        }}
+                        className="tf-surface flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold text-tf-cyan hover:border-tf-cyan disabled:opacity-60"
+                      >
+                        <Activity className="h-3.5 w-3.5" />
+                        {testingExisting
+                          ? t('dashboard.simple.testing_proxy')
+                          : t('wizard.modal.step2_test_button')}
+                      </button>
+                    )}
+                    <CheckCircle2 className="h-5 w-5 shrink-0 text-tf-green" />
                   </div>
                 </div>
-                <CheckCircle2 className="h-5 w-5 text-tf-green" />
+                {existingTestFeedback && (
+                  <p
+                    className={`text-[11px] font-semibold ${
+                      existingTestFeedback.ok ? 'text-tf-green' : 'text-tf-red'
+                    }`}
+                  >
+                    {existingTestFeedback.ok
+                      ? t('wizard.modal.step2_test_ok', {
+                          ms: existingTestFeedback.ms
+                        })
+                      : t('wizard.modal.step2_test_failed')}
+                  </p>
+                )}
               </div>
             ) : (
               <div className="rounded-tf-md border border-tf-cyan/30 bg-tf-cyan/10 p-3.5 text-xs">
@@ -293,22 +460,166 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
               </div>
             )}
 
-            <div>
-              <label
-                htmlFor={uriTextareaId}
-                className="mb-1.5 block text-xs font-medium text-tf-secondary"
+            <div className="flex gap-2">
+              <button
+                type="button"
+                aria-pressed={proxyInputMode === 'link'}
+                onClick={() => setProxyInputMode('link')}
+                className={`flex-1 rounded-tf-md px-3 py-1.5 text-xs font-bold transition ${
+                  proxyInputMode === 'link'
+                    ? 'bg-tf-accent text-tf-bg'
+                    : 'tf-surface-alt text-tf-secondary hover:text-tf-primary'
+                }`}
               >
-                {t('wizard.modal.step2_paste_uri')}
-              </label>
-              <textarea
-                id={uriTextareaId}
-                rows={3}
-                value={customUri}
-                onChange={(e) => setCustomUri(e.target.value)}
-                placeholder={t('wizard.modal.step2_uri_placeholder')}
-                className="tf-input w-full p-2.5 font-mono text-xs"
-              />
+                {t('wizard.modal.step2_tab_link')}
+              </button>
+              <button
+                type="button"
+                aria-pressed={proxyInputMode === 'manual'}
+                onClick={() => setProxyInputMode('manual')}
+                className={`flex-1 rounded-tf-md px-3 py-1.5 text-xs font-bold transition ${
+                  proxyInputMode === 'manual'
+                    ? 'bg-tf-accent text-tf-bg'
+                    : 'tf-surface-alt text-tf-secondary hover:text-tf-primary'
+                }`}
+              >
+                {t('wizard.modal.step2_tab_manual')}
+              </button>
             </div>
+
+            {proxyInputMode === 'link' ? (
+              <div>
+                <label
+                  htmlFor={uriTextareaId}
+                  className="mb-1.5 block text-xs font-medium text-tf-secondary"
+                >
+                  {t('wizard.modal.step2_paste_uri')}
+                </label>
+                <textarea
+                  id={uriTextareaId}
+                  rows={3}
+                  value={customUri}
+                  onChange={(e) => setCustomUri(e.target.value)}
+                  placeholder={t('wizard.modal.step2_uri_placeholder')}
+                  className="tf-input w-full p-2.5 font-mono text-xs"
+                />
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                <div className="grid grid-cols-3 gap-2.5">
+                  <div>
+                    <label
+                      htmlFor={`${manualFormId}-protocol`}
+                      className="block text-[11px] text-tf-secondary"
+                    >
+                      {t('wizard.modal.step2_manual_protocol')}
+                    </label>
+                    <select
+                      id={`${manualFormId}-protocol`}
+                      value={manualProtocol}
+                      onChange={(e) =>
+                        setManualProtocol(e.target.value as ProxyProtocol)
+                      }
+                      className="tf-input mt-1 w-full px-2 py-1.5 text-xs uppercase"
+                    >
+                      {WIZARD_PROTOCOLS.map((p) => (
+                        <option key={p} value={p}>
+                          {p.toUpperCase()}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label
+                      htmlFor={`${manualFormId}-host`}
+                      className="block text-[11px] text-tf-secondary"
+                    >
+                      {t('wizard.modal.step2_manual_host')}
+                    </label>
+                    <input
+                      id={`${manualFormId}-host`}
+                      type="text"
+                      value={manualHost}
+                      onChange={(e) => setManualHost(e.target.value)}
+                      placeholder={t('proxies.modal.add_proxy.host_placeholder')}
+                      className="tf-input mt-1 w-full px-2.5 py-1.5 text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label
+                      htmlFor={`${manualFormId}-port`}
+                      className="block text-[11px] text-tf-secondary"
+                    >
+                      {t('wizard.modal.step2_manual_port')}
+                    </label>
+                    <input
+                      id={`${manualFormId}-port`}
+                      type="number"
+                      min={1}
+                      max={UI_CONFIG.MAX_PORT}
+                      value={manualPort}
+                      onChange={(e) => {
+                        setManualPort(e.target.value);
+                        setManualPortError(null);
+                      }}
+                      className="tf-input mt-1 w-full px-2.5 py-1.5 text-xs"
+                    />
+                  </div>
+                </div>
+                {manualPortError && (
+                  <p role="alert" className="text-xs font-semibold text-tf-red">
+                    {manualPortError}
+                  </p>
+                )}
+                <div className="grid grid-cols-3 gap-2.5">
+                  <div>
+                    <label
+                      htmlFor={`${manualFormId}-name`}
+                      className="block text-[11px] text-tf-secondary"
+                    >
+                      {t('wizard.modal.step2_manual_name')}
+                    </label>
+                    <input
+                      id={`${manualFormId}-name`}
+                      type="text"
+                      value={manualName}
+                      onChange={(e) => setManualName(e.target.value)}
+                      className="tf-input mt-1 w-full px-2.5 py-1.5 text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label
+                      htmlFor={`${manualFormId}-user`}
+                      className="block text-[11px] text-tf-secondary"
+                    >
+                      {t('wizard.modal.step2_manual_user')}
+                    </label>
+                    <input
+                      id={`${manualFormId}-user`}
+                      type="text"
+                      value={manualUsername}
+                      onChange={(e) => setManualUsername(e.target.value)}
+                      className="tf-input mt-1 w-full px-2.5 py-1.5 text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label
+                      htmlFor={`${manualFormId}-pass`}
+                      className="block text-[11px] text-tf-secondary"
+                    >
+                      {t('wizard.modal.step2_manual_pass')}
+                    </label>
+                    <input
+                      id={`${manualFormId}-pass`}
+                      type="password"
+                      value={manualPassword}
+                      onChange={(e) => setManualPassword(e.target.value)}
+                      className="tf-input mt-1 w-full px-2.5 py-1.5 text-xs"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -364,6 +675,17 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
                 <CheckCircle2 className="h-4 w-4 text-tf-cyan" />
               )}
             </button>
+
+            <div className="rounded-tf-md border border-tf-border bg-tf-surface-alt p-3 text-xs">
+              <div className="font-bold text-tf-primary">
+                {t('wizard.modal.step3_summary_title')}
+              </div>
+              <p className="mt-1 text-[11px] text-tf-secondary">
+                {hasPlannedProxy
+                  ? t('wizard.modal.step3_summary_with_proxy')
+                  : t('wizard.modal.step3_summary_direct')}
+              </p>
+            </div>
           </div>
         )}
 
