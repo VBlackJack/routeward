@@ -5,6 +5,8 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+## [v2026.1121.01] - 2026-11-21
+
 ### Added
 - Windows System Tray: added dynamic colored status dot badges on the tray icon (green Protected, orange Paused, gray Offline), 1-click **Start Service** when offline, **Pause for 15 minutes** with cancellable auto-resume, and debounced native Windows warning notifications (`NIF_INFO`) when a proxy outage triggers the kill-switch.
 - Desktop UI (Simple mode): added **Undo** buttons in deletion toasts (rules and proxies), 1-click **Paste from Clipboard** proxy import on Home and My Proxy, **Make Primary** proxy promotion (`SetPrimaryProxy` IPC + `/api/proxies/set-primary`), a 1-click **Router & Printers (Local Network)** compatibility pack, a Before/After IP check (`/api/system/direct-ip`) inside **Verify My Protection**, a plain-language **"Where does a website go?"** site tester, shadowed-rule warnings with 1-click **Move First**, and window-wide drag-and-drop import for `.json` profiles, FoxyProxy exports, and `.txt` proxy lists.
