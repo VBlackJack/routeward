@@ -5,6 +5,8 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+## [v2026.1121.00] - 2026-11-21
+
 ### Added
 - Desktop UI (Simple mode): added 1-click **Start Protection** on Home when the Windows service is stopped, a 3-step readiness checklist, temporary pause buttons (`15m` / `1h`) with automatic resume countdown, a 1-click **Verify My Protection** check, a guided **"App not working?"** troubleshooter to unblock failed apps or sites in Direct mode, and a dismissible proxy outage alert banner.
 - Desktop UI (My Proxy & Wizard): exposed proxy link pasting directly in Simple mode (both button and quick-paste auto-fill in the Add Proxy form), added manual host/port input and live connection testing in the 3-step wizard, added a 1-click **Automatic Backup Proxy Switch** (failover) toggle when two or more proxies are active, and added **Detect Existing Proxy** (`/api/system/detect-proxies`) to discover Windows registry, environment, Tor, or local SSH/HTTP proxies.
