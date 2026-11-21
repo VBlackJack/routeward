@@ -143,7 +143,7 @@ unsafe fn create_hicon_from_rgba(rgba: &[u8]) -> Option<HICON> {
         return None;
     }
     let mut bgra = Vec::with_capacity(rgba.len());
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         bgra.push(px[2]);
         bgra.push(px[1]);
         bgra.push(px[0]);
