@@ -5,6 +5,8 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+## [v2026.1122.00] - 2026-11-22
+
 ### Added
 - Background protection model: the desired protection state is persisted by the daemon (`protection_state.json`) and re-applied at daemon start, so protection survives Exit and reboot; pauses are held by the daemon (`PauseEngine` IPC, `/api/engine/pause`, `routeward ctl pause --seconds N`) and resume on their own, even after a reboot.
 - Windows: the first **Start protection** installs and starts the RouteWard service with a single UAC prompt (`routeward service install --start --allow-sid`), enables sign-in autostart with `--minimized` (tray only), and falls back to a spawned daemon only when no service exists.
@@ -19,6 +21,7 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 - Proxy deletion and **Make Primary** retarget Simple rules to the new primary (or disable them) instead of leaving dangling targets or switching to direct; undoing a proxy deletion no longer claims a stored password; `has_password` is computed from the password actually received.
 - Setup assistant: an unreadable proxy link is kept with an explanation, a failed proxy is replaced on retry, and a failed protection start is reported instead of a success toast.
 - "Show advanced fields" no longer drops the simple input (which could create a match-all rule), and Activity quick actions update the existing rule instead of adding one that never wins.
+- Security: the `url` dependency is updated to 2.5.9 (RUSTSEC-2026-0592).
 
 ## [v2026.1121.01] - 2026-11-21
 
