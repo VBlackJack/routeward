@@ -269,3 +269,5 @@ To really stop protection:
 If you are already locked out, go back to section 0. From a terminal, `routeward ctl pause --seconds 900` pauses protection for 15 minutes.
 
 RouteWard starts with the tray icon at sign-in (minimized, no window). Protection is remembered: if it was on, it comes back on after a reboot.
+
+An upgrade keeps protection on when it was on before: after installing a new version, RouteWard turns protection back on by itself.

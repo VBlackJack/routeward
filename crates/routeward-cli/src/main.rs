@@ -32,6 +32,7 @@ use routeward_core::logger::FileLogger;
 use routeward_core::pac::PacGenerator;
 use routeward_core::rules::ConnectionRequest;
 use routeward_core::system::protection_state::MAX_PAUSE_SECS;
+use routeward_core::system::upgrade_migration::{consume_upgrade_marker, migrate_upgrade_state};
 use routeward_core::system::user_state::{AllUsersCleanupReport, UserCleanupReport};
 use routeward_core::system::windows_service::{
     install_windows_service, query_windows_service_status, restore_windows_service,
@@ -132,6 +133,14 @@ enum Commands {
     /// Delete the RouteWard data directory (profile and logs) of this machine; run by the
     /// uninstaller. Needs elevation and refuses while a RouteWard daemon is active
     PurgeData,
+    /// Keep protection on across an upgrade from a version that did not persist it; run by the
+    /// installer once the upgrade is committed. Never starts the service and always exits 0
+    #[command(hide = true)]
+    MigrateUpgradeState {
+        /// SID of the installing user, whose registry hive holds the marker left by the installer
+        #[arg(long)]
+        user_sid: String,
+    },
     /// Restore the normal Internet connection of the current user: turn protection off in the
     /// background (when reachable), then give back the system proxy settings. Needs no
     /// elevation and never fails because the background service is unreachable
@@ -385,6 +394,65 @@ fn run_purge_data(constants: &SystemConstants, i18n: &I18nRegistry) -> RouteWard
             detail: "purge-data is only implemented on Windows".to_string(),
         })
     }
+}
+
+/// Attempts to ask the new daemon to start protection during the upgrade migration. The service
+/// may still be coming up when the installer commits, so a refused connection is retried a few
+/// times before giving up.
+const MIGRATE_DAEMON_ATTEMPTS: u32 = 5;
+/// Pause between two attempts to reach the new daemon, in milliseconds.
+const MIGRATE_DAEMON_RETRY_DELAY_MS: u64 = 1_000;
+
+/// Calls `call` up to `attempts` times, sleeping `delay` between two attempts. `Ok(true)` is a
+/// success, `Ok(false)` is a definitive refusal (no retry), `Err` is a connection failure that is
+/// retried. Returns whether the daemon accepted the request.
+async fn call_daemon_with_retry<F, Fut, E>(mut call: F, attempts: u32, delay: Duration) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool, E>>,
+{
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(delay).await;
+        }
+        if let Ok(accepted) = call().await {
+            return accepted;
+        }
+    }
+    false
+}
+
+/// Runs `routeward migrate-upgrade-state --user-sid <SID>` (hidden, run by the installer as
+/// SYSTEM): reads and consumes the registry marker the installer left in that user's hive, then,
+/// when the old daemon was running and no state file exists yet, turns protection on through the
+/// new daemon, or persists the enabled state directly when the daemon is unreachable. Every outcome
+/// is logged and the command never fails, so it can never break an upgrade.
+async fn run_migrate_upgrade_state(constants: &SystemConstants, user_sid: &str) {
+    let protection_was_running = consume_upgrade_marker(user_sid);
+    let profile_path = match constants.ipc.resolve_daemon_profile_path() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot resolve the daemon profile path, nothing migrated");
+            return;
+        }
+    };
+    let state_path =
+        routeward_core::system::protection_state::state_path_for_profile(&profile_path);
+    let client = IpcClient::new(constants.ipc.clone());
+    let outcome = migrate_upgrade_state(&state_path, protection_was_running, || {
+        call_daemon_with_retry(
+            || async {
+                client
+                    .call_raw(IpcCommand::ToggleEngine { start: true })
+                    .await
+                    .map(|resp| resp.ok)
+            },
+            MIGRATE_DAEMON_ATTEMPTS,
+            Duration::from_millis(MIGRATE_DAEMON_RETRY_DELAY_MS),
+        )
+    })
+    .await;
+    tracing::info!(outcome = ?outcome, "upgrade protection state migration finished");
 }
 
 #[derive(Subcommand)]
@@ -916,6 +984,7 @@ fn init_logging(command: &Commands) {
     let verbose_default = matches!(
         command,
         Commands::PurgeData
+            | Commands::MigrateUpgradeState { .. }
             | Commands::Cleanup {
                 all_users: true,
                 ..
@@ -997,6 +1066,11 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Commands::Recover { pause_at_end } = args.command {
         return run_recover(constants, &args.locale, pause_at_end).await;
+    }
+
+    if let Commands::MigrateUpgradeState { user_sid } = &args.command {
+        run_migrate_upgrade_state(&constants, user_sid).await;
+        return Ok(());
     }
 
     if matches!(args.command, Commands::PurgeData) {
@@ -1169,7 +1243,8 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Ctl { .. }
         | Commands::Service { .. }
         | Commands::Recover { .. }
-        | Commands::PurgeData => unreachable!(),
+        | Commands::PurgeData
+        | Commands::MigrateUpgradeState { .. } => unreachable!(),
     }
 
     Ok(())
@@ -1339,6 +1414,104 @@ mod tests {
     fn purge_data_subcommand_parses() {
         let args = CliArgs::try_parse_from(["routeward", "purge-data"]).expect("parses");
         assert!(matches!(args.command, Commands::PurgeData));
+    }
+
+    #[test]
+    fn migrate_upgrade_state_subcommand_parses_and_is_hidden() {
+        use clap::CommandFactory;
+        let args = CliArgs::try_parse_from([
+            "routeward",
+            "migrate-upgrade-state",
+            "--user-sid",
+            "S-1-5-18",
+        ])
+        .expect("parses");
+        assert!(
+            matches!(&args.command, Commands::MigrateUpgradeState { user_sid } if user_sid == "S-1-5-18")
+        );
+        assert!(CliArgs::try_parse_from(["routeward", "migrate-upgrade-state"]).is_err());
+        let cmd = CliArgs::command();
+        let sub = cmd
+            .find_subcommand("migrate-upgrade-state")
+            .expect("registered");
+        assert!(sub.is_hide_set(), "must not appear in help");
+        assert!(!cmd
+            .clone()
+            .render_help()
+            .to_string()
+            .contains("migrate-upgrade-state"));
+    }
+
+    #[tokio::test]
+    async fn daemon_call_succeeds_on_the_third_attempt() {
+        let calls = std::cell::Cell::new(0u32);
+        let accepted = call_daemon_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                async move {
+                    if n < 3 {
+                        Err(())
+                    } else {
+                        Ok(true)
+                    }
+                }
+            },
+            MIGRATE_DAEMON_ATTEMPTS,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(accepted);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn daemon_call_refusal_is_not_retried() {
+        let calls = std::cell::Cell::new(0u32);
+        let accepted = call_daemon_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                async { Ok::<bool, ()>(false) }
+            },
+            MIGRATE_DAEMON_ATTEMPTS,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(!accepted);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_failed_attempts_fall_back_to_writing_the_enabled_state() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "routeward_cli_migrate_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = root.join("protection_state.json");
+        let calls = std::cell::Cell::new(0u32);
+        let outcome = migrate_upgrade_state(&state, true, || {
+            call_daemon_with_retry(
+                || {
+                    calls.set(calls.get() + 1);
+                    async { Err::<bool, ()>(()) }
+                },
+                MIGRATE_DAEMON_ATTEMPTS,
+                Duration::ZERO,
+            )
+        })
+        .await;
+        assert_eq!(calls.get(), MIGRATE_DAEMON_ATTEMPTS);
+        assert_eq!(
+            outcome,
+            routeward_core::system::upgrade_migration::MigrationOutcome::WrittenDirectly
+        );
+        assert!(state.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

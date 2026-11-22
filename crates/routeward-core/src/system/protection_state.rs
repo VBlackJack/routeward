@@ -116,14 +116,36 @@ impl ProtectionState {
     /// Atomically writes the state (temporary sibling, sync, rename). With `harden`, the daemon
     /// file permissions are applied as for the profile.
     pub fn save_to_path(&self, path: &Path, harden: bool) -> RouteWardResult<()> {
-        let save_err = |detail: String| RouteWardError::ConfigError {
-            key: ERR_KEY_CONFIG_SAVE,
-            detail,
-        };
-        let json = serde_json::to_string_pretty(self).map_err(|err| save_err(err.to_string()))?;
+        let tmp_path = self.write_temp_sibling(path, harden)?;
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(save_error(err.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Writes the state like [`Self::save_to_path`] but never replaces an existing file: the
+    /// temporary sibling is published with a hard link, which fails when the target exists.
+    /// Returns `Ok(true)` when the file was created and `Ok(false)` when it already existed (left
+    /// untouched). The temporary file is always removed.
+    pub fn save_new_to_path(&self, path: &Path, harden: bool) -> RouteWardResult<bool> {
+        let tmp_path = self.write_temp_sibling(path, harden)?;
+        let published = fs::hard_link(&tmp_path, path);
+        let _ = fs::remove_file(&tmp_path);
+        match published {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(err) => Err(save_error(err.to_string())),
+        }
+    }
+
+    /// Serializes the state into a synced, optionally hardened temporary file next to `path`
+    /// and returns its path. On failure the temporary file is removed.
+    fn write_temp_sibling(&self, path: &Path, harden: bool) -> RouteWardResult<PathBuf> {
+        let json = serde_json::to_string_pretty(self).map_err(|err| save_error(err.to_string()))?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|err| save_err(err.to_string()))?;
+                fs::create_dir_all(parent).map_err(|err| save_error(err.to_string()))?;
             }
         }
         let tmp_path = path.with_file_name(format!(
@@ -137,7 +159,7 @@ impl ProtectionState {
         })();
         if let Err(err) = write_result {
             let _ = fs::remove_file(&tmp_path);
-            return Err(save_err(err.to_string()));
+            return Err(save_error(err.to_string()));
         }
         if harden {
             if let Err(err) = apply_secure_profile_file_permissions(&tmp_path, false) {
@@ -145,11 +167,15 @@ impl ProtectionState {
                 return Err(err);
             }
         }
-        if let Err(err) = fs::rename(&tmp_path, path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(save_err(err.to_string()));
-        }
-        Ok(())
+        Ok(tmp_path)
+    }
+}
+
+/// Wraps an I/O or serialization detail into the state-save configuration error.
+fn save_error(detail: String) -> RouteWardError {
+    RouteWardError::ConfigError {
+        key: ERR_KEY_CONFIG_SAVE,
+        detail,
     }
 }
 
@@ -184,6 +210,38 @@ mod tests {
         let disabled = ProtectionState::default();
         disabled.save_to_path(&path, false).expect("overwrite");
         assert_eq!(ProtectionState::load_or_default(&path), disabled);
+        let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "only the state file remains");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_new_publishes_a_missing_file_and_leaves_no_temporary_file() {
+        let path = temp_state_path();
+        let state = ProtectionState {
+            protection_enabled: true,
+            paused_until_epoch_ms: None,
+        };
+        assert!(state.save_new_to_path(&path, false).expect("save new"));
+        assert_eq!(ProtectionState::load_or_default(&path), state);
+        let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "only the state file remains");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_new_never_replaces_an_existing_file_and_leaves_no_temporary_file() {
+        let path = temp_state_path();
+        let existing = ProtectionState {
+            protection_enabled: true,
+            paused_until_epoch_ms: Some(NOW + 5_000),
+        };
+        existing.save_to_path(&path, false).expect("seed");
+        let before = fs::read(&path).unwrap();
+        let other = ProtectionState::default();
+        assert!(!other.save_new_to_path(&path, false).expect("save new"));
+        assert_eq!(fs::read(&path).unwrap(), before, "content untouched");
+        assert_eq!(ProtectionState::load_or_default(&path), existing);
         let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1, "only the state file remains");
         let _ = fs::remove_dir_all(path.parent().unwrap());

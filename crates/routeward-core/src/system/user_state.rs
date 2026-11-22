@@ -693,7 +693,7 @@ pub fn is_user_hive_sid(key_name: &str) -> bool {
 }
 
 /// SID of the LocalSystem account.
-const SID_LOCAL_SYSTEM: &str = "S-1-5-18";
+pub(crate) const SID_LOCAL_SYSTEM: &str = "S-1-5-18";
 /// SID of the built-in Administrators group.
 const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
 /// Prefix of a DOS-style extended path as returned by `GetFinalPathNameByHandleW`.
@@ -898,7 +898,7 @@ pub struct Win32RegistryStore {
 }
 
 #[cfg(windows)]
-mod win32 {
+pub(crate) mod win32 {
     use super::*;
     use windows_sys::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_PATH_NOT_FOUND,
@@ -924,19 +924,19 @@ mod win32 {
     /// Capacity (UTF-16 units) for an expanded profile path.
     const EXPANDED_PATH_CAPACITY: usize = 4096;
 
-    fn registry_error(detail: String) -> RouteWardError {
+    pub(crate) fn registry_error(detail: String) -> RouteWardError {
         RouteWardError::SystemError {
             key: ERR_KEY_SYSTEM_REGISTRY_WRITE,
             detail,
         }
     }
 
-    fn to_wide(text: &str) -> Vec<u16> {
+    pub(crate) fn to_wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
     /// Closes the key on drop.
-    struct OpenKey(HKEY);
+    pub(crate) struct OpenKey(pub(crate) HKEY);
 
     impl Drop for OpenKey {
         fn drop(&mut self) {
@@ -976,7 +976,7 @@ mod win32 {
     /// Opens `hive\subkey` one component at a time without following registry symbolic links and
     /// fails when any component is a link: in another user's hive, a link planted by that user
     /// could send a SYSTEM write to a key of the machine. `Ok(None)`: a component does not exist.
-    fn open_key_rejecting_links(
+    pub(crate) fn open_key_rejecting_links(
         hive: HKEY,
         subkey: &str,
         access: u32,
@@ -1048,7 +1048,7 @@ mod win32 {
         }
     }
 
-    fn read_raw(key: &OpenKey, name: &str) -> RouteWardResult<Option<(u32, Vec<u8>)>> {
+    pub(crate) fn read_raw(key: &OpenKey, name: &str) -> RouteWardResult<Option<(u32, Vec<u8>)>> {
         let wide_name = to_wide(name);
         for _ in 0..READ_ATTEMPTS {
             let mut reg_type = 0u32;
