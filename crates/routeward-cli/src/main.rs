@@ -32,6 +32,9 @@ use routeward_core::logger::FileLogger;
 use routeward_core::pac::PacGenerator;
 use routeward_core::rules::ConnectionRequest;
 use routeward_core::system::protection_state::MAX_PAUSE_SECS;
+use routeward_core::system::upgrade_migration::{
+    migrate_upgrade_state, upgrade_status_path_for_profile,
+};
 use routeward_core::system::user_state::{AllUsersCleanupReport, UserCleanupReport};
 use routeward_core::system::windows_service::{
     install_windows_service, query_windows_service_status, restore_windows_service,
@@ -132,6 +135,10 @@ enum Commands {
     /// Delete the RouteWard data directory (profile and logs) of this machine; run by the
     /// uninstaller. Needs elevation and refuses while a RouteWard daemon is active
     PurgeData,
+    /// Keep protection on across an upgrade from a version that did not persist it; run by the
+    /// installer once the upgrade is committed. Never starts the service
+    #[command(hide = true)]
+    MigrateUpgradeState,
     /// Restore the normal Internet connection of the current user: turn protection off in the
     /// background (when reachable), then give back the system proxy settings. Needs no
     /// elevation and never fails because the background service is unreachable
@@ -385,6 +392,49 @@ fn run_purge_data(constants: &SystemConstants, i18n: &I18nRegistry) -> RouteWard
             detail: "purge-data is only implemented on Windows".to_string(),
         })
     }
+}
+
+/// Attempts to ask the new daemon to start protection during the upgrade migration. The service
+/// may still be coming up when the installer commits, so a refused connection is retried a few
+/// times before giving up.
+const MIGRATE_DAEMON_ATTEMPTS: u32 = 5;
+/// Pause between two attempts to reach the new daemon, in milliseconds.
+const MIGRATE_DAEMON_RETRY_DELAY_MS: u64 = 1_000;
+
+/// Runs `routeward migrate-upgrade-state` (hidden, run by the installer as SYSTEM): when the old
+/// daemon was running and no state file exists yet, turns protection on through the new daemon, or
+/// persists the enabled state directly when the daemon is unreachable. Every outcome is logged
+/// and the command never fails, so it can never break an upgrade.
+async fn run_migrate_upgrade_state(constants: &SystemConstants) {
+    let profile_path = match constants.ipc.resolve_daemon_profile_path() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot resolve the daemon profile path, nothing migrated");
+            return;
+        }
+    };
+    let state_path =
+        routeward_core::system::protection_state::state_path_for_profile(&profile_path);
+    let status_path = upgrade_status_path_for_profile(&profile_path);
+    let client = IpcClient::new(constants.ipc.clone());
+    let outcome = migrate_upgrade_state(&state_path, &status_path, || async {
+        for attempt in 0..MIGRATE_DAEMON_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(MIGRATE_DAEMON_RETRY_DELAY_MS)).await;
+            }
+            match client
+                .call_raw(IpcCommand::ToggleEngine { start: true })
+                .await
+            {
+                Ok(resp) if resp.ok => return true,
+                Ok(_) => return false,
+                Err(_) => {}
+            }
+        }
+        false
+    })
+    .await;
+    tracing::info!(outcome = ?outcome, "upgrade protection state migration finished");
 }
 
 #[derive(Subcommand)]
@@ -916,6 +966,7 @@ fn init_logging(command: &Commands) {
     let verbose_default = matches!(
         command,
         Commands::PurgeData
+            | Commands::MigrateUpgradeState
             | Commands::Cleanup {
                 all_users: true,
                 ..
@@ -997,6 +1048,11 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Commands::Recover { pause_at_end } = args.command {
         return run_recover(constants, &args.locale, pause_at_end).await;
+    }
+
+    if matches!(args.command, Commands::MigrateUpgradeState) {
+        run_migrate_upgrade_state(&constants).await;
+        return Ok(());
     }
 
     if matches!(args.command, Commands::PurgeData) {
@@ -1169,7 +1225,8 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Ctl { .. }
         | Commands::Service { .. }
         | Commands::Recover { .. }
-        | Commands::PurgeData => unreachable!(),
+        | Commands::PurgeData
+        | Commands::MigrateUpgradeState => unreachable!(),
     }
 
     Ok(())
@@ -1339,6 +1396,23 @@ mod tests {
     fn purge_data_subcommand_parses() {
         let args = CliArgs::try_parse_from(["routeward", "purge-data"]).expect("parses");
         assert!(matches!(args.command, Commands::PurgeData));
+    }
+
+    #[test]
+    fn migrate_upgrade_state_subcommand_parses_and_is_hidden() {
+        use clap::CommandFactory;
+        let args = CliArgs::try_parse_from(["routeward", "migrate-upgrade-state"]).expect("parses");
+        assert!(matches!(args.command, Commands::MigrateUpgradeState));
+        let cmd = CliArgs::command();
+        let sub = cmd
+            .find_subcommand("migrate-upgrade-state")
+            .expect("registered");
+        assert!(sub.is_hide_set(), "must not appear in help");
+        assert!(!cmd
+            .clone()
+            .render_help()
+            .to_string()
+            .contains("migrate-upgrade-state"));
     }
 
     #[tokio::test]

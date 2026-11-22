@@ -22,7 +22,14 @@
       UpgradeCode="C6F5A2B4-9E3A-4F81-8C12-9C4E12B7F801"
       Scope="perMachine">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of RouteWard is already installed." />
+    <!--
+      Schedule="afterInstallInitialize": the previous product is removed after InstallInitialize and
+      inside the same transaction as the new files, so one rollback restores the old product, and the
+      deferred capture action below runs BEFORE the old daemon is stopped (RemoveExistingProducts).
+      The default schedule (afterInstallValidate) removes the old product in its own earlier
+      transaction, which leaves no place to capture its state and no way to undo it.
+    -->
+    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer version of RouteWard is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <Icon Id="RouteWardIcon.ico" SourceFile="$(var.IconPath)" />
@@ -32,10 +39,11 @@
     <Property Id="ARPNOMODIFY" Value="1" />
 
     <!--
-      Service restore after an upgrade. MajorUpgrade uninstalls the previous product first
-      (RemoveExistingProducts), and its ServiceControl Remove="uninstall" deletes the RouteWard service
-      together with the allow-sid arguments of its command line. AppSearch runs before that removal,
-      so the old registration is captured here and replayed after InstallFiles by the custom actions below.
+      Service restore after an upgrade. MajorUpgrade uninstalls the previous product
+      (RemoveExistingProducts, scheduled right after InstallInitialize, in the same transaction as the new
+      files), and its ServiceControl Remove="uninstall" deletes the RouteWard service together with the
+      allow-sid arguments of its command line. AppSearch runs before that removal, so the old registration
+      is captured here and replayed after InstallFiles by the custom actions below.
       Type="raw" keeps the value as stored: a REG_EXPAND_SZ ImagePath comes back with a "#%" prefix
       (stripped by the CLI) and the DWORD Start value as "#2" (automatic) or "#3" (manual).
     -->
@@ -141,6 +149,74 @@
       TerminalServerAware is not set on any action: that flag only applies to impersonated deferred
       actions, and none of these impersonates the user.
     -->
+    <!--
+      Protection kept across an upgrade. Versions up to 2026.1121.x never persisted the desired protection
+      state (protection_state.json), so the new daemon of a major upgrade finds no file and would leave
+      protection off even though it was on. Two actions carry it over:
+
+      CaptureOldProtectionStatus (deferred, before RemoveExistingProducts, so the OLD daemon still runs):
+      runs the OLD routeward.exe "ctl status" through cmd.exe and redirects its JSON answer to
+      %ProgramData%\RouteWard\upgrade_status.json. The old daemon answers over its named pipe, whose ACL
+      admits SYSTEM. The redirect always truncates the file, so a stale capture can never pass for a fresh
+      one, and a failing command (daemon stopped, old CLI missing) just leaves an empty file. The old
+      directory comes from the HKLM InstallDir value written by the old product; two rows cover a stored
+      value with or without a trailing backslash (">>" is the MSI "ends with" operator). The command line
+      has no brace anywhere (a Formatted string treats it as a reference). WixQuietExec parses the quoted
+      cmd.exe path, then hands the rest to CreateProcess untouched; cmd.exe strips the outer pair of quotes
+      of the /c argument when more than two quotes are present, which leaves the quoted exe path and the
+      quoted redirect target intact. Side effect to know about: "ctl" creates a log directory under the
+      systemprofile of the SYSTEM account. "Return=ignore": a failed capture must never block the upgrade.
+
+      MigrateUpgradeState (commit, runs the NEW hidden "migrate-upgrade-state" command): reads the capture
+      and, only when the old daemon was running and no state file exists, turns protection on through the
+      new daemon (or writes the enabled state when the daemon is not reachable). It never starts the
+      service and never overwrites a state file. A commit action only runs once the whole transaction
+      succeeded, so a rolled-back upgrade never leaves an enabled state behind. Known limit: Windows does
+      not run commit actions when the DisableRollback policy is set; protection then stays off after the
+      upgrade (the previous behavior).
+    -->
+    <Property Id="ROUTEWARD_OLD_INSTALLDIR" Secure="yes">
+      <RegistrySearch
+          Id="RouteWardOldInstallDirSearch"
+          Root="HKLM"
+          Key="Software\RouteWard"
+          Name="InstallDir"
+          Type="raw" />
+    </Property>
+    <SetProperty
+        Id="CaptureOldProtectionStatus"
+        Value="&quot;[SystemFolder]cmd.exe&quot; /d /c &quot;&quot;[ROUTEWARD_OLD_INSTALLDIR]routeward.exe&quot; ctl status &gt; &quot;[CommonAppDataFolder]RouteWard\upgrade_status.json&quot;&quot;"
+        Before="CaptureOldProtectionStatus"
+        Sequence="execute"
+        Condition="NOT REMOVE AND WIX_UPGRADE_DETECTED AND ROUTEWARD_OLD_INSTALLDIR AND ROUTEWARD_OLD_INSTALLDIR &gt;&gt; &quot;\&quot;" />
+    <CustomAction
+        Id="CaptureOldProtectionStatus"
+        BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+        DllEntry="WixQuietExec"
+        Execute="deferred"
+        Impersonate="no"
+        Return="ignore" />
+    <SetProperty
+        Id="CaptureOldProtectionStatusNoSlash"
+        Value="&quot;[SystemFolder]cmd.exe&quot; /d /c &quot;&quot;[ROUTEWARD_OLD_INSTALLDIR]\routeward.exe&quot; ctl status &gt; &quot;[CommonAppDataFolder]RouteWard\upgrade_status.json&quot;&quot;"
+        Before="CaptureOldProtectionStatusNoSlash"
+        Sequence="execute"
+        Condition="NOT REMOVE AND WIX_UPGRADE_DETECTED AND ROUTEWARD_OLD_INSTALLDIR AND NOT (ROUTEWARD_OLD_INSTALLDIR &gt;&gt; &quot;\&quot;)" />
+    <CustomAction
+        Id="CaptureOldProtectionStatusNoSlash"
+        BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+        DllEntry="WixQuietExec"
+        Execute="deferred"
+        Impersonate="no"
+        Return="ignore" />
+    <CustomAction
+        Id="MigrateUpgradeState"
+        FileRef="RouteWardCliExe"
+        ExeCommand="migrate-upgrade-state"
+        Execute="commit"
+        Impersonate="no"
+        Return="ignore" />
+
     <Property Id="KEEPDATA" Secure="yes" />
 
     <SetProperty
@@ -171,6 +247,9 @@
         Return="ignore" />
 
     <InstallExecuteSequence>
+      <Custom Action="CaptureOldProtectionStatus" Before="RemoveExistingProducts" Condition="NOT REMOVE AND WIX_UPGRADE_DETECTED AND ROUTEWARD_OLD_INSTALLDIR AND ROUTEWARD_OLD_INSTALLDIR &gt;&gt; &quot;\&quot;" />
+      <Custom Action="CaptureOldProtectionStatusNoSlash" Before="RemoveExistingProducts" Condition="NOT REMOVE AND WIX_UPGRADE_DETECTED AND ROUTEWARD_OLD_INSTALLDIR AND NOT (ROUTEWARD_OLD_INSTALLDIR &gt;&gt; &quot;\&quot;)" />
+      <Custom Action="MigrateUpgradeState" Before="InstallFinalize" Condition="NOT REMOVE AND WIX_UPGRADE_DETECTED" />
       <Custom Action="CleanupUserSettings" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="PurgeProgramData" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT KEEPDATA" />
       <Custom Action="RollbackRestoreServiceAutoStart" Before="RestoreServiceAutoStart" Condition="NOT REMOVE AND (UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND ROUTEWARD_OLD_IMAGEPATH &lt;&gt; &quot;&quot; AND ROUTEWARD_OLD_SVC_START = &quot;#2&quot;" />

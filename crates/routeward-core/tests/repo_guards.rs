@@ -652,3 +652,110 @@ fn release_tag_mapping_pads_the_day_counter() {
     let manifest = "[workspace.package]\nversion = \"2026.1201.12\"\n";
     assert_eq!(release_tag_for_workspace_version(manifest), "v2026.1201.12");
 }
+
+/// Returns the opening tags named `tag` (for example `<Custom `) of an XML text, each as one
+/// string from `<` to the closing `>`; quoted attribute values never end a tag early.
+fn xml_tags<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(tag) {
+        let tail = &rest[start..];
+        let mut in_quotes = false;
+        let mut end = tail.len();
+        for (idx, ch) in tail.char_indices() {
+            match ch {
+                '"' => in_quotes = !in_quotes,
+                '>' if !in_quotes => {
+                    end = idx + 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        out.push(&tail[..end]);
+        rest = &tail[end..];
+    }
+    out
+}
+
+/// Value of the attribute `name` inside one tag string.
+fn xml_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!(" {name}=\"");
+    let from = tag.find(&needle)? + needle.len();
+    let len = tag[from..].find('"')?;
+    Some(&tag[from..from + len])
+}
+
+fn tag_with_attr<'a>(tags: &[&'a str], name: &str, value: &str) -> &'a str {
+    tags.iter()
+        .copied()
+        .find(|tag| xml_attr(tag, name) == Some(value))
+        .unwrap_or_else(|| panic!("no tag with {name}=\"{value}\""))
+}
+
+#[test]
+fn msi_upgrade_keeps_protection_actions_are_wired_safely() {
+    const CAPTURE_ACTIONS: &[&str] = &[
+        "CaptureOldProtectionStatus",
+        "CaptureOldProtectionStatusNoSlash",
+    ];
+    const DECIDE_ACTION: &str = "MigrateUpgradeState";
+    let wxs = fs::read_to_string(repo_root().join("packaging/windows/RouteWard.wxs"))
+        .expect("RouteWard.wxs");
+
+    let upgrade = xml_tags(&wxs, "<MajorUpgrade");
+    assert_eq!(upgrade.len(), 1);
+    assert_eq!(
+        xml_attr(upgrade[0], "Schedule"),
+        Some("afterInstallInitialize")
+    );
+
+    let sequence_rows = xml_tags(&wxs, "<Custom ");
+    for action in CAPTURE_ACTIONS {
+        let row = tag_with_attr(&sequence_rows, "Action", action);
+        assert_eq!(
+            xml_attr(row, "Before"),
+            Some("RemoveExistingProducts"),
+            "{action} must run before the old product is removed"
+        );
+        let condition = xml_attr(row, "Condition").expect("capture condition");
+        assert!(condition.contains("NOT REMOVE"), "{action}: {condition}");
+    }
+    let decide_row = tag_with_attr(&sequence_rows, "Action", DECIDE_ACTION);
+    let decide_condition = xml_attr(decide_row, "Condition").expect("decide condition");
+    assert!(
+        decide_condition.contains("NOT REMOVE"),
+        "{decide_condition}"
+    );
+
+    let actions = xml_tags(&wxs, "<CustomAction");
+    let decide = tag_with_attr(&actions, "Id", DECIDE_ACTION);
+    assert_eq!(xml_attr(decide, "Execute"), Some("commit"));
+    assert_eq!(xml_attr(decide, "FileRef"), Some("RouteWardCliExe"));
+    for action in CAPTURE_ACTIONS {
+        let capture = tag_with_attr(&actions, "Id", action);
+        assert_eq!(xml_attr(capture, "Execute"), Some("deferred"));
+        assert_eq!(xml_attr(capture, "Impersonate"), Some("no"));
+    }
+
+    // A brace inside a Formatted value starts a reference; it must be written as an escape.
+    let set_properties = xml_tags(&wxs, "<SetProperty");
+    assert!(set_properties.len() >= CAPTURE_ACTIONS.len());
+    for tag in set_properties {
+        let value = xml_attr(tag, "Value").unwrap_or("");
+        let unescaped = value.replace("[\\{]", "").replace("[\\}]", "");
+        assert!(
+            !unescaped.contains('{') && !unescaped.contains('}'),
+            "unescaped brace in a SetProperty value: {value}"
+        );
+    }
+}
+
+#[test]
+fn xml_tag_scanner_ignores_quoted_angle_brackets() {
+    let xml = r#"<A One="a>b" Two="c"/><A One="d"/>"#;
+    let tags = xml_tags(xml, "<A");
+    assert_eq!(tags.len(), 2);
+    assert_eq!(xml_attr(tags[0], "Two"), Some("c"));
+    assert_eq!(xml_attr(tags[1], "One"), Some("d"));
+}

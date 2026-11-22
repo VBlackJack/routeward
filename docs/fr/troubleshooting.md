@@ -269,3 +269,5 @@ Pour vraiment arrêter la protection :
 Si vous êtes déjà coupé d'Internet, retournez à la section 0. Depuis un terminal, `routeward ctl pause --seconds 900` met la protection en pause pendant 15 minutes.
 
 RouteWard démarre avec l'icône de la barre système à l'ouverture de session (réduit, sans fenêtre). La protection est mémorisée : si elle était active, elle revient après un redémarrage.
+
+Une mise à jour garde la protection active si elle l'était avant : après l'installation d'une nouvelle version, RouteWard réactive la protection tout seul.
