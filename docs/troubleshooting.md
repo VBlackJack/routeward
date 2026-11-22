@@ -271,3 +271,44 @@ If you are already locked out, go back to section 0. From a terminal, `routeward
 RouteWard starts with the tray icon at sign-in (minimized, no window). Protection is remembered: if it was on, it comes back on after a reboot.
 
 An upgrade keeps protection on when it was on before: after installing a new version, RouteWard turns protection back on by itself.
+
+## 16. What Is Blocked, Why, and How to Unblock It
+
+Open **Activity**, then the **Blocked** tab. Every connection RouteWard stopped is listed, grouped by app and then by site, with the reason in plain words, the rule that applied, the last time it happened, and how many times. The **Home** page also shows a shortcut to this tab as soon as something was blocked.
+
+**Unblock something**
+
+- [ ] Open **Activity**, then **Blocked**.
+- [ ] Find the app or site, then click **Unblock**.
+- [ ] Choose how long it lasts: **15 minutes**, **1 hour** or **Always**.
+- [ ] Pick one of the offered choices. If you already set that app or site to Blocked in Simple mode, the first choice changes that rule in place.
+- [ ] Read the summary (the rules that change and the predicted result), then click **Apply**.
+- [ ] Changed your mind? Click **Undo** in the message that appears right after.
+
+RouteWard never turns the safety cutoff (kill switch) off for you. When the cutoff is what blocked an app because the proxy is down, the choices are to test the proxy, open its settings, pause protection for 15 minutes, or let that one app go out directly. The last one shows a red warning: the app then connects without the proxy, so your real address is visible. Blocks that are normal (the fast web protocol QUIC, an app's private name lookup, a program RouteWard could not identify) only get an explanation, because there is nothing to fix.
+
+**Known limit.** Some traffic is dropped by the system or by the Linux firewall before RouteWard can tell which app sent it. That traffic cannot appear as a row. It is only counted in the information line at the bottom of the Blocked tab.
+
+**Read the logs**
+
+- [ ] Open **Settings**, then **Technical diagnostics**, then **Event Logs** (or click **See logs** on a blocked item or on a connection in Activity).
+- [ ] Type words in **Search**, pick the part of RouteWard, the period and the level.
+- [ ] **See logs** from a connection opens the logs already limited to that connection, 30 seconds before and after it.
+- [ ] The **Source** list switches between the live log and the log files of previous days (kept for 14 days).
+- [ ] Click **Load more** to read older lines of a file.
+
+From a terminal: `routeward ctl logs`, `routeward ctl blocked` and `routeward ctl diagnose` show the same information.
+
+**Run a check-up**
+
+- [ ] Open **Settings**, **Technical diagnostics**, then **Check-up** (or click **Run a check-up** in the Blocked tab).
+- [ ] Click **Run the check-up**. Each finding explains the problem in plain words and offers a button when RouteWard can help.
+
+**Export a diagnostic file**
+
+- [ ] In the **Check-up** tab, click **Export a diagnostic file**.
+- [ ] Choose how many days of logs, and whether to include recent connections and your settings.
+- [ ] Tick **Hide website names** if you do not want to show which sites were visited. Without it, the file lists them.
+- [ ] Click **Prepare the file**, check the list of parts and their sizes, then click **Download the file**.
+
+The file is built on your computer and saved by your browser window. RouteWard sends it nowhere. Passwords and tokens are never included, the proxy login name is replaced by `[user]`, and the proxy address is kept so the person helping you can see it. From a terminal: `routeward ctl export-diagnostics --output file.json` (add `--mask-domains` to hide site names).

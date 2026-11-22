@@ -271,3 +271,44 @@ Si vous êtes déjà coupé d'Internet, retournez à la section 0. Depuis un ter
 RouteWard démarre avec l'icône de la barre système à l'ouverture de session (réduit, sans fenêtre). La protection est mémorisée : si elle était active, elle revient après un redémarrage.
 
 Une mise à jour garde la protection active si elle l'était avant : après l'installation d'une nouvelle version, RouteWard réactive la protection tout seul.
+
+## 16. Ce qui est bloqué, pourquoi, et comment le débloquer
+
+Ouvrez **Activité**, puis l'onglet **Bloqué**. Chaque connexion arrêtée par RouteWard y est listée, regroupée par application puis par site, avec la raison en mots simples, la règle appliquée, la dernière fois et le nombre de fois. La page **Accueil** affiche aussi un raccourci vers cet onglet dès que quelque chose a été bloqué.
+
+**Débloquer quelque chose**
+
+- [ ] Ouvrez **Activité**, puis **Bloqué**.
+- [ ] Trouvez l'application ou le site, puis cliquez sur **Débloquer**.
+- [ ] Choisissez la durée : **15 minutes**, **1 heure** ou **Toujours**.
+- [ ] Choisissez l'une des propositions. Si vous aviez réglé cette application ou ce site sur Bloqué en Mode Simple, la première proposition modifie cette règle directement.
+- [ ] Lisez le résumé (les règles qui changent et le résultat prévu), puis cliquez sur **Appliquer**.
+- [ ] Vous avez changé d'avis ? Cliquez sur **Annuler** dans le message qui apparaît juste après.
+
+RouteWard ne désactive jamais le coupe-circuit à votre place. Quand c'est le coupe-circuit qui a bloqué une application parce que le proxy ne répond plus, les propositions sont : tester le proxy, ouvrir ses réglages, mettre la protection en pause 15 minutes, ou laisser cette seule application sortir en direct. Cette dernière affiche un avertissement rouge : l'application se connecte alors sans le proxy, et votre vraie adresse devient visible. Les blocages normaux (le protocole web rapide QUIC, la recherche de noms privée d'une application, un programme que RouteWard n'a pas pu identifier) reçoivent seulement une explication, car il n'y a rien à corriger.
+
+**Limite connue.** Une partie du trafic est arrêtée par le système ou par le pare-feu Linux avant que RouteWard sache quelle application l'a envoyé. Ce trafic ne peut pas apparaître comme une ligne. Il est seulement compté dans la ligne d'information en bas de l'onglet Bloqué.
+
+**Lire les journaux**
+
+- [ ] Ouvrez **Réglages**, puis **Diagnostics techniques**, puis **Journaux d'événements** (ou cliquez sur **Voir les journaux** sur un élément bloqué ou sur une connexion dans Activité).
+- [ ] Tapez des mots dans **Rechercher**, choisissez la partie de RouteWard, la période et le niveau.
+- [ ] **Voir les journaux** depuis une connexion ouvre les journaux déjà limités à cette connexion, 30 secondes avant et après.
+- [ ] La liste **Source** bascule entre le journal en direct et les fichiers des jours précédents (conservés 14 jours).
+- [ ] Cliquez sur **Charger la suite** pour lire les lignes plus anciennes d'un fichier.
+
+Depuis un terminal : `routeward ctl logs`, `routeward ctl blocked` et `routeward ctl diagnose` donnent les mêmes informations.
+
+**Lancer un bilan**
+
+- [ ] Ouvrez **Réglages**, **Diagnostics techniques**, puis **Bilan** (ou cliquez sur **Lancer un bilan** dans l'onglet Bloqué).
+- [ ] Cliquez sur **Lancer le bilan**. Chaque constat explique le problème en mots simples et propose un bouton quand RouteWard peut aider.
+
+**Exporter un fichier de diagnostic**
+
+- [ ] Dans l'onglet **Bilan**, cliquez sur **Exporter un fichier de diagnostic**.
+- [ ] Choisissez le nombre de jours de journaux, et si les connexions récentes et vos réglages sont inclus.
+- [ ] Cochez **Masquer les noms de sites** si vous ne voulez pas montrer quels sites ont été visités. Sans cela, le fichier les liste.
+- [ ] Cliquez sur **Préparer le fichier**, vérifiez la liste des parties et leurs tailles, puis cliquez sur **Télécharger le fichier**.
+
+Le fichier est fabriqué sur votre ordinateur et enregistré par la fenêtre. RouteWard ne l'envoie nulle part. Les mots de passe et les jetons ne sont jamais inclus, l'identifiant du proxy est remplacé par `[user]`, et l'adresse du proxy est conservée pour que la personne qui vous aide puisse la voir. Depuis un terminal : `routeward ctl export-diagnostics --output fichier.json` (ajoutez `--mask-domains` pour masquer les noms de sites).

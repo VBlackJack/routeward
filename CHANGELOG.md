@@ -5,6 +5,13 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+### Added
+- Desktop UI: a **Blocked** tab in Activity that lists every blocked connection by app and site with the reason in plain words (one reason per block, with a fallback for older daemons), the rule that applied, the last time and the count, plus a Home shortcut when something was blocked and a note on the known limit (kernel and unattributed drops are only counted).
+- Desktop UI: **Unblock** with a rule diff and predicted outcome from the daemon before confirming (`/api/rules/preview`), exceptions placed above the blocking rule, 15 minutes / 1 hour / always durations (`expiresAt`), an undo toast, and never any change to the global kill switch.
+- Desktop UI: logs with text search, component, period and level filters, live or daemon file by date with paging, and "See logs" from a blocked item or a connection (the connection and a 30 second window around it).
+- Desktop UI: a **Check-up** tab with plain-language findings and fix buttons, and a diagnostic export dialog that shows the manifest (sections and sizes) and a "mask sites" option before downloading the redacted JSON.
+- Locale keys for the above (English and French), including the `cli.diagnose.*`, `cli.blocked.*`, `cli.logs.*` and `cli.export.*` texts used by the command line.
+
 ### Fixed
 - Upgrading from v2026.1121.01 or earlier (MSI or .deb) now keeps protection on when it was on before the upgrade.
 
