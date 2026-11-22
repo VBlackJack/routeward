@@ -693,84 +693,176 @@ fn tag_with_attr<'a>(tags: &[&'a str], name: &str, value: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no tag with {name}=\"{value}\""))
 }
 
+/// Value of `const NAME: &str = r"...";` (or a plain string literal) in a Rust source text.
+fn rust_str_const(source: &str, name: &str) -> String {
+    let needle = format!("const {name}: &str = ");
+    let from = source
+        .find(&needle)
+        .unwrap_or_else(|| panic!("constant {name} not found"))
+        + needle.len();
+    let literal = source[from..].trim_start_matches('r');
+    let body = literal.strip_prefix('"').expect("string literal");
+    let end = body.find('"').expect("closing quote");
+    body[..end].to_string()
+}
+
 #[test]
 fn msi_upgrade_keeps_protection_actions_are_wired_safely() {
-    const CAPTURE_ACTIONS: &[&str] = &[
-        "CaptureOldProtectionStatus",
-        "CaptureOldProtectionStatusNoSlash",
-    ];
+    const CAPTURE_ACTION: &str = "CaptureOldProtectionStatus";
     const DECIDE_ACTION: &str = "MigrateUpgradeState";
+    const CMD_LINE_PROPERTY: &str = "WixQuietExecCmdLine";
+    const CMD_LINE_ACTION: &str = "SetRouteWardCaptureCmdLine";
+    const OLD_CLI_PROPERTY: &str = "RouteWardOldCli";
+    const ESCAPED_OLD_CLI_REFERENCE: &str = "[\\[]RouteWardOldCli[\\]]";
+    const ENDS_WITH_OPERATOR: &str = "&gt;&gt;";
     let wxs = fs::read_to_string(repo_root().join("packaging/windows/RouteWard.wxs"))
         .expect("RouteWard.wxs");
 
+    // The default schedule: the afterInstallInitialize one makes a deferred action precede
+    // RemoveExistingProducts, which Windows Installer rejects with error 2613.
     let upgrade = xml_tags(&wxs, "<MajorUpgrade");
     assert_eq!(upgrade.len(), 1);
-    assert_eq!(
-        xml_attr(upgrade[0], "Schedule"),
-        Some("afterInstallInitialize")
+    assert!(
+        matches!(
+            xml_attr(upgrade[0], "Schedule"),
+            None | Some("afterInstallValidate")
+        ),
+        "MajorUpgrade must keep the default schedule: {}",
+        upgrade[0]
     );
 
     let sequence_rows = xml_tags(&wxs, "<Custom ");
     let actions = xml_tags(&wxs, "<CustomAction");
     let set_properties = xml_tags(&wxs, "<SetProperty");
-    for action in CAPTURE_ACTIONS {
-        let row = tag_with_attr(&sequence_rows, "Action", action);
-        assert_eq!(
-            xml_attr(row, "Before"),
-            Some("RemoveExistingProducts"),
-            "{action} must run before the old product is removed"
-        );
-        let condition = xml_attr(row, "Condition").expect("capture condition");
-        assert!(condition.contains("NOT REMOVE"), "{action}: {condition}");
-    }
-    let decide_row = tag_with_attr(&sequence_rows, "Action", DECIDE_ACTION);
-    let decide_condition = xml_attr(decide_row, "Condition").expect("decide condition");
+
+    // Exactly one capture action, immediate and impersonated, before InstallValidate.
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|tag| xml_attr(tag, "Id").is_some_and(|id| id.starts_with("Capture")))
+            .count(),
+        1,
+        "exactly one capture action is expected"
+    );
+    let capture = tag_with_attr(&actions, "Id", CAPTURE_ACTION);
+    assert_eq!(xml_attr(capture, "DllEntry"), Some("WixQuietExec"));
+    assert_eq!(xml_attr(capture, "Return"), Some("ignore"));
     assert!(
-        decide_condition.contains("NOT REMOVE"),
-        "{decide_condition}"
+        matches!(xml_attr(capture, "Execute"), None | Some("immediate")),
+        "the capture must be immediate (a deferred one causes error 2613): {capture}"
     );
     assert!(
-        decide_condition.contains("ROUTEWARD_OLD_INSTALLDIR"),
-        "a stale capture must not trigger the migration without an old product: {decide_condition}"
+        xml_attr(capture, "Impersonate").is_none(),
+        "the capture runs as the installing user: {capture}"
+    );
+    let capture_row = tag_with_attr(&sequence_rows, "Action", CAPTURE_ACTION);
+    assert_eq!(xml_attr(capture_row, "Before"), Some("InstallValidate"));
+    let capture_condition = xml_attr(capture_row, "Condition").expect("capture condition");
+    for needle in [
+        "NOT REMOVE",
+        "WIX_UPGRADE_DETECTED",
+        "ROUTEWARD_OLD_INSTALLDIR",
+    ] {
+        assert!(
+            capture_condition.contains(needle),
+            "capture condition lacks {needle}: {capture_condition}"
+        );
+    }
+
+    // Its command line is set through the fixed property WixQuietExec reads in immediate mode.
+    let cmd_line = tag_with_attr(&set_properties, "Id", CMD_LINE_PROPERTY);
+    assert_eq!(xml_attr(cmd_line, "Action"), Some(CMD_LINE_ACTION));
+    assert_eq!(xml_attr(cmd_line, "Before"), Some(CAPTURE_ACTION));
+    assert_eq!(xml_attr(cmd_line, "Sequence"), Some("execute"));
+    assert_eq!(xml_attr(cmd_line, "Condition"), Some(capture_condition));
+    let migration_source = fs::read_to_string(
+        repo_root().join("crates/routeward-core/src/system/upgrade_migration.rs"),
+    )
+    .expect("upgrade_migration.rs");
+    let marker_key = rust_str_const(&migration_source, "UPGRADE_MARKER_SUBKEY");
+    let marker_value = rust_str_const(&migration_source, "UPGRADE_MARKER_VALUE");
+    let hkcu_key = format!("HKCU\\{marker_key}");
+    let value = xml_attr(cmd_line, "Value").expect("capture command line");
+    for needle in [
+        format!("reg delete {hkcu_key}"),
+        "findstr /c:".to_string(),
+        format!("reg add {hkcu_key} /v {marker_value} /t REG_DWORD /d 1"),
+        ESCAPED_OLD_CLI_REFERENCE.to_string(),
+    ] {
+        assert!(
+            value.contains(&needle),
+            "capture command line lacks `{needle}`: {value}"
+        );
+    }
+    assert!(
+        value.starts_with("&quot;"),
+        "WixQuietExec requires a command line that starts with a quote: {value}"
     );
 
+    // The old CLI path comes from two mutually exclusive rows, resolved before the setter above.
+    let old_cli: Vec<&str> = set_properties
+        .iter()
+        .copied()
+        .filter(|tag| xml_attr(tag, "Id") == Some(OLD_CLI_PROPERTY))
+        .collect();
+    assert_eq!(old_cli.len(), 2, "one row per trailing-backslash case");
+    for tag in &old_cli {
+        assert_eq!(xml_attr(tag, "Before"), Some(CMD_LINE_ACTION), "{tag}");
+        assert_eq!(xml_attr(tag, "Sequence"), Some("execute"), "{tag}");
+        let condition = xml_attr(tag, "Condition").expect("old CLI condition");
+        assert!(condition.contains(ENDS_WITH_OPERATOR), "{condition}");
+        assert!(condition.contains("NOT REMOVE"), "{condition}");
+    }
+    let conditions: Vec<&str> = old_cli
+        .iter()
+        .map(|tag| xml_attr(tag, "Condition").unwrap())
+        .collect();
+    assert_ne!(
+        xml_attr(old_cli[0], "Action"),
+        xml_attr(old_cli[1], "Action")
+    );
+    assert!(
+        conditions.iter().filter(|c| c.contains("NOT (")).count() == 1
+            && conditions.iter().filter(|c| !c.contains("NOT (")).count() == 1,
+        "the two conditions must be mutually exclusive: {conditions:?}"
+    );
+
+    // The decision runs in the commit phase, as SYSTEM, through WixQuietExec.
+    let decide_row = tag_with_attr(&sequence_rows, "Action", DECIDE_ACTION);
+    assert_eq!(xml_attr(decide_row, "Before"), Some("InstallFinalize"));
+    let decide_condition = xml_attr(decide_row, "Condition").expect("decide condition");
+    for needle in [
+        "NOT REMOVE",
+        "WIX_UPGRADE_DETECTED",
+        "ROUTEWARD_OLD_INSTALLDIR",
+    ] {
+        assert!(
+            decide_condition.contains(needle),
+            "decide condition lacks {needle}: {decide_condition}"
+        );
+    }
     let decide = tag_with_attr(&actions, "Id", DECIDE_ACTION);
     assert_eq!(xml_attr(decide, "Execute"), Some("commit"));
+    assert_eq!(xml_attr(decide, "Impersonate"), Some("no"));
+    assert_eq!(xml_attr(decide, "Return"), Some("ignore"));
     assert_eq!(xml_attr(decide, "DllEntry"), Some("WixQuietExec"));
     assert!(
         xml_attr(decide, "FileRef").is_none(),
         "a FileRef exe action drops the stderr log"
     );
-
-    for action in CAPTURE_ACTIONS
-        .iter()
-        .chain(std::iter::once(&DECIDE_ACTION))
-    {
-        let custom = tag_with_attr(&actions, "Id", action);
-        assert_eq!(xml_attr(custom, "Return"), Some("ignore"), "{action}");
-        assert_eq!(xml_attr(custom, "Impersonate"), Some("no"), "{action}");
-        if CAPTURE_ACTIONS.contains(action) {
-            assert_eq!(xml_attr(custom, "Execute"), Some("deferred"), "{action}");
-        }
-        let row = tag_with_attr(&sequence_rows, "Action", action);
-        let set_property = tag_with_attr(&set_properties, "Id", action);
-        assert_eq!(
-            xml_attr(set_property, "Before"),
-            Some(*action),
-            "{action}: its SetProperty must run right before it"
-        );
-        assert_eq!(xml_attr(set_property, "Sequence"), Some("execute"));
-        assert_eq!(
-            xml_attr(set_property, "Condition"),
-            xml_attr(row, "Condition"),
-            "{action}: SetProperty and Custom row conditions must match"
-        );
-    }
+    let decide_set = tag_with_attr(&set_properties, "Id", DECIDE_ACTION);
+    assert_eq!(xml_attr(decide_set, "Before"), Some(DECIDE_ACTION));
+    assert_eq!(xml_attr(decide_set, "Sequence"), Some("execute"));
+    assert_eq!(xml_attr(decide_set, "Condition"), Some(decide_condition));
+    assert!(
+        xml_attr(decide_set, "Value")
+            .expect("decide command line")
+            .contains("--user-sid [UserSID]"),
+        "the migration must be told whose marker to read"
+    );
 
     // A brace inside a Formatted value starts a reference; it must be written as an escape.
-    let set_properties = xml_tags(&wxs, "<SetProperty");
-    assert!(set_properties.len() >= CAPTURE_ACTIONS.len());
-    for tag in set_properties {
+    for tag in &set_properties {
         let value = xml_attr(tag, "Value").unwrap_or("");
         let unescaped = value.replace("[\\{]", "").replace("[\\}]", "");
         assert!(
@@ -778,6 +870,13 @@ fn msi_upgrade_keeps_protection_actions_are_wired_safely() {
             "unescaped brace in a SetProperty value: {value}"
         );
     }
+}
+
+#[test]
+fn rust_str_const_reads_raw_and_plain_literals() {
+    let source = "pub const A: &str = r\"x\\y\";\nconst B: &str = \"z\";";
+    assert_eq!(rust_str_const(source, "A"), "x\\y");
+    assert_eq!(rust_str_const(source, "B"), "z");
 }
 
 #[test]

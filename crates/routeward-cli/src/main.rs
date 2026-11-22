@@ -32,9 +32,7 @@ use routeward_core::logger::FileLogger;
 use routeward_core::pac::PacGenerator;
 use routeward_core::rules::ConnectionRequest;
 use routeward_core::system::protection_state::MAX_PAUSE_SECS;
-use routeward_core::system::upgrade_migration::{
-    fallback_upgrade_status_path, migrate_upgrade_state, upgrade_status_path_for_profile,
-};
+use routeward_core::system::upgrade_migration::{consume_upgrade_marker, migrate_upgrade_state};
 use routeward_core::system::user_state::{AllUsersCleanupReport, UserCleanupReport};
 use routeward_core::system::windows_service::{
     install_windows_service, query_windows_service_status, restore_windows_service,
@@ -136,9 +134,13 @@ enum Commands {
     /// uninstaller. Needs elevation and refuses while a RouteWard daemon is active
     PurgeData,
     /// Keep protection on across an upgrade from a version that did not persist it; run by the
-    /// installer once the upgrade is committed. Never starts the service
+    /// installer once the upgrade is committed. Never starts the service and always exits 0
     #[command(hide = true)]
-    MigrateUpgradeState,
+    MigrateUpgradeState {
+        /// SID of the installing user, whose registry hive holds the marker left by the installer
+        #[arg(long)]
+        user_sid: String,
+    },
     /// Restore the normal Internet connection of the current user: turn protection off in the
     /// background (when reachable), then give back the system proxy settings. Needs no
     /// elevation and never fails because the background service is unreachable
@@ -420,27 +422,24 @@ where
     false
 }
 
-/// Runs `routeward migrate-upgrade-state` (hidden, run by the installer as SYSTEM): when the old
-/// daemon was running and no state file exists yet, turns protection on through the new daemon, or
-/// persists the enabled state directly when the daemon is unreachable. Every outcome is logged
-/// and the command never fails, so it can never break an upgrade. The captured status file is
-/// deleted on every path, including when the profile path cannot be resolved.
-async fn run_migrate_upgrade_state(constants: &SystemConstants) {
+/// Runs `routeward migrate-upgrade-state --user-sid <SID>` (hidden, run by the installer as
+/// SYSTEM): reads and consumes the registry marker the installer left in that user's hive, then,
+/// when the old daemon was running and no state file exists yet, turns protection on through the
+/// new daemon, or persists the enabled state directly when the daemon is unreachable. Every outcome
+/// is logged and the command never fails, so it can never break an upgrade.
+async fn run_migrate_upgrade_state(constants: &SystemConstants, user_sid: &str) {
+    let protection_was_running = consume_upgrade_marker(user_sid);
     let profile_path = match constants.ipc.resolve_daemon_profile_path() {
         Ok(path) => path,
         Err(err) => {
             tracing::warn!(error = %err, "cannot resolve the daemon profile path, nothing migrated");
-            if let Some(status_path) = fallback_upgrade_status_path() {
-                let _ = std::fs::remove_file(status_path);
-            }
             return;
         }
     };
     let state_path =
         routeward_core::system::protection_state::state_path_for_profile(&profile_path);
-    let status_path = upgrade_status_path_for_profile(&profile_path);
     let client = IpcClient::new(constants.ipc.clone());
-    let outcome = migrate_upgrade_state(&state_path, &status_path, || {
+    let outcome = migrate_upgrade_state(&state_path, protection_was_running, || {
         call_daemon_with_retry(
             || async {
                 client
@@ -985,7 +984,7 @@ fn init_logging(command: &Commands) {
     let verbose_default = matches!(
         command,
         Commands::PurgeData
-            | Commands::MigrateUpgradeState
+            | Commands::MigrateUpgradeState { .. }
             | Commands::Cleanup {
                 all_users: true,
                 ..
@@ -1069,8 +1068,8 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         return run_recover(constants, &args.locale, pause_at_end).await;
     }
 
-    if matches!(args.command, Commands::MigrateUpgradeState) {
-        run_migrate_upgrade_state(&constants).await;
+    if let Commands::MigrateUpgradeState { user_sid } = &args.command {
+        run_migrate_upgrade_state(&constants, user_sid).await;
         return Ok(());
     }
 
@@ -1245,7 +1244,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Service { .. }
         | Commands::Recover { .. }
         | Commands::PurgeData
-        | Commands::MigrateUpgradeState => unreachable!(),
+        | Commands::MigrateUpgradeState { .. } => unreachable!(),
     }
 
     Ok(())
@@ -1420,8 +1419,17 @@ mod tests {
     #[test]
     fn migrate_upgrade_state_subcommand_parses_and_is_hidden() {
         use clap::CommandFactory;
-        let args = CliArgs::try_parse_from(["routeward", "migrate-upgrade-state"]).expect("parses");
-        assert!(matches!(args.command, Commands::MigrateUpgradeState));
+        let args = CliArgs::try_parse_from([
+            "routeward",
+            "migrate-upgrade-state",
+            "--user-sid",
+            "S-1-5-18",
+        ])
+        .expect("parses");
+        assert!(
+            matches!(&args.command, Commands::MigrateUpgradeState { user_sid } if user_sid == "S-1-5-18")
+        );
+        assert!(CliArgs::try_parse_from(["routeward", "migrate-upgrade-state"]).is_err());
         let cmd = CliArgs::command();
         let sub = cmd
             .find_subcommand("migrate-upgrade-state")
@@ -1485,10 +1493,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let state = root.join("protection_state.json");
-        let status = root.join("upgrade_status.json");
-        std::fs::write(&status, r#"{"ok":true,"result":{"running":true}}"#).unwrap();
         let calls = std::cell::Cell::new(0u32);
-        let outcome = migrate_upgrade_state(&state, &status, || {
+        let outcome = migrate_upgrade_state(&state, true, || {
             call_daemon_with_retry(
                 || {
                     calls.set(calls.get() + 1);
@@ -1505,7 +1511,6 @@ mod tests {
             routeward_core::system::upgrade_migration::MigrationOutcome::WrittenDirectly
         );
         assert!(state.exists());
-        assert!(!status.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
