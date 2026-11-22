@@ -2,7 +2,51 @@
 
 # Dépannage (Troubleshooting)
 
-## 0. Dépannage Rapide dans l'Application Bureau (Mode Simple)
+## 0. Je n'ai plus Internet
+
+Faites ces étapes dans l'ordre. Arrêtez-vous dès que votre Internet refonctionne. Une action par ligne.
+
+**Étape A - Utiliser le raccourci du menu Démarrer (aucun droit administrateur requis)**
+
+- [ ] Ouvrez le menu Démarrer.
+- [ ] Tapez `RouteWard - Restore Internet`.
+- [ ] Cliquez dessus.
+- [ ] Patientez quelques secondes, puis essayez un site web.
+
+Ce raccourci lance `routeward recover --pause-at-end` : il désactive la protection et rétablit vos paramètres de proxy Windows.
+
+**Étape B - Mettre en pause depuis l'icône de la barre système**
+
+- [ ] Repérez l'icône RouteWard près de l'horloge (cliquez sur la petite flèche si elle est masquée).
+- [ ] Faites un clic droit sur l'icône.
+- [ ] Cliquez sur **Pause 15 min**.
+- [ ] Essayez un site web. La protection reprend toute seule à la fin de la pause.
+
+**Étape C - Désactiver le proxy Windows à la main**
+
+- [ ] Ouvrez les **Paramètres** de Windows.
+- [ ] Allez dans **Réseau et Internet > Proxy**.
+- [ ] Désactivez **Utiliser un serveur proxy**.
+- [ ] Désactivez **Utiliser un script d'installation**.
+- [ ] Essayez un site web.
+
+**Étape D - Arrêter le service (utilisateurs avancés)**
+
+- [ ] Ouvrez un terminal en tant qu'administrateur.
+- [ ] Lancez `routeward service stop`.
+- [ ] Essayez un site web.
+
+**Étape E - Désinstaller (dernier recours)**
+
+- [ ] Ouvrez les **Paramètres** de Windows, puis **Applications > Applications installées**.
+- [ ] Sélectionnez **RouteWard** et cliquez sur **Désinstaller**.
+- [ ] Redémarrez l'ordinateur.
+
+La désinstallation rend les paramètres de proxy que RouteWard avait modifiés (voir [Désinstaller le MSI](build.md#désinstaller-le-msi-ce-qui-est-nettoyé-ce-qui-ne-lest-pas)).
+
+Depuis un terminal, `routeward recover` fait la même chose que le raccourci du menu Démarrer.
+
+## 0b. Dépannage Rapide dans l'Application Bureau (Mode Simple)
 
 Si une application ou un site web ne charge plus lorsque la protection est active :
 
@@ -211,3 +255,17 @@ Redémarrer les applications listées (ou recharger la page, ou rouvrir la sessi
 - **Une application ou un site précis ne fonctionne plus** : cliquez sur **Une app ne marche plus ?** sur l'Accueil en Mode Simple pour l'autoriser en Direct en 1 clic.
 - **Une règle d'exclusion de site semble ignorée** : utilisez le champ **Par où passe un site ?** dans **Mes Apps & Sites**. Si une règle plus large passe devant, RouteWard affiche un avertissement avec un bouton **Faire passer en premier** en 1 clic.
 - **Box Internet (`192.168.x.x`) ou imprimante Wi-Fi inaccessible** : activez le pack en 1 clic **Box & Imprimantes (Réseau local)** dans **Mes Apps & Sites**.
+
+## 15. "Quitter" Garde la Protection Active en Arrière-Plan
+
+RouteWard fonctionne normalement via son service Windows, qui démarre avec l'ordinateur. Fermer la fenêtre ne fait que la masquer dans la zone de notification (un message affiché une seule fois l'explique). Choisir **Quitter** dans le menu de l'icône ferme l'application, mais **la protection continue en arrière-plan grâce au service** : vos applications restent protégées et le coupe-circuit reste actif.
+
+Pour vraiment arrêter la protection :
+
+- [ ] Ouvrez RouteWard (ou faites un clic droit sur l'icône de la barre système).
+- [ ] Cliquez sur **Pause** (pour une durée choisie, la protection reprend toute seule, même après un redémarrage), ou désactivez la protection.
+- [ ] Choisissez ensuite **Quitter** si vous voulez aussi fermer l'application.
+
+Si vous êtes déjà coupé d'Internet, retournez à la section 0. Depuis un terminal, `routeward ctl pause --seconds 900` met la protection en pause pendant 15 minutes.
+
+RouteWard démarre avec l'icône de la barre système à l'ouverture de session (réduit, sans fenêtre). La protection est mémorisée : si elle était active, elle revient après un redémarrage.

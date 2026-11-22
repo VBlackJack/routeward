@@ -105,7 +105,13 @@ The daemon binds `\\.\pipe\routeward-daemon` with an explicit DACL restricting a
 > **Important (Windows UAC Account Elevation):** When launched interactively via `routeward.exe daemon`, the daemon must run under the same user account that runs the desktop UI or `routeward ctl`, unless you pass `--allow-sid <SID>` explicitly.
 
 ### Windows Service Mode (SCM) & Packaging
-For persistent background execution under `LocalSystem`, register RouteWard as a Windows Service while granting your desktop account SID access to the Named Pipe:
+The Windows service is the normal way to run RouteWard. With the MSI, nothing has to be registered by hand: the first time you click **Start** in the app or the tray, RouteWard installs the service (one Windows administrator prompt) and the service then starts automatically at boot. Protection is remembered: if it was on, it comes back on after a reboot, and a pause resumes by itself at its end, even after a reboot. RouteWard itself starts at sign-in with the tray icon only (minimized, no window).
+
+Choosing **Exit** in the tray closes the desktop app only; the service keeps protecting in the background. To really stop, use **Pause** or turn protection off before exiting (see [Troubleshooting](troubleshooting.md)).
+
+The MSI also adds a Start menu shortcut, **RouteWard - Restore Internet**, which runs `routeward recover --pause-at-end` without administrator rights: it turns protection off and restores the Windows proxy settings. From a terminal, `routeward recover` is the equivalent, and `routeward ctl pause --seconds N` pauses protection for `N` seconds.
+
+For manual or scripted setups (ZIP, development), you can register RouteWard as a Windows Service under `LocalSystem` yourself while granting your desktop account SID access to the Named Pipe:
 
 `install-service.ps1` first copies `routeward.exe`, `routeward-desktop.exe`, and any bundled WinDivert files from the (user-writable) extraction folder to `%ProgramFiles%\RouteWard` (override with `-InstallDir`) and registers the installed copy. `routeward.exe service install` itself refuses a service binary whose directory, or any parent directory, is writable by non-administrators, because the service runs as `LocalSystem`.
 
