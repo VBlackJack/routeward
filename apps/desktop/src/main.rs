@@ -19,7 +19,10 @@
 mod navigation;
 
 use routeward_core::ipc::generate_ephemeral_token;
-use routeward_desktop_lib::commands::DesktopCommandBridge;
+use routeward_core::system::AUTOSTART_MINIMIZED_ARG;
+use routeward_desktop_lib::commands::{DesktopCommandBridge, ExitDisposition};
+#[cfg(target_os = "windows")]
+use routeward_desktop_lib::single_instance::{Acquisition, SingleInstance};
 #[cfg(target_os = "windows")]
 use routeward_desktop_lib::tray::TrayHandle;
 use routeward_desktop_lib::{
@@ -64,6 +67,9 @@ const LOOPBACK_MAX_WAITING_CONNECTIONS: usize = 64;
 const LOOPBACK_MAX_SERVING_REQUESTS: usize = 64;
 const ICON_WINDOW_DIMENSION: u32 = 32;
 const ICON_TASKBAR_DIMENSION: u32 = 256;
+/// How long the tray icon stays after the first "protection continues" notice, so the balloon
+/// can be read before the icon (and the balloon with it) disappears.
+const EXIT_NOTICE_LINGER_MS: u64 = 6000;
 
 fn load_window_icon_32() -> Option<Icon> {
     Icon::from_rgba(
@@ -435,6 +441,16 @@ where
     args.into_iter().any(|arg| arg.as_ref() == "--smoke-ipc")
 }
 
+/// True when the app was started by the sign-in autostart: tray only, no window.
+fn is_minimized_arg_list<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .any(|arg| arg.as_ref() == AUTOSTART_MINIMIZED_ARG)
+}
+
 fn run_smoke_ipc() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -487,6 +503,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::fmt::init();
 
+    // One app per user session: a second launch asks the first one to show its window and ends.
+    #[cfg(target_os = "windows")]
+    let single_instance = match SingleInstance::acquire() {
+        Ok(Acquisition::First(guard)) => Some(Arc::new(guard)),
+        Ok(Acquisition::AlreadyRunning) => return Ok(()),
+        Err(code) => {
+            tracing::warn!("Single-instance guard unavailable (Win32 error {code})");
+            None
+        }
+    };
+    let start_minimized = is_minimized_arg_list(std::env::args().skip(1));
+
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -504,6 +532,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let event_loop = EventLoopBuilder::<DesktopWindowCommand>::with_user_event().build();
     let event_proxy = event_loop.create_proxy();
+    let quit_proxy = event_proxy.clone();
+
+    #[cfg(target_os = "windows")]
+    if let Some(guard) = &single_instance {
+        let proxy_for_show = event_proxy.clone();
+        guard.spawn_show_listener(move || {
+            let _ = proxy_for_show.send_event(DesktopWindowCommand::ShowWindow);
+        });
+    }
 
     #[cfg(target_os = "windows")]
     let (tray_handle, tray_ready) = {
@@ -521,8 +558,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tray_for_bridge.lock().sync_status(snapshot);
             }));
             let tray_for_alerts = Arc::clone(&tray);
-            bridge.set_tray_alert_callback(Arc::new(move |title, body| {
-                tray_for_alerts.lock().show_alert(title, body);
+            bridge.set_tray_alert_callback(Arc::new(move |balloon| {
+                tray_for_alerts.lock().show_alert(balloon);
             }));
         }
         (tray, ready)
@@ -554,7 +591,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             WINDOW_DEFAULT_HEIGHT,
         ))
         .with_min_inner_size(LogicalSize::new(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT))
-        .with_theme(Some(initial_tao_theme));
+        .with_theme(Some(initial_tao_theme))
+        // Started by the sign-in autostart: stay in the tray (the window opens from there). Without
+        // a tray there would be no way to open it, so the window shows anyway.
+        .with_visible(!(start_minimized && tray_ready));
 
     #[cfg(target_os = "windows")]
     let window_builder = {
@@ -641,6 +681,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
+        // The single-instance guard lives as long as the event loop.
+        #[cfg(target_os = "windows")]
+        let _ = &single_instance;
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -648,11 +691,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 if tray_ready {
                     window.set_visible(false);
+                    bridge_for_loop.notify_close_to_tray_once();
                 } else {
-                    #[cfg(target_os = "windows")]
-                    tray_handle.lock().shutdown();
-                    bridge_for_loop.restore_system_settings_on_exit();
-                    *control_flow = ControlFlow::Exit;
+                    let _ = quit_proxy.send_event(DesktopWindowCommand::Quit);
                 }
             }
             Event::UserEvent(cmd) => match cmd {
@@ -665,11 +706,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 DesktopWindowCommand::Close => {
                     if tray_ready {
                         window.set_visible(false);
+                        bridge_for_loop.notify_close_to_tray_once();
                     } else {
-                        #[cfg(target_os = "windows")]
-                        tray_handle.lock().shutdown();
-                        bridge_for_loop.restore_system_settings_on_exit();
-                        *control_flow = ControlFlow::Exit;
+                        let _ = quit_proxy.send_event(DesktopWindowCommand::Quit);
                     }
                 }
                 DesktopWindowCommand::DragWindow => {
@@ -683,41 +722,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 DesktopWindowCommand::StartDaemon => {
                     let b = Arc::clone(&bridge_for_loop);
                     rt_for_loop.spawn(async move {
-                        match b.start_privileged_daemon().await {
-                            Ok(state) => {
-                                if state.diagnostics.daemon_connected && !state.diagnostics.running
-                                {
-                                    if let Err(err) = b.toggle_engine(true).await {
-                                        b.log_warn(format!(
-                                            "Tray auto-enable after daemon start failed: {err}"
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                b.log_warn(format!("Tray daemon start failed: {err:?}"));
-                            }
-                        }
+                        b.tray_start_protection().await;
                     });
                 }
                 DesktopWindowCommand::ToggleEngine => {
                     let b = Arc::clone(&bridge_for_loop);
                     rt_for_loop.spawn(async move {
-                        let running = b.get_diagnostics().running;
-                        if let Err(err) = b.toggle_engine(!running).await {
-                            b.log_warn(format!("Tray engine toggle failed: {err}"));
-                        }
+                        b.tray_toggle_engine().await;
                     });
                 }
-                DesktopWindowCommand::PauseEngineMinutes(minutes) => {
+                DesktopWindowCommand::PauseEngineSeconds(seconds) => {
                     let b = Arc::clone(&bridge_for_loop);
                     rt_for_loop.spawn(async move {
-                        if let Err(err) = b
-                            .pause_engine_for(std::time::Duration::from_secs(minutes * 60))
-                            .await
-                        {
-                            b.log_warn(format!("Tray timed pause failed: {err}"));
-                        }
+                        // The daemon keeps the deadline: closing the app does not end the pause.
+                        b.tray_pause(seconds).await;
                     });
                 }
                 DesktopWindowCommand::SwitchProfile(idx) => {
@@ -730,9 +748,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     apply_window_theme(&window, appearance);
                 }
                 DesktopWindowCommand::Quit => {
+                    // Decide first what happens to protection (it may keep running in the
+                    // background), off the UI thread; then come back to exit.
+                    let b = Arc::clone(&bridge_for_loop);
+                    let proxy = quit_proxy.clone();
+                    rt_for_loop.spawn(async move {
+                        if b.prepare_exit().await
+                            == (ExitDisposition::ProtectionContinues { announce: true })
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                EXIT_NOTICE_LINGER_MS,
+                            ))
+                            .await;
+                        }
+                        let _ = proxy.send_event(DesktopWindowCommand::QuitNow);
+                    });
+                }
+                DesktopWindowCommand::QuitNow => {
                     #[cfg(target_os = "windows")]
                     tray_handle.lock().shutdown();
-                    bridge_for_loop.restore_system_settings_on_exit();
+                    bridge_for_loop.restore_system_settings_unless_protected();
                     *control_flow = ControlFlow::Exit;
                 }
             },
@@ -771,6 +806,14 @@ mod tests {
         assert!(is_smoke_ipc_arg_list(["--foo", "--smoke-ipc"]));
         assert!(!is_smoke_ipc_arg_list::<[&str; 0], &str>([]));
         assert!(!is_smoke_ipc_arg_list(["--help"]));
+    }
+
+    #[test]
+    fn detects_the_minimized_autostart_flag() {
+        assert!(is_minimized_arg_list(["--minimized"]));
+        assert!(is_minimized_arg_list(["--other", "--minimized"]));
+        assert!(!is_minimized_arg_list::<[&str; 0], &str>([]));
+        assert!(!is_minimized_arg_list(["--smoke-ipc"]));
     }
 
     /// Reads one byte from the stream: `Some(byte)` when the server sent one, `None` on a close.

@@ -1192,21 +1192,38 @@
   },
   "tray": {
     "status": {
-      "offline": "RouteWard - Service Offline",
+      "offline": "RouteWard - Not running",
       "protected": "RouteWard - Protected",
-      "paused": "RouteWard - Paused"
+      "paused": "RouteWard - Protection is off",
+      "paused_until": "RouteWard - Paused until {time}"
     },
     "menu": {
-      "pause": "Pause Protection",
-      "pause_15m": "Pause for 15 minutes",
-      "enable": "Enable Protection",
-      "start_service": "Start Service",
+      "pause": "Turn protection off",
+      "pause_15m": "Pause 15 min",
+      "enable": "Turn protection on",
+      "resume_now": "Resume now",
+      "start_service": "Start protection",
       "open": "Open RouteWard",
       "quit": "Exit"
     },
     "alert": {
-      "outage_title": "RouteWard - Proxy Unreachable",
-      "outage_body": "Internet is blocked by the safety cutoff to prevent an IP leak. Right-click here to pause 15 min or open RouteWard."
+      "outage_title": "RouteWard - Connection problem",
+      "outage_body": "Your Internet is cut on purpose so your real address stays hidden. Click here to open RouteWard, or use the RouteWard icon near the clock to pause protection for 15 min.",
+      "outage_body_open": "Your proxy is not answering, so some connections are failing. Click here to open RouteWard."
+    },
+    "notice": {
+      "title": "RouteWard",
+      "restored_body": "RouteWard is not running, your normal connection was restored.",
+      "exit_background_title": "RouteWard keeps protecting you",
+      "exit_background_body": "Protection continues in the background. To pause it, use the RouteWard icon near the clock. If your Internet stops working, open the Start menu and choose \"RouteWard - Restore Internet\".",
+      "close_to_tray_title": "RouteWard is still running",
+      "close_to_tray_body": "RouteWard keeps running here, near the clock. Click the icon to open it again, or right-click it to exit.",
+      "service_install_failed": "Background protection could not be set up. RouteWard works for now, but protection will not come back after a restart.",
+      "uac_cancelled": "Permission was declined, so protection was not started.",
+      "access_denied": "RouteWard is running, but this account is not allowed to control it.",
+      "start_failed": "RouteWard could not start protection. Open RouteWard for details.",
+      "toggle_failed": "RouteWard could not change protection. Open RouteWard for details.",
+      "pause_failed": "RouteWard could not pause protection. Open RouteWard for details."
     }
   }
 }

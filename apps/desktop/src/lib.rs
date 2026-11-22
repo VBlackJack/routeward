@@ -16,8 +16,11 @@
 
 pub mod commands;
 pub mod daemon_launcher;
+pub mod notices;
 mod routes;
 mod security;
+#[cfg(target_os = "windows")]
+pub mod single_instance;
 mod sse;
 #[cfg(test)]
 mod tests;
@@ -37,8 +40,19 @@ pub use security::{
 };
 pub use sse::stream_sse_events;
 
-const DEFAULT_DESKTOP_LOCALE: &str = "fr";
+/// Locale used when neither `ROUTEWARD_LOCALE` nor the operating system gives a French one.
+const DEFAULT_DESKTOP_LOCALE: &str = "en";
+const FRENCH_DESKTOP_LOCALE: &str = "fr";
+const FRENCH_LOCALE_PREFIX: &str = "fr";
 const ENV_ROUTEWARD_LOCALE: &str = "ROUTEWARD_LOCALE";
+#[cfg(not(target_os = "windows"))]
+const ENV_OS_LANG: &str = "LANG";
+/// Length of the buffer `GetUserDefaultLocaleName` fills (`LOCALE_NAME_MAX_LENGTH`).
+#[cfg(target_os = "windows")]
+const OS_LOCALE_NAME_MAX_LEN: usize = 85;
+
+/// Duration of the tray "Pause 15 min" action, handed to the daemon (it keeps the deadline).
+pub const TRAY_PAUSE_SECS: u64 = 15 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayStatusSnapshot {
@@ -47,6 +61,61 @@ pub struct TrayStatusSnapshot {
     pub locale: String,
     pub active_profile_id: String,
     pub profiles: Vec<(String, String)>,
+    /// End of a timed pause (Unix milliseconds) kept by the daemon, when one is pending.
+    pub paused_until_epoch_ms: Option<u64>,
+}
+
+/// How a tray balloon is flagged (icon next to the text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayBalloonLevel {
+    Info,
+    Warning,
+}
+
+/// A notification shown from the tray icon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayBalloon {
+    pub title: String,
+    pub body: String,
+    pub level: TrayBalloonLevel,
+}
+
+/// Maps an operating-system locale name (`fr-FR`, `en-US`, `fr_CA.UTF-8`) to a desktop locale:
+/// any French variant gives French, everything else English.
+pub fn locale_from_os_name(name: &str) -> &'static str {
+    if name
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with(FRENCH_LOCALE_PREFIX)
+    {
+        FRENCH_DESKTOP_LOCALE
+    } else {
+        DEFAULT_DESKTOP_LOCALE
+    }
+}
+
+/// The locale of the operating system user, as a desktop locale.
+pub fn os_default_locale() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
+        let mut buffer = [0u16; OS_LOCALE_NAME_MAX_LEN];
+        // SAFETY: the buffer is valid for `OS_LOCALE_NAME_MAX_LEN` UTF-16 units, which is the
+        // size passed; the function writes a NUL-terminated name and returns its length.
+        let written =
+            unsafe { GetUserDefaultLocaleName(buffer.as_mut_ptr(), OS_LOCALE_NAME_MAX_LEN as i32) };
+        if written <= 0 {
+            return DEFAULT_DESKTOP_LOCALE;
+        }
+        let len = buffer.iter().position(|&unit| unit == 0).unwrap_or(0);
+        locale_from_os_name(&String::from_utf16_lossy(&buffer[..len]))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var(ENV_OS_LANG)
+            .map(|lang| locale_from_os_name(&lang))
+            .unwrap_or(DEFAULT_DESKTOP_LOCALE)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,10 +204,14 @@ pub enum DesktopWindowCommand {
     ShowWindow,
     StartDaemon,
     ToggleEngine,
-    PauseEngineMinutes(u64),
+    /// Pause protection for that many seconds; the daemon keeps the deadline.
+    PauseEngineSeconds(u64),
     SwitchProfile(usize),
     ApplyTheme(WindowThemeAppearance),
+    /// The user asked to exit: decide what happens to protection, then exit.
     Quit,
+    /// Exit now (sent once the decision taken for `Quit` is done).
+    QuitNow,
 }
 
 pub fn create_desktop_bridge() -> Result<DesktopCommandBridge, String> {
@@ -148,7 +221,7 @@ pub fn create_desktop_bridge() -> Result<DesktopCommandBridge, String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_DESKTOP_LOCALE.to_string());
+        .unwrap_or_else(|| os_default_locale().to_string());
     let bridge = DesktopCommandBridge::new(constants, profile, &locale);
     bridge.spawn_background_sync();
     Ok(bridge)

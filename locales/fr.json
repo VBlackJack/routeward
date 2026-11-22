@@ -1192,21 +1192,38 @@
   },
   "tray": {
     "status": {
-      "offline": "RouteWard - Service arrêté",
+      "offline": "RouteWard - Non démarré",
       "protected": "RouteWard - Protégé",
-      "paused": "RouteWard - En pause"
+      "paused": "RouteWard - Protection désactivée",
+      "paused_until": "RouteWard - En pause jusqu'à {time}"
     },
     "menu": {
-      "pause": "Mettre en pause",
-      "pause_15m": "Pause 15 minutes",
+      "pause": "Désactiver la protection",
+      "pause_15m": "Pause de 15 min",
       "enable": "Activer la protection",
-      "start_service": "Démarrer le service",
+      "resume_now": "Reprendre maintenant",
+      "start_service": "Démarrer la protection",
       "open": "Ouvrir RouteWard",
       "quit": "Quitter"
     },
     "alert": {
-      "outage_title": "RouteWard - Proxy injoignable",
-      "outage_body": "Internet est bloqué par sécurité pour éviter une fuite IP. Faites un clic droit ici pour mettre en pause 15 min ou ouvrir RouteWard."
+      "outage_title": "RouteWard - Problème de connexion",
+      "outage_body": "Votre accès à Internet est coupé volontairement pour que votre vraie adresse reste cachée. Cliquez ici pour ouvrir RouteWard, ou utilisez l'icône RouteWard près de l'horloge pour mettre la protection en pause 15 min.",
+      "outage_body_open": "Votre proxy ne répond pas : certaines connexions échouent. Cliquez ici pour ouvrir RouteWard."
+    },
+    "notice": {
+      "title": "RouteWard",
+      "restored_body": "RouteWard n'est pas lancé, votre connexion normale a été rétablie.",
+      "exit_background_title": "RouteWard continue de vous protéger",
+      "exit_background_body": "La protection continue en arrière-plan. Pour la mettre en pause, utilisez l'icône RouteWard près de l'horloge. Si Internet ne fonctionne plus, ouvrez le menu Démarrer et choisissez \"RouteWard - Restore Internet\".",
+      "close_to_tray_title": "RouteWard est toujours actif",
+      "close_to_tray_body": "RouteWard reste actif ici, près de l'horloge. Cliquez sur l'icône pour le rouvrir, ou faites un clic droit pour quitter.",
+      "service_install_failed": "La protection en arrière-plan n'a pas pu être installée. RouteWard fonctionne pour l'instant, mais la protection ne reviendra pas après un redémarrage.",
+      "uac_cancelled": "L'autorisation a été refusée, la protection n'a donc pas été démarrée.",
+      "access_denied": "RouteWard est actif, mais ce compte n'a pas le droit de le contrôler.",
+      "start_failed": "RouteWard n'a pas pu démarrer la protection. Ouvrez RouteWard pour plus de détails.",
+      "toggle_failed": "RouteWard n'a pas pu modifier la protection. Ouvrez RouteWard pour plus de détails.",
+      "pause_failed": "RouteWard n'a pas pu mettre la protection en pause. Ouvrez RouteWard pour plus de détails."
     }
   }
 }

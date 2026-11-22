@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
-use crate::{DesktopWindowCommand, TrayStatusSnapshot};
+use crate::{
+    DesktopWindowCommand, TrayBalloon, TrayBalloonLevel, TrayStatusSnapshot, TRAY_PAUSE_SECS,
+};
 use parking_lot::Mutex;
 use routeward_core::i18n::I18nRegistry;
 use std::cell::RefCell;
@@ -25,12 +27,13 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{FILETIME, HWND, LPARAM, LRESULT, POINT, SYSTEMTIME, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING,
-    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW,
-    NOTIFYICON_VERSION_4,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO,
+    NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_BALLOONUSERCLICK,
+    NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
@@ -59,7 +62,14 @@ const IDM_QUIT: u32 = 1003;
 const IDM_PAUSE_15M: u32 = 1004;
 const IDM_PROFILE_BASE: u32 = 2000;
 const MAX_TRAY_PROFILES: usize = 20;
-const TRAY_PAUSE_MINUTES: u64 = 15;
+/// Seconds between 1601-01-01 (FILETIME epoch) and 1970-01-01 (Unix epoch).
+const FILETIME_UNIX_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
+/// FILETIME ticks (100 ns) per second and per millisecond.
+const FILETIME_TICKS_PER_SEC: u64 = 10_000_000;
+const FILETIME_TICKS_PER_MS: u64 = 10_000;
+const MILLIS_PER_SEC: u64 = 1000;
+/// Placeholder of the time in the "paused until" status text.
+const TIME_PLACEHOLDER: &str = "{time}";
 
 fn to_wide_null(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(once(0)).collect()
@@ -180,31 +190,73 @@ pub struct TrayMenuLabels {
 const TRAY_KEY_STATUS_OFFLINE: &str = "tray.status.offline";
 const TRAY_KEY_STATUS_PROTECTED: &str = "tray.status.protected";
 const TRAY_KEY_STATUS_PAUSED: &str = "tray.status.paused";
+const TRAY_KEY_STATUS_PAUSED_UNTIL: &str = "tray.status.paused_until";
 const TRAY_KEY_MENU_PAUSE: &str = "tray.menu.pause";
 const TRAY_KEY_MENU_PAUSE_15M: &str = "tray.menu.pause_15m";
 const TRAY_KEY_MENU_ENABLE: &str = "tray.menu.enable";
+const TRAY_KEY_MENU_RESUME_NOW: &str = "tray.menu.resume_now";
 const TRAY_KEY_MENU_START_SERVICE: &str = "tray.menu.start_service";
 const TRAY_KEY_MENU_OPEN: &str = "tray.menu.open";
 const TRAY_KEY_MENU_QUIT: &str = "tray.menu.quit";
 
+/// Local time of day (`HH:MM`) of a Unix timestamp in milliseconds; UTC when the time zone
+/// conversion is unavailable.
+pub fn format_local_time_of_day(epoch_ms: u64) -> String {
+    let ticks = (epoch_ms / MILLIS_PER_SEC + FILETIME_UNIX_EPOCH_OFFSET_SECS)
+        * FILETIME_TICKS_PER_SEC
+        + (epoch_ms % MILLIS_PER_SEC) * FILETIME_TICKS_PER_MS;
+    let file_time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    // SAFETY: both SYSTEMTIME values are plain output structs; the null time zone means "the
+    // current time zone of the user".
+    unsafe {
+        let mut utc: SYSTEMTIME = std::mem::zeroed();
+        let mut local: SYSTEMTIME = std::mem::zeroed();
+        if FileTimeToSystemTime(&file_time, &mut utc) == 0 {
+            return String::new();
+        }
+        if SystemTimeToTzSpecificLocalTime(null(), &utc, &mut local) == 0 {
+            local = utc;
+        }
+        format!("{:02}:{:02}", local.wHour, local.wMinute)
+    }
+}
+
 /// Builds the tray tooltip and menu labels from the shared locale files for the snapshot locale.
 pub fn build_tray_labels(snapshot: &TrayStatusSnapshot) -> TrayMenuLabels {
+    build_tray_labels_with(snapshot, &format_local_time_of_day)
+}
+
+/// [`build_tray_labels`] with the clock formatting injected (so tests do not depend on the time
+/// zone of the machine).
+pub fn build_tray_labels_with(
+    snapshot: &TrayStatusSnapshot,
+    format_time: &dyn Fn(u64) -> String,
+) -> TrayMenuLabels {
     let i18n = I18nRegistry::new(snapshot.locale.trim());
-    let status_key = if !snapshot.daemon_connected {
-        TRAY_KEY_STATUS_OFFLINE
-    } else if snapshot.running {
-        TRAY_KEY_STATUS_PROTECTED
-    } else {
-        TRAY_KEY_STATUS_PAUSED
+    // A pending timed pause only matters while protection is off.
+    let paused_until = snapshot
+        .paused_until_epoch_ms
+        .filter(|_| snapshot.daemon_connected && !snapshot.running);
+    let status_line = match paused_until {
+        Some(deadline) => i18n
+            .t(TRAY_KEY_STATUS_PAUSED_UNTIL)
+            .replace(TIME_PLACEHOLDER, &format_time(deadline)),
+        None if !snapshot.daemon_connected => i18n.t(TRAY_KEY_STATUS_OFFLINE),
+        None if snapshot.running => i18n.t(TRAY_KEY_STATUS_PROTECTED),
+        None => i18n.t(TRAY_KEY_STATUS_PAUSED),
     };
     let toggle_key = if !snapshot.daemon_connected {
         TRAY_KEY_MENU_START_SERVICE
     } else if snapshot.running {
         TRAY_KEY_MENU_PAUSE
+    } else if paused_until.is_some() {
+        TRAY_KEY_MENU_RESUME_NOW
     } else {
         TRAY_KEY_MENU_ENABLE
     };
-    let status_line = i18n.t(status_key);
     TrayMenuLabels {
         tooltip: status_line.clone(),
         status_line,
@@ -248,7 +300,7 @@ impl TrayStatusIcons {
 
 struct TrayWindowState {
     snapshot: Arc<Mutex<TrayStatusSnapshot>>,
-    pending_alert: Arc<Mutex<Option<(String, String)>>>,
+    pending_alert: Arc<Mutex<Option<TrayBalloon>>>,
     command_cb: Arc<dyn Fn(DesktopWindowCommand) + Send + Sync>,
     taskbar_created_msg: u32,
     icons: TrayStatusIcons,
@@ -270,13 +322,16 @@ impl TrayWindowState {
     }
 
     fn show_pending_alert(&self) {
-        let Some((title, body)) = self.pending_alert.lock().take() else {
+        let Some(balloon) = self.pending_alert.lock().take() else {
             return;
         };
         let mut nid = self.nid.borrow_mut();
-        encode_utf16_fixed(&title, &mut nid.szInfoTitle);
-        encode_utf16_fixed(&body, &mut nid.szInfo);
-        nid.dwInfoFlags = NIIF_WARNING;
+        encode_utf16_fixed(&balloon.title, &mut nid.szInfoTitle);
+        encode_utf16_fixed(&balloon.body, &mut nid.szInfo);
+        nid.dwInfoFlags = match balloon.level {
+            TrayBalloonLevel::Info => NIIF_INFO,
+            TrayBalloonLevel::Warning => NIIF_WARNING,
+        };
         nid.uFlags = NIF_INFO;
         unsafe {
             Shell_NotifyIconW(NIM_MODIFY, &*nid);
@@ -394,7 +449,7 @@ impl TrayWindowState {
                     }
                 }
                 IDM_PAUSE_15M => {
-                    (self.command_cb)(DesktopWindowCommand::PauseEngineMinutes(TRAY_PAUSE_MINUTES))
+                    (self.command_cb)(DesktopWindowCommand::PauseEngineSeconds(TRAY_PAUSE_SECS))
                 }
                 IDM_QUIT => (self.command_cb)(DesktopWindowCommand::Quit),
                 id if id >= IDM_PROFILE_BASE
@@ -457,6 +512,7 @@ unsafe extern "system" fn tray_wnd_proc(
             } else if ev == WM_LBUTTONDBLCLK as usize
                 || ev == NIN_SELECT as usize
                 || ev == NIN_KEYSELECT_FALLBACK as usize
+                || ev == NIN_BALLOONUSERCLICK as usize
             {
                 (state.command_cb)(DesktopWindowCommand::ShowWindow);
             }
@@ -476,7 +532,7 @@ pub struct TrayHandle {
     ready: Arc<AtomicBool>,
     hwnd_raw: Arc<AtomicIsize>,
     snapshot: Arc<Mutex<TrayStatusSnapshot>>,
-    pending_alert: Arc<Mutex<Option<(String, String)>>>,
+    pending_alert: Arc<Mutex<Option<TrayBalloon>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -632,8 +688,8 @@ impl TrayHandle {
         }
     }
 
-    pub fn show_alert(&self, title: String, body: String) {
-        *self.pending_alert.lock() = Some((title, body));
+    pub fn show_alert(&self, balloon: TrayBalloon) {
+        *self.pending_alert.lock() = Some(balloon);
         let raw = self.hwnd_raw.load(Ordering::SeqCst);
         if raw != 0 && self.is_ready() {
             unsafe {
@@ -675,32 +731,120 @@ mod tests {
         assert_eq!(buf[127], 0);
     }
 
+    fn snapshot(
+        daemon_connected: bool,
+        running: bool,
+        locale: &str,
+        paused_until_epoch_ms: Option<u64>,
+    ) -> TrayStatusSnapshot {
+        TrayStatusSnapshot {
+            daemon_connected,
+            running,
+            locale: locale.to_string(),
+            active_profile_id: "default".to_string(),
+            profiles: Vec::new(),
+            paused_until_epoch_ms,
+        }
+    }
+
+    fn fixed_clock(_epoch_ms: u64) -> String {
+        "14:35".to_string()
+    }
+
     #[test]
     fn tray_labels_adapt_to_locale_and_daemon_state() {
-        let offline = build_tray_labels(&TrayStatusSnapshot {
-            daemon_connected: false,
-            running: false,
-            locale: "fr".to_string(),
-            active_profile_id: "default".to_string(),
-            profiles: Vec::new(),
-        });
+        let offline = build_tray_labels_with(&snapshot(false, false, "fr", None), &fixed_clock);
         assert!(offline.toggle_enabled);
         assert!(!offline.pause_15m_enabled);
-        assert_eq!(offline.toggle_engine, "Démarrer le service");
-        assert!(offline.status_line.contains("arrêté"));
+        assert_eq!(offline.toggle_engine, "Démarrer la protection");
+        assert_eq!(offline.status_line, "RouteWard - Non démarré");
+        assert_eq!(offline.quit_app, "Quitter");
 
-        let protected_en = build_tray_labels(&TrayStatusSnapshot {
-            daemon_connected: true,
-            running: true,
-            locale: "en".to_string(),
-            active_profile_id: "default".to_string(),
-            profiles: Vec::new(),
-        });
+        let offline_en = build_tray_labels_with(&snapshot(false, false, "en", None), &fixed_clock);
+        assert_eq!(offline_en.toggle_engine, "Start protection");
+        assert_eq!(offline_en.status_line, "RouteWard - Not running");
+
+        let protected_en = build_tray_labels_with(&snapshot(true, true, "en", None), &fixed_clock);
         assert!(protected_en.toggle_enabled);
         assert!(protected_en.pause_15m_enabled);
-        assert!(protected_en.status_line.contains("Protected"));
-        assert_eq!(protected_en.toggle_engine, "Pause Protection");
-        assert_eq!(protected_en.pause_15m, "Pause for 15 minutes");
+        assert_eq!(protected_en.status_line, "RouteWard - Protected");
+        assert_eq!(protected_en.toggle_engine, "Turn protection off");
+        assert_eq!(protected_en.pause_15m, "Pause 15 min");
+        assert_eq!(protected_en.open_app, "Open RouteWard");
+        assert_eq!(protected_en.quit_app, "Exit");
+
+        let protected_fr = build_tray_labels_with(&snapshot(true, true, "fr", None), &fixed_clock);
+        assert_eq!(protected_fr.status_line, "RouteWard - Protégé");
+        assert_eq!(protected_fr.toggle_engine, "Désactiver la protection");
+        assert_eq!(protected_fr.pause_15m, "Pause de 15 min");
+        assert_eq!(protected_fr.open_app, "Ouvrir RouteWard");
+
+        let off_en = build_tray_labels_with(&snapshot(true, false, "en", None), &fixed_clock);
+        assert_eq!(off_en.status_line, "RouteWard - Protection is off");
+        assert_eq!(off_en.toggle_engine, "Turn protection on");
+        assert!(!off_en.pause_15m_enabled);
+    }
+
+    #[test]
+    fn a_timed_pause_shows_its_end_and_offers_to_resume_now() {
+        let deadline = Some(1_700_000_000_000);
+        let paused_en =
+            build_tray_labels_with(&snapshot(true, false, "en", deadline), &fixed_clock);
+        assert_eq!(paused_en.status_line, "RouteWard - Paused until 14:35");
+        assert_eq!(paused_en.toggle_engine, "Resume now");
+        assert!(!paused_en.pause_15m_enabled);
+
+        let paused_fr =
+            build_tray_labels_with(&snapshot(true, false, "fr", deadline), &fixed_clock);
+        assert_eq!(paused_fr.status_line, "RouteWard - En pause jusqu'à 14:35");
+        assert_eq!(paused_fr.toggle_engine, "Reprendre maintenant");
+
+        // A stale deadline never overrides a protection that runs, nor an unreachable daemon.
+        let running = build_tray_labels_with(&snapshot(true, true, "en", deadline), &fixed_clock);
+        assert_eq!(running.status_line, "RouteWard - Protected");
+        let offline = build_tray_labels_with(&snapshot(false, false, "en", deadline), &fixed_clock);
+        assert_eq!(offline.status_line, "RouteWard - Not running");
+    }
+
+    #[test]
+    fn local_time_of_day_is_a_zero_padded_hour_and_minute() {
+        let text = format_local_time_of_day(1_700_000_000_000);
+        assert_eq!(text.len(), 5, "got {text:?}");
+        assert_eq!(&text[2..3], ":");
+        assert!(text[..2].parse::<u32>().is_ok_and(|hour| hour < 24));
+        assert!(text[3..].parse::<u32>().is_ok_and(|minute| minute < 60));
+    }
+
+    #[test]
+    fn tray_labels_never_show_jargon_to_a_beginner() {
+        for locale in ["en", "fr"] {
+            for (connected, running, until) in [
+                (false, false, None),
+                (true, true, None),
+                (true, false, None),
+                (true, false, Some(1_700_000_000_000)),
+            ] {
+                let labels = build_tray_labels_with(
+                    &snapshot(connected, running, locale, until),
+                    &fixed_clock,
+                );
+                for text in [
+                    &labels.status_line,
+                    &labels.toggle_engine,
+                    &labels.pause_15m,
+                    &labels.open_app,
+                    &labels.quit_app,
+                ] {
+                    let lower = text.to_lowercase();
+                    for jargon in ["daemon", "engine", "moteur", "service", "démon"] {
+                        assert!(
+                            !lower.contains(jargon),
+                            "{locale}: {text:?} contains {jargon}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

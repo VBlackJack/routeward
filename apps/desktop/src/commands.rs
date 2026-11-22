@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-use crate::daemon_launcher::{self, DaemonLaunchError, DaemonStartGuard};
-use crate::TrayStatusSnapshot;
+use crate::daemon_launcher::{self, DaemonLaunchError, DaemonStartGuard, LaunchMode};
+use crate::notices::{NoticeFlags, NOTICE_CLOSE_TO_TRAY, NOTICE_EXIT_BACKGROUND};
+use crate::{TrayBalloon, TrayBalloonLevel, TrayStatusSnapshot};
 use parking_lot::{Mutex, RwLock};
 use routeward_core::checker::ProxyHealthReport;
 use routeward_core::config::{
@@ -50,14 +51,53 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 const COMPONENT_DESKTOP_BRIDGE: &str = "DesktopBridge";
 const BRIDGE_EVENT_CHANNEL_CAPACITY: usize = 256;
-const DAEMON_START_POLL_ATTEMPTS: usize = 16;
+/// Polls for the daemon after a launch (a freshly installed service needs a few seconds).
+const DAEMON_START_POLL_ATTEMPTS: usize = 40;
 const DAEMON_START_POLL_INTERVAL_MS: u64 = 250;
 const OUTAGE_ALERT_COOLDOWN_SECS: u64 = 60;
+/// How long the daemon may stay unreachable before the desktop gives the proxy settings back.
+const DAEMON_UNREACHABLE_GRACE_SECS: u64 = 5;
+/// Longest wait for the engine to stop when the app exits while it runs its own daemon.
+const EXIT_STOP_ENGINE_TIMEOUT_SECS: u64 = 5;
 const TRAY_KEY_OUTAGE_TITLE: &str = "tray.alert.outage_title";
-const TRAY_KEY_OUTAGE_BODY: &str = "tray.alert.outage_body";
+const TRAY_KEY_OUTAGE_BODY_KILL_SWITCH: &str = "tray.alert.outage_body";
+const TRAY_KEY_OUTAGE_BODY_OPEN: &str = "tray.alert.outage_body_open";
+const TRAY_KEY_NOTICE_TITLE: &str = "tray.notice.title";
+const TRAY_KEY_NOTICE_RESTORED_BODY: &str = "tray.notice.restored_body";
+const TRAY_KEY_NOTICE_EXIT_TITLE: &str = "tray.notice.exit_background_title";
+const TRAY_KEY_NOTICE_EXIT_BODY: &str = "tray.notice.exit_background_body";
+const TRAY_KEY_NOTICE_CLOSE_TITLE: &str = "tray.notice.close_to_tray_title";
+const TRAY_KEY_NOTICE_CLOSE_BODY: &str = "tray.notice.close_to_tray_body";
+const TRAY_KEY_NOTICE_TOGGLE_FAILED: &str = "tray.notice.toggle_failed";
+const TRAY_KEY_NOTICE_PAUSE_FAILED: &str = "tray.notice.pause_failed";
+const TRAY_KEY_NOTICE_START_FAILED: &str = "tray.notice.start_failed";
 
 type TrayNotifyCallback = Arc<dyn Fn(TrayStatusSnapshot) + Send + Sync>;
-type TrayAlertCallback = Arc<dyn Fn(String, String) + Send + Sync>;
+type TrayAlertCallback = Arc<dyn Fn(TrayBalloon) + Send + Sync>;
+
+/// What happens to protection when the app exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitDisposition {
+    /// The background service keeps protecting: the proxy settings are left as they are.
+    /// `announce` is true when a notice was shown (and must stay visible a moment).
+    ProtectionContinues { announce: bool },
+    /// Nothing keeps running: the proxy settings are given back.
+    Stopped,
+}
+
+/// A daemon start: the resulting state, and why the background service was not used.
+pub struct DaemonStartReport {
+    pub state: DaemonFullState,
+    /// Locale key explaining why a plain daemon runs instead of the service.
+    pub fallback_reason_key: Option<&'static str>,
+}
+
+/// True when a connection update shows the proxy failed to carry the traffic: the connection
+/// was blocked and carries the detail of an upstream failure. A block decided by a rule has no
+/// such detail, so it never raises the outage alert.
+pub fn is_proxy_outage(conn: &TrackedConnection) -> bool {
+    conn.status == ConnectionStatus::Blocked && conn.error_detail.is_some()
+}
 
 /// A failed system operation (registry tools, process spawn): the localized message plus the
 /// stable i18n key the UI uses to translate it again in its own locale.
@@ -115,8 +155,14 @@ pub struct DesktopCommandBridge {
     daemon_start_guard: Arc<DaemonStartGuard>,
     tray_notify: Arc<Mutex<Option<TrayNotifyCallback>>>,
     tray_alert: Arc<Mutex<Option<TrayAlertCallback>>>,
-    pause_timer_generation: Arc<AtomicU64>,
     last_outage_alert_epoch_secs: Arc<AtomicU64>,
+    notice_flags: Arc<NoticeFlags>,
+    /// Since when the daemon has been unreachable (cleared as soon as it answers).
+    unreachable_since: Arc<Mutex<Option<std::time::Instant>>>,
+    /// True once the proxy settings were given back for the current unreachable period.
+    self_heal_done: Arc<AtomicBool>,
+    /// Set when the app exits while the background service keeps protecting.
+    keep_settings_on_exit: Arc<AtomicBool>,
 }
 
 impl DesktopCommandBridge {
@@ -140,6 +186,12 @@ impl DesktopCommandBridge {
         );
         let net = &constants.network;
         let (event_tx, _) = tokio::sync::broadcast::channel(BRIDGE_EVENT_CHANNEL_CAPACITY);
+        // Next to the other per-user state (the WebView data lives in a sub-directory of it).
+        let webview_dir = constants.telemetry.resolve_user_webview_dir();
+        let notice_flags_path = webview_dir
+            .parent()
+            .unwrap_or(&webview_dir)
+            .join(crate::notices::NOTICE_FLAGS_FILE_NAME);
 
         let initial_diagnostics = SystemDiagnostics {
             daemon_connected: false,
@@ -185,8 +237,11 @@ impl DesktopCommandBridge {
             daemon_start_guard: Arc::new(DaemonStartGuard::default()),
             tray_notify: Arc::new(Mutex::new(None)),
             tray_alert: Arc::new(Mutex::new(None)),
-            pause_timer_generation: Arc::new(AtomicU64::new(0)),
             last_outage_alert_epoch_secs: Arc::new(AtomicU64::new(0)),
+            notice_flags: Arc::new(NoticeFlags::new(notice_flags_path)),
+            unreachable_since: Arc::new(Mutex::new(None)),
+            self_heal_done: Arc::new(AtomicBool::new(false)),
+            keep_settings_on_exit: Arc::new(AtomicBool::new(false)),
         };
 
         bridge.log_info(format!(
@@ -239,6 +294,7 @@ impl DesktopCommandBridge {
     pub fn tray_snapshot(&self) -> TrayStatusSnapshot {
         let st = self.state.read();
         let running = st.diagnostics.running;
+        let paused_until_epoch_ms = st.diagnostics.paused_until_epoch_ms;
         let active_profile_id = st.profile.profile_id.clone();
         drop(st);
         let profiles = self
@@ -253,7 +309,14 @@ impl DesktopCommandBridge {
             locale: self.i18n.get_locale(),
             active_profile_id,
             profiles,
+            paused_until_epoch_ms,
         }
+    }
+
+    /// Stores the one-time notice flags at `path` (tests use a temporary directory).
+    pub fn with_notice_flags_path(mut self, path: std::path::PathBuf) -> Self {
+        self.notice_flags = Arc::new(NoticeFlags::new(path));
+        self
     }
 
     pub fn set_tray_callback(&self, cb: TrayNotifyCallback) {
@@ -265,21 +328,37 @@ impl DesktopCommandBridge {
         *self.tray_alert.lock() = Some(cb);
     }
 
-    fn maybe_notify_proxy_outage(&self, conn: &TrackedConnection) {
-        if conn.status != ConnectionStatus::Blocked {
-            return;
+    /// Shows a balloon from the tray icon, when the tray is up.
+    fn show_balloon(&self, title: String, body: String, level: TrayBalloonLevel) {
+        let cb = self.tray_alert.lock().clone();
+        if let Some(cb) = cb {
+            cb(TrayBalloon { title, body, level });
         }
-        let Some(detail) = conn.error_detail.as_deref() else {
-            return;
-        };
-        let lower = detail.to_ascii_lowercase();
-        let is_outage = lower.contains("kill-switch")
-            || lower.contains("killswitch")
-            || lower.contains("unreachable")
-            || lower.contains("timeout")
-            || lower.contains("upstream")
-            || lower.contains("proxy");
-        if !is_outage {
+    }
+
+    /// Shows the app-titled notice whose text is the locale key `body_key`.
+    fn show_notice(&self, body_key: &str, level: TrayBalloonLevel) {
+        self.show_balloon(
+            self.i18n.t(TRAY_KEY_NOTICE_TITLE),
+            self.i18n.t(body_key),
+            level,
+        );
+    }
+
+    /// Text of a failed daemon call for a balloon: the translated message of its error key, or
+    /// the generic text `generic_key` when the failure carries none (never the raw OS detail).
+    fn describe_ipc_failure(&self, err: &IpcCallError, generic_key: &str) -> String {
+        if let Some(key) = err.error_key() {
+            let text = self.i18n.t(key);
+            if text != key {
+                return text;
+            }
+        }
+        self.i18n.t(generic_key)
+    }
+
+    fn maybe_notify_proxy_outage(&self, conn: &TrackedConnection) {
+        if !is_proxy_outage(conn) {
             return;
         }
         let now_secs = std::time::SystemTime::now()
@@ -297,13 +376,23 @@ impl DesktopCommandBridge {
         {
             return;
         }
-        let cb = self.tray_alert.lock().clone();
-        if let Some(cb) = cb {
-            cb(
-                self.i18n.t(TRAY_KEY_OUTAGE_TITLE),
-                self.i18n.t(TRAY_KEY_OUTAGE_BODY),
-            );
-        }
+        // Only the safety cutoff blocks the other traffic: without it the text must not say so.
+        let kill_switch_on = self
+            .state
+            .read()
+            .profile
+            .security_policy
+            .kill_switch_enabled;
+        let body_key = if kill_switch_on {
+            TRAY_KEY_OUTAGE_BODY_KILL_SWITCH
+        } else {
+            TRAY_KEY_OUTAGE_BODY_OPEN
+        };
+        self.show_balloon(
+            self.i18n.t(TRAY_KEY_OUTAGE_TITLE),
+            self.i18n.t(body_key),
+            TrayBalloonLevel::Warning,
+        );
     }
 
     fn notify_tray(&self) {
@@ -345,6 +434,7 @@ impl DesktopCommandBridge {
                     ));
                     bridge.mark_disconnected();
                 }
+                bridge.self_heal_if_daemon_unreachable().await;
                 tokio::time::sleep(reconnect_delay).await;
             }
         });
@@ -457,6 +547,7 @@ impl DesktopCommandBridge {
                         Ok(mut diag) => {
                             diag.daemon_connected = true;
                             self.state.write().diagnostics = diag;
+                            self.notify_tray();
                         }
                         Err(err) => return Err(err.to_string()),
                     }
@@ -486,6 +577,7 @@ impl DesktopCommandBridge {
                 "Daemon connection established ({})",
                 self.ipc_endpoint_label()
             ));
+            self.note_daemon_reachable();
             let bridge_for_profiles = self.clone();
             tokio::spawn(async move {
                 let _ = bridge_for_profiles.list_profiles().await;
@@ -591,6 +683,7 @@ impl DesktopCommandBridge {
                         "Connected to daemon via IPC command ({})",
                         self.ipc_endpoint_label()
                     ));
+                    self.note_daemon_reachable();
                     let _ = self
                         .event_tx
                         .send(IpcStreamEvent::Resync { skipped_events: 0 });
@@ -704,6 +797,176 @@ impl DesktopCommandBridge {
                     "Could not restore system proxy settings on exit: {err}"
                 ));
             }
+        }
+    }
+
+    /// Exit path of the app: gives the proxy settings back unless the background service keeps
+    /// protecting (then they must stay, or the protection would silently stop).
+    pub fn restore_system_settings_unless_protected(&self) {
+        if self.keep_settings_on_exit.load(Ordering::SeqCst) {
+            self.log_info(
+                "Leaving the system proxy settings: protection continues in the background",
+            );
+            return;
+        }
+        self.restore_system_settings_on_exit();
+    }
+
+    /// The daemon answered: the next unreachable period starts from zero.
+    fn note_daemon_reachable(&self) {
+        *self.unreachable_since.lock() = None;
+        self.self_heal_done.store(false, Ordering::SeqCst);
+    }
+
+    /// When the daemon has been unreachable for a while, gives the proxy settings back (only the
+    /// values still owned by RouteWard) so the user's normal connection works, and says so once.
+    ///
+    /// Called at startup and each time the connection attempt fails; it does nothing while a
+    /// start is in progress or once the settings were given back for this unreachable period.
+    async fn self_heal_if_daemon_unreachable(&self) {
+        if self.is_daemon_connected() {
+            self.note_daemon_reachable();
+            return;
+        }
+        let since = *self
+            .unreachable_since
+            .lock()
+            .get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < Duration::from_secs(DAEMON_UNREACHABLE_GRACE_SECS) {
+            return;
+        }
+        if self.daemon_start_guard.is_in_flight()
+            || self.self_heal_done.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let endpoint = self.get_diagnostics().relay_tcp_endpoint;
+        let pac_url = self.pac_url();
+        let outcome = tokio::task::spawn_blocking(move || {
+            SystemProxyManager::restore_owned_settings(&endpoint, &pac_url)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(report)) if report.proxy_restored || report.pac_restored => {
+                self.log_info("RouteWard is not running: restored the system proxy settings");
+                self.show_notice(TRAY_KEY_NOTICE_RESTORED_BODY, TrayBalloonLevel::Info);
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                self.log_warn(format!(
+                    "Could not restore the system proxy settings while the daemon is unreachable: {err}"
+                ));
+            }
+            Err(join_err) => {
+                self.log_warn(format!("Self-heal task failed: {join_err}"));
+            }
+        }
+    }
+
+    /// Decides what happens to protection when the app exits, and does what it takes.
+    ///
+    /// - Background service installed and protection active (or about to resume): it keeps
+    ///   running; the proxy settings stay; the first time a notice explains it.
+    /// - No service (a daemon this app started): the engine is stopped first.
+    pub async fn prepare_exit(&self) -> ExitDisposition {
+        if !self.is_daemon_connected() {
+            return ExitDisposition::Stopped;
+        }
+        let diag = self.get_diagnostics();
+        let service_installed = tokio::task::spawn_blocking(daemon_launcher::is_service_installed)
+            .await
+            .unwrap_or(false);
+        if service_installed {
+            if !(diag.running || diag.paused_until_epoch_ms.is_some()) {
+                return ExitDisposition::Stopped;
+            }
+            self.keep_settings_on_exit.store(true, Ordering::SeqCst);
+            let announce = self.notice_flags.claim(NOTICE_EXIT_BACKGROUND);
+            if announce {
+                self.show_balloon(
+                    self.i18n.t(TRAY_KEY_NOTICE_EXIT_TITLE),
+                    self.i18n.t(TRAY_KEY_NOTICE_EXIT_BODY),
+                    TrayBalloonLevel::Info,
+                );
+            }
+            return ExitDisposition::ProtectionContinues { announce };
+        }
+        if diag.running {
+            let stop = tokio::time::timeout(
+                Duration::from_secs(EXIT_STOP_ENGINE_TIMEOUT_SECS),
+                self.toggle_engine(false),
+            )
+            .await;
+            match stop {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => self.log_warn(format!("Could not stop the engine on exit: {err}")),
+                Err(_) => self.log_warn("Timed out stopping the engine on exit"),
+            }
+        }
+        ExitDisposition::Stopped
+    }
+
+    /// First time the window is closed into the tray: says the app is still running there.
+    pub fn notify_close_to_tray_once(&self) {
+        if self.notice_flags.claim(NOTICE_CLOSE_TO_TRAY) {
+            self.show_balloon(
+                self.i18n.t(TRAY_KEY_NOTICE_CLOSE_TITLE),
+                self.i18n.t(TRAY_KEY_NOTICE_CLOSE_BODY),
+                TrayBalloonLevel::Info,
+            );
+        }
+    }
+
+    /// Tray "Start protection": brings the daemon up (installing the background service when
+    /// there is none), then turns the engine on. Every failure ends in a balloon.
+    pub async fn tray_start_protection(&self) {
+        match self.start_privileged_daemon_detailed().await {
+            Ok(report) => {
+                if let Some(reason_key) = report.fallback_reason_key {
+                    self.show_notice(reason_key, TrayBalloonLevel::Warning);
+                }
+                let diag = &report.state.diagnostics;
+                if diag.daemon_connected && !diag.running {
+                    if let Err(err) = self.toggle_engine(true).await {
+                        self.log_warn(format!("Tray auto-enable after daemon start failed: {err}"));
+                        self.show_balloon(
+                            self.i18n.t(TRAY_KEY_NOTICE_TITLE),
+                            self.describe_ipc_failure(&err, TRAY_KEY_NOTICE_START_FAILED),
+                            TrayBalloonLevel::Warning,
+                        );
+                    }
+                }
+            }
+            Err(DaemonLaunchError::AlreadyInFlight) => {}
+            Err(err) => {
+                self.log_warn(format!("Tray daemon start failed: {err:?}"));
+                self.show_notice(err.tray_notice_key(), TrayBalloonLevel::Warning);
+            }
+        }
+    }
+
+    /// Tray "Turn protection on/off" and "Resume now".
+    pub async fn tray_toggle_engine(&self) {
+        let running = self.get_diagnostics().running;
+        if let Err(err) = self.toggle_engine(!running).await {
+            self.log_warn(format!("Tray engine toggle failed: {err}"));
+            self.show_balloon(
+                self.i18n.t(TRAY_KEY_NOTICE_TITLE),
+                self.describe_ipc_failure(&err, TRAY_KEY_NOTICE_TOGGLE_FAILED),
+                TrayBalloonLevel::Warning,
+            );
+        }
+    }
+
+    /// Tray "Pause 15 min": the daemon keeps the deadline and resumes by itself.
+    pub async fn tray_pause(&self, seconds: u64) {
+        if let Err(err) = self.pause_engine(seconds).await {
+            self.log_warn(format!("Tray timed pause failed: {err}"));
+            self.show_balloon(
+                self.i18n.t(TRAY_KEY_NOTICE_TITLE),
+                self.describe_ipc_failure(&err, TRAY_KEY_NOTICE_PAUSE_FAILED),
+                TrayBalloonLevel::Warning,
+            );
         }
     }
 
@@ -1032,12 +1295,12 @@ impl DesktopCommandBridge {
         outcome.map(|_| profile)
     }
 
-    pub async fn toggle_engine(&self, start: bool) -> Result<SystemDiagnostics, IpcCallError> {
-        self.pause_timer_generation.fetch_add(1, Ordering::SeqCst);
-        match self
-            .call_daemon_detailed::<SystemDiagnostics>(IpcCommand::ToggleEngine { start })
-            .await
-        {
+    /// Applies the diagnostics a daemon call returned to the cached state and the tray.
+    fn apply_engine_result(
+        &self,
+        result: Result<SystemDiagnostics, IpcCallError>,
+    ) -> Result<SystemDiagnostics, IpcCallError> {
+        match result {
             Ok(mut diag) => {
                 diag.daemon_connected = true;
                 diag.active_locale = self.i18n.get_locale();
@@ -1053,23 +1316,24 @@ impl DesktopCommandBridge {
         }
     }
 
-    /// Pauses protection for `duration`, then automatically re-enables it unless cancelled by a manual toggle.
-    pub async fn pause_engine_for(&self, duration: Duration) -> Result<(), IpcCallError> {
-        self.toggle_engine(false).await?;
-        let expected_gen = self.pause_timer_generation.load(Ordering::SeqCst);
-        let bridge = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
-            if bridge.pause_timer_generation.load(Ordering::SeqCst) == expected_gen
-                && bridge.is_daemon_connected()
-                && !bridge.get_diagnostics().running
-            {
-                if let Err(err) = bridge.toggle_engine(true).await {
-                    bridge.log_warn(format!("Timed tray auto-resume failed: {err}"));
-                }
-            }
-        });
-        Ok(())
+    /// Starts or stops the engine. Either choice cancels a pending pause (the daemon decides).
+    pub async fn toggle_engine(&self, start: bool) -> Result<SystemDiagnostics, IpcCallError> {
+        let result = self
+            .call_daemon_detailed::<SystemDiagnostics>(IpcCommand::ToggleEngine { start })
+            .await;
+        self.apply_engine_result(result)
+    }
+
+    /// Pauses protection for `duration_secs`. The daemon keeps the deadline and resumes by
+    /// itself, so the pause survives this app being closed.
+    pub async fn pause_engine(
+        &self,
+        duration_secs: u64,
+    ) -> Result<SystemDiagnostics, IpcCallError> {
+        let result = self
+            .call_daemon_detailed::<SystemDiagnostics>(IpcCommand::PauseEngine { duration_secs })
+            .await;
+        self.apply_engine_result(result)
     }
 
     pub async fn set_interception_mode(
@@ -1096,8 +1360,22 @@ impl DesktopCommandBridge {
     }
 
     pub async fn start_privileged_daemon(&self) -> Result<DaemonFullState, DaemonLaunchError> {
+        self.start_privileged_daemon_detailed()
+            .await
+            .map(|report| report.state)
+    }
+
+    /// Brings the daemon up. Without the background service, one elevated command installs it,
+    /// starts it and turns on the sign-in autostart (minimized); when that fails, a plain
+    /// elevated daemon runs instead and the report says why.
+    pub async fn start_privileged_daemon_detailed(
+        &self,
+    ) -> Result<DaemonStartReport, DaemonLaunchError> {
         if self.is_daemon_connected() {
-            return Ok(self.refresh_state().await);
+            return Ok(DaemonStartReport {
+                state: self.refresh_state().await,
+                fallback_reason_key: None,
+            });
         }
 
         let release = self
@@ -1105,9 +1383,9 @@ impl DesktopCommandBridge {
             .try_acquire()
             .ok_or(DaemonLaunchError::AlreadyInFlight)?;
         let locale = self.i18n.get_locale();
-        let proc_handle =
+        let outcome =
             match daemon_launcher::start_privileged_daemon_with_release(&release, &locale).await {
-                Ok(handle) => handle,
+                Ok(outcome) => outcome,
                 Err(err) => {
                     self.log_error(format!(
                         "Failed to launch privileged daemon: {}",
@@ -1116,11 +1394,28 @@ impl DesktopCommandBridge {
                     return Err(err);
                 }
             };
+        let fallback_reason_key = outcome.fallback_reason_key;
+        if let Some(reason_key) = fallback_reason_key {
+            self.log_warn(format!(
+                "Background service not installed, running a plain daemon instead ({reason_key})"
+            ));
+        }
+        if outcome.mode == LaunchMode::ServiceInstalled {
+            // First successful install of the service: protection also comes back at sign-in.
+            self.log_info("Background service installed; enabling the sign-in autostart");
+            if let Err(err) = self.set_autostart(true).await {
+                self.log_warn(format!("Could not enable the sign-in autostart: {err}"));
+            }
+        }
+        let proc_handle = outcome.handle;
 
         for _ in 0..DAEMON_START_POLL_ATTEMPTS {
             let state = self.refresh_state().await;
             if state.diagnostics.daemon_connected {
-                return Ok(state);
+                return Ok(DaemonStartReport {
+                    state,
+                    fallback_reason_key,
+                });
             }
             if let Some(exit_code) = proc_handle.as_ref().and_then(|h| h.try_exit_code()) {
                 if exit_code != 0 {
@@ -1136,7 +1431,10 @@ impl DesktopCommandBridge {
         }
 
         self.log_warn("Timed out waiting for elevated daemon IPC connection after launch");
-        Ok(self.refresh_state().await)
+        Ok(DaemonStartReport {
+            state: self.refresh_state().await,
+            fallback_reason_key,
+        })
     }
 
     pub fn list_fake_ip_entries(&self) -> Vec<FakeIpEntry> {

@@ -21,11 +21,12 @@ use crate::{parse_hex_colorref, resolve_palette_window_appearance, DesktopWindow
 use routeward_core::config::{InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule};
 use routeward_core::error::{
     ERR_KEY_CHAIN_EMPTY, ERR_KEY_CLEANUP_DAEMON_ACTIVE, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_SAVE,
-    ERR_KEY_DAEMON_ALREADY_RUNNING, ERR_KEY_DAEMON_INSECURE_PROFILE,
+    ERR_KEY_DAEMON_ALREADY_RUNNING, ERR_KEY_DAEMON_INSECURE_PROFILE, ERR_KEY_DAEMON_INVALID_PAUSE,
     ERR_KEY_INTERCEPTOR_NFT_FAILED, ERR_KEY_INTERCEPTOR_OPEN,
 };
 use routeward_core::ipc::IpcCallError;
 use routeward_core::rules::ConnectionRequest;
+use routeward_core::system::protection_state::MAX_PAUSE_SECS;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -167,6 +168,12 @@ struct ProfileIdRequest {
 #[derive(Debug, Deserialize)]
 struct ToggleEngineRequest {
     start: bool,
+}
+
+/// Body of `POST /api/engine/pause`. A negative, fractional or missing value fails to parse.
+#[derive(Debug, Deserialize)]
+struct PauseEngineRequest {
+    seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,6 +397,36 @@ pub async fn handle_api_route(
         }
     }
 
+    if path.starts_with("/api/engine/pause") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        match serde_json::from_str::<PauseEngineRequest>(body_str) {
+            Ok(req) if (1..=MAX_PAUSE_SECS).contains(&req.seconds) => {
+                return Some(match bridge.pause_engine(req.seconds).await {
+                    Ok(diag) => ok_json_response(&diag, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
+            }
+            Ok(req) => {
+                let json = serde_json::to_vec(&serde_json::json!({
+                    "error": format!(
+                        "Pause duration {}s is outside 1..={MAX_PAUSE_SECS} seconds",
+                        req.seconds
+                    ),
+                    "errorKey": ERR_KEY_DAEMON_INVALID_PAUSE,
+                }))
+                .unwrap_or_default();
+                return Some((400, json_ct, json));
+            }
+            Err(err) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                    .unwrap_or_default();
+                return Some((400, json_ct, json));
+            }
+        }
+    }
+
     if path.starts_with("/api/engine/mode") {
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
@@ -413,14 +450,22 @@ pub async fn handle_api_route(
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
         }
-        match bridge.start_privileged_daemon().await {
-            Ok(state) => {
-                let json = serde_json::to_vec(&serde_json::json!({
+        match bridge.start_privileged_daemon_detailed().await {
+            Ok(report) => {
+                let state = report.state;
+                let mut body = serde_json::json!({
                     "started": true,
                     "connected": state.diagnostics.daemon_connected,
                     "state": state,
-                }))
-                .unwrap_or_default();
+                });
+                // Present only when the background service could not be installed and a plain
+                // daemon runs instead: a locale key the UI can translate.
+                if let (Some(reason_key), Some(map)) =
+                    (report.fallback_reason_key, body.as_object_mut())
+                {
+                    map.insert("fallbackReasonKey".to_string(), reason_key.into());
+                }
+                let json = serde_json::to_vec(&body).unwrap_or_default();
                 return Some((200, json_ct, json));
             }
             Err(err) => {

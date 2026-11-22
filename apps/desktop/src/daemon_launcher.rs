@@ -28,10 +28,51 @@ const CLI_BINARY_FILENAME: &str = "routeward.exe";
 #[cfg(not(windows))]
 const CLI_BINARY_FILENAME: &str = "routeward";
 
+/// Locale key of the notice shown when the background service could not be installed and the
+/// protection runs as a plain process instead (it will not survive a restart of the PC).
+pub const FALLBACK_KEY_SERVICE_INSTALL_FAILED: &str = "tray.notice.service_install_failed";
+/// Locale keys of the notices shown when a start from the tray fails.
+const NOTICE_KEY_UAC_CANCELLED: &str = "tray.notice.uac_cancelled";
+const NOTICE_KEY_ACCESS_DENIED: &str = "tray.notice.access_denied";
+const NOTICE_KEY_START_FAILED: &str = "tray.notice.start_failed";
+/// How long the elevated `service install --start` may take before it counts as failed.
+#[cfg(windows)]
+const SERVICE_INSTALL_TIMEOUT_MS: u32 = 60_000;
+/// Prefix every Windows security identifier starts with.
+const SID_PREFIX: &str = "S-1-";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonLaunchPlan {
-    StartService { args: Vec<String> },
-    SpawnDaemon { args: Vec<String> },
+    /// Install the Windows service (one elevated command), start it and allow the user's pipe.
+    InstallService {
+        args: Vec<String>,
+    },
+    StartService {
+        args: Vec<String>,
+    },
+    SpawnDaemon {
+        args: Vec<String>,
+    },
+}
+
+/// How the daemon was brought up by a launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// The service did not exist: it was installed (and started) by this launch.
+    ServiceInstalled,
+    /// The existing service was started.
+    ServiceStarted,
+    /// A plain elevated daemon process was spawned (no service).
+    SpawnedDaemon,
+}
+
+/// Result of a launch: the elevated process to watch (if any), how it was started, and why the
+/// service was not used when a plain daemon had to be spawned instead.
+pub struct LaunchOutcome {
+    pub handle: Option<ElevatedProcessHandle>,
+    pub mode: LaunchMode,
+    /// Locale key explaining why the service was not installed, when a fallback happened.
+    pub fallback_reason_key: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +126,15 @@ impl DaemonLaunchError {
             Self::ConfigInvalid(_) => "config_invalid",
             Self::DaemonExitedEarly(_) => "daemon_exited",
             Self::LaunchFailed(_) => "start_failed",
+        }
+    }
+
+    /// Locale key of the plain-words notice a failed start from the tray shows.
+    pub fn tray_notice_key(&self) -> &'static str {
+        match self {
+            Self::UacCancelled => NOTICE_KEY_UAC_CANCELLED,
+            Self::AlreadyRunningAccessDenied => NOTICE_KEY_ACCESS_DENIED,
+            _ => NOTICE_KEY_START_FAILED,
         }
     }
 
@@ -165,6 +215,48 @@ impl ElevatedProcessHandle {
     pub fn try_exit_code(&self) -> Option<u32> {
         None
     }
+
+    /// Waits up to `timeout_ms` for the process to end and returns its exit code.
+    #[cfg(windows)]
+    pub fn wait_exit_code(&self, timeout_ms: u32) -> Option<u32> {
+        use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+        if self.raw_handle == 0 {
+            return None;
+        }
+        let handle = self.raw_handle as HANDLE;
+        unsafe {
+            if WaitForSingleObject(handle, timeout_ms) == WAIT_OBJECT_0 {
+                let mut exit_code: u32 = 0;
+                if GetExitCodeProcess(handle, &mut exit_code) != 0 {
+                    return Some(exit_code);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// True when the Windows service is registered (running or not).
+pub fn is_service_installed() -> bool {
+    routeward_core::system::windows_service::query_windows_service_status()
+        .map(|status| status.installed)
+        .unwrap_or(false)
+}
+
+/// True when `exit_code` is the clean exit of an elevated `service install --start`.
+pub fn service_install_succeeded(exit_code: Option<u32>) -> bool {
+    exit_code == Some(0)
+}
+
+/// True when `sid` looks like a Windows security identifier (`S-1-` followed by digits and
+/// dashes). The value ends up on the command line of an elevated process, so anything else is
+/// refused.
+pub fn is_plausible_sid(sid: &str) -> bool {
+    sid.strip_prefix(SID_PREFIX).is_some_and(|rest| {
+        !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '-')
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,6 +272,11 @@ pub struct DaemonStartGuard {
 }
 
 impl DaemonStartGuard {
+    /// True while a daemon start is in progress.
+    pub fn is_in_flight(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
     pub fn try_acquire(&self) -> Option<InFlightRelease> {
         if self
             .in_flight
@@ -234,6 +331,36 @@ pub fn normalize_safe_locale(locale: &str) -> &'static str {
     }
 }
 
+/// The old way to run without the service: an elevated daemon process that lives until the
+/// machine restarts or the daemon is stopped. Used when the service cannot be installed.
+pub fn build_spawn_daemon_plan(allow_sid: Option<&str>, locale: &str) -> DaemonLaunchPlan {
+    DaemonLaunchPlan::SpawnDaemon {
+        args: spawn_daemon_args(allow_sid, locale),
+    }
+}
+
+/// Arguments of the `routeward daemon` command a spawned daemon runs with.
+pub fn spawn_daemon_args(allow_sid: Option<&str>, locale: &str) -> Vec<String> {
+    let safe_locale = normalize_safe_locale(locale);
+    let mut args = vec![
+        "daemon".to_string(),
+        "--locale".to_string(),
+        safe_locale.to_string(),
+    ];
+    if let Some(sid) = allow_sid.map(str::trim).filter(|s| !s.is_empty()) {
+        args.push("--allow-sid".to_string());
+        args.push(sid.to_string());
+    }
+    args
+}
+
+/// Chooses how to bring the daemon up.
+///
+/// - Service registered: start it (a running service the user cannot reach is an access problem).
+/// - No service and a usable user SID: install the service, start it and allow that user's pipe,
+///   all in one elevated command (a single UAC prompt).
+/// - No service and no usable SID: the service pipe would not be reachable by the user, so a
+///   plain elevated daemon is spawned.
 pub fn build_daemon_launch_plan(
     installed: bool,
     service_state: &str,
@@ -250,23 +377,24 @@ pub fn build_daemon_launch_plan(
         });
     }
 
-    let safe_locale = normalize_safe_locale(locale);
-    let mut args = vec![
-        "daemon".to_string(),
-        "--locale".to_string(),
-        safe_locale.to_string(),
-    ];
-    if let Some(sid) = allow_sid.map(str::trim).filter(|s| !s.is_empty()) {
-        args.push("--allow-sid".to_string());
-        args.push(sid.to_string());
+    match allow_sid.map(str::trim).filter(|sid| is_plausible_sid(sid)) {
+        Some(sid) => Ok(DaemonLaunchPlan::InstallService {
+            args: vec![
+                "service".to_string(),
+                "install".to_string(),
+                "--start".to_string(),
+                "--allow-sid".to_string(),
+                sid.to_string(),
+            ],
+        }),
+        None => Ok(build_spawn_daemon_plan(allow_sid, locale)),
     }
-    Ok(DaemonLaunchPlan::SpawnDaemon { args })
 }
 
 pub async fn start_privileged_daemon_with_release(
     _release: &InFlightRelease,
     locale: &str,
-) -> Result<Option<ElevatedProcessHandle>, DaemonLaunchError> {
+) -> Result<LaunchOutcome, DaemonLaunchError> {
     #[cfg(not(windows))]
     {
         let _ = locale;
@@ -285,7 +413,7 @@ pub async fn start_privileged_daemon_with_release(
 pub async fn start_privileged_daemon(
     guard: &DaemonStartGuard,
     locale: &str,
-) -> Result<Option<ElevatedProcessHandle>, DaemonLaunchError> {
+) -> Result<LaunchOutcome, DaemonLaunchError> {
     let release = guard
         .try_acquire()
         .ok_or(DaemonLaunchError::AlreadyInFlight)?;
@@ -387,9 +515,7 @@ mod windows_impl {
         }
     }
 
-    pub fn launch_elevated(
-        locale: &str,
-    ) -> Result<Option<ElevatedProcessHandle>, DaemonLaunchError> {
+    pub fn launch_elevated(locale: &str) -> Result<LaunchOutcome, DaemonLaunchError> {
         let desktop_exe =
             std::env::current_exe().map_err(|e| DaemonLaunchError::LaunchFailed(e.to_string()))?;
         let cli_exe =
@@ -406,16 +532,55 @@ mod windows_impl {
             && !svc_state.eq_ignore_ascii_case("running")
             && start_windows_service().is_ok()
         {
-            return Ok(None);
+            return Ok(LaunchOutcome {
+                handle: None,
+                mode: LaunchMode::ServiceStarted,
+                fallback_reason_key: None,
+            });
         }
 
         let user_sid = current_user_sid_string().ok();
         let plan = build_daemon_launch_plan(installed, svc_state, user_sid.as_deref(), locale)?;
 
         match plan {
-            DaemonLaunchPlan::StartService { args } | DaemonLaunchPlan::SpawnDaemon { args } => {
-                run_elevated_cli(&cli_exe, &args)
+            DaemonLaunchPlan::InstallService { args } => {
+                let installed_ok = match run_elevated_cli(&cli_exe, &args) {
+                    // Declined: do not ask again through a second prompt.
+                    Err(DaemonLaunchError::UacCancelled) => {
+                        return Err(DaemonLaunchError::UacCancelled)
+                    }
+                    Err(_) => false,
+                    Ok(handle) => service_install_succeeded(
+                        handle
+                            .as_ref()
+                            .and_then(|h| h.wait_exit_code(SERVICE_INSTALL_TIMEOUT_MS)),
+                    ),
+                };
+                if installed_ok {
+                    return Ok(LaunchOutcome {
+                        handle: None,
+                        mode: LaunchMode::ServiceInstalled,
+                        fallback_reason_key: None,
+                    });
+                }
+                // The service could not be installed: run the daemon as a plain process.
+                let args = spawn_daemon_args(user_sid.as_deref(), locale);
+                Ok(LaunchOutcome {
+                    handle: run_elevated_cli(&cli_exe, &args)?,
+                    mode: LaunchMode::SpawnedDaemon,
+                    fallback_reason_key: Some(FALLBACK_KEY_SERVICE_INSTALL_FAILED),
+                })
             }
+            DaemonLaunchPlan::StartService { args } => Ok(LaunchOutcome {
+                handle: run_elevated_cli(&cli_exe, &args)?,
+                mode: LaunchMode::ServiceStarted,
+                fallback_reason_key: None,
+            }),
+            DaemonLaunchPlan::SpawnDaemon { args } => Ok(LaunchOutcome {
+                handle: run_elevated_cli(&cli_exe, &args)?,
+                mode: LaunchMode::SpawnedDaemon,
+                fallback_reason_key: None,
+            }),
         }
     }
 }
@@ -478,11 +643,37 @@ mod tests {
             .expect_err("running service while IPC disconnected implies pipe ACL mismatch");
         assert_eq!(running_err, DaemonLaunchError::AlreadyRunningAccessDenied);
 
-        let daemon_plan =
+        let install_plan =
             build_daemon_launch_plan(false, "not_installed", Some("S-1-5-21-1001"), "en")
-                .expect("uninstalled service should launch elevated daemon with user SID");
+                .expect("uninstalled service should be installed for the user SID");
         assert_eq!(
-            daemon_plan,
+            install_plan,
+            DaemonLaunchPlan::InstallService {
+                args: vec![
+                    "service".into(),
+                    "install".into(),
+                    "--start".into(),
+                    "--allow-sid".into(),
+                    "S-1-5-21-1001".into(),
+                ]
+            }
+        );
+
+        // Without a usable SID the service pipe would stay out of the user's reach: spawn a daemon.
+        for unusable in [None, Some(""), Some("not-a-sid"), Some("S-1-5-21 --evil")] {
+            let plan = build_daemon_launch_plan(false, "not_installed", unusable, "fr")
+                .expect("an uninstalled service without a usable SID spawns a daemon");
+            assert!(
+                matches!(plan, DaemonLaunchPlan::SpawnDaemon { .. }),
+                "{unusable:?} must not reach the elevated service install command"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_fallback_plan_keeps_the_old_daemon_arguments() {
+        assert_eq!(
+            build_spawn_daemon_plan(Some("S-1-5-21-1001"), "en"),
             DaemonLaunchPlan::SpawnDaemon {
                 args: vec![
                     "daemon".into(),
@@ -492,6 +683,42 @@ mod tests {
                     "S-1-5-21-1001".into(),
                 ]
             }
+        );
+        assert_eq!(
+            spawn_daemon_args(None, "fr-FR"),
+            vec!["daemon", "--locale", "fr"]
+        );
+    }
+
+    #[test]
+    fn only_a_clean_exit_counts_as_a_successful_service_install() {
+        assert!(service_install_succeeded(Some(0)));
+        assert!(!service_install_succeeded(Some(1)));
+        assert!(!service_install_succeeded(None));
+    }
+
+    #[test]
+    fn sid_validation_accepts_real_sids_only() {
+        assert!(is_plausible_sid("S-1-5-21-1-2-3-1000"));
+        assert!(!is_plausible_sid("S-1-"));
+        assert!(!is_plausible_sid("S-2-5-21"));
+        assert!(!is_plausible_sid("S-1-5-21-1 --other"));
+        assert!(!is_plausible_sid(""));
+    }
+
+    #[test]
+    fn launch_errors_map_to_plain_tray_notices() {
+        assert_eq!(
+            DaemonLaunchError::UacCancelled.tray_notice_key(),
+            "tray.notice.uac_cancelled"
+        );
+        assert_eq!(
+            DaemonLaunchError::AlreadyRunningAccessDenied.tray_notice_key(),
+            "tray.notice.access_denied"
+        );
+        assert_eq!(
+            DaemonLaunchError::MissingCliBinary.tray_notice_key(),
+            "tray.notice.start_failed"
         );
     }
 

@@ -27,7 +27,7 @@
 
     <Icon Id="RouteWardIcon.ico" SourceFile="$(var.IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="RouteWardIcon.ico" />
-    <Property Id="ARPCOMMENTS" Value="RouteWard $(var.DisplayVersion) - Process-aware OS proxy router" />
+    <Property Id="ARPCOMMENTS" Value="RouteWard $(var.DisplayVersion) - Choose which apps use your proxy and keep your real address private" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/VBlackJack/routeward" />
     <Property Id="ARPNOMODIFY" Value="1" />
 
@@ -183,6 +183,7 @@
       <ComponentGroupRef Id="ProductComponents" />
       <ComponentGroupRef Id="ProgramDataComponents" />
       <ComponentRef Id="ApplicationShortcutComponent" />
+      <ComponentRef Id="RestoreInternetShortcutComponent" />
       <?if $(var.IncludeWinDivert) = "yes" ?>
       <ComponentGroupRef Id="WinDivertComponents" />
       <?endif ?>
@@ -288,6 +289,32 @@
           Root="HKLM"
           Key="Software\RouteWard"
           Name="StartMenuShortcut"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+    </Component>
+
+    <!--
+      "RouteWard - Restore Internet": the way back for a user who lost their connection while RouteWard is
+      stopped or crashed. It runs the CLI "recover" command (gives the proxy and PAC settings back, stops the
+      protection, then pauses it at the end) and keeps the console open (the pause-at-end option) so the result can be read.
+      Its own component (own GUID and registry key path) so it can be added or removed independently of the
+      main shortcut; the shared Start menu folder is removed together with the last shortcut.
+    -->
+    <Component Id="RestoreInternetShortcutComponent" Directory="ApplicationProgramsFolder" Guid="B27E5A91-4D3C-4F68-9A15-7C0D8E3B6F52">
+      <Shortcut
+          Id="RouteWardRestoreInternetShortcut"
+          Name="RouteWard - Restore Internet"
+          Description="Use this if your Internet stopped working: gives your normal connection back"
+          Target="[#RouteWardCliExe]"
+          Arguments="recover --pause-at-end"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="RouteWardIcon.ico" />
+      <RemoveFolder Id="CleanUpRestoreInternetProgramsFolder" On="uninstall" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\RouteWard"
+          Name="RestoreInternetShortcut"
           Type="integer"
           Value="1"
           KeyPath="yes" />

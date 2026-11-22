@@ -1248,3 +1248,281 @@ async fn system_errors_reach_the_ui_as_localized_messages_not_os_text() {
         );
     }
 }
+
+fn unique_test_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
+/// Constants whose IPC endpoint is unique to the calling test.
+fn constants_with_private_ipc_endpoint(tag: &str) -> SystemConstants {
+    let mut constants = SystemConstants::load_embedded().expect("SystemConstants");
+    let suffix = unique_test_suffix();
+    #[cfg(windows)]
+    {
+        constants.ipc.windows_pipe_name = format!(r"\\.\pipe\routeward-{tag}-test-{suffix}");
+    }
+    #[cfg(not(windows))]
+    {
+        constants.ipc.unix_socket_path = format!("/tmp/routeward-{tag}-test-{suffix}.sock");
+    }
+    constants
+}
+
+#[tokio::test]
+async fn pause_route_rejects_bad_bodies_and_reports_a_missing_daemon() {
+    use routeward_core::error::ERR_KEY_DAEMON_INVALID_PAUSE;
+    use routeward_core::system::protection_state::MAX_PAUSE_SECS;
+
+    let constants = constants_with_private_ipc_endpoint("pause-missing");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let bridge = DesktopCommandBridge::new(constants, profile, "en");
+
+    let get = handle_api_route("GET", "/api/engine/pause", "{}", &bridge, None)
+        .await
+        .expect("route response");
+    assert_eq!(get.0, 405);
+
+    for body in [
+        "{invalid",
+        "{}",
+        r#"{"seconds":-5}"#,
+        r#"{"seconds":1.5}"#,
+        r#"{"seconds":"60"}"#,
+    ] {
+        let res = handle_api_route("POST", "/api/engine/pause", body, &bridge, None)
+            .await
+            .expect("route response");
+        assert_eq!(res.0, 400, "body {body} must be refused");
+    }
+
+    for seconds in [0, MAX_PAUSE_SECS + 1] {
+        let body = format!(r#"{{"seconds":{seconds}}}"#);
+        let res = handle_api_route("POST", "/api/engine/pause", &body, &bridge, None)
+            .await
+            .expect("route response");
+        assert_eq!(res.0, 400, "{seconds}s is out of range");
+        let json: serde_json::Value = serde_json::from_slice(&res.2).expect("json");
+        assert_eq!(json["errorKey"], ERR_KEY_DAEMON_INVALID_PAUSE);
+    }
+
+    let missing_daemon = handle_api_route(
+        "POST",
+        "/api/engine/pause",
+        r#"{"seconds":900}"#,
+        &bridge,
+        None,
+    )
+    .await
+    .expect("route response");
+    assert_eq!(missing_daemon.0, 503);
+    let json: serde_json::Value = serde_json::from_slice(&missing_daemon.2).expect("json");
+    assert!(json["error"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(json["errorKey"], "errors.daemon.disconnected");
+}
+
+#[tokio::test]
+async fn pause_route_pauses_through_the_daemon_and_a_toggle_cancels_it() {
+    let constants = constants_with_private_ipc_endpoint("pause-live");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let bridge = DesktopCommandBridge::new(constants.clone(), profile.clone(), "en");
+
+    let controller = RouteWardController::new(constants, profile, "en");
+    let service = DaemonIpcService::bind_for_test(controller).expect("bind test ipc");
+    let service_task = tokio::spawn(async move {
+        let _ = service.run_accept_loop().await;
+    });
+
+    let paused = handle_api_route(
+        "POST",
+        "/api/engine/pause",
+        r#"{"seconds":600}"#,
+        &bridge,
+        None,
+    )
+    .await
+    .expect("route response");
+    assert_eq!(paused.0, 200, "{}", String::from_utf8_lossy(&paused.2));
+    let diag: serde_json::Value = serde_json::from_slice(&paused.2).expect("json");
+    assert_eq!(diag["running"], false);
+    assert!(
+        diag["pausedUntilEpochMs"].as_u64().is_some(),
+        "the deadline kept by the daemon is reported: {diag}"
+    );
+    assert_eq!(
+        bridge.tray_snapshot().paused_until_epoch_ms,
+        diag["pausedUntilEpochMs"].as_u64(),
+        "the tray shows the pause deadline"
+    );
+
+    let stopped = handle_api_route(
+        "POST",
+        "/api/engine/toggle",
+        r#"{"start":false}"#,
+        &bridge,
+        None,
+    )
+    .await
+    .expect("route response");
+    assert_eq!(stopped.0, 200);
+    let diag: serde_json::Value = serde_json::from_slice(&stopped.2).expect("json");
+    assert!(
+        diag["pausedUntilEpochMs"].is_null(),
+        "a toggle ends the pause"
+    );
+    assert_eq!(bridge.tray_snapshot().paused_until_epoch_ms, None);
+
+    service_task.abort();
+}
+
+#[test]
+fn desktop_locale_follows_the_operating_system_language() {
+    assert_eq!(locale_from_os_name("fr-FR"), "fr");
+    assert_eq!(locale_from_os_name("fr_CA.UTF-8"), "fr");
+    assert_eq!(locale_from_os_name("FR"), "fr");
+    assert_eq!(locale_from_os_name("en-US"), "en");
+    assert_eq!(locale_from_os_name("de-DE"), "en");
+    assert_eq!(locale_from_os_name(""), "en");
+    assert!(matches!(os_default_locale(), "en" | "fr"));
+}
+
+#[test]
+fn only_an_upstream_failure_counts_as_a_proxy_outage() {
+    use crate::commands::is_proxy_outage;
+    use routeward_core::telemetry::TrackedConnection;
+
+    let connection = |status: &str, detail: Option<&str>| -> TrackedConnection {
+        let mut value = serde_json::json!({
+            "id": "c1",
+            "pid": 1,
+            "processName": "app.exe",
+            "processPath": "",
+            "targetHost": "example.com",
+            "resolvedDomain": null,
+            "targetPort": 443,
+            "protocol": "tcp",
+            "matchedRule": "rule",
+            "routeLabel": "BLOCK",
+            "latencyMs": 0,
+            "rxBytes": 0,
+            "txBytes": 0,
+            "status": status,
+            "startedAt": "2026-11-22T10:00:00Z",
+        });
+        if let (Some(detail), Some(map)) = (detail, value.as_object_mut()) {
+            map.insert("errorDetail".to_string(), detail.into());
+        }
+        serde_json::from_value(value).expect("tracked connection")
+    };
+
+    // The wording of the detail does not matter, only that the proxy failed the connection.
+    assert!(is_proxy_outage(&connection(
+        "blocked",
+        Some("connexion refusee")
+    )));
+    // A block decided by a rule (no failure detail) never raises the alert, whatever its name.
+    assert!(!is_proxy_outage(&connection("blocked", None)));
+    assert!(!is_proxy_outage(&connection(
+        "closed",
+        Some("proxy timeout")
+    )));
+    assert!(!is_proxy_outage(&connection("active", Some("proxy"))));
+}
+
+#[test]
+fn tray_notice_texts_fit_a_balloon_in_both_languages() {
+    use routeward_core::i18n::I18nRegistry;
+
+    const BALLOON_BODY_MAX_CHARS: usize = 255;
+    const BALLOON_TITLE_MAX_CHARS: usize = 63;
+    let body_keys = [
+        "tray.alert.outage_body",
+        "tray.alert.outage_body_open",
+        "tray.notice.restored_body",
+        "tray.notice.exit_background_body",
+        "tray.notice.close_to_tray_body",
+        "tray.notice.service_install_failed",
+        "tray.notice.uac_cancelled",
+        "tray.notice.access_denied",
+        "tray.notice.start_failed",
+        "tray.notice.toggle_failed",
+        "tray.notice.pause_failed",
+    ];
+    let title_keys = [
+        "tray.alert.outage_title",
+        "tray.notice.title",
+        "tray.notice.exit_background_title",
+        "tray.notice.close_to_tray_title",
+    ];
+    for locale in ["en", "fr"] {
+        let i18n = I18nRegistry::new(locale);
+        for key in body_keys {
+            let text = i18n.t(key);
+            assert_ne!(text, key, "{locale}: missing key {key}");
+            assert!(
+                text.chars().count() <= BALLOON_BODY_MAX_CHARS,
+                "{locale}: {key} is too long for a balloon ({} chars)",
+                text.chars().count()
+            );
+        }
+        for key in title_keys {
+            let text = i18n.t(key);
+            assert_ne!(text, key, "{locale}: missing key {key}");
+            assert!(
+                text.chars().count() <= BALLOON_TITLE_MAX_CHARS,
+                "{locale}: {key}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn first_close_to_tray_notice_is_shown_once() {
+    use std::sync::Mutex as StdMutex;
+
+    let constants = constants_with_private_ipc_endpoint("notice");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let flags_dir =
+        std::env::temp_dir().join(format!("routeward-notice-test-{}", unique_test_suffix()));
+    let bridge = DesktopCommandBridge::new(constants, profile, "en")
+        .with_notice_flags_path(flags_dir.join(crate::notices::NOTICE_FLAGS_FILE_NAME));
+
+    let shown: Arc<StdMutex<Vec<TrayBalloon>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&shown);
+    bridge.set_tray_alert_callback(Arc::new(move |balloon| {
+        sink.lock().expect("lock").push(balloon);
+    }));
+
+    bridge.notify_close_to_tray_once();
+    bridge.notify_close_to_tray_once();
+
+    let balloons = shown.lock().expect("lock");
+    assert_eq!(balloons.len(), 1, "the notice must be shown a single time");
+    assert_eq!(
+        balloons[0].title,
+        bridge.translate("tray.notice.close_to_tray_title")
+    );
+    assert_eq!(balloons[0].level, TrayBalloonLevel::Info);
+    let _ = std::fs::remove_dir_all(flags_dir);
+}
+
+#[tokio::test]
+async fn exit_without_a_reachable_daemon_gives_the_settings_back() {
+    use crate::commands::ExitDisposition;
+
+    let constants = constants_with_private_ipc_endpoint("exit-offline");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let bridge = DesktopCommandBridge::new(constants, profile, "en");
+
+    assert_eq!(bridge.prepare_exit().await, ExitDisposition::Stopped);
+}
