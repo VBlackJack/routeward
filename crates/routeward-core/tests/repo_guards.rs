@@ -51,6 +51,10 @@ const HEADER_SCAN_LINES: usize = 20;
 const DYNAMIC_LOCALE_KEY_PREFIXES: &[&str] = &[
     // App.tsx: `app.nav.${id}.tab`
     "app.nav.",
+    // BlockedView.tsx, activityWhy.ts: `blocked.reasons.${reason}.title|body` (see blockReason.ts)
+    "blocked.reasons.",
+    // AnalyzerPanel.tsx: `analyzer.findings.${code}.title|body|fix` (codes come from the daemon)
+    "analyzer.findings.",
     // ConnectionsView.tsx: `connections.table.status.${conn.status}`
     "connections.table.status.",
     // ConnectionsView.tsx: `connections.toolbar.status_filter.${st}`
