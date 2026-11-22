@@ -45,9 +45,12 @@ import {
 } from './services/ipc';
 import { useThemeForge } from './theme/ThemeForgeContext';
 import {
+  Finding,
+  FixAction,
   InterceptionMode,
   ProfileSummary,
   ProxyChain,
+  QueryLogsRequest,
   RoutingRule,
   ToastNotification
 } from './types/routeward';
@@ -95,6 +98,13 @@ import {
 import { GlossaryModal } from './components/GlossaryModal';
 import { TroubleshootModal } from './components/TroubleshootModal';
 import { ConfirmApplyModal } from './components/ConfirmApplyModal';
+import { ActivitySubtab, ActivitySubtabs } from './components/ActivitySubtabs';
+import { AnalyzerPanel } from './components/AnalyzerPanel';
+import { BlockedView } from './components/BlockedView';
+import { DiagnosticExportModal } from './components/DiagnosticExportModal';
+import { useUnblockFlow } from './components/useUnblockFlow';
+import { LogsJump } from './services/logQuery';
+import { useBlockedSummary } from './services/useBlockedSummary';
 
 interface PendingConfirm {
   title: string;
@@ -1224,6 +1234,132 @@ export const App: React.FC = () => {
 
   const isEngineRunning = diagnostics.daemonConnected && diagnostics.running;
   const activePrimaryProxy = profile.proxies.find((p) => p.enabled) ?? null;
+
+  const [activitySubtab, setActivitySubtab] =
+    useState<ActivitySubtab>('connections');
+  const [logsJump, setLogsJump] = useState<LogsJump | null>(null);
+  const [diagnosticsRequest, setDiagnosticsRequest] = useState<{
+    tab: 'logs' | 'checkup';
+  } | null>(null);
+  const [findings, setFindings] = useState<Finding[]>([]);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzed, setAnalyzed] = useState(false);
+  const [analyzerError, setAnalyzerError] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const logsJumpSeq = useRef(0);
+
+  const loadBlocked = useCallback(() => routewardClient.getBlocked(), []);
+  const blocked = useBlockedSummary(
+    activeTab === 'activity' && activitySubtab === 'blocked',
+    loadBlocked
+  );
+  const queryLogs = useCallback(
+    (req: QueryLogsRequest) => routewardClient.queryLogs(req),
+    []
+  );
+
+  const openBlockedTab = () => {
+    setActivitySubtab('blocked');
+    setActiveTab('activity');
+  };
+
+  const openLogsFor = (target: {
+    connectionId?: string;
+    pid?: number;
+    centerMs: number;
+  }) => {
+    logsJumpSeq.current += 1;
+    setLogsJump({ ...target, nonce: logsJumpSeq.current });
+    setDiagnosticsRequest({ tab: 'logs' });
+    setActiveTab('settings');
+  };
+
+  const runAnalyzer = () => {
+    setAnalyzing(true);
+    setAnalyzerError(false);
+    routewardClient
+      .analyzeDiagnostics()
+      .then((res) => {
+        setFindings(res.findings ?? []);
+        setAnalyzed(true);
+      })
+      .catch(() => setAnalyzerError(true))
+      .finally(() => setAnalyzing(false));
+  };
+
+  const openCheckup = () => {
+    setDiagnosticsRequest({ tab: 'checkup' });
+    setActiveTab('settings');
+    runAnalyzer();
+  };
+
+  const handleFix = (fix: FixAction) => {
+    switch (fix.type) {
+      case 'openProxy':
+        setActiveTab('proxy');
+        break;
+      case 'testProxy':
+        void testAndRecordProxy(fix.id).then((report) => {
+          setProxyOutageDetected(!report?.reachable);
+          pushToast(
+            report?.reachable
+              ? t('app.toast.proxy.tested')
+              : t('app.toast.proxy.unreachable'),
+            report?.reachable ? 'success' : 'error'
+          );
+        });
+        break;
+      case 'unblock':
+        openBlockedTab();
+        break;
+      case 'editRule':
+        setActiveTab('apps');
+        break;
+      case 'pauseProtection':
+        void handleTemporaryPause(UI_CONFIG.OUTAGE_PAUSE_MINUTES);
+        break;
+      case 'openSetting':
+        setActiveTab('settings');
+        break;
+      default:
+        break;
+    }
+  };
+
+  const unblockFlow = useUnblockFlow({
+    rules: profile.rules,
+    proxies: profile.proxies,
+    chains: profile.chains,
+    t,
+    previewRuleChange: (req) => routewardClient.previewRuleChange(req),
+    upsertRule: (rule) => routewardClient.upsertRule(rule),
+    removeRule: (ruleId) => routewardClient.removeRule(ruleId),
+    onCommand: (command, target) => {
+      switch (command) {
+        case 'testProxy': {
+          const proxyId = target.proxyId ?? activePrimaryProxy?.id;
+          if (proxyId) handleFix({ type: 'testProxy', id: proxyId });
+          break;
+        }
+        case 'openProxy':
+          setActiveTab('proxy');
+          break;
+        case 'pause':
+          void handleTemporaryPause(UI_CONFIG.OUTAGE_PAUSE_MINUTES);
+          break;
+        case 'flushDns':
+          runMutation(
+            () => routewardClient.flushFakeIps(),
+            () => pushToast(t('app.toast.dns.flushed'), 'info')
+          );
+          break;
+        default:
+          break;
+      }
+    },
+    notify: pushToast,
+    onError: (err) => pushErrorToast(err)
+  });
   const proxyReachability = resolveProxyReachability(
     activePrimaryProxy,
     unreachableProxyIds,
@@ -1742,6 +1878,7 @@ export const App: React.FC = () => {
             }}
             onOpenWizard={() => setShowWizardModal(true)}
             onOpenTroubleshoot={() => setShowTroubleshootModal(true)}
+            onOpenBlocked={openBlockedTab}
             onNavigateRules={() => setActiveTab('apps')}
             onSwitchToExpert={() => handleSetExperienceMode('expert')}
           />
@@ -1910,6 +2047,38 @@ export const App: React.FC = () => {
         )}
 
         {activeTab === 'activity' && (
+          <ActivitySubtabs
+            value={activitySubtab}
+            onChange={setActivitySubtab}
+            blockedCount={telemetry.blockedCount}
+          />
+        )}
+
+        {activeTab === 'activity' && activitySubtab === 'blocked' && (
+          <BlockedView
+            entries={blocked.entries}
+            counters={blocked.counters}
+            rules={profile.rules}
+            proxies={profile.proxies}
+            chains={profile.chains}
+            loading={blocked.loading}
+            error={blocked.error}
+            onRefresh={blocked.refresh}
+            onChoose={(target, option, duration) => {
+              void unblockFlow.choose(target, option, duration);
+            }}
+            onSeeLogs={(entry) =>
+              openLogsFor({
+                connectionId: entry.lastConnectionId,
+                pid: entry.lastPid,
+                centerMs: Date.parse(entry.lastSeen)
+              })
+            }
+            onOpenCheckup={openCheckup}
+          />
+        )}
+
+        {activeTab === 'activity' && activitySubtab === 'connections' && (
           <ConnectionsView
             connections={connections}
             proxies={profile.proxies}
@@ -1958,6 +2127,13 @@ export const App: React.FC = () => {
                 'info'
               );
             }}
+            onSeeLogs={(conn) =>
+              openLogsFor({
+                connectionId: conn.id,
+                pid: conn.pid,
+                centerMs: Date.parse(conn.startedAt)
+              })
+            }
           />
         )}
 
@@ -1999,6 +2175,22 @@ export const App: React.FC = () => {
             onClearLogs={() => {
               runMutation(() => routewardClient.clearLogs());
             }}
+            onQueryLogs={queryLogs}
+            logsJump={logsJump}
+            diagnosticsRequest={diagnosticsRequest}
+            checkupPanel={
+              <AnalyzerPanel
+                findings={findings}
+                proxies={profile.proxies}
+                rules={profile.rules}
+                loading={analyzing}
+                error={analyzerError}
+                analyzed={analyzed}
+                onRun={runAnalyzer}
+                onFix={handleFix}
+                onExport={() => setShowExportModal(true)}
+              />
+            }
             pacEnabled={pacEnabled}
             pacUrl={pacUrl}
             autostartEnabled={autostartEnabled}
@@ -2226,6 +2418,19 @@ export const App: React.FC = () => {
             setVerifyRequestId((prev) => prev + 1);
           }}
           onClose={() => setShowWizardModal(false)}
+        />
+      )}
+
+      {unblockFlow.element}
+
+      {showExportModal && (
+        <DiagnosticExportModal
+          onCollect={(req) => routewardClient.collectDiagnostics(req)}
+          onClose={() => setShowExportModal(false)}
+          onDownloaded={(fileName) => {
+            setShowExportModal(false);
+            pushToast(t('diagnostics.export.done', { name: fileName }), 'success');
+          }}
         />
       )}
 

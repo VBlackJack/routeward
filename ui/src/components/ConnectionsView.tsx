@@ -20,6 +20,7 @@ import {
   Ban,
   CheckCircle,
   Download,
+  FileText,
   Globe,
   PowerOff,
   Radar,
@@ -66,6 +67,8 @@ interface ConnectionsViewProps {
   onMissingProxy?: () => void;
   onSwitchToExpert?: () => void;
   onExportActivity?: (format: 'csv' | 'json') => void;
+  /** Opens the logs filtered on one connection and the moment it happened. */
+  onSeeLogs?: (connection: TrackedConnection) => void;
 }
 
 type SimpleActivityFilter = 'all' | 'proxied' | 'blocked';
@@ -94,7 +97,8 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
   onQuickCreateRule,
   onMissingProxy,
   onSwitchToExpert,
-  onExportActivity
+  onExportActivity,
+  onSeeLogs
 }) => {
   const { t } = useTranslation();
   const [filterText, setFilterText] = useState('');
@@ -834,6 +838,18 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
               </div>
             </div>
 
+            {onSeeLogs && (
+              <div className="mt-4 border-t border-tf-border pt-3">
+                <button
+                  type="button"
+                  onClick={() => onSeeLogs(selectedConnection)}
+                  className="tf-surface-alt flex w-full items-center justify-center gap-2 py-2 text-xs font-semibold text-tf-primary hover:border-tf-accent"
+                >
+                  <FileText className="h-3.5 w-3.5" />
+                  {t('connections.inspector.drawer.see_logs')}
+                </button>
+              </div>
+            )}
             {selectedConnection.status === 'active' && (
               <div className="mt-4 border-t border-tf-border pt-3">
                 <button

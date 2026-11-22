@@ -50,6 +50,7 @@ import {
 import { HelpTooltip } from './HelpTooltip';
 import { ExperienceMode } from './QuickSetupWizardModal';
 import { SimpleDashboardView } from './SimpleDashboardView';
+import { BlockedShortcut } from './BlockedShortcut';
 
 export type DashboardUseCaseId = UseCaseId;
 
@@ -82,6 +83,8 @@ interface DashboardViewProps {
   onUpdateSecurityPolicy: (partial: Partial<SecurityPolicyConfig>) => void;
   onOpenWizard: () => void;
   onOpenTroubleshoot?: () => void;
+  /** Opens the Blocked tab of Activity; the shortcut shows only when something was blocked. */
+  onOpenBlocked?: () => void;
   onNavigateRules: () => void;
   onSwitchToExpert: () => void;
 }
@@ -109,6 +112,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onUpdateSecurityPolicy,
   onOpenWizard,
   onOpenTroubleshoot,
+  onOpenBlocked,
   onNavigateRules,
   onSwitchToExpert
 }) => {
@@ -144,6 +148,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         onUpdateSecurityPolicy={onUpdateSecurityPolicy}
         onOpenWizard={onOpenWizard}
         onOpenTroubleshoot={onOpenTroubleshoot}
+        onOpenBlocked={onOpenBlocked}
         onNavigateRules={onNavigateRules}
         onSwitchToExpert={onSwitchToExpert}
       />
@@ -189,6 +194,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   return (
     <div className="space-y-6">
       {/* Health Summary Banner (Expert mode) */}
+      <BlockedShortcut blockedCount={telemetry.blockedCount} onOpen={onOpenBlocked} />
+
       <div
         className={`tf-card flex flex-wrap items-center justify-between gap-4 border-l-4 p-5 ${toneBorder}`}
       >

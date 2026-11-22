@@ -24,6 +24,8 @@ interface ConfirmApplyModalProps {
   intro: string;
   /** One plain-language line per change that will be made. */
   changes: string[];
+  /** Optional alert shown under the list (for example a rule change that will not be enough). */
+  warning?: string;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -33,6 +35,7 @@ export const ConfirmApplyModal: React.FC<ConfirmApplyModalProps> = ({
   title,
   intro,
   changes,
+  warning,
   onConfirm,
   onCancel
 }) => {
@@ -63,6 +66,14 @@ export const ConfirmApplyModal: React.FC<ConfirmApplyModalProps> = ({
               <li key={line}>{line}</li>
             ))}
           </ul>
+        )}
+        {warning && (
+          <p
+            role="alert"
+            className="mt-3 rounded-tf-md border border-tf-orange/40 bg-tf-orange/10 p-2.5 text-[11px] text-tf-primary"
+          >
+            {warning}
+          </p>
         )}
         <p className="mt-3 text-[11px] text-tf-secondary">
           {t('dashboard.confirm.undo_hint')}

@@ -120,6 +120,33 @@ export const UI_CONFIG = {
   SIMPLE_FAILOVER_CHAIN_ID: 'chain-simple-failover',
   /** Priority for high-priority quick unblock rules created from troubleshooting. */
   TROUBLESHOOT_RULE_PRIORITY: 6,
+  /** Length of the "15 minutes" temporary unblock (milliseconds). */
+  UNBLOCK_SHORT_DURATION_MS: 15 * 60 * 1000,
+  /** Length of the "1 hour" temporary unblock (milliseconds). */
+  UNBLOCK_LONG_DURATION_MS: 60 * 60 * 1000,
+  /** Prefixes of the exception rules created by the Unblock flow. */
+  UNBLOCK_RULE_ID_PREFIXES: {
+    APP: 'rule-unblock-app-',
+    SITE: 'rule-unblock-site-'
+  } as const,
+  /** Refresh period of the Blocked tab while it is open (milliseconds). */
+  BLOCKED_REFRESH_INTERVAL_MS: 3000,
+  /** Half-width of the time window opened by "See logs" from a connection (milliseconds). */
+  LOG_JUMP_WINDOW_MS: 30000,
+  /** Number of log lines requested per page from the daemon. */
+  LOG_QUERY_PAGE_SIZE: 200,
+  /** Time ranges offered by the logs filter (milliseconds, 0 means no limit). */
+  LOG_TIME_RANGE_MS: {
+    ALL: 0,
+    LAST_15_MIN: 15 * 60 * 1000,
+    LAST_HOUR: 60 * 60 * 1000,
+    LAST_DAY: 24 * 60 * 60 * 1000
+  } as const,
+  /** Days of daemon log files offered for the diagnostic export, and the default. */
+  DIAGNOSTIC_LOG_DAYS_OPTIONS: [1, 3, 7, 14] as const,
+  DIAGNOSTIC_LOG_DAYS_DEFAULT: 3,
+  /** Prefix of the diagnostic file name (a date and the extension follow). */
+  DIAGNOSTIC_FILE_PREFIX: 'routeward-diagnostic-',
   /**
    * 1-click protection and compatibility packs offered in Simple mode (works even without a proxy).
    * Each pack owns one or more rules; the engine ANDs processes and domains inside one rule, so a
@@ -267,6 +294,11 @@ export const UI_CONFIG = {
     DNS_ALLOCATE: '/api/dns/allocate',
     DNS_FLUSH: '/api/dns/flush',
     LOGS_CLEAR: '/api/logs/clear',
+    LOGS_QUERY: '/api/logs/query',
+    BLOCKED: '/api/blocked',
+    DIAGNOSTICS_ANALYZE: '/api/diagnostics/analyze',
+    DIAGNOSTICS_COLLECT: '/api/diagnostics/collect',
+    RULES_PREVIEW: '/api/rules/preview',
     SYSTEM_PROXY: '/api/system-proxy',
     SYSTEM_PAC: '/api/system/pac',
     SYSTEM_AUTOSTART: '/api/system/autostart',
