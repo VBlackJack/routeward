@@ -148,7 +148,11 @@ pub(crate) fn consume_marker_at(
     let key = match open_key_rejecting_links(hive, subkey, KEY_QUERY_VALUE | KEY_SET_VALUE) {
         Ok(Some(key)) => key,
         Ok(None) => {
-            tracing::info!("no upgrade marker key, protection not carried over");
+            if user_hive_is_missing(hive, subkey) {
+                tracing::info!("user hive not loaded, protection not carried over");
+            } else {
+                tracing::info!("no upgrade marker key, protection not carried over");
+            }
             return false;
         }
         Err(err) => {
@@ -221,6 +225,23 @@ pub(crate) fn consume_marker_at(
     running
 }
 
+/// True when the first path component of `subkey` (the `<SID>` hive under `HKEY_USERS`) cannot be
+/// opened because it does not exist, which separates "the user hive is not loaded" from "the
+/// marker key is absent". A subkey without a separator, or any other open outcome, is `false`.
+#[cfg(windows)]
+fn user_hive_is_missing(hive: windows_sys::Win32::System::Registry::HKEY, subkey: &str) -> bool {
+    use crate::system::user_state::win32::open_key_rejecting_links;
+    use windows_sys::Win32::System::Registry::KEY_QUERY_VALUE;
+
+    match subkey.split_once('\\') {
+        Some((first, _)) => matches!(
+            open_key_rejecting_links(hive, first, KEY_QUERY_VALUE),
+            Ok(None)
+        ),
+        None => false,
+    }
+}
+
 /// What the migration decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationOutcome {
@@ -240,7 +261,8 @@ pub enum MigrationOutcome {
 ///
 /// `start_via_daemon` asks the new daemon to start protection (which persists the choice) and
 /// returns whether it succeeded; it is injected so the logic runs without a pipe. The service
-/// is never started here, and an existing state file is never overwritten. When the daemon reports
+/// is never started here, and an existing state file is never overwritten (the fallback publishes with a hard link, which fails if the file
+/// exists). When the daemon reports
 /// success but the state file still does not exist, or the daemon is unusable, the enabled state is
 /// written directly (the file is absent, so nothing can be overwritten).
 pub async fn migrate_upgrade_state<F, Fut>(
@@ -263,11 +285,14 @@ where
             protection_enabled: true,
             paused_until_epoch_ms: None,
         };
-        match enabled.save_to_path(
+        // Published without replacing: a file that appeared since the check above (the daemon
+        // persisted it meanwhile) is kept and counts as already persisted.
+        match enabled.save_new_to_path(
             state_path,
             RouteWardController::detect_elevated_privileges(),
         ) {
-            Ok(()) => MigrationOutcome::WrittenDirectly,
+            Ok(true) => MigrationOutcome::WrittenDirectly,
+            Ok(false) => MigrationOutcome::StateAlreadyPersisted,
             Err(_) => MigrationOutcome::WriteFailed,
         }
     }
@@ -282,6 +307,9 @@ mod tests {
     use uuid::Uuid;
 
     const SAMPLE_USER_SID: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+    /// A well-formed SID whose hive is never loaded on a test machine.
+    #[cfg(windows)]
+    const UNLOADED_HIVE_SID: &str = "S-1-5-21-9999999999-9999999999-9999999999-9999";
     const FRESH_AGE: Duration = Duration::from_secs(60);
 
     fn facts(reg_type: u32, data: &[u8], age: Option<Duration>) -> MarkerFacts {
@@ -748,6 +776,16 @@ mod tests {
             // SAFETY: handle created above.
             unsafe { RegCloseKey(handle) };
             assert!(!consume(&path));
+        }
+
+        #[test]
+        fn an_unloaded_user_hive_is_told_apart_from_a_missing_marker_key() {
+            let key = TestKey::new();
+            assert!(!user_hive_is_missing(HKEY_USERS, &key.path("Upgrade")));
+            let unloaded = format!(r"{UNLOADED_HIVE_SID}\{UPGRADE_MARKER_SUBKEY}");
+            assert!(user_hive_is_missing(HKEY_USERS, &unloaded));
+            assert!(!consume(&unloaded));
+            assert!(!user_hive_is_missing(HKEY_USERS, "no-separator"));
         }
 
         #[test]

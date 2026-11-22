@@ -42,8 +42,8 @@
 
     <!--
       Service restore after an upgrade. MajorUpgrade uninstalls the previous product
-      (RemoveExistingProducts, scheduled right after InstallInitialize, in the same transaction as the new
-      files), and its ServiceControl Remove="uninstall" deletes the RouteWard service together with the
+      (RemoveExistingProducts, with the default schedule: right after InstallValidate, in its own
+      transaction, before InstallInitialize), and its ServiceControl Remove="uninstall" deletes the RouteWard service together with the
       allow-sid arguments of its command line. AppSearch runs before that removal, so the old registration
       is captured here and replayed after InstallFiles by the custom actions below.
       Type="raw" keeps the value as stored: a REG_EXPAND_SZ ImagePath comes back with a "#%" prefix
@@ -176,7 +176,7 @@
       once by the action, then cleared) and requires it to start with a double quote. The SetProperty row
       below builds it; the references that must be resolved only by the action itself are escaped
       (the open bracket and close bracket escapes around RouteWardOldCli), so they are formatted once.
-      [SystemFolder] is SysWOW64 on x64, harmless for cmd.exe. The command line has no brace (a Formatted
+      [SystemFolder] is System32 or SysWOW64 depending on the package, harmless for cmd.exe either way. The command line has no brace (a Formatted
       string treats it as a reference). RouteWardOldCli is the path of the OLD routeward.exe built from the
       HKLM InstallDir value written by the old product; two rows cover a stored value with or without a
       trailing backslash (">>" is the MSI "ends with" operator). "Return=ignore": a failed capture must
@@ -190,9 +190,16 @@
             captured and protection stays off, as before this feature.
         (c) Windows does not run commit actions when the DisableRollback policy is set; protection then
             stays off after the upgrade (the previous behavior).
+        (d) A protection that the old version had paused is not carried over: the old daemon reports
+            running false, so nothing is captured, matching the old behavior.
+        (e) The capture has no explicit timeout (WixQuietExec has none), whereas the IPC reads of the old
+            CLI have an idle timeout.
+        (f) An empty HKCU\Software\RouteWard\Upgrade key remains for users who upgraded: the commit action
+            deletes only the value and never a key in a user hive, by design, against registry link
+            attacks.
 
-      MigrateUpgradeState (commit, runs the NEW hidden "migrate-upgrade-state" command (with the user SID option) through
-      WixQuietExec, like CleanupUserSettings and PurgeProgramData, so its log output reaches the installer
+      MigrateUpgradeState is a commit action. It runs the NEW hidden "migrate-upgrade-state" command, given
+      the user SID option, through WixQuietExec, like CleanupUserSettings and PurgeProgramData, so its log output reaches the installer
       log: the CLI logs to stderr, which a plain FileRef exe action would drop). WixQuietExec reads its
       command line from the CustomActionData property named after the action, and commit actions are
       deferred-class, so they receive CustomActionData exactly like deferred ones; the SetProperty below is
