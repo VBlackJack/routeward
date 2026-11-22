@@ -21,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2026.1122.0"
+version = "2026.1122.1"
 edition = "2021"
 # Measured minimum: uuid 1.28.0 (in Cargo.lock) declares 1.89; bisected with pinned toolchains.
 rust-version = "1.89"

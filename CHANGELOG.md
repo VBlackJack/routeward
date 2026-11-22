@@ -5,6 +5,8 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+## [v2026.1122.01] - 2026-11-22
+
 ### Fixed
 - Upgrading from v2026.1121.01 or earlier (MSI or .deb) now keeps protection on when it was on before the upgrade.
 
