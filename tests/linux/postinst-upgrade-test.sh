@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Exercises packaging/linux/postinst upgrade handling with a stubbed CLI and a temp state dir.
-# No root and no systemd needed.
+# Exercises packaging/linux/postinst upgrade handling with a stubbed CLI, a stubbed systemctl
+# and a temp state dir. No root and no systemd needed; the real systemctl is never reached.
 
 set -u
 
@@ -28,9 +28,30 @@ check() {
     if [ "$2" = "ok" ]; then echo "PASS: $1"; else echo "FAIL: $1"; fail=1; fi
 }
 
-# make_cli <mode>: running | stopped | down
+# Stub systemctl first on PATH: records its arguments and whether the state file existed at
+# call time, so the log proves the order (state written BEFORE try-restart).
+mkdir -p "$work/bin" "$work/sysd"
+cat >"$work/bin/systemctl" <<'STUB'
+#!/bin/sh
+if [ -e "$ROUTEWARD_STATE_DIR/protection_state.json" ]; then seen=file; else seen=nofile; fi
+echo "$* state=$seen" >>"$STUB_LOG"
+exit 0
+STUB
+chmod 755 "$work/bin/systemctl"
+PATH="$work/bin:$PATH"
+export PATH
+STUB_LOG="$work/systemctl.log"
+export STUB_LOG
+ROUTEWARD_SYSTEMD_DIR="$work/sysd"
+export ROUTEWARD_SYSTEMD_DIR
+ROUTEWARD_STATUS_TIMEOUT=1
+export ROUTEWARD_STATUS_TIMEOUT
+
+# make_cli <mode>: running | stopped | notok | hang | down
 make_cli() {
     case "$1" in
+        notok) body='printf "{\n  \"ok\": false\n}\n"' ;;
+        hang) body='sleep 30' ;;
         running) body='printf "{\n  \"running\": true\n}\n"' ;;
         stopped) body='printf "{\n  \"running\": false\n}\n"' ;;
         *) body='exit 1' ;;
@@ -45,6 +66,7 @@ run_case() {
     dir="$work/state"
     rm -rf "$dir"
     mkdir -p "$dir"
+    : >"$STUB_LOG"
     ROUTEWARD_STATE_DIR="$dir" ROUTEWARD_CLI="$work/routeward" \
         sh "$postinst" configure "$2" >/dev/null 2>&1
     rc=$?
@@ -54,6 +76,9 @@ run_case running 2026.1121.01
 if [ "$rc" = 0 ] && [ -f "$dir/protection_state.json" ] \
     && [ "$(cat "$dir/protection_state.json")" = '{"protectionEnabled":true}' ]; then r=ok; else r=bad; fi
 check "running daemon on upgrade writes the state file" "$r"
+if grep -qx 'try-restart routeward.service state=file' "$STUB_LOG" \
+    && grep -qx 'daemon-reload state=file' "$STUB_LOG"; then r=ok; else r=bad; fi
+check "systemctl try-restart ran after the state file was written" "$r"
 mode=$(stat -c %a "$dir/protection_state.json" 2>/dev/null || echo unknown)
 if [ "$(uname -s)" != Linux ]; then
     echo "SKIP: file mode check (needs a Linux filesystem, got $mode)"
@@ -72,9 +97,25 @@ run_case down 2026.1121.01
 if [ "$rc" = 0 ] && [ ! -e "$dir/protection_state.json" ]; then r=ok; else r=bad; fi
 check "unreachable daemon writes nothing" "$r"
 
+run_case notok 2026.1121.01
+if [ "$rc" = 0 ] && [ ! -e "$dir/protection_state.json" ]; then r=ok; else r=bad; fi
+check "status JSON with ok false and no running field writes nothing" "$r"
+
+if command -v timeout >/dev/null 2>&1; then
+    start=$(date +%s)
+    run_case hang 2026.1121.01
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$rc" = 0 ] && [ "$elapsed" -lt 10 ] && [ ! -e "$dir/protection_state.json" ]; then r=ok; else r=bad; fi
+    check "hanging CLI is cut off, postinst exits 0 and writes nothing (took ${elapsed}s)" "$r"
+else
+    echo "SKIP: hanging CLI case (timeout command not available)"
+fi
+
 run_case running ""
 if [ "$rc" = 0 ] && [ ! -e "$dir/protection_state.json" ]; then r=ok; else r=bad; fi
 check "fresh install writes nothing" "$r"
+if grep -q try-restart "$STUB_LOG"; then r=bad; else r=ok; fi
+check "fresh install does not try-restart" "$r"
 
 make_cli running
 dir="$work/state"

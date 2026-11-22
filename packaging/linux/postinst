@@ -15,9 +15,14 @@
 
 set -eu
 
-# Test hooks: ROUTEWARD_STATE_DIR (default /etc/routeward) and ROUTEWARD_CLI
-# (default /usr/bin/routeward) exist only so tests/linux/postinst-upgrade-test.sh can run
-# this script without root; packages never set them.
+# Test hooks: ROUTEWARD_STATE_DIR (default /etc/routeward), ROUTEWARD_CLI
+# (default /usr/bin/routeward), ROUTEWARD_STATUS_TIMEOUT (seconds, default 10) and
+# ROUTEWARD_SYSTEMD_DIR (default /run/systemd/system) exist only so
+# tests/linux/postinst-upgrade-test.sh can run this script without root or systemd;
+# packages never set them.
+#
+# Side effect: `routeward ctl status` run as root creates the per-user log directory under
+# /root; this is harmless.
 #
 # Versions up to 2026.1121.x never persisted the desired protection state, so the daemon
 # restarted by an upgrade would come back with protection off. When the OLD daemon is still
@@ -32,7 +37,7 @@ carry_protection_over_upgrade() {
         [ ! -e "$dir/protection_state.json" ] || exit 0
         [ -x "$cli" ] || exit 0
         if command -v timeout >/dev/null 2>&1; then
-            status=$(timeout 10 "$cli" ctl status 2>/dev/null) || exit 0
+            status=$(timeout "${ROUTEWARD_STATUS_TIMEOUT:-10}" "$cli" ctl status 2>/dev/null) || exit 0
         else
             status=$("$cli" ctl status 2>/dev/null) || exit 0
         fi
@@ -61,7 +66,7 @@ if [ "${1:-}" = "configure" ]; then
         carry_protection_over_upgrade
     fi
 
-    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    if [ -d "${ROUTEWARD_SYSTEMD_DIR:-/run/systemd/system}" ] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload || true
         if [ -n "${2:-}" ]; then
             systemctl try-restart routeward.service || true
