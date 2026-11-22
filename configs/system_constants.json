@@ -157,7 +157,8 @@
     "logFlushIntervalMs": 500,
     "eventBroadcastCapacity": 256,
     "udpFlowIdleTimeoutMs": 30000,
-    "telemetryUpdateIntervalMs": 250
+    "telemetryUpdateIntervalMs": 250,
+    "maxBlockedSummaryEntries": 500
   },
   "ipc": {
     "unixSocketPath": "/run/routeward/routeward.sock",

@@ -19,6 +19,7 @@ pub mod security;
 use crate::error::{
     RouteWardError, RouteWardResult, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_LOAD, ERR_KEY_CONFIG_SAVE,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -633,6 +634,14 @@ pub struct TelemetryConstants {
     /// traffic counters grow; a final update is always emitted when the connection closes.
     #[serde(default = "default_telemetry_update_interval_ms")]
     pub telemetry_update_interval_ms: u64,
+    /// Maximum number of aggregated entries kept in the blocked-connections summary; the entry
+    /// with the oldest `lastSeen` is evicted first.
+    #[serde(default = "default_max_blocked_summary_entries")]
+    pub max_blocked_summary_entries: usize,
+}
+
+fn default_max_blocked_summary_entries() -> usize {
+    500
 }
 
 fn default_udp_flow_idle_timeout_ms() -> u64 {
@@ -1085,6 +1094,10 @@ pub struct RoutingRule {
     pub port_ranges: Vec<PortRange>,
     pub protocol: TransportProtocol,
     pub action: RuleAction,
+    /// Instant after which the rule no longer applies (temporary exceptions). Omitted from the
+    /// JSON when unset so an older daemon can still load a profile exported by this version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -552,6 +552,7 @@ impl FoxyProxyImporter {
                     port_ranges: Vec::new(),
                     protocol: TransportProtocol::Tcp,
                     action,
+                    expires_at: None,
                 });
             }
         }
@@ -736,6 +737,7 @@ mod tests {
                 action: RuleAction::Proxy {
                     target_id: "edge-proxy".to_string(),
                 },
+                expires_at: None,
             },
             RoutingRule {
                 id: "cli-only-rule".to_string(),
@@ -750,6 +752,7 @@ mod tests {
                 action: RuleAction::Proxy {
                     target_id: "edge-proxy".to_string(),
                 },
+                expires_at: None,
             },
         ];
         profile.default_action = RuleAction::Direct;

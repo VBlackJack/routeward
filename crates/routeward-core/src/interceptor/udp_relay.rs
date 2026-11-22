@@ -15,6 +15,10 @@
  */
 
 use super::dns_handler::DnsReplyCheck;
+use super::policy::{
+    block_reason_for_decision, block_reason_for_rule, port_policy_override,
+    FRAGMENTED_UDP_RULE_NAME, LOCAL_NAME_GUARD_RULE_NAME, LOCAL_NAME_PROCESS_NAME,
+};
 use super::{
     RouteWardController, COMPONENT_DNS, COMPONENT_ENGINE, COMPONENT_PROXY, COMPONENT_TRANSPARENT,
     ROUTE_BLOCK_LABEL, ROUTE_DIRECT_LABEL,
@@ -29,7 +33,9 @@ use crate::interceptor::nftables::NftablesInterceptor;
 use crate::process::ProcessResolver;
 use crate::proxy::udp::Socks5UdpTarget;
 use crate::rules::ConnectionRequest;
-use crate::telemetry::{udp_flow_key, ConnectionStatus, LogLevel, TrackedConnection};
+use crate::telemetry::{
+    udp_flow_key, BlockReason, BlockedRecord, ConnectionStatus, LogLevel, TrackedConnection,
+};
 use chrono::Utc;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -96,6 +102,11 @@ impl RouteWardController {
                 status: ConnectionStatus::Active,
                 started_at: Utc::now(),
                 error_detail: None,
+                block_reason: None,
+                matched_rule_id: None,
+                proxy_id: None,
+                target_ip: None,
+                simulated: false,
             },
             rec.is_proxied,
             rec.rx_bytes,
@@ -132,6 +143,21 @@ impl RouteWardController {
         }
     }
 
+    /// Records a blocked UDP datagram: one connection record per (client, target, reason) flow
+    /// while datagrams keep arriving, every datagram still counted in the blocked summary.
+    pub(super) fn record_blocked_udp(&self, client_addr: SocketAddr, record: BlockedRecord) {
+        let route = format!("{ROUTE_BLOCK_LABEL}|{:?}", record.reason);
+        let flow_key = match record.target_host.parse::<IpAddr>() {
+            Ok(ip) => udp_flow_key(client_addr, SocketAddr::new(ip, record.target_port), &route),
+            Err(_) => format!(
+                "udp|{}|{}:{}|{}",
+                client_addr, record.target_host, record.target_port, route
+            ),
+        };
+        self.telemetry
+            .record_blocked_udp(&flow_key, TrackedConnection::blocked(record));
+    }
+
     /// Evaluates routing rules for a single UDP datagram and forwards it through a SOCKS5 `UDP ASSOCIATE`
     /// session (`Proxy` / `Chain`) or directly (`Direct`), enforcing per-datagram rule evaluation,
     /// Fake-IP reverse lookup (`ATYP = 0x03`), QUIC (`UDP 443`) and DoQ (`UDP 853`) blocking,
@@ -159,43 +185,51 @@ impl RouteWardController {
             process_name: process_name.to_string(),
             process_path: process_path.map(|s| s.to_string()),
             target_host: raw_host.clone(),
-            target_ip: target_ip_str,
+            target_ip: target_ip_str.clone(),
             target_port,
             protocol: TransportProtocol::Udp,
         });
 
-        let (kill_switch_enabled, block_udp_on_tcp_only, block_quic_443, block_encrypted_dns) = {
+        let (kill_switch_enabled, block_udp_on_tcp_only) = {
             let prof = self.profile.read();
             (
                 prof.security_policy.kill_switch_enabled,
                 prof.security_policy.block_udp_on_tcp_only_proxy,
-                prof.security_policy.block_quic_udp_443,
-                prof.security_policy.block_encrypted_dns_bypass,
             )
         };
 
-        if target_port == self.constants.network.quic_default_port && block_quic_443 {
-            self.push_rate_limited_warn(
-                "quic_udp_443",
-                COMPONENT_ENGINE,
-                format!(
-                    "Blocked QUIC UDP/{} datagram from PID={} process=\"{}\" -> {}:{} (blockQuicUdp443=true)",
-                    target_port, pid, process_name, raw_host, target_port
-                ),
-            );
-            eval.matched_rule_name = "SecurityPolicy:blockQuicUdp443".to_string();
-            eval.action = RuleAction::Block;
-        } else if target_port == self.constants.dns.dns_over_tls_port && block_encrypted_dns {
-            self.push_rate_limited_warn(
-                "doq_udp_853",
-                COMPONENT_DNS,
-                format!(
-                    "Blocked encrypted DNS (UDP/{}) datagram from PID={} process=\"{}\" -> {}:{}",
-                    target_port, pid, process_name, raw_host, target_port
-                ),
-            );
-            eval.matched_rule_name = "SecurityPolicy:blockEncryptedDnsBypass".to_string();
-            eval.action = RuleAction::Block;
+        let mut policy_reason: Option<BlockReason> = None;
+        let udp_override = port_policy_override(
+            &self.profile.read().security_policy,
+            self.policy_ports(),
+            TransportProtocol::Udp,
+            target_port,
+        );
+        if let Some(over) = udp_override {
+            match over.reason {
+                BlockReason::QuicBlocked => {
+                    self.push_rate_limited_warn(
+                        "quic_udp_443",
+                        COMPONENT_ENGINE,
+                        format!(
+                            "Blocked QUIC UDP/{} datagram from PID={} process=\"{}\" -> {}:{} (blockQuicUdp443=true)",
+                            target_port, pid, process_name, raw_host, target_port
+                        ),
+                    );
+                }
+                _ => {
+                    self.push_rate_limited_warn(
+                        "doq_udp_853",
+                        COMPONENT_DNS,
+                        format!(
+                            "Blocked encrypted DNS (UDP/{}) datagram from PID={} process=\"{}\" -> {}:{}",
+                            target_port, pid, process_name, raw_host, target_port
+                        ),
+                    );
+                }
+            }
+            over.apply(&mut eval);
+            policy_reason = Some(over.reason);
         }
 
         // Decision 3: Fragmented UDP datagram whose rule is Proxy/Chain is blocked when kill switch is active.
@@ -218,8 +252,9 @@ impl RouteWardController {
                 ),
             );
             if kill_switch_enabled {
-                eval.matched_rule_name = "SecurityPolicy:FragmentedUdpBlocked".to_string();
+                eval.matched_rule_name = FRAGMENTED_UDP_RULE_NAME.to_string();
                 eval.action = RuleAction::Block;
+                policy_reason = Some(BlockReason::FragmentedUdpBlocked);
             } else {
                 eval.action = RuleAction::Direct;
             }
@@ -236,26 +271,20 @@ impl RouteWardController {
 
         match &eval.action {
             RuleAction::Block => {
-                self.telemetry.record_connection(
-                    TrackedConnection {
-                        id: Uuid::new_v4().to_string(),
-                        pid,
-                        process_name: proc_basename,
-                        process_path: proc_path_str,
-                        target_host: raw_host,
-                        resolved_domain: eval.effective_domain,
-                        target_port,
-                        protocol: TransportProtocol::Udp,
-                        matched_rule: eval.matched_rule_name.clone(),
-                        route_label: ROUTE_BLOCK_LABEL.to_string(),
-                        latency_ms: 0,
-                        rx_bytes: 0,
-                        tx_bytes: 0,
-                        status: ConnectionStatus::Blocked,
-                        started_at: Utc::now(),
-                        error_detail: None,
-                    },
-                    false,
+                let reason =
+                    policy_reason.unwrap_or_else(|| block_reason_for_rule(&eval.matched_rule_id));
+                self.record_blocked_udp(
+                    client_addr,
+                    BlockedRecord::new(
+                        reason,
+                        TransportProtocol::Udp,
+                        eval.matched_rule_name.clone(),
+                    )
+                    .process(proc_basename, proc_path_str, pid)
+                    .target(raw_host, target_port)
+                    .with_ip(target_ip_str.clone())
+                    .with_domain(eval.effective_domain)
+                    .with_rule_id(eval.matched_rule_id),
                 );
                 Err(RouteWardError::BlockedByPolicy {
                     key: ERR_KEY_RULE_BLOCKED,
@@ -318,26 +347,23 @@ impl RouteWardController {
                                     err
                                 ),
                             );
-                            self.telemetry.record_connection(
-                                TrackedConnection {
-                                    id: Uuid::new_v4().to_string(),
-                                    pid,
-                                    process_name: proc_basename,
-                                    process_path: proc_path_str,
-                                    target_host: raw_host,
-                                    resolved_domain: eval.effective_domain,
-                                    target_port,
-                                    protocol: TransportProtocol::Udp,
-                                    matched_rule: eval.matched_rule_name,
-                                    route_label: ROUTE_BLOCK_LABEL.to_string(),
-                                    latency_ms: 0,
-                                    rx_bytes: 0,
-                                    tx_bytes: 0,
-                                    status: ConnectionStatus::Blocked,
-                                    started_at: Utc::now(),
-                                    error_detail: None,
-                                },
-                                false,
+                            let reason = match BlockReason::from_upstream_error(&err) {
+                                BlockReason::FakeIpEgressGuard => BlockReason::FakeIpEgressGuard,
+                                _ => BlockReason::KillSwitchDirectUdpFailed,
+                            };
+                            self.record_blocked_udp(
+                                client_addr,
+                                BlockedRecord::new(
+                                    reason,
+                                    TransportProtocol::Udp,
+                                    eval.matched_rule_name,
+                                )
+                                .process(proc_basename, proc_path_str, pid)
+                                .target(raw_host, target_port)
+                                .with_ip(target_ip_str.clone())
+                                .with_domain(eval.effective_domain)
+                                .with_rule_id(eval.matched_rule_id)
+                                .with_error(err.to_string()),
                             );
                         }
                         return Err(err);
@@ -465,26 +491,20 @@ impl RouteWardController {
                                     pid, proc_basename, raw_host, target_port, eval.matched_rule_name, err
                                 ),
                             );
-                            self.telemetry.record_connection(
-                                TrackedConnection {
-                                    id: Uuid::new_v4().to_string(),
-                                    pid,
-                                    process_name: proc_basename,
-                                    process_path: proc_path_str,
-                                    target_host: raw_host,
-                                    resolved_domain: eval.effective_domain,
-                                    target_port,
-                                    protocol: TransportProtocol::Udp,
-                                    matched_rule: eval.matched_rule_name,
-                                    route_label: ROUTE_BLOCK_LABEL.to_string(),
-                                    latency_ms: 0,
-                                    rx_bytes: 0,
-                                    tx_bytes: 0,
-                                    status: ConnectionStatus::Blocked,
-                                    started_at: Utc::now(),
-                                    error_detail: None,
-                                },
-                                false,
+                            self.record_blocked_udp(
+                                client_addr,
+                                BlockedRecord::new(
+                                    BlockReason::from_upstream_error(&err),
+                                    TransportProtocol::Udp,
+                                    eval.matched_rule_name,
+                                )
+                                .process(proc_basename, proc_path_str, pid)
+                                .target(raw_host, target_port)
+                                .with_ip(target_ip_str.clone())
+                                .with_domain(eval.effective_domain)
+                                .with_rule_id(eval.matched_rule_id)
+                                .with_proxy(Some(target_id.clone()))
+                                .with_error(err.to_string()),
                             );
                         }
                         Err(err)
@@ -594,26 +614,19 @@ impl RouteWardController {
                                     pid, proc_basename, raw_host, target_port, eval.matched_rule_name, err
                                 ),
                             );
-                            self.telemetry.record_connection(
-                                TrackedConnection {
-                                    id: Uuid::new_v4().to_string(),
-                                    pid,
-                                    process_name: proc_basename,
-                                    process_path: proc_path_str,
-                                    target_host: raw_host,
-                                    resolved_domain: eval.effective_domain,
-                                    target_port,
-                                    protocol: TransportProtocol::Udp,
-                                    matched_rule: eval.matched_rule_name,
-                                    route_label: ROUTE_BLOCK_LABEL.to_string(),
-                                    latency_ms: 0,
-                                    rx_bytes: 0,
-                                    tx_bytes: 0,
-                                    status: ConnectionStatus::Blocked,
-                                    started_at: Utc::now(),
-                                    error_detail: None,
-                                },
-                                false,
+                            self.record_blocked_udp(
+                                client_addr,
+                                BlockedRecord::new(
+                                    BlockReason::from_upstream_error(&err),
+                                    TransportProtocol::Udp,
+                                    eval.matched_rule_name,
+                                )
+                                .process(proc_basename, proc_path_str, pid)
+                                .target(raw_host, target_port)
+                                .with_ip(target_ip_str.clone())
+                                .with_domain(eval.effective_domain)
+                                .with_rule_id(eval.matched_rule_id)
+                                .with_error(err.to_string()),
                             );
                         }
                         Err(err)
@@ -658,26 +671,16 @@ impl RouteWardController {
                             "Blocked public FQDN \"{qname}\" on local name resolution protocol (LLMNR/mDNS) from {peer_addr}"
                         ),
                     );
-                    self.telemetry.record_connection(
-                        TrackedConnection {
-                            id: Uuid::new_v4().to_string(),
-                            pid: 0,
-                            process_name: "local-name-proto".to_string(),
-                            process_path: "local-name-proto".to_string(),
-                            target_host: qname.clone(),
-                            resolved_domain: Some(qname),
-                            target_port: orig_dst.port(),
-                            protocol: TransportProtocol::Udp,
-                            matched_rule: "SecurityPolicy:LocalNamePublicFqdnBlocked".to_string(),
-                            route_label: ROUTE_BLOCK_LABEL.to_string(),
-                            latency_ms: 0,
-                            rx_bytes: 0,
-                            tx_bytes: 0,
-                            status: ConnectionStatus::Blocked,
-                            started_at: Utc::now(),
-                            error_detail: None,
-                        },
-                        false,
+                    self.record_blocked_udp(
+                        peer_addr,
+                        BlockedRecord::new(
+                            BlockReason::LocalNameGuard,
+                            TransportProtocol::Udp,
+                            LOCAL_NAME_GUARD_RULE_NAME,
+                        )
+                        .process(LOCAL_NAME_PROCESS_NAME, LOCAL_NAME_PROCESS_NAME, 0)
+                        .target(qname.clone(), orig_dst.port())
+                        .with_domain(Some(qname)),
                     );
                 }
                 LocalNameQueryDecision::BlockMalformed => {}
@@ -774,26 +777,14 @@ impl RouteWardController {
         );
 
         if proc_name == "unknown" && eval_action == RuleAction::Block {
-            self.telemetry.record_connection(
-                TrackedConnection {
-                    id: Uuid::new_v4().to_string(),
-                    pid,
-                    process_name: proc_name,
-                    process_path: proc_path,
-                    target_host,
-                    resolved_domain: effective_domain,
-                    target_port,
-                    protocol: TransportProtocol::Udp,
-                    matched_rule: matched_rule_name,
-                    route_label: ROUTE_BLOCK_LABEL.to_string(),
-                    latency_ms: 0,
-                    rx_bytes: 0,
-                    tx_bytes: 0,
-                    status: ConnectionStatus::Blocked,
-                    started_at: Utc::now(),
-                    error_detail: None,
-                },
-                false,
+            let reason = block_reason_for_decision(None, &matched_rule_name);
+            self.record_blocked_udp(
+                peer_addr,
+                BlockedRecord::new(reason, TransportProtocol::Udp, matched_rule_name)
+                    .process(proc_name, proc_path, pid)
+                    .target(target_host.clone(), target_port)
+                    .with_ip(Some(target_host))
+                    .with_domain(effective_domain),
             );
             return;
         }
