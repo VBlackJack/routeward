@@ -406,7 +406,9 @@ describe('Core UI view components', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:10853',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'fr'
+      activeLocale: 'fr',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     };
     const securityPolicy: SecurityPolicyConfig = {
       killSwitchEnabled: true,
@@ -584,7 +586,9 @@ describe('Core UI view components', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:10853',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'fr'
+      activeLocale: 'fr',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     };
     const logs: LogEntry[] = [
       {
@@ -820,7 +824,9 @@ describe('Core UI view components', () => {
           relayHttpEndpoint: '127.0.0.1:10809',
           dnsEndpoint: '127.0.0.1:1053',
           fakeIpCidr: '198.18.0.0/15',
-          activeLocale: 'en'
+          activeLocale: 'en',
+          pausedUntilEpochMs: null,
+          autoStartErrorKey: null
         }}
         securityPolicy={{
           killSwitchEnabled: true,
@@ -1001,7 +1007,9 @@ describe('Core UI view components', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:5353',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'en'
+      activeLocale: 'en',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     };
     const securityPolicy: SecurityPolicyConfig = {
       killSwitchEnabled: true,
@@ -1227,7 +1235,9 @@ describe('Core UI view components', () => {
           relayHttpEndpoint: '127.0.0.1:10809',
           dnsEndpoint: '127.0.0.1:10853',
           fakeIpCidr: '198.18.0.0/15',
-          activeLocale: 'en'
+          activeLocale: 'en',
+          pausedUntilEpochMs: null,
+          autoStartErrorKey: null
         }}
         securityPolicy={{
           killSwitchEnabled: true,
@@ -1461,7 +1471,9 @@ describe('Core UI view components', () => {
           relayHttpEndpoint: '127.0.0.1:10809',
           dnsEndpoint: '127.0.0.1:5353',
           fakeIpCidr: '198.18.0.0/15',
-          activeLocale: 'fr'
+          activeLocale: 'fr',
+          pausedUntilEpochMs: null,
+          autoStartErrorKey: null
         }}
         dnsCount={0}
         securityPolicy={{
@@ -1653,7 +1665,9 @@ describe('Core UI view components', () => {
           relayHttpEndpoint: '127.0.0.1:10809',
           dnsEndpoint: '127.0.0.1:5353',
           fakeIpCidr: '198.18.0.0/15',
-          activeLocale: 'fr'
+          activeLocale: 'fr',
+          pausedUntilEpochMs: null,
+          autoStartErrorKey: null
         }}
         dnsCount={0}
         securityPolicy={{

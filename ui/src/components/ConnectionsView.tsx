@@ -46,6 +46,8 @@ import {
   RoutingRule,
   TrackedConnection
 } from '../types/routeward';
+import { findConnectionToExplain } from '../services/activityWhy';
+import { ActivityWhy } from './ActivityWhy';
 import { ExperienceMode } from './QuickSetupWizardModal';
 
 interface ConnectionsViewProps {
@@ -392,6 +394,13 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                     <div className="text-xs text-tf-secondary">
                       {group.domains.join(', ')}
                     </div>
+                    {(() => {
+                      const failing = findConnectionToExplain(
+                        connections,
+                        group.processName
+                      );
+                      return failing ? <ActivityWhy connection={failing} /> : null;
+                    })()}
                   </div>
 
                 <div className="flex flex-wrap items-center gap-2">

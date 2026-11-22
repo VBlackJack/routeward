@@ -67,6 +67,8 @@ interface SettingsViewProps {
   activeAccent: AccentTint;
   language: 'en' | 'fr';
   onUpdateSecurityPolicy: (partial: Partial<SecurityPolicyConfig>) => void;
+  /** When given, the all-in-one shield asks for confirmation, remembers the user's mix and offers undo. */
+  onToggleAllShields?: (next: boolean) => void;
   onSetInterceptionMode: (mode: InterceptionMode) => void;
   onToggleSystemProxy: () => Promise<void>;
   onOpenThemeForge: () => void;
@@ -108,6 +110,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   activeAccent,
   language,
   onUpdateSecurityPolicy,
+  onToggleAllShields,
   onSetInterceptionMode,
   onToggleSystemProxy,
   onOpenThemeForge,
@@ -155,6 +158,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleToggleAllShields = () => {
     const next = !allShieldsActive;
+    if (onToggleAllShields) {
+      onToggleAllShields(next);
+      return;
+    }
     onUpdateSecurityPolicy({
       killSwitchEnabled: next,
       blockUdpOnTcpOnlyProxy: next,

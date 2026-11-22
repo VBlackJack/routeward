@@ -32,6 +32,14 @@ import {
 } from 'lucide-react';
 import { formatBytes, formatSampleTime } from '../services/format';
 import {
+  computeProtectionHealth,
+  formatPauseEnd,
+  PROTECTION_HEALTH_TEXTS,
+  ProtectionHealth
+} from '../services/protectionHealth';
+import { UseCaseId } from '../services/protectionPresets';
+import {
+  ProxyChain,
   ProxyHealthReport,
   ProxyNode,
   RoutingRule,
@@ -43,7 +51,7 @@ import { HelpTooltip } from './HelpTooltip';
 import { ExperienceMode } from './QuickSetupWizardModal';
 import { SimpleDashboardView } from './SimpleDashboardView';
 
-export type DashboardUseCaseId = 'privacy' | 'work' | 'gaming' | 'strict';
+export type DashboardUseCaseId = UseCaseId;
 
 interface DashboardViewProps {
   telemetry: TelemetrySnapshot;
@@ -52,9 +60,13 @@ interface DashboardViewProps {
   securityPolicy: SecurityPolicyConfig;
   experienceMode: ExperienceMode;
   proxies?: ProxyNode[];
+  chains?: ProxyChain[];
   rules?: RoutingRule[];
+  /** The shared protection state; computed from the diagnostics when the parent gives none. */
+  health?: ProtectionHealth;
+  /** Changes each time the user asks for a protection check from outside (for example the wizard). */
+  verifyRequestId?: number;
   startingProtection?: boolean;
-  pauseRemainingSec?: number | null;
   onToggleEngine?: () => void;
   onTemporaryPause?: (minutes: number) => Promise<void> | void;
   onStartAndEnableProtection?: () => Promise<void> | void;
@@ -81,9 +93,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   securityPolicy,
   experienceMode,
   proxies = [],
+  chains = [],
   rules = [],
+  health: healthProp,
+  verifyRequestId = 0,
   startingProtection = false,
-  pauseRemainingSec = null,
   onToggleEngine,
   onTemporaryPause,
   onStartAndEnableProtection,
@@ -98,7 +112,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onNavigateRules,
   onSwitchToExpert
 }) => {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const health =
+    healthProp ??
+    computeProtectionHealth({
+      diagnostics,
+      primaryProxy: proxies.find((p) => p.enabled) ?? null,
+      proxyReachability: 'unknown'
+    });
 
   if (experienceMode === 'simple') {
     return (
@@ -107,9 +128,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         diagnostics={diagnostics}
         securityPolicy={securityPolicy}
         proxies={proxies}
+        chains={chains}
         rules={rules}
+        health={health}
+        verifyRequestId={verifyRequestId}
         startingProtection={startingProtection}
-        pauseRemainingSec={pauseRemainingSec}
         onToggleEngine={onToggleEngine}
         onTemporaryPause={onTemporaryPause}
         onStartAndEnableProtection={onStartAndEnableProtection}
@@ -127,7 +150,23 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     );
   }
 
-  const isEngineRunning = diagnostics.daemonConnected && diagnostics.running;
+  const healthTexts = PROTECTION_HEALTH_TEXTS[health.state];
+  const healthTime =
+    health.pausedUntilEpochMs !== null
+      ? formatPauseEnd(health.pausedUntilEpochMs, i18n.language)
+      : '';
+  const toneBorder =
+    health.tone === 'ok'
+      ? 'border-l-tf-green'
+      : health.tone === 'warn'
+        ? 'border-l-tf-orange'
+        : 'border-l-tf-red';
+  const toneIconBox =
+    health.tone === 'ok'
+      ? 'bg-tf-green/20 text-tf-green'
+      : health.tone === 'warn'
+        ? 'bg-tf-orange/20 text-tf-orange'
+        : 'bg-tf-red/20 text-tf-red';
 
   const totalActions =
     telemetry.proxiedCount + telemetry.directCount + telemetry.blockedCount || 1;
@@ -151,19 +190,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     <div className="space-y-6">
       {/* Health Summary Banner (Expert mode) */}
       <div
-        className={`tf-card flex flex-wrap items-center justify-between gap-4 border-l-4 p-5 ${
-          isEngineRunning ? 'border-l-tf-green' : 'border-l-tf-red'
-        }`}
+        className={`tf-card flex flex-wrap items-center justify-between gap-4 border-l-4 p-5 ${toneBorder}`}
       >
         <div className="flex items-start gap-3.5">
           <div
-            className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-tf-lg ${
-              isEngineRunning
-                ? 'bg-tf-green/20 text-tf-green'
-                : 'bg-tf-red/20 text-tf-red'
-            }`}
+            className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-tf-lg ${toneIconBox}`}
           >
-            {isEngineRunning ? (
+            {health.tone === 'ok' ? (
               <ShieldCheck className="h-6 w-6" />
             ) : (
               <ShieldAlert className="h-6 w-6" />
@@ -172,26 +205,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-bold text-tf-primary">
-                {isEngineRunning
-                  ? t('dashboard.health_banner.protected_title')
-                  : t('dashboard.health_banner.paused_title')}
+                {t(healthTexts.title, { time: healthTime })}
               </h2>
               <span
-                className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${
-                  isEngineRunning
-                    ? 'bg-tf-green/20 text-tf-green'
-                    : 'bg-tf-red/20 text-tf-red'
-                }`}
+                className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${toneIconBox}`}
               >
-                {isEngineRunning
-                  ? t('dashboard.health_banner.status_badge_ok')
-                  : t('dashboard.health_banner.status_badge_off')}
+                {t(healthTexts.badge)}
               </span>
             </div>
             <p className="mt-1 max-w-2xl text-xs text-tf-secondary">
-              {isEngineRunning
-                ? t('dashboard.health_banner.protected_desc')
-                : t('dashboard.health_banner.paused_desc')}
+              {t(healthTexts.desc, { time: healthTime })}
             </p>
           </div>
         </div>

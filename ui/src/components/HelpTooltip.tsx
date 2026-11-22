@@ -23,27 +23,43 @@ interface HelpTooltipProps {
 
 export const HelpTooltip: React.FC<HelpTooltipProps> = ({ text }) => {
   const [open, setOpen] = useState(false);
+  // A click pins the tooltip so that hovering first and then clicking does not close it.
+  const [pinned, setPinned] = useState(false);
   const tooltipId = useId();
+
+  const close = () => {
+    setOpen(false);
+    setPinned(false);
+  };
 
   return (
     <span
       className="relative inline-flex items-center"
       onMouseEnter={() => setOpen(true)}
-      onMouseLeave={() => setOpen(false)}
+      onMouseLeave={() => {
+        if (!pinned) {
+          setOpen(false);
+        }
+      }}
     >
       <button
         type="button"
         onClick={(e) => {
           e.stopPropagation();
-          setOpen((prev) => !prev);
+          if (pinned) {
+            close();
+          } else {
+            setOpen(true);
+            setPinned(true);
+          }
         }}
         onFocus={() => setOpen(true)}
-        onBlur={() => setOpen(false)}
+        onBlur={close}
         onKeyDown={(e) => {
           if (e.key === 'Escape' && open) {
             // Close only the tooltip, not the surrounding modal.
             e.stopPropagation();
-            setOpen(false);
+            close();
           }
         }}
         className="inline-flex h-6 w-6 items-center justify-center rounded-full text-tf-secondary transition hover:bg-tf-surface-alt hover:text-tf-accent"

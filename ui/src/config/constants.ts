@@ -35,7 +35,8 @@ export const UI_CONFIG = {
     PROFILE: 'routeward_active_profile',
     EXPERIENCE_MODE: 'routeward_ux_mode',
     WIZARD_COMPLETED: 'routeward_wizard_done',
-    NETWORK_PROFILE_RULES: 'routeward_network_profiles'
+    NETWORK_PROFILE_RULES: 'routeward_network_profiles',
+    SERVICE_NOTICE_SHOWN: 'routeward_service_notice_shown'
   },
   NETWORK_POLL_INTERVAL_MS: 15000,
   TELEMETRY_REFRESH_INTERVAL_MS: 1000,
@@ -105,6 +106,14 @@ export const UI_CONFIG = {
   TOAST_DURATION_MS: 3200,
   /** Extended auto-dismiss delay for toasts that carry an Undo action. */
   TOAST_UNDO_DURATION_MS: 6000,
+  /** Seconds in one minute, used to turn a pause length in minutes into the daemon's seconds. */
+  SECONDS_PER_MINUTE: 60,
+  /** Pause length (minutes) offered by the outage banner and the troubleshooter. */
+  OUTAGE_PAUSE_MINUTES: 15,
+  /** A pause that ended up to this long before now (ms) counts as having run its course. */
+  PAUSE_RESUME_TOAST_TOLERANCE_MS: 5000,
+  /** Delay between two refreshes of the pause countdown (milliseconds). */
+  PAUSE_COUNTDOWN_TICK_MS: 1000,
   /** Quick temporary pause durations (in minutes) shown in Simple mode. */
   TEMPORARY_PAUSE_OPTIONS_MINUTES: [15, 60] as const,
   /** Stable identifier of the automatic backup-proxy failover chain managed in Simple mode. */
@@ -238,6 +247,7 @@ export const UI_CONFIG = {
     STATE: '/api/state',
     EVENTS: '/api/events',
     ENGINE_TOGGLE: '/api/engine/toggle',
+    ENGINE_PAUSE: '/api/engine/pause',
     ENGINE_MODE: '/api/engine/mode',
     PROFILE_REPLACE: '/api/profile/replace',
     THEME: '/api/theme',

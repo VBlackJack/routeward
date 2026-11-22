@@ -264,6 +264,10 @@ export interface SystemDiagnostics {
   dnsEndpoint: string;
   fakeIpCidr: string;
   activeLocale: string;
+  /** Unix time in milliseconds at which a running pause ends, null when protection is not paused. */
+  pausedUntilEpochMs: number | null;
+  /** Error key of the last failed automatic start of protection, null when there is none. */
+  autoStartErrorKey: string | null;
 }
 
 export interface FakeIpEntry {

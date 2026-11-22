@@ -48,6 +48,7 @@ import {
   TrackedConnection
 } from '../types/routeward';
 import { ParsedSseFrame, parseSseChunk, runRealtimeSseLoop } from './sse';
+import { detectInitialLocale } from './locale';
 import {
   formatProxyUri as formatProxyUriHelper,
   generateClientId,
@@ -113,11 +114,7 @@ function createInitialProfile(): ProfileConfig {
 
 function createInitialDiagnostics(profile: ProfileConfig): SystemDiagnostics {
   const net = SYSTEM_CONSTANTS.network;
-  const savedLocale =
-    typeof window !== 'undefined'
-      ? window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.LOCALE) ||
-        UI_CONFIG.DEFAULT_LOCALE
-      : UI_CONFIG.DEFAULT_LOCALE;
+  const savedLocale = detectInitialLocale();
   return {
     daemonConnected: false,
     running: false,
@@ -128,7 +125,9 @@ function createInitialDiagnostics(profile: ProfileConfig): SystemDiagnostics {
     relayHttpEndpoint: `${net.localBindHost}:${net.defaultRelayHttpPort}`,
     dnsEndpoint: `${net.localBindHost}:${net.defaultDnsListenPort}`,
     fakeIpCidr: profile.dnsConfig.fakeIpCidr,
-    activeLocale: savedLocale
+    activeLocale: savedLocale,
+    pausedUntilEpochMs: null,
+    autoStartErrorKey: null
   };
 }
 
@@ -678,6 +677,29 @@ export class RouteWardClientService {
         UI_CONFIG.API_ENDPOINTS.ENGINE_TOGGLE,
         'POST',
         { start }
+      );
+      this.diagnostics = diag;
+      await this.fetchState();
+      return this.diagnostics;
+    } catch (err) {
+      this.handleRequestFailure(err);
+      if (err instanceof HttpResponseError) {
+        throw err;
+      }
+    }
+    return this.diagnostics;
+  }
+
+  /**
+   * Pauses protection for `seconds`. The daemon owns the deadline and resumes by itself, so the
+   * pause survives a closed window; the end time comes back in `pausedUntilEpochMs`.
+   */
+  public async pauseEngine(seconds: number): Promise<SystemDiagnostics> {
+    try {
+      const diag = await this.requestJson<SystemDiagnostics>(
+        UI_CONFIG.API_ENDPOINTS.ENGINE_PAUSE,
+        'POST',
+        { seconds }
       );
       this.diagnostics = diag;
       await this.fetchState();
@@ -1293,6 +1315,14 @@ export class RouteWardClientService {
     } catch {
       return [];
     }
+  }
+
+  /** Like `detectExistingProxies` but lets a failed detection reach the caller. */
+  public async detectExistingProxiesStrict(): Promise<DetectedProxyCandidate[]> {
+    return this.requestJson<DetectedProxyCandidate[]>(
+      UI_CONFIG.API_ENDPOINTS.SYSTEM_DETECT_PROXIES,
+      'GET'
+    );
   }
 
   public async getCurrentNetworkInfo(): Promise<CurrentNetworkInfo> {

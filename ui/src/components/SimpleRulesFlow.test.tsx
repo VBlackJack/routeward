@@ -618,7 +618,9 @@ describe('App proxy lifecycle handlers', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:5353',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'fr'
+      activeLocale: 'fr',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     });
     upsertRule = vi
       .spyOn(routewardClient, 'upsertRule')
