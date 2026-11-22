@@ -259,7 +259,9 @@ impl RouteWardController {
         controller.telemetry.push_log(
             LogLevel::Info,
             COMPONENT_ENGINE,
-            controller.i18n.t("cli.engine.startup.loaded_profile"),
+            controller
+                .i18n
+                .t_english("cli.engine.startup.loaded_profile"),
         );
 
         controller
@@ -347,7 +349,7 @@ impl RouteWardController {
             COMPONENT_ENGINE,
             format!(
                 "{}: {relay_addr}",
-                self.i18n.t("cli.engine.startup.listening_socks")
+                self.i18n.t_english("cli.engine.startup.listening_socks")
             ),
         );
         self.telemetry.push_log(
@@ -355,7 +357,8 @@ impl RouteWardController {
             COMPONENT_TRANSPARENT,
             format!(
                 "{}: {transparent_addr}",
-                self.i18n.t("cli.engine.startup.listening_transparent")
+                self.i18n
+                    .t_english("cli.engine.startup.listening_transparent")
             ),
         );
         self.telemetry.push_log(
@@ -401,7 +404,7 @@ impl RouteWardController {
         self.telemetry.push_log(
             LogLevel::Info,
             COMPONENT_ENGINE,
-            self.i18n.t("cli.engine.startup.banner"),
+            self.i18n.t_english("cli.engine.startup.banner"),
         );
 
         // Bind first, spawn after: a listener that cannot be bound would otherwise leave the
@@ -522,7 +525,8 @@ impl RouteWardController {
                         COMPONENT_TRANSPARENT,
                         format!(
                             "{}: [{}]:{}",
-                            self.i18n.t("cli.engine.startup.listening_transparent"),
+                            self.i18n
+                                .t_english("cli.engine.startup.listening_transparent"),
                             v6_ip,
                             port
                         ),
@@ -1119,7 +1123,8 @@ impl RouteWardController {
             COMPONENT_ENGINE,
             format!(
                 "{}: {backend_name}",
-                self.i18n.t("cli.engine.startup.interception_active")
+                self.i18n
+                    .t_english("cli.engine.startup.interception_active")
             ),
         );
         Ok(backend_name)
@@ -1140,7 +1145,7 @@ impl RouteWardController {
         self.telemetry.push_log(
             LogLevel::Info,
             COMPONENT_ENGINE,
-            self.i18n.t("app.header.engine.stopped"),
+            self.i18n.t_english("app.header.engine.stopped"),
         );
         self.telemetry.flush_file_logger();
     }
@@ -1198,7 +1203,7 @@ impl RouteWardController {
                     COMPONENT_DNS,
                     format!(
                         "{} ({stage} via {method})",
-                        self.i18n.t("cli.engine.startup.dns_cache_flushed")
+                        self.i18n.t_english("cli.engine.startup.dns_cache_flushed")
                     ),
                 );
             }
@@ -2101,14 +2106,14 @@ impl RouteWardController {
         let msg = if report.reachable {
             format!(
                 "{}: {} ({} ms)",
-                self.i18n.t("cli.engine.check.result_online"),
+                self.i18n.t_english("cli.engine.check.result_online"),
                 node.name,
                 report.latency_ms.unwrap_or(0)
             )
         } else {
             format!(
                 "{}: {}",
-                self.i18n.t("cli.engine.check.result_offline"),
+                self.i18n.t_english("cli.engine.check.result_offline"),
                 node.name
             )
         };
@@ -2393,7 +2398,7 @@ impl RouteWardController {
             COMPONENT_ENGINE,
             format!(
                 "{} (securityPolicyChanged={security_changed}, dnsConfigChanged={dns_changed})",
-                self.i18n.t("cli.engine.startup.reloaded_live")
+                self.i18n.t_english("cli.engine.startup.reloaded_live")
             ),
         );
     }

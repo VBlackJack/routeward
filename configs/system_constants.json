@@ -158,7 +158,16 @@
     "eventBroadcastCapacity": 256,
     "udpFlowIdleTimeoutMs": 30000,
     "telemetryUpdateIntervalMs": 250,
-    "maxBlockedSummaryEntries": 500
+    "maxBlockedSummaryEntries": 500,
+    "logRetentionDays": 14,
+    "logQueryMaxReadBytes": 2097152,
+    "logQueryMaxEntries": 1000,
+    "diagnosticsMaxLogDays": 14,
+    "diagnosticsDefaultLogDays": 3,
+    "diagnosticsLogsMaxBytes": 3145728,
+    "diagnosticsBundleMaxBytes": 6291456,
+    "analyzerUnattributedDropsThreshold": 20,
+    "analyzerLogFolderLargeBytes": 268435456
   },
   "ipc": {
     "unixSocketPath": "/run/routeward/routeward.sock",

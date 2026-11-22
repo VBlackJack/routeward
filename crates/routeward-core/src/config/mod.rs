@@ -638,6 +638,69 @@ pub struct TelemetryConstants {
     /// with the oldest `lastSeen` is evicted first.
     #[serde(default = "default_max_blocked_summary_entries")]
     pub max_blocked_summary_entries: usize,
+    /// Daily log files older than this many days are deleted from the log directory.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+    /// Most bytes one log query reads from a daemon log file.
+    #[serde(default = "default_log_query_max_read_bytes")]
+    pub log_query_max_read_bytes: usize,
+    /// Most entries one log query returns, whatever limit the client asks for.
+    #[serde(default = "default_log_query_max_entries")]
+    pub log_query_max_entries: usize,
+    /// Most days of daemon log files a diagnostic bundle includes.
+    #[serde(default = "default_diagnostics_max_log_days")]
+    pub diagnostics_max_log_days: u32,
+    /// Days of logs a diagnostic export includes when the caller does not choose.
+    #[serde(default = "default_diagnostics_default_log_days")]
+    pub diagnostics_default_log_days: u32,
+    /// Most bytes of log text a diagnostic bundle includes.
+    #[serde(default = "default_diagnostics_logs_max_bytes")]
+    pub diagnostics_logs_max_bytes: usize,
+    /// Most bytes a whole diagnostic bundle may reach (it must fit in one IPC line).
+    #[serde(default = "default_diagnostics_bundle_max_bytes")]
+    pub diagnostics_bundle_max_bytes: usize,
+    /// Dropped unattributed packets from which the check-up reports them.
+    #[serde(default = "default_analyzer_unattributed_drops_threshold")]
+    pub analyzer_unattributed_drops_threshold: u64,
+    /// Log directory size (bytes) from which the check-up reports it as large.
+    #[serde(default = "default_analyzer_log_folder_large_bytes")]
+    pub analyzer_log_folder_large_bytes: u64,
+}
+
+fn default_log_retention_days() -> u32 {
+    14
+}
+
+fn default_log_query_max_read_bytes() -> usize {
+    2_097_152
+}
+
+fn default_log_query_max_entries() -> usize {
+    1000
+}
+
+fn default_diagnostics_max_log_days() -> u32 {
+    14
+}
+
+fn default_diagnostics_default_log_days() -> u32 {
+    3
+}
+
+fn default_diagnostics_logs_max_bytes() -> usize {
+    3_145_728
+}
+
+fn default_diagnostics_bundle_max_bytes() -> usize {
+    6_291_456
+}
+
+fn default_analyzer_unattributed_drops_threshold() -> u64 {
+    20
+}
+
+fn default_analyzer_log_folder_large_bytes() -> u64 {
+    268_435_456
 }
 
 fn default_max_blocked_summary_entries() -> usize {

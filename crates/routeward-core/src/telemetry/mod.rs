@@ -331,6 +331,7 @@ impl TelemetryHub {
             enable_logging,
             constants.log_flush_interval_ms,
         );
+        file_logger.set_retention_days(constants.log_retention_days);
         let broadcast_cap = constants
             .event_broadcast_capacity
             .max(MIN_BROADCAST_CAPACITY);
@@ -371,6 +372,11 @@ impl TelemetryHub {
     /// Subscribes to live [`TelemetryEvent`] notifications (telemetry ticks, connection updates, logs).
     pub fn subscribe(&self) -> broadcast::Receiver<TelemetryEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Directory of the daily log files this hub writes to.
+    pub fn log_dir(&self) -> &std::path::Path {
+        self.file_logger.log_dir()
     }
 
     pub fn set_file_logging_enabled(&self, enabled: bool) {
@@ -828,7 +834,8 @@ impl TelemetryHub {
             tracing::debug!(component = component, "{}", msg);
             return;
         }
-        self.file_logger.log(level, component, &msg);
+        self.file_logger
+            .log_with_context(level, component, &msg, context.as_ref());
         let entry = LogEntry {
             id: Uuid::new_v4().to_string(),
             timestamp: Utc::now(),
@@ -1014,6 +1021,9 @@ mod tests {
             udp_flow_idle_timeout_ms: 30000,
             telemetry_update_interval_ms: 250,
             max_blocked_summary_entries: 500,
+            ..crate::config::SystemConstants::load_embedded()
+                .expect("SystemConstants")
+                .telemetry
         };
         let hub = TelemetryHub::new_with_logging(&constants, false);
         let base_time = Utc::now();

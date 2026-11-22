@@ -443,7 +443,7 @@ impl RouteWardController {
                                 COMPONENT_PROXY,
                                 format!(
                                     "{}: node=\"{}\" (id={}, reason={}; cached for {}s)",
-                                    ctrl_warn.i18n.t(ERR_KEY_UDP_NOT_SUPPORTED),
+                                    ctrl_warn.i18n.t_english(ERR_KEY_UDP_NOT_SUPPORTED),
                                     unsupported_node.name,
                                     unsupported_node.id,
                                     reason,
@@ -568,7 +568,7 @@ impl RouteWardController {
                                 COMPONENT_PROXY,
                                 format!(
                                     "{}: node=\"{}\" (id={}, reason={}; cached for {}s)",
-                                    ctrl_warn.i18n.t(ERR_KEY_UDP_NOT_SUPPORTED),
+                                    ctrl_warn.i18n.t_english(ERR_KEY_UDP_NOT_SUPPORTED),
                                     unsupported_node.name,
                                     unsupported_node.id,
                                     reason,
