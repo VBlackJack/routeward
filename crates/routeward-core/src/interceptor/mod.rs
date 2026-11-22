@@ -15,6 +15,8 @@
  */
 
 pub mod backend;
+#[cfg(test)]
+mod block_reason_tests;
 mod controller;
 mod dns_handler;
 pub mod dns_server_exempt;

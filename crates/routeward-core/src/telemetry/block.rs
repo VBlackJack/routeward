@@ -385,3 +385,7 @@ impl BlockedSummaryStore {
         self.entries.clear();
     }
 }
+
+#[cfg(test)]
+#[path = "block_tests.rs"]
+mod tests;

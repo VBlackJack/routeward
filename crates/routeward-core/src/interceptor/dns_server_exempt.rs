@@ -1144,8 +1144,8 @@ fn windows_ports_of(pids: &HashMap<u32, String>, state: &mut TrackerState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::telemetry::ConnectionStatus;
     use crate::config::{PortRange, SystemConstants};
+    use crate::telemetry::ConnectionStatus;
     use std::cell::Cell;
     use std::net::{Ipv4Addr, Ipv6Addr};
 

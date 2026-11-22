@@ -351,3 +351,7 @@ fn kill_switch_prediction(
     }
     None
 }
+
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod tests;

@@ -1261,3 +1261,7 @@ mod tests {
         assert!(saw_update, "tick must flush the pending counter update");
     }
 }
+
+#[cfg(test)]
+#[path = "hub_blocked_tests.rs"]
+mod hub_blocked_tests;
