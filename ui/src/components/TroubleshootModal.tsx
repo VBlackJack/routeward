@@ -62,6 +62,8 @@ export const TroubleshootModal: React.FC<TroubleshootModalProps> = ({
 }) => {
   const { t, i18n } = useTranslation();
   const titleId = useId();
+  // A pause only makes sense while protection is filtering traffic; without a known state, offer it.
+  const canPause = health === undefined || health.engineActive;
 
   const recentIssues = useMemo(() => {
     const seen = new Set<string>();
@@ -148,7 +150,7 @@ export const TroubleshootModal: React.FC<TroubleshootModalProps> = ({
                     {t('troubleshoot.proxy_down.test')}
                   </button>
                 )}
-                {onPauseProtection && (
+                {onPauseProtection && canPause && (
                   <button
                     type="button"
                     onClick={() =>

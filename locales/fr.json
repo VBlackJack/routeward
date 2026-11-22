@@ -99,7 +99,7 @@
         "tab": "Mes apps et sites"
       },
       "proxy": {
-        "tab": "Mon Proxy"
+        "tab": "Mon proxy"
       },
       "activity": {
         "tab": "Activité"
@@ -461,7 +461,7 @@
       "no_apps": "Aucune activité d'application ne correspond à votre filtre.",
       "empty_paused_cta": "Activer la protection pour voir l'activité",
       "empty_refresh_cta": "Actualiser les applications actives",
-      "switch_expert_cta": "Afficher les sockets bruts et PIDs (Avancé)"
+      "switch_expert_cta": "Afficher les outils experts"
     },
     "toolbar": {
       "search": {
@@ -546,9 +546,9 @@
       "desc": "Configurez ci-dessous votre propre serveur proxy externe SOCKS5, HTTP ou HTTPS (tunnel SSH, Tor, passerelle VPN ou proxy d'entreprise). Sans proxy actif, RouteWard fonctionne en Mode Filtrage Direct."
     },
     "simple": {
-      "title": "Mon Proxy",
+      "title": "Mon proxy",
       "subtitle": "Ajoutez votre serveur proxy ou lien d'abonnement et vérifiez qu'il répond correctement.",
-      "add": "Ajouter un Proxy",
+      "add": "Ajouter un proxy",
       "paste_link_button": "Coller un lien proxy",
       "paste_clipboard_button": "Coller du presse-papiers",
       "set_primary": "Passer en principal",
@@ -572,6 +572,7 @@
       "detect_button": "Détecter un proxy existant",
       "detecting": "Recherche...",
       "detect_empty": "Aucun proxy local ou système détecté sur cet ordinateur.",
+      "detect_failed": "La détection a échoué, réessayez.",
       "detect_import": "Importer",
       "status_unreachable": "Ne répond pas",
       "import_title": "Ajouter des liens de proxy",
@@ -981,11 +982,11 @@
     "recover": {
       "title": "Rétablissement de votre connexion Internet...",
       "engine_stopped": "La protection a été désactivée en arrière-plan.",
-      "daemon_unreachable": "La protection RouteWard n'était pas active en arrière-plan.",
+      "daemon_unreachable": "RouteWard n'a pas pu être joint en arrière-plan : il n'a donc pas pu être désactivé d'ici.",
       "engine_stop_failed": "La protection en arrière-plan n'a pas pu être désactivée. Elle risque de se réactiver plus tard.",
       "internet_restored": "Votre connexion Internet normale est rétablie.",
       "next_step": "Ouvrez RouteWard pour réactiver la protection.",
-      "failed": "RouteWard n'a pas pu rétablir vos réglages Internet. Redémarrez votre ordinateur, ou ouvrez les Paramètres Windows, allez dans Réseau et Internet, puis Proxy, et désactivez le proxy.",
+      "failed": "RouteWard n'a pas pu rétablir vos réglages Internet. Suivez les étapes \"Je n'ai plus Internet\" du guide de dépannage de RouteWard, ou ouvrez les Paramètres Windows, allez dans Réseau et Internet, puis Proxy, et désactivez le proxy.",
       "press_enter": "Appuyez sur Entrée pour fermer cette fenêtre."
     }
   },
@@ -1026,7 +1027,8 @@
       "io_timeout": "La protection en arrière-plan de RouteWard n'a pas répondu à temps. Patientez un instant puis réessayez.",
       "insecure_profile": "RouteWard a refusé de démarrer, car son dossier de réglages peut être modifié par d'autres utilisateurs. Réinstallez RouteWard pour réparer ses droits d'accès.",
       "cleanup_refused_active": "Nettoyage refusé : la protection est encore active. Arrêtez-la d'abord, ou relancez la commande avec --force.",
-      "invalid_pause": "Cette durée de pause n'est pas valide. Choisissez une durée comprise entre 1 seconde et 24 heures."
+      "invalid_pause": "Cette durée de pause n'est pas valide. Choisissez une durée comprise entre 1 seconde et 24 heures.",
+      "pause_not_active": "La protection est désactivée : il n'y a rien à mettre en pause. Activez d'abord la protection."
     },
     "service": {
       "insecure_binary_location": "RouteWard ne peut pas être installé comme service d'arrière-plan depuis ce dossier, car d'autres utilisateurs pourraient le modifier. Installez RouteWard dans Program Files puis réessayez."

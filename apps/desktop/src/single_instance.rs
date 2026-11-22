@@ -87,7 +87,11 @@ impl SingleInstance {
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 CloseHandle(mutex);
                 CloseHandle(event);
-                Self::signal_existing(event_name);
+                if !Self::signal_existing(event_name) {
+                    tracing::warn!(
+                        "Another RouteWard instance runs but could not be asked to show its window"
+                    );
+                }
                 return Ok(Acquisition::AlreadyRunning);
             }
             Ok(Acquisition::First(Self {

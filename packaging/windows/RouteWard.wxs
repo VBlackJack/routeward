@@ -296,8 +296,9 @@
 
     <!--
       "RouteWard - Restore Internet": the way back for a user who lost their connection while RouteWard is
-      stopped or crashed. It runs the CLI "recover" command (gives the proxy and PAC settings back, stops the
-      protection, then pauses it at the end) and keeps the console open (the pause-at-end option) so the result can be read.
+      stopped or crashed. It runs the CLI "recover" command (gives the proxy and PAC settings back and stops the
+      protection), then waits for the user to press Enter before the console closes (the pause-at-end option) so the
+      result can be read.
       Its own component (own GUID and registry key path) so it can be added or removed independently of the
       main shortcut; the shared Start menu folder is removed together with the last shortcut.
     -->

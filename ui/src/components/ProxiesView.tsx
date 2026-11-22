@@ -152,6 +152,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [detectedCandidates, setDetectedCandidates] = useState<
     DetectedProxyCandidate[] | null
   >(null);
+  const [detectFailed, setDetectFailed] = useState(false);
   const [armedDeleteId, setArmedDeleteId] = useState<string | null>(null);
   const [showAddProxy, setShowAddProxy] = useState(false);
   const [showImportUri, setShowImportUri] = useState(false);
@@ -193,11 +194,17 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const handleDetectExisting = async () => {
     if (detectingProxies) return;
     setDetectingProxies(true);
+    setDetectFailed(false);
     try {
       const detector =
-        onDetectExistingProxies ?? (() => routewardClient.detectExistingProxies());
+        onDetectExistingProxies ??
+        (() => routewardClient.detectExistingProxiesStrict());
       const found = await detector();
       setDetectedCandidates(found);
+    } catch {
+      // A failed search is not "no proxy found": say so.
+      setDetectedCandidates(null);
+      setDetectFailed(true);
     } finally {
       setDetectingProxies(false);
     }
@@ -532,6 +539,14 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             {t('proxies.external_explainer.desc')}
           </p>
         </div>
+
+        {detectFailed && (
+          <div className="tf-card p-4 text-xs">
+            <p role="alert" className="text-tf-orange">
+              {t('proxies.simple.detect_failed')}
+            </p>
+          </div>
+        )}
 
         {detectedCandidates !== null && (
           <div className="tf-card space-y-2.5 p-4 text-xs">

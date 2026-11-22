@@ -142,6 +142,48 @@ impl PartialEq<String> for SystemOpError {
     }
 }
 
+/// RouteWard-owned system settings the self-heal gave back, to be put back once the background
+/// protection answers again with the engine running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HealedSettings {
+    pub proxy: bool,
+    pub pac: bool,
+}
+
+impl HealedSettings {
+    fn is_empty(self) -> bool {
+        !self.proxy && !self.pac
+    }
+}
+
+/// What to do with the remembered healed settings when a fresh daemon state arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HealFollowUp {
+    /// Nothing was given back: nothing to do.
+    Nothing,
+    /// The engine runs again: put back exactly these settings.
+    Reapply(HealedSettings),
+    /// The engine is off or paused: the user's choice wins, forget the memory.
+    Forget,
+}
+
+/// Pure decision of the self-heal state machine, called on every daemon state.
+pub(crate) fn plan_heal_followup(healed: HealedSettings, engine_running: bool) -> HealFollowUp {
+    if healed.is_empty() {
+        HealFollowUp::Nothing
+    } else if engine_running {
+        HealFollowUp::Reapply(healed)
+    } else {
+        HealFollowUp::Forget
+    }
+}
+
+/// True when leaving the app must stop the engine of a daemon this app started: it runs, or it
+/// is paused (stopping cancels the pause and records the choice as off, so it cannot come back).
+pub(crate) fn exit_must_stop_engine(running: bool, paused_until_epoch_ms: Option<u64>) -> bool {
+    running || paused_until_epoch_ms.is_some()
+}
+
 #[derive(Clone)]
 pub struct DesktopCommandBridge {
     constants: Arc<SystemConstants>,
@@ -163,6 +205,8 @@ pub struct DesktopCommandBridge {
     self_heal_done: Arc<AtomicBool>,
     /// Set when the app exits while the background service keeps protecting.
     keep_settings_on_exit: Arc<AtomicBool>,
+    /// Settings the self-heal gave back, waiting for the protection to run again.
+    healed_settings: Arc<Mutex<HealedSettings>>,
 }
 
 impl DesktopCommandBridge {
@@ -241,6 +285,7 @@ impl DesktopCommandBridge {
             notice_flags: Arc::new(NoticeFlags::new(notice_flags_path)),
             unreachable_since: Arc::new(Mutex::new(None)),
             self_heal_done: Arc::new(AtomicBool::new(false)),
+            healed_settings: Arc::new(Mutex::new(HealedSettings::default())),
             keep_settings_on_exit: Arc::new(AtomicBool::new(false)),
         };
 
@@ -586,7 +631,44 @@ impl DesktopCommandBridge {
         } else if prev_running != new_running {
             self.emit_resync();
         }
+        self.reapply_healed_settings_if_protecting(new_running);
         self.notify_tray();
+    }
+
+    /// Once the protection answers again with the engine running, puts back exactly the
+    /// settings the self-heal gave back, silently. Needs a Tokio runtime.
+    fn reapply_healed_settings_if_protecting(&self, engine_running: bool) {
+        let followup = {
+            let mut healed = self.healed_settings.lock();
+            let plan = plan_heal_followup(*healed, engine_running);
+            if plan != HealFollowUp::Nothing {
+                *healed = HealedSettings::default();
+            }
+            plan
+        };
+        let HealFollowUp::Reapply(settings) = followup else {
+            return;
+        };
+        let bridge = self.clone();
+        tokio::spawn(async move {
+            if settings.proxy {
+                if let Err(err) = bridge.set_system_proxy(true).await {
+                    bridge.log_warn(format!(
+                        "Could not put the system proxy back after the self-heal: {}",
+                        err.message
+                    ));
+                }
+            }
+            if settings.pac {
+                if let Err(err) = bridge.set_system_pac(true).await {
+                    bridge.log_warn(format!(
+                        "Could not put the PAC settings back after the self-heal: {}",
+                        err.message
+                    ));
+                }
+            }
+            bridge.log_info("Protection is running again: put the system settings back");
+        });
     }
 
     fn apply_telemetry_event(&self, event: TelemetryEvent) {
@@ -848,6 +930,11 @@ impl DesktopCommandBridge {
         .await;
         match outcome {
             Ok(Ok(report)) if report.proxy_restored || report.pac_restored => {
+                {
+                    let mut healed = self.healed_settings.lock();
+                    healed.proxy |= report.proxy_restored;
+                    healed.pac |= report.pac_restored;
+                }
                 self.log_info("RouteWard is not running: restored the system proxy settings");
                 self.show_notice(TRAY_KEY_NOTICE_RESTORED_BODY, TrayBalloonLevel::Info);
             }
@@ -891,7 +978,7 @@ impl DesktopCommandBridge {
             }
             return ExitDisposition::ProtectionContinues { announce };
         }
-        if diag.running {
+        if exit_must_stop_engine(diag.running, diag.paused_until_epoch_ms) {
             let stop = tokio::time::timeout(
                 Duration::from_secs(EXIT_STOP_ENGINE_TIMEOUT_SECS),
                 self.toggle_engine(false),

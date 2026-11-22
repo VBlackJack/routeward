@@ -348,6 +348,10 @@ export const App: React.FC = () => {
       const res = await routewardClient.startDaemon();
       if (res.connected) {
         pushToast(t('app.toast.daemon.started'), 'success');
+        if (res.fallbackReasonKey) {
+          // The service could not be set up: say so, protection will not survive a restart.
+          pushToast(t(res.fallbackReasonKey), 'warning');
+        }
         let noticeSeen = false;
         try {
           noticeSeen =
@@ -1828,6 +1832,9 @@ export const App: React.FC = () => {
             rules={profile.rules}
             unreachableProxyIds={unreachableProxyIds}
             experienceMode={experienceMode}
+            onDetectExistingProxies={() =>
+              routewardClient.detectExistingProxiesStrict()
+            }
             onTestProxy={async (id) => {
               try {
                 const report = await routewardClient.testProxy(id);

@@ -1336,6 +1336,8 @@ async fn pause_route_pauses_through_the_daemon_and_a_toggle_cancels_it() {
     let bridge = DesktopCommandBridge::new(constants.clone(), profile.clone(), "en");
 
     let controller = RouteWardController::new(constants, profile, "en");
+    // Only protection the user turned on can be paused.
+    controller.record_protection_choice(true);
     let service = DaemonIpcService::bind_for_test(controller).expect("bind test ipc");
     let service_task = tokio::spawn(async move {
         let _ = service.run_accept_loop().await;
@@ -1525,4 +1527,39 @@ async fn exit_without_a_reachable_daemon_gives_the_settings_back() {
     let bridge = DesktopCommandBridge::new(constants, profile, "en");
 
     assert_eq!(bridge.prepare_exit().await, ExitDisposition::Stopped);
+}
+
+#[test]
+fn self_heal_reapplies_exactly_what_it_restored_when_protection_runs_again() {
+    use crate::commands::{plan_heal_followup, HealFollowUp, HealedSettings};
+
+    let nothing = HealedSettings::default();
+    assert_eq!(plan_heal_followup(nothing, true), HealFollowUp::Nothing);
+    assert_eq!(plan_heal_followup(nothing, false), HealFollowUp::Nothing);
+
+    let proxy_only = HealedSettings {
+        proxy: true,
+        pac: false,
+    };
+    assert_eq!(
+        plan_heal_followup(proxy_only, true),
+        HealFollowUp::Reapply(proxy_only)
+    );
+    let both = HealedSettings {
+        proxy: true,
+        pac: true,
+    };
+    assert_eq!(plan_heal_followup(both, true), HealFollowUp::Reapply(both));
+    // An engine that is off or paused means the user's choice wins: nothing is put back.
+    assert_eq!(plan_heal_followup(both, false), HealFollowUp::Forget);
+}
+
+#[test]
+fn exit_stops_the_engine_when_it_runs_or_is_paused() {
+    use crate::commands::exit_must_stop_engine;
+
+    assert!(exit_must_stop_engine(true, None));
+    assert!(exit_must_stop_engine(false, Some(1_700_000_000_000)));
+    assert!(exit_must_stop_engine(true, Some(1_700_000_000_000)));
+    assert!(!exit_must_stop_engine(false, None));
 }

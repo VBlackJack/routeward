@@ -171,7 +171,7 @@ RouteWard est organisé en workspace Rust comprenant trois crates (`routeward-co
 
 ### Ergonomie Bureau, System Tray et Démarrage Privilégié en 1 Clic
 - **5 Onglets par Cas d'Usage & Modes Simple/Avancé (`ui/src/`)** :
-  - Organise l'interface autour de 5 onglets (`Alt+1`..`Alt+5`) : **Accueil** (`DashboardView.tsx`), **Mes Apps & Sites** (`RulesView.tsx`), **Mon Proxy** (`ProxiesView.tsx`), **Activité** (`ConnectionsView.tsx`) et **Réglages** (`SettingsView.tsx`, intégrant les sous-onglets techniques `DnsView` et `LogsView`).
+  - Organise l'interface autour de 5 onglets (`Alt+1`..`Alt+5`) : **Accueil** (`DashboardView.tsx`), **Mes Apps & Sites** (`RulesView.tsx`), **Mon proxy** (`ProxiesView.tsx`), **Activité** (`ConnectionsView.tsx`) et **Réglages** (`SettingsView.tsx`, intégrant les sous-onglets techniques `DnsView` et `LogsView`).
   - Démarre par défaut en mode **Simple** (bascule `Simple` / `Avancé` persistée dans `localStorage`), conditionne l'ouverture automatique de l'assistant `QuickSetupWizardModal` à `daemonConnected` pour ne pas masquer la bannière de déconnexion, signale le proxy actif par un badge `Principal` et permet l'édition des règles existantes en mode Simple comme Avancé.
 - **Zone de Notification Windows Native (`apps/desktop/src/tray.rs`)** :
   - Exécute une boucle Win32 dédiée (`Shell_NotifyIconW` / `NOTIFYICONDATAW`, reprise automatique sur `TaskbarCreated`) avec infobulle d'état UTF-16 et menu contextuel bilingue (`Ouvrir RouteWard`, `Activer la protection` / `Mettre en pause`, sous-menu de sélection rapide des profils, `Quitter`) synchronisés en temps réel via `DesktopCommandBridge::notify_tray()`.

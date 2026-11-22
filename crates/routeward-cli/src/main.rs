@@ -232,6 +232,22 @@ fn run_cleanup_user(constants: &SystemConstants) -> RouteWardResult<UserCleanupR
     Ok(report)
 }
 
+/// Gives back only the proxy and PAC settings that are still RouteWard's. Unlike
+/// `cleanup --user`, it keeps the sign-in autostart entry: recovering the Internet must not
+/// make the protection disappear at the next sign-in.
+fn run_restore_owned_settings(constants: &SystemConstants) -> RouteWardResult<UserCleanupReport> {
+    let net = &constants.network;
+    let socks_endpoint = format!("{}:{}", net.local_bind_host, net.default_relay_tcp_port);
+    let pac_url = local_pac_url(&net.local_bind_host, net.default_pac_port);
+    let report = SystemProxyManager::restore_owned_settings(&socks_endpoint, &pac_url)?;
+    tracing::info!(
+        proxy_restored = report.proxy_restored,
+        pac_restored = report.pac_restored,
+        "owned proxy settings restored by recover"
+    );
+    Ok(report)
+}
+
 /// What the background protection answered to the "turn protection off" request of `recover`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoverDaemonOutcome {
@@ -258,7 +274,7 @@ fn recover_message_keys(daemon: RecoverDaemonOutcome, restored: bool) -> Vec<&'s
 }
 
 /// Runs `routeward recover`: best-effort turn-off of the background protection, then the same
-/// per-user restore as `cleanup --user`. Needs no elevation.
+/// restore of the proxy settings RouteWard owns (the autostart entry stays). Needs no elevation.
 async fn run_recover(
     constants: SystemConstants,
     locale: &str,
@@ -276,7 +292,7 @@ async fn run_recover(
         Ok(_) => RecoverDaemonOutcome::Refused,
         Err(_) => RecoverDaemonOutcome::Unreachable,
     };
-    let restore = run_cleanup_user(&constants);
+    let restore = run_restore_owned_settings(&constants);
     let restored = restore.is_ok();
 
     for key in recover_message_keys(daemon, restored) {
@@ -1280,6 +1296,21 @@ mod tests {
                 for jargon in ["daemon", "ipc", "démon", "windivert"] {
                     assert!(!lower.contains(jargon), "{locale}:{key} mentions {jargon}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn recover_failure_texts_do_not_mislead() {
+        for locale in ["en", "fr"] {
+            let i18n = I18nRegistry::new(locale);
+            let failed = i18n.t("cli.recover.failed").to_lowercase();
+            for advice in ["restart your computer", "redémarrez votre ordinateur"] {
+                assert!(!failed.contains(advice), "{locale}: advises a restart");
+            }
+            let unreachable = i18n.t("cli.recover.daemon_unreachable").to_lowercase();
+            for claim in ["was not running", "n'était pas actif"] {
+                assert!(!unreachable.contains(claim), "{locale}: claims not running");
             }
         }
     }

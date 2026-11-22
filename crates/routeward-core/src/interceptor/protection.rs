@@ -18,7 +18,9 @@
 
 use super::{RouteWardController, COMPONENT_ENGINE};
 use crate::config::InterceptionMode;
-use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_DAEMON_INVALID_PAUSE};
+use crate::error::{
+    RouteWardError, RouteWardResult, ERR_KEY_DAEMON_INVALID_PAUSE, ERR_KEY_DAEMON_PAUSE_NOT_ACTIVE,
+};
 use crate::system::protection_state::{
     decide_startup_action, is_valid_pause_secs, now_epoch_ms, pause_deadline_ms, ProtectionState,
     StartupAction, MAX_PAUSE_SECS, PAUSE_TIMER_POLL_MS,
@@ -48,6 +50,17 @@ impl ProtectionRuntime {
             auto_start_error_key: Mutex::new(None),
         }
     }
+}
+
+/// How long a pause ending at `deadline` is meant to last from `now`, capped at the maximum.
+fn planned_pause_duration(now_ms: u64, deadline: u64) -> Duration {
+    Duration::from_millis(deadline.saturating_sub(now_ms).min(MAX_PAUSE_SECS * 1000))
+}
+
+/// True once the wall clock reached the deadline or the planned time elapsed on the monotonic
+/// clock, whichever comes first.
+fn pause_is_over(now_ms: u64, deadline: u64, elapsed: Duration, planned: Duration) -> bool {
+    now_ms >= deadline || elapsed >= planned
 }
 
 impl RouteWardController {
@@ -116,6 +129,14 @@ impl RouteWardController {
                 detail: format!(
                     "Pause duration {duration_secs}s is outside 1..={MAX_PAUSE_SECS} seconds"
                 ),
+            });
+        }
+        // Pausing protection that is off would turn it on at the deadline, against the user's
+        // choice. A pause that is already running may be replaced (its choice is "on").
+        if !self.is_running() && !self.protection.state.lock().protection_enabled {
+            return Err(RouteWardError::DaemonError {
+                key: ERR_KEY_DAEMON_PAUSE_NOT_ACTIVE,
+                detail: "Pause refused: protection is not running and was turned off".to_string(),
             });
         }
         self.cancel_pause_timer();
@@ -206,13 +227,18 @@ impl RouteWardController {
             return;
         }
         let controller = self.clone();
+        // The wall clock can be moved backwards: the pause also ends on the monotonic clock,
+        // and never lasts longer than the maximum pause.
+        let planned = planned_pause_duration(now_epoch_ms(), deadline);
+        let started = std::time::Instant::now();
         let handle = tokio::spawn(async move {
             loop {
                 let now = now_epoch_ms();
-                if now >= deadline {
+                if pause_is_over(now, deadline, started.elapsed(), planned) {
                     break;
                 }
-                let remaining = Duration::from_millis(deadline - now);
+                let remaining = Duration::from_millis(deadline.saturating_sub(now))
+                    .min(planned.saturating_sub(started.elapsed()));
                 tokio::time::sleep(remaining.min(Duration::from_millis(PAUSE_TIMER_POLL_MS))).await;
             }
             controller.resume_after_pause(deadline);
@@ -269,9 +295,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_is_refused_when_protection_is_off() {
+        let dir = temp_dir();
+        let controller = relay_controller(&dir);
+        let err = controller.pause_protection(600).expect_err("refused");
+        assert_eq!(err.i18n_key(), ERR_KEY_DAEMON_PAUSE_NOT_ACTIVE);
+        assert!(controller.paused_until_epoch_ms().is_none());
+        assert!(
+            !ProtectionState::load_or_default(&state_path_for_profile(
+                &dir.join("active_profile.json")
+            ))
+            .protection_enabled
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pause_ends_on_the_monotonic_clock_when_the_wall_clock_goes_backwards() {
+        let planned = planned_pause_duration(1_000, 61_000);
+        assert_eq!(planned, Duration::from_secs(60));
+        // Wall clock moved back: still before the deadline, but the planned time has elapsed.
+        assert!(!pause_is_over(
+            1_000,
+            61_000,
+            Duration::from_secs(59),
+            planned
+        ));
+        assert!(pause_is_over(0, 61_000, Duration::from_secs(60), planned));
+        assert!(pause_is_over(61_000, 61_000, Duration::ZERO, planned));
+        // A deadline far in the future is capped at the maximum pause.
+        assert_eq!(
+            planned_pause_duration(0, u64::MAX),
+            Duration::from_secs(MAX_PAUSE_SECS)
+        );
+    }
+
+    #[tokio::test]
     async fn pause_persists_deadline_and_choice_cancels_it() {
         let dir = temp_dir();
         let controller = relay_controller(&dir);
+        controller.record_protection_choice(true);
         let path = state_path_for_profile(&dir.join("active_profile.json"));
 
         let deadline = controller.pause_protection(600).expect("pause");

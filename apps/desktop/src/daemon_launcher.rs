@@ -245,6 +245,30 @@ pub fn is_service_installed() -> bool {
         .unwrap_or(false)
 }
 
+/// What to do after the elevated service install reported a failure or timed out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterFailedInstall {
+    /// The service got installed and runs: nothing to start.
+    ServiceAlreadyRunning,
+    /// The service got installed but is stopped: start it.
+    StartService,
+    /// No service: fall back to a plain elevated daemon. Never combined with a service.
+    SpawnDaemon,
+}
+
+/// Decides the fallback once the install attempt is over, from the real service state.
+pub fn decide_after_failed_install(installed: bool, service_state: &str) -> AfterFailedInstall {
+    if !installed {
+        return AfterFailedInstall::SpawnDaemon;
+    }
+    let state = service_state.trim().to_ascii_lowercase();
+    if state == "running" || state == "start_pending" {
+        AfterFailedInstall::ServiceAlreadyRunning
+    } else {
+        AfterFailedInstall::StartService
+    }
+}
+
 /// True when `exit_code` is the clean exit of an elevated `service install --start`.
 pub fn service_install_succeeded(exit_code: Option<u32>) -> bool {
     exit_code == Some(0)
@@ -455,6 +479,12 @@ mod windows_impl {
         }
     }
 
+    /// Runs the CLI elevated through the UAC prompt.
+    ///
+    /// The arguments are only quoted when they contain a space, with no escaping. That is safe
+    /// because every variable argument is checked before it gets here: the user SID passes the
+    /// strict SID check and the locale comes from a whitelist, so neither can hold a quote or
+    /// another special character. Keep it that way: never pass free text through this function.
     fn run_elevated_cli(
         cli_exe: &Path,
         args: &[String],
@@ -563,6 +593,37 @@ mod windows_impl {
                         fallback_reason_key: None,
                     });
                 }
+                // The install may still have succeeded (a late exit, a timeout): start the
+                // service when it is there, and never run both a service and a spawned daemon.
+                let after = query_windows_service_status().ok();
+                match decide_after_failed_install(
+                    after.as_ref().is_some_and(|s| s.installed),
+                    after.as_ref().map_or("", |s| s.state.as_str()),
+                ) {
+                    AfterFailedInstall::ServiceAlreadyRunning => {
+                        return Ok(LaunchOutcome {
+                            handle: None,
+                            mode: LaunchMode::ServiceStarted,
+                            fallback_reason_key: None,
+                        });
+                    }
+                    AfterFailedInstall::StartService => {
+                        if start_windows_service().is_ok() {
+                            return Ok(LaunchOutcome {
+                                handle: None,
+                                mode: LaunchMode::ServiceStarted,
+                                fallback_reason_key: None,
+                            });
+                        }
+                        let args = vec!["service".to_string(), "start".to_string()];
+                        return Ok(LaunchOutcome {
+                            handle: run_elevated_cli(&cli_exe, &args)?,
+                            mode: LaunchMode::ServiceStarted,
+                            fallback_reason_key: None,
+                        });
+                    }
+                    AfterFailedInstall::SpawnDaemon => {}
+                }
                 // The service could not be installed: run the daemon as a plain process.
                 let args = spawn_daemon_args(user_sid.as_deref(), locale);
                 Ok(LaunchOutcome {
@@ -666,6 +727,25 @@ mod tests {
             assert!(
                 matches!(plan, DaemonLaunchPlan::SpawnDaemon { .. }),
                 "{unusable:?} must not reach the elevated service install command"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_install_never_spawns_a_daemon_next_to_an_installed_service() {
+        assert_eq!(
+            decide_after_failed_install(false, "not_installed"),
+            AfterFailedInstall::SpawnDaemon
+        );
+        assert_eq!(
+            decide_after_failed_install(true, "stopped"),
+            AfterFailedInstall::StartService
+        );
+        for state in ["running", "START_PENDING", " Running "] {
+            assert_eq!(
+                decide_after_failed_install(true, state),
+                AfterFailedInstall::ServiceAlreadyRunning,
+                "{state}"
             );
         }
     }

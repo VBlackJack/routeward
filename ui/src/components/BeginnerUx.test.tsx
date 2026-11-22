@@ -36,6 +36,7 @@ import { DashboardView } from './DashboardView';
 import { GlossaryModal } from './GlossaryModal';
 import { HelpTooltip } from './HelpTooltip';
 import { QuickSetupWizardModal } from './QuickSetupWizardModal';
+import { ProxiesView } from './ProxiesView';
 import { TroubleshootModal } from './TroubleshootModal';
 
 function makeProxy(id: string, host: string): ProxyNode {
@@ -473,6 +474,35 @@ describe('Beginner UX: setup assistant', () => {
   });
 });
 
+describe('Beginner UX: proxy detection on the proxy tab', () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('says the detection failed instead of "none found"', async () => {
+    await i18n.changeLanguage('en');
+    render(
+      <ProxiesView
+        proxies={[]}
+        chains={[]}
+        experienceMode="simple"
+        onDetectExistingProxies={vi.fn().mockRejectedValue(new Error('network down'))}
+        onTestProxy={vi.fn()}
+        onTestAllProxies={vi.fn()}
+        onAddProxy={vi.fn()}
+        onImportUris={vi.fn()}
+        onCopyUri={vi.fn()}
+        onRemoveProxy={vi.fn()}
+        onAddChain={vi.fn()}
+        onRemoveChain={vi.fn()}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('proxies.simple.detect_button') }));
+    expect(await screen.findByText(i18n.t('proxies.simple.detect_failed'))).toBeInTheDocument();
+    expect(screen.queryByText(i18n.t('proxies.simple.detect_empty'))).not.toBeInTheDocument();
+  });
+});
+
 describe('Beginner UX: troubleshooter', () => {
   afterEach(() => {
     cleanup();
@@ -530,6 +560,45 @@ describe('Beginner UX: troubleshooter', () => {
     expect(onPauseProtection).toHaveBeenCalledWith(15);
     expect(onChangeProxy).toHaveBeenCalledTimes(1);
     expect(screen.getByText(i18n.t('troubleshoot.modal.allow_warning'))).toBeInTheDocument();
+  });
+
+  it('offers the pause only while protection is active', async () => {
+    await i18n.changeLanguage('en');
+    const stopped = computeProtectionHealth({
+      diagnostics: makeDiagnostics({ running: false }),
+      primaryProxy: null,
+      proxyReachability: 'unknown'
+    });
+    const pauseLabel = i18n.t('troubleshoot.proxy_down.pause', { minutes: 15 });
+    const failures = [failure('a', 'upstream proxy unreachable'), failure('b', 'connection timed out')];
+    const { rerender } = render(
+      <TroubleshootModal
+        connections={failures}
+        health={stopped}
+        onPauseProtection={vi.fn()}
+        onAllowAppDirect={vi.fn()}
+        onAllowSiteDirect={vi.fn()}
+        onClose={vi.fn()}
+      />
+    );
+    expect(screen.queryByRole('button', { name: pauseLabel })).not.toBeInTheDocument();
+
+    const active = computeProtectionHealth({
+      diagnostics: makeDiagnostics({ running: true }),
+      primaryProxy: null,
+      proxyReachability: 'unknown'
+    });
+    rerender(
+      <TroubleshootModal
+        connections={failures}
+        health={active}
+        onPauseProtection={vi.fn()}
+        onAllowAppDirect={vi.fn()}
+        onAllowSiteDirect={vi.fn()}
+        onClose={vi.fn()}
+      />
+    );
+    expect(screen.getByRole('button', { name: pauseLabel })).toBeInTheDocument();
   });
 
   it('does not lead with the proxy outage when failures come from rules', async () => {

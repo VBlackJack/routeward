@@ -171,7 +171,7 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
 
 ### Desktop UX, System Tray, and Privileged 1-Click Start
 - **5 Use-Case Tabs & Simple/Advanced Modes (`ui/src/`)**:
-  - Organizes controls across 5 use-case tabs (`Alt+1`..`Alt+5`): **Home** (`DashboardView.tsx`), **My Apps & Sites** (`RulesView.tsx`), **My Proxy** (`ProxiesView.tsx`), **Activity** (`ConnectionsView.tsx`), and **Settings** (`SettingsView.tsx`, embedding `DnsView` and `LogsView` diagnostic subtabs).
+  - Organizes controls across 5 use-case tabs (`Alt+1`..`Alt+5`): **Home** (`DashboardView.tsx`), **My Apps & Sites** (`RulesView.tsx`), **My proxy** (`ProxiesView.tsx`), **Activity** (`ConnectionsView.tsx`), and **Settings** (`SettingsView.tsx`, embedding `DnsView` and `LogsView` diagnostic subtabs).
   - Defaults to **Simple** mode (hiding low-level cockpit metrics behind a persistent `Simple` / `Advanced` toggle in `localStorage`), gates automatic opening of the 3-step `QuickSetupWizardModal` on `daemonConnected` so it never covers the disconnected banner, highlights the active primary proxy with a `Primary` badge, and supports editing existing rules in both Simple and Advanced views.
 - **Native Windows System Tray (`apps/desktop/src/tray.rs`)**:
   - Hosts a dedicated Win32 tray thread (`Shell_NotifyIconW` / `NOTIFYICONDATAW`, `TaskbarCreated` recovery) with a live UTF-16 status tooltip, localized (`en`/`fr`) context menu (`Open RouteWard`, `Enable/Pause Protection`, `Profiles` quick-switch submenu, `Exit`) synchronized via `DesktopCommandBridge::notify_tray()`.

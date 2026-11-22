@@ -954,6 +954,15 @@ mod tests {
             );
         }
 
+        // Protection that is off cannot be paused; once the user chose "on" it can.
+        let refused = dispatch_command(&controller, pause(600)).await;
+        assert!(!refused.ok);
+        assert_eq!(
+            refused.error_key.as_deref(),
+            Some(crate::error::ERR_KEY_DAEMON_PAUSE_NOT_ACTIVE)
+        );
+        controller.record_protection_choice(true);
+
         let resp = dispatch_command(&controller, pause(600)).await;
         assert!(resp.ok);
         let diag: crate::interceptor::SystemDiagnostics =

@@ -99,7 +99,7 @@
         "tab": "My Apps & Sites"
       },
       "proxy": {
-        "tab": "My Proxy"
+        "tab": "My proxy"
       },
       "activity": {
         "tab": "Activity"
@@ -461,7 +461,7 @@
       "no_apps": "No application activity matches your filter yet.",
       "empty_paused_cta": "Enable protection to see activity",
       "empty_refresh_cta": "Refresh active apps",
-      "switch_expert_cta": "Show raw sockets and PIDs (Advanced)"
+      "switch_expert_cta": "Show expert tools"
     },
     "toolbar": {
       "search": {
@@ -546,10 +546,10 @@
       "desc": "Configure your own external SOCKS5, HTTP, or HTTPS proxy server below (SSH tunnel, Tor, VPN gateway, or corporate relay). Without an active proxy, RouteWard operates safely in Direct Filter Mode."
     },
     "simple": {
-      "title": "My Proxy",
+      "title": "My proxy",
       "subtitle": "Add your proxy server or subscription link and verify that it responds cleanly.",
-      "add": "Add Proxy",
-      "paste_link_button": "Paste Proxy Link",
+      "add": "Add proxy",
+      "paste_link_button": "Paste proxy link",
       "paste_clipboard_button": "Paste from Clipboard",
       "set_primary": "Make Primary",
       "empty": "No external proxy configured yet. You can still filter and block apps directly, or add an upstream proxy server above.",
@@ -572,6 +572,7 @@
       "detect_button": "Detect Existing Proxy",
       "detecting": "Scanning...",
       "detect_empty": "No local or system proxy was detected on this computer.",
+      "detect_failed": "Detection failed, try again.",
       "detect_import": "Import",
       "status_unreachable": "Not responding",
       "import_title": "Add proxy links",
@@ -981,11 +982,11 @@
     "recover": {
       "title": "Restoring your Internet connection...",
       "engine_stopped": "Protection was turned off in the background.",
-      "daemon_unreachable": "RouteWard protection was not running in the background.",
+      "daemon_unreachable": "RouteWard could not be reached in the background, so it could not be turned off from here.",
       "engine_stop_failed": "Background protection could not be turned off. It may turn itself back on later.",
       "internet_restored": "Your normal Internet connection is restored.",
       "next_step": "Open RouteWard to turn protection back on.",
-      "failed": "RouteWard could not restore your Internet settings. Restart your computer, or open Windows Settings, go to Network and Internet, then Proxy, and turn off the proxy.",
+      "failed": "RouteWard could not restore your Internet settings. Follow the \"I have no Internet anymore\" steps in the RouteWard troubleshooting guide, or open Windows Settings, go to Network and Internet, then Proxy, and turn off the proxy.",
       "press_enter": "Press Enter to close this window."
     }
   },
@@ -1026,7 +1027,8 @@
       "io_timeout": "RouteWard's background protection did not answer in time. Wait a moment and try again.",
       "insecure_profile": "RouteWard refused to start because its settings folder can be changed by other users. Reinstall RouteWard to repair its permissions.",
       "cleanup_refused_active": "Cleanup refused: protection is still running. Stop it first, or run the command again with --force.",
-      "invalid_pause": "This pause length is not valid. Choose a duration between 1 second and 24 hours."
+      "invalid_pause": "This pause length is not valid. Choose a duration between 1 second and 24 hours.",
+      "pause_not_active": "Protection is off, so there is nothing to pause. Turn protection on first."
     },
     "service": {
       "insecure_binary_location": "RouteWard cannot be set up as a background service from this folder, because other users could modify it. Install RouteWard under Program Files and try again."

@@ -1192,11 +1192,15 @@ export class RouteWardClientService {
     }
   }
 
-  public async startDaemon(): Promise<{ connected: boolean }> {
+  public async startDaemon(): Promise<{
+    connected: boolean;
+    fallbackReasonKey?: string;
+  }> {
     const res = await this.requestJson<{
       started: boolean;
       connected: boolean;
       state?: DaemonFullState;
+      fallbackReasonKey?: string;
     }>(
       UI_CONFIG.API_ENDPOINTS.DAEMON_START,
       'POST',
@@ -1208,7 +1212,12 @@ export class RouteWardClientService {
     } else {
       await this.fetchState();
     }
-    return { connected: this.diagnostics.daemonConnected };
+    return {
+      connected: this.diagnostics.daemonConnected,
+      ...(res.fallbackReasonKey
+        ? { fallbackReasonKey: res.fallbackReasonKey }
+        : {})
+    };
   }
 
   public async setDesktopLocale(locale: 'fr' | 'en'): Promise<void> {

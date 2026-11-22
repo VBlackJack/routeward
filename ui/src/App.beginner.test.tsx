@@ -148,6 +148,23 @@ describe('App: beginner UX flows', () => {
     expect(screen.getByText(i18n.t('app.service_notice.title'))).toBeInTheDocument();
   });
 
+  it('warns when the background service could not be set up', async () => {
+    vi.spyOn(routewardClient, 'getDiagnostics').mockReturnValue(
+      diagnostics({ elevatedPrivileges: false })
+    );
+    vi.spyOn(routewardClient, 'startDaemon').mockResolvedValue({
+      connected: true,
+      fallbackReasonKey: 'tray.notice.service_install_failed'
+    });
+    renderApp();
+    fireEvent.click(
+      screen.getByRole('button', { name: i18n.t('app.daemon_banner.not_elevated_button') })
+    );
+    expect(
+      await screen.findByText(i18n.t('tray.notice.service_install_failed'))
+    ).toBeInTheDocument();
+  });
+
   it('closing the setup assistant does not mark it as completed', async () => {
     window.localStorage.removeItem(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED);
     vi.spyOn(routewardClient, 'getDiagnostics').mockReturnValue(diagnostics({}));
