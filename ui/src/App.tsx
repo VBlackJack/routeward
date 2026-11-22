@@ -53,7 +53,13 @@ import {
   ToastNotification,
   TransportProtocol
 } from './types/routeward';
-import { resolveSimpleProxyAction } from './services/friendly';
+import {
+  applyProxyRemovalToRule,
+  isSimpleCreatedRuleId,
+  normalizeProxyImportText,
+  planProxyRemoval,
+  resolveSimpleProxyAction
+} from './services/friendly';
 import {
   DashboardUseCaseId,
   DashboardView
@@ -732,16 +738,48 @@ export const App: React.FC = () => {
     );
   };
 
+  const [unreachableProxyIds, setUnreachableProxyIds] = useState<string[]>([]);
+
+  /** Remembers which proxies failed their last test (the daemon keeps no failure flag). */
+  const recordProxyTestReport = (
+    proxyId: string,
+    report: { reachable: boolean } | null
+  ) => {
+    if (!report) return;
+    setUnreachableProxyIds((prev) => {
+      const without = prev.filter((id) => id !== proxyId);
+      return report.reachable ? without : [...without, proxyId];
+    });
+  };
+
+  const testAndRecordProxy = async (proxyId: string) => {
+    const report = await routewardClient.testProxy(proxyId).catch(() => null);
+    recordProxyTestReport(proxyId, report);
+    return report;
+  };
+
+  /** Tests every enabled proxy that appeared since `knownIds`, like a proxy added by hand. */
+  const testAddedProxies = (knownIds: Set<string>) => {
+    if (!diagnostics.daemonConnected) return;
+    routewardClient
+      .getProfile()
+      .proxies.filter((p) => p.enabled && !knownIds.has(p.id))
+      .forEach((p) => {
+        void testAndRecordProxy(p.id);
+      });
+  };
+
   const handleToggleSimpleFailover = async (
     enabled: boolean,
     chain: ProxyChain | null
   ) => {
-    if (!chain) return;
+    // Only the chain managed by the Simple screen is touched: Expert chains are never adopted.
+    if (!chain || chain.id !== UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID) return;
     try {
       if (enabled) {
         await routewardClient.upsertChain(chain);
         const rulesToMigrate = profile.rules.filter(
-          (r) => r.action.type === 'proxy'
+          (r) => isSimpleCreatedRuleId(r.id) && r.action.type === 'proxy'
         );
         for (const rule of rulesToMigrate) {
           await routewardClient.upsertRule({
@@ -752,19 +790,29 @@ export const App: React.FC = () => {
         pushToast(t('proxies.simple.failover_applied_toast'), 'success');
       } else {
         const primaryProxyId = profile.proxies.find((p) => p.enabled)?.id;
+        // Every rule that still points at the chain must move before the chain disappears.
         const rulesToRestore = profile.rules.filter(
           (r) => r.action.type === 'chain' && r.action.targetId === chain.id
         );
         for (const rule of rulesToRestore) {
-          await routewardClient.upsertRule({
-            ...rule,
-            action: primaryProxyId
-              ? { type: 'proxy', targetId: primaryProxyId }
-              : { type: 'direct' }
-          });
+          await routewardClient.upsertRule(
+            primaryProxyId
+              ? { ...rule, action: { type: 'proxy', targetId: primaryProxyId } }
+              : { ...rule, enabled: false }
+          );
         }
         await routewardClient.removeChain(chain.id);
-        pushToast(t('proxies.simple.failover_disabled_toast'), 'info');
+        const disabledCount = primaryProxyId
+          ? 0
+          : rulesToRestore.filter((r) => r.enabled).length;
+        pushToast(
+          disabledCount > 0
+            ? t('proxies.simple.failover_disabled_rules_toast', {
+                count: disabledCount
+              })
+            : t('proxies.simple.failover_disabled_toast'),
+          'info'
+        );
       }
     } catch (err) {
       pushErrorToast(err);
@@ -773,40 +821,77 @@ export const App: React.FC = () => {
 
   const handleRemoveProxyWithCleanup = async (proxyId: string) => {
     const removedProxy = profile.proxies.find((p) => p.id === proxyId) ?? null;
+    const plan = planProxyRemoval(
+      proxyId,
+      profile.proxies,
+      profile.chains,
+      profile.rules
+    );
+    const removedFailoverChain = plan.removeFailoverChain
+      ? (profile.chains.find((c) => c.id === UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID) ??
+        null)
+      : null;
     try {
-      const remainingEnabled = profile.proxies.filter(
-        (p) => p.enabled && p.id !== proxyId
-      );
-      const failoverChain = profile.chains.find(
-        (c) => c.id === UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID
-      );
-      if (failoverChain && remainingEnabled.length < 2) {
-        const fallbackId = remainingEnabled[0]?.id;
-        const rulesUsingFailover = profile.rules.filter(
-          (r) =>
-            r.action.type === 'chain' && r.action.targetId === failoverChain.id
-        );
-        for (const rule of rulesUsingFailover) {
-          await routewardClient.upsertRule({
-            ...rule,
-            action: fallbackId
-              ? { type: 'proxy', targetId: fallbackId }
-              : { type: 'direct' }
-          });
-        }
-        await routewardClient.removeChain(failoverChain.id);
+      // Rules first: they move to the new primary proxy, or are turned off when none is left.
+      // They are never switched to a direct connection (that would expose the real IP address).
+      for (const rule of plan.affectedRules) {
+        await routewardClient.upsertRule(applyProxyRemovalToRule(rule, plan));
+      }
+      if (removedFailoverChain) {
+        await routewardClient.removeChain(removedFailoverChain.id);
       }
       await routewardClient.removeProxy(proxyId);
+      setUnreachableProxyIds((prev) => prev.filter((id) => id !== proxyId));
+
+      let message = t('app.toast.proxy.deleted');
+      if (plan.newPrimary && plan.affectedRules.length > 0) {
+        message = t('proxies.delete.toast_retargeted', {
+          count: plan.affectedRules.length,
+          name: plan.newPrimary.name
+        });
+      } else if (!plan.newPrimary && plan.affectedEnabledCount > 0) {
+        message = t('proxies.delete.toast_disabled', {
+          count: plan.affectedEnabledCount
+        });
+      }
+
+      // The UI never holds a proxy password: a restored proxy needs it typed again.
+      const hadPassword = Boolean(removedProxy?.auth?.hasPassword);
+      const restoredProxy = removedProxy
+        ? {
+            ...removedProxy,
+            auth: removedProxy.auth
+              ? {
+                  username: removedProxy.auth.username,
+                  hasPassword: false
+                }
+              : null
+          }
+        : null;
       pushToast(
-        t('app.toast.proxy.deleted'),
+        message,
         'warning',
-        removedProxy
+        restoredProxy
           ? {
               label: t('app.toast.undo'),
               onAction: () => {
                 runMutation(
-                  () => routewardClient.upsertProxy(removedProxy),
-                  () => pushToast(t('app.toast.undo_applied'), 'info')
+                  async () => {
+                    await routewardClient.upsertProxy(restoredProxy);
+                    if (removedFailoverChain) {
+                      await routewardClient.upsertChain(removedFailoverChain);
+                    }
+                    for (const rule of plan.affectedRules) {
+                      await routewardClient.upsertRule(rule);
+                    }
+                  },
+                  () =>
+                    pushToast(
+                      hadPassword
+                        ? t('proxies.delete.undo_password_needed')
+                        : t('app.toast.undo_applied'),
+                      hadPassword ? 'warning' : 'info'
+                    )
                 );
               }
             }
@@ -818,9 +903,35 @@ export const App: React.FC = () => {
   };
 
   const handleSetPrimaryProxy = async (proxyId: string) => {
+    const oldPrimaryId = profile.proxies.find((p) => p.enabled)?.id;
     try {
       await routewardClient.setPrimaryProxy(proxyId);
-      pushToast(t('app.toast.proxy.primary_changed'), 'success');
+      const newPrimaryId = routewardClient
+        .getProfile()
+        .proxies.find((p) => p.enabled)?.id;
+      // Only rules created from Simple screens follow the primary proxy: Expert rules stay put.
+      let movedCount = 0;
+      if (oldPrimaryId && newPrimaryId === proxyId && oldPrimaryId !== proxyId) {
+        const rulesToMove = profile.rules.filter(
+          (r) =>
+            isSimpleCreatedRuleId(r.id) &&
+            r.action.type === 'proxy' &&
+            r.action.targetId === oldPrimaryId
+        );
+        for (const rule of rulesToMove) {
+          await routewardClient.upsertRule({
+            ...rule,
+            action: { type: 'proxy', targetId: proxyId }
+          });
+          movedCount += 1;
+        }
+      }
+      pushToast(
+        movedCount > 0
+          ? t('proxies.primary.toast_rules_moved', { count: movedCount })
+          : t('app.toast.proxy.primary_changed'),
+        'success'
+      );
     } catch (err) {
       pushErrorToast(err);
     }
@@ -832,7 +943,10 @@ export const App: React.FC = () => {
       return;
     }
     try {
-      const raw = (await navigator.clipboard.readText()).trim();
+      const raw = normalizeProxyImportText(
+        (await navigator.clipboard.readText()).trim(),
+        UI_CONFIG.DEFAULT_LINK_PROXY_PROTOCOL
+      );
       if (!raw || !raw.includes('://')) {
         pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
         return;
@@ -841,14 +955,7 @@ export const App: React.FC = () => {
       const count = await routewardClient.importProxyUris(raw);
       if (count > 0) {
         pushToast(`${t('app.toast.proxy.imported_uris')} (${count})`, 'success');
-        if (diagnostics.daemonConnected) {
-          const added = routewardClient
-            .getProfile()
-            .proxies.find((p) => !beforeIds.has(p.id) && p.enabled);
-          if (added) {
-            void routewardClient.testProxy(added.id).catch(() => {});
-          }
-        }
+        testAddedProxies(beforeIds);
       } else {
         pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
       }
@@ -1481,10 +1588,12 @@ export const App: React.FC = () => {
             proxies={profile.proxies}
             chains={profile.chains}
             rules={profile.rules}
+            unreachableProxyIds={unreachableProxyIds}
             experienceMode={experienceMode}
             onTestProxy={async (id) => {
               try {
                 const report = await routewardClient.testProxy(id);
+                recordProxyTestReport(id, report);
                 if (report?.reachable) {
                   pushToast(t('app.toast.proxy.tested'), 'success');
                 } else {
@@ -1496,7 +1605,10 @@ export const App: React.FC = () => {
             }}
             onTestAllProxies={async () => {
               try {
-                await routewardClient.testAllProxies();
+                const reports = await routewardClient.testAllProxies();
+                reports.forEach((report) =>
+                  recordProxyTestReport(report.proxyId, report)
+                );
                 pushToast(t('app.toast.proxy.tested'));
               } catch (err) {
                 pushErrorToast(err);
@@ -1513,12 +1625,13 @@ export const App: React.FC = () => {
                     node.enabled &&
                     diagnostics.daemonConnected
                   ) {
-                    void routewardClient.testProxy(node.id).catch(() => {});
+                    void testAndRecordProxy(node.id);
                   }
                 }
               );
             }}
             onImportUris={(text) => {
+              const knownIds = new Set(profile.proxies.map((p) => p.id));
               runMutation(
                 () => routewardClient.importProxyUris(text),
                 (count) => {
@@ -1526,6 +1639,9 @@ export const App: React.FC = () => {
                     pushToast(
                       `${t('app.toast.proxy.imported_uris')} (${count})`
                     );
+                    testAddedProxies(knownIds);
+                  } else {
+                    pushToast(t('proxies.import.none_added'), 'warning');
                   }
                 }
               );

@@ -382,8 +382,8 @@
       "filter_all": "All Apps",
       "filter_proxied": "Protected",
       "filter_blocked": "Blocked",
-      "route_proxy": "Use Proxy",
-      "route_direct": "Direct",
+      "route_proxy": "Use proxy",
+      "route_direct": "Normal connection",
       "route_blocked": "Block",
       "count_connections_one": "{{count}} connection",
       "count_connections_other": "{{count}} connections",
@@ -464,6 +464,9 @@
         "terminate_socket": "Terminate Active Socket",
         "close": "Close Inspector"
       }
+    },
+    "quick": {
+      "block_site": "Block {{domain}}"
     }
   },
   "proxies": {
@@ -472,7 +475,7 @@
       "desc": "Configure your own external SOCKS5, HTTP, or HTTPS proxy server below (SSH tunnel, Tor, VPN gateway, or corporate relay). Without an active proxy, RouteWard operates safely in Direct Filter Mode."
     },
     "simple": {
-      "title": "My Proxy Server",
+      "title": "My Proxy",
       "subtitle": "Add your proxy server or subscription link and verify that it responds cleanly.",
       "add": "Add Proxy",
       "paste_link_button": "Paste Proxy Link",
@@ -488,7 +491,6 @@
       "status_ok": "Working",
       "status_untested": "Not checked",
       "test_connection": "Check Connection",
-      "in_use_warning": "Used by {{count}} rule(s)",
       "failover_title": "Automatic Backup Proxy Switch",
       "failover_desc": "If your primary proxy stops responding, RouteWard automatically switches to your other active proxies.",
       "failover_chain_name": "Automatic Backup Proxy",
@@ -499,7 +501,11 @@
       "detect_button": "Detect Existing Proxy",
       "detecting": "Scanning...",
       "detect_empty": "No local or system proxy was detected on this computer.",
-      "detect_import": "Import"
+      "detect_import": "Import",
+      "status_unreachable": "Not responding",
+      "import_title": "Add proxy links",
+      "import_subtitle": "Paste one proxy link per line, for example socks5://user:password@proxy.example.com:1080 or 192.168.1.10:8080",
+      "failover_disabled_rules_toast": "Automatic backup proxy disabled. No proxy is left for {{count}} rule(s): they were turned off."
     },
     "section": {
       "servers": {
@@ -540,7 +546,8 @@
         "tls_insecure": "TLS Unverified",
         "password_set": "Password Set",
         "untested": "Untested",
-        "exit_ip": "Exit IP"
+        "exit_ip": "Exit IP",
+        "unreachable": "Not responding"
       }
     },
     "modal": {
@@ -566,7 +573,10 @@
         "tls_skip_verify_label": "Skip TLS certificate verification (Insecure - lab only)",
         "sspi_hint": "Tip: for Windows NTLM/Negotiate proxies, leave blank for current logon or use DOMAIN\\username",
         "submit": "Save Proxy",
-        "cancel": "Cancel"
+        "cancel": "Cancel",
+        "quick_paste_invalid": "Link not recognized. Example: socks5://user:password@proxy.example.com:1080 or 192.168.1.10:8080",
+        "show_password": "Show password",
+        "hide_password": "Hide password"
       },
       "import_uri": {
         "title": "Batch Import Proxies (URIs or Base64 Subscription)",
@@ -587,6 +597,24 @@
         "submit": "Save Chain",
         "cancel": "Cancel"
       }
+    },
+    "delete": {
+      "warning_retarget_one": "{{count}} rule uses this proxy. It will switch to \"{{name}}\".",
+      "warning_retarget_other": "{{count}} rules use this proxy. They will switch to \"{{name}}\".",
+      "warning_disable_one": "{{count}} rule uses this proxy and no other proxy is left. It will be turned off, and its apps will then follow your other rules or the default behavior.",
+      "warning_disable_other": "{{count}} rules use this proxy and no other proxy is left. They will be turned off, and their apps will then follow your other rules or the default behavior.",
+      "toast_retargeted_one": "Proxy removed. {{count}} rule now uses \"{{name}}\".",
+      "toast_retargeted_other": "Proxy removed. {{count}} rules now use \"{{name}}\".",
+      "toast_disabled_one": "Proxy removed. {{count}} rule was turned off because no proxy is left. Add a proxy to use it again.",
+      "toast_disabled_other": "Proxy removed. {{count}} rules were turned off because no proxy is left. Add a proxy to use them again.",
+      "undo_password_needed": "Proxy restored. Its password was not kept: edit it to type the password again."
+    },
+    "primary": {
+      "toast_rules_moved_one": "Primary proxy updated. {{count}} rule follows the new primary proxy.",
+      "toast_rules_moved_other": "Primary proxy updated. {{count}} rules follow the new primary proxy."
+    },
+    "import": {
+      "none_added": "No proxy was added: the links were not recognized. Example: socks5://user:password@proxy.example.com:1080"
     }
   },
   "rules": {
@@ -610,11 +638,11 @@
       "optional_app_label": "Only for these applications (Optional, e.g. msedge.exe)",
       "optional_app_placeholder": "msedge.exe (leave blank for all apps)",
       "action_label": "How should it connect?",
-      "action_badge_proxy": "Via Proxy",
-      "action_badge_direct": "Normal (Direct)",
+      "action_badge_proxy": "Use proxy",
+      "action_badge_direct": "Normal connection",
       "action_badge_block": "Blocked",
-      "action_badge_chain": "Via Proxy (Backup)",
-      "show_advanced_options": "Show advanced rule fields (priority, CIDR, ports)",
+      "action_badge_chain": "Use proxy (backup)",
+      "show_advanced_options": "Show more options (priority, addresses, ports)",
       "hide_advanced_options": "Back to simple form",
       "detected_apps_title": "Apps on This Computer",
       "detected_apps_subtitle": "Pick any running or installed app without typing executable names.",
@@ -635,7 +663,18 @@
       "tester_title": "Where does a website go?",
       "tester_placeholder": "Paste a website (e.g. https://www.example.com)",
       "tester_button": "Check",
-      "tester_rule_label": "Applied rule: {{name}}"
+      "tester_rule_label": "Applied rule: {{name}}",
+      "pack_telemetry_apps_name": "Telemetry (programs)",
+      "pack_telemetry_sites_name": "Telemetry (websites)",
+      "error_no_criteria": "Choose at least one app, website or address. Without it, this rule would apply to all of your traffic.",
+      "app_name_completed": "Full name used: {{name}}",
+      "app_not_running_warning": "No running app matches \"{{app}}\" right now. The rule will apply as soon as this app starts.",
+      "targets_addresses_one": "{{count}} address range",
+      "targets_addresses_other": "{{count}} address ranges",
+      "targets_more": "+{{count}} more",
+      "protocol_any": "All",
+      "addresses_label": "Addresses or networks (comma-separated, e.g. 192.168.1.10)",
+      "tester_hosts_hint": "Both the bare address and its \"www.\" version are checked."
     },
     "header": {
       "title": "Process & Destination Routing Rules",
@@ -670,9 +709,9 @@
       "section_title": "My Applications - 1-Click Visual Routing",
       "section_subtitle": "Choose how each category of application connects to the Internet without typing .exe names or port numbers.",
       "status_default": "Default: Normal connection",
-      "action_proxy": "Via External Proxy",
-      "action_direct": "Normal (Direct)",
-      "action_block": "Block Internet",
+      "action_proxy": "Use proxy",
+      "action_direct": "Normal connection",
+      "action_block": "Block",
       "browsers": {
         "name": "Web Browsers",
         "desc": "Firefox, Chrome, Brave, Edge, Opera, Vivaldi"
@@ -778,6 +817,10 @@
         "submit": "Convert & Import",
         "cancel": "Cancel"
       }
+    },
+    "generated": {
+      "default_policy": "Default behavior",
+      "app_on_sites": "{{app}} on {{sites}}"
     }
   },
   "dns": {

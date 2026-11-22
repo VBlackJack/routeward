@@ -25,6 +25,8 @@ import {
   ClipboardPaste,
   Copy,
   Edit3,
+  Eye,
+  EyeOff,
   FileCode2,
   KeyRound,
   Link2,
@@ -42,7 +44,12 @@ import { ConfirmDeleteButton } from './ConfirmDeleteButton';
 import { ExperienceMode } from './QuickSetupWizardModal';
 import { UI_CONFIG } from '../config/constants';
 import { generateClientId, routewardClient } from '../services/ipc';
-import { parseSingleProxyUri } from '../services/uri';
+import {
+  normalizeProxyImportText,
+  parseLooseProxyLink,
+  planProxyRemoval,
+  splitHostAndPort
+} from '../services/friendly';
 import {
   ChainStrategy,
   DetectedProxyCandidate,
@@ -56,6 +63,8 @@ interface ProxiesViewProps {
   proxies: ProxyNode[];
   chains: ProxyChain[];
   rules?: RoutingRule[];
+  /** Ids of proxies whose last connection test failed (the daemon keeps no failure flag). */
+  unreachableProxyIds?: string[];
   experienceMode?: ExperienceMode;
   onDetectExistingProxies?: () => Promise<DetectedProxyCandidate[]>;
   onTestProxy: (id: string) => Promise<void>;
@@ -87,6 +96,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   proxies,
   chains,
   rules = [],
+  unreachableProxyIds = [],
   experienceMode = 'expert',
   onDetectExistingProxies,
   onTestProxy,
@@ -104,10 +114,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const { t } = useTranslation();
   const enabledProxies = proxies.filter((p) => p.enabled);
   const primaryProxyId = enabledProxies[0]?.id ?? null;
+  // Only the chain this screen created is managed here: an Expert chain is never adopted.
   const simpleFailoverChain = chains.find(
-    (c) =>
-      c.id === UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID ||
-      (c.enabled && c.strategy === 'failover')
+    (c) => c.id === UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID
   );
   const simpleFailoverEnabled = Boolean(simpleFailoverChain?.enabled);
 
@@ -161,6 +170,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [portInput, setPortInput] = useState<string>(
     String(UI_CONFIG.DEFAULT_PROXY_PORT)
   );
+  const [portTouched, setPortTouched] = useState(false);
+  const [protocolTouched, setProtocolTouched] = useState(false);
+  const [quickPasteInvalid, setQuickPasteInvalid] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const [portError, setPortError] = useState<string | null>(null);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -227,15 +240,18 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setTestingId(null);
   };
 
-  const applyParsedUriToForm = (raw: string): boolean => {
+  const applyParsedLinkToForm = (raw: string): boolean => {
     const trimmed = raw.trim();
-    if (!trimmed.includes('://')) return false;
-    const parsed = parseSingleProxyUri(trimmed);
+    const parsed = parseLooseProxyLink(
+      trimmed,
+      protocolTouched ? protocol : UI_CONFIG.DEFAULT_LINK_PROXY_PROTOCOL
+    );
     if (!parsed) return false;
     setName((prev) => (prev.trim() ? prev : parsed.name));
     setProtocol(parsed.protocol);
     setHost(parsed.host);
     setPortInput(String(parsed.port));
+    setPortTouched(true);
     setPortError(null);
     setUsername(parsed.auth?.username || '');
     if (parsed.auth?.password) {
@@ -248,7 +264,49 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setTls(parsed.tls);
     setTlsSkipVerify(Boolean(parsed.tlsSkipVerify));
     setQuickPasteApplied(true);
+    setQuickPasteInvalid(false);
     return true;
+  };
+
+  /** Parses the link field once the user is done typing (paste, Enter or leaving the field). */
+  const commitQuickPaste = (value: string) => {
+    if (!value.trim()) {
+      setQuickPasteInvalid(false);
+      return;
+    }
+    if (applyParsedLinkToForm(value)) {
+      setQuickPasteText('');
+    } else {
+      setQuickPasteInvalid(true);
+    }
+  };
+
+  /** Splits `host:port` or a full link typed in the host field. */
+  const resolveHostField = (value: string): { host: string; port: number | null } => {
+    const split = splitHostAndPort(value);
+    return split ? { host: split.host, port: split.port } : { host: value, port: null };
+  };
+
+  const commitHostField = (value: string) => {
+    if (value.includes('://')) {
+      applyParsedLinkToForm(value);
+      return;
+    }
+    const resolved = resolveHostField(value);
+    if (resolved.port !== null) {
+      setHost(resolved.host);
+      setPortInput(String(resolved.port));
+      setPortTouched(true);
+      setPortError(null);
+    }
+  };
+
+  const handleProtocolChange = (next: ProxyProtocol) => {
+    setProtocol(next);
+    setProtocolTouched(true);
+    if (!portTouched && !editingProxyId) {
+      setPortInput(String(UI_CONFIG.DEFAULT_PROXY_PORT_BY_PROTOCOL[next]));
+    }
   };
 
   const openNewProxyModal = () => {
@@ -261,6 +319,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setProtocol('socks5');
     setHost('');
     setPortInput(String(UI_CONFIG.DEFAULT_PROXY_PORT));
+    setPortTouched(false);
+    setProtocolTouched(false);
+    setQuickPasteInvalid(false);
+    setShowPassword(false);
     setPortError(null);
     setUsername('');
     setPassword('');
@@ -281,6 +343,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setProtocol(proxy.protocol);
     setHost(proxy.host);
     setPortInput(String(proxy.port));
+    setPortTouched(true);
+    setProtocolTouched(true);
+    setQuickPasteInvalid(false);
+    setShowPassword(false);
     setPortError(null);
     setUsername(proxy.auth?.username || '');
     setPassword('');
@@ -293,7 +359,12 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const handleCreateProxy = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim() || !host.trim()) return;
-    const parsedPort = Number(portInput.trim());
+    const hostField = resolveHostField(host.trim());
+    const effectiveHost = hostField.host;
+    const parsedPort =
+      hostField.port !== null && !portTouched
+        ? hostField.port
+        : Number(portInput.trim());
     if (
       !Number.isInteger(parsedPort) ||
       parsedPort < 1 ||
@@ -325,13 +396,13 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       id: editingProxyId || generateClientId('proxy'),
       name: name.trim(),
       protocol,
-      host: host.trim(),
+      host: effectiveHost,
       port: parsedPort,
       auth: authPayload,
       udpEnabled: protocol === 'socks5' ? udpEnabled : false,
       tls: effectiveTls,
       tlsSkipVerify: effectiveTls ? tlsSkipVerify : false,
-      sni: effectiveTls ? (preservedSni ?? host.trim()) : null,
+      sni: effectiveTls ? (preservedSni ?? effectiveHost) : null,
       enabled: existing?.enabled ?? true,
       lastLatencyMs: null,
       exitIp: null
@@ -345,7 +416,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const handleBatchUriSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!uriBatchText.trim()) return;
-    onImportUris(uriBatchText);
+    onImportUris(
+      normalizeProxyImportText(uriBatchText, UI_CONFIG.DEFAULT_LINK_PROXY_PROTOCOL)
+    );
     setUriBatchText('');
     setShowImportUri(false);
   };
@@ -557,9 +630,11 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       </span>
                     )}
                   </div>
-                  <span className="rounded bg-tf-surface-alt px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-tf-accent">
-                    {proxy.protocol}
-                  </span>
+                  {experienceMode === 'expert' && (
+                    <span className="rounded bg-tf-surface-alt px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-tf-accent">
+                      {proxy.protocol}
+                    </span>
+                  )}
                 </div>
 
                 <div className="mt-2 font-mono text-xs text-tf-secondary">
@@ -607,8 +682,14 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   {proxy.lastLatencyMs !== null ? (
                     <span className="rounded bg-tf-green/20 px-2 py-0.5 font-mono font-bold text-tf-green">
                       {experienceMode === 'simple'
-                        ? `${t('proxies.simple.status_ok')} (${proxy.lastLatencyMs} ms)`
+                        ? t('proxies.simple.status_ok')
                         : `${proxy.lastLatencyMs} ms`}
+                    </span>
+                  ) : unreachableProxyIds.includes(proxy.id) ? (
+                    <span className="rounded bg-tf-red/20 px-2 py-0.5 font-semibold text-tf-red">
+                      {experienceMode === 'simple'
+                        ? t('proxies.simple.status_unreachable')
+                        : t('proxies.card.badge.unreachable')}
                     </span>
                   ) : (
                     <span className="rounded bg-tf-surface-alt px-2 py-0.5 text-tf-secondary">
@@ -704,22 +785,23 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     title={t('proxies.card.action.delete')}
                     ariaLabel={t('proxies.card.action.delete')}
                     warningText={(() => {
-                      const referencingChainIds = new Set(
-                        chains
-                          .filter((c) => c.proxyIds.includes(proxy.id))
-                          .map((c) => c.id)
+                      const plan = planProxyRemoval(
+                        proxy.id,
+                        proxies,
+                        chains,
+                        rules
                       );
-                      const refCount = rules.filter(
-                        (r) =>
-                          (r.action.type === 'proxy' &&
-                            r.action.targetId === proxy.id) ||
-                          (r.action.type === 'chain' &&
-                            Boolean(r.action.targetId) &&
-                            referencingChainIds.has(r.action.targetId!))
-                      ).length;
-                      return refCount > 0
-                        ? t('proxies.simple.in_use_warning', { count: refCount })
-                        : undefined;
+                      if (plan.affectedRules.length === 0) {
+                        return undefined;
+                      }
+                      return plan.newPrimary
+                        ? t('proxies.delete.warning_retarget', {
+                            count: plan.affectedRules.length,
+                            name: plan.newPrimary.name
+                          })
+                        : t('proxies.delete.warning_disable', {
+                            count: plan.affectedRules.length
+                          });
                     })()}
                     onArm={() => setArmedDeleteId(`proxy:${proxy.id}`)}
                     onConfirm={() => {
@@ -832,16 +914,24 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
           >
             <div>
               <h3 id={importTitleId} className="text-base font-bold text-tf-primary">
-                {t('proxies.modal.import_uri.title')}
+                {experienceMode === 'simple'
+                  ? t('proxies.simple.import_title')
+                  : t('proxies.modal.import_uri.title')}
               </h3>
               <p className="mt-1 text-xs text-tf-secondary">
-                {t('proxies.modal.import_uri.subtitle')}
+                {experienceMode === 'simple'
+                  ? t('proxies.simple.import_subtitle')
+                  : t('proxies.modal.import_uri.subtitle')}
               </p>
             </div>
             <textarea name="proxy-uri-batch"
               rows={5}
               required
-              aria-label={t('proxies.modal.import_uri.title')}
+              aria-label={
+                experienceMode === 'simple'
+                  ? t('proxies.simple.import_title')
+                  : t('proxies.modal.import_uri.title')
+              }
               value={uriBatchText}
               onChange={(e) => setUriBatchText(e.target.value)}
               placeholder={t('proxies.modal.import_uri.placeholder')}
@@ -895,15 +985,31 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   type="text"
                   value={quickPasteText}
                   onChange={(e) => {
-                    const val = e.target.value;
-                    setQuickPasteText(val);
-                    if (applyParsedUriToForm(val)) {
+                    setQuickPasteText(e.target.value);
+                    setQuickPasteInvalid(false);
+                  }}
+                  onPaste={(e) => {
+                    const pasted = e.clipboardData.getData('text');
+                    if (pasted && applyParsedLinkToForm(pasted)) {
+                      e.preventDefault();
                       setQuickPasteText('');
+                    }
+                  }}
+                  onBlur={(e) => commitQuickPaste(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      commitQuickPaste(e.currentTarget.value);
                     }
                   }}
                   placeholder={t('proxies.modal.add_proxy.quick_paste_placeholder')}
                   className="tf-input mt-1 w-full px-2.5 py-1.5 font-mono text-xs"
                 />
+                {quickPasteInvalid && (
+                  <p role="alert" className="mt-1 text-[11px] font-semibold text-tf-red">
+                    {t('proxies.modal.add_proxy.quick_paste_invalid')}
+                  </p>
+                )}
                 {quickPasteApplied && (
                   <p className="mt-1 text-[11px] font-semibold text-tf-green">
                     {t('proxies.modal.add_proxy.quick_paste_applied')}
@@ -930,7 +1036,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 </label>
                 <select id={`${formId}-f2`}
                   value={protocol}
-                  onChange={(e) => setProtocol(e.target.value as ProxyProtocol)}
+                  onChange={(e) =>
+                    handleProtocolChange(e.target.value as ProxyProtocol)
+                  }
                   className="tf-input mt-1 w-full px-2 py-1.5 text-sm uppercase"
                 >
                   {PROTOCOLS.map((p) => (
@@ -948,13 +1056,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   type="text"
                   required
                   value={host}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    if (!editingProxyId && val.includes('://') && applyParsedUriToForm(val)) {
-                      return;
-                    }
-                    setHost(val);
-                  }}
+                  onChange={(e) => setHost(e.target.value)}
+                  onBlur={(e) => commitHostField(e.target.value)}
                   placeholder={t('proxies.modal.add_proxy.host_placeholder')}
                   className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
                 />
@@ -971,6 +1074,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   value={portInput}
                   onChange={(e) => {
                     setPortInput(e.target.value);
+                    setPortTouched(true);
                     setPortError(null);
                   }}
                   className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
@@ -1009,19 +1113,43 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     </span>
                   )}
                 </div>
-                <input
-                  id={`${formId}-password`}
-                  type="password"
-                  value={password}
-                  disabled={!replacingPassword}
-                  placeholder={
-                    existingHasPassword && !replacingPassword
-                      ? t('proxies.modal.add_proxy.password_unchanged_placeholder')
-                      : ''
-                  }
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="tf-input mt-1 w-full px-3 py-1.5 text-sm disabled:opacity-60"
-                />
+                <div className="relative mt-1">
+                  <input
+                    id={`${formId}-password`}
+                    type={showPassword ? 'text' : 'password'}
+                    value={password}
+                    disabled={!replacingPassword}
+                    placeholder={
+                      existingHasPassword && !replacingPassword
+                        ? t('proxies.modal.add_proxy.password_unchanged_placeholder')
+                        : ''
+                    }
+                    onChange={(e) => setPassword(e.target.value)}
+                    className="tf-input w-full py-1.5 pl-3 pr-9 text-sm disabled:opacity-60"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((prev) => !prev)}
+                    aria-pressed={showPassword}
+                    aria-label={
+                      showPassword
+                        ? t('proxies.modal.add_proxy.hide_password')
+                        : t('proxies.modal.add_proxy.show_password')
+                    }
+                    title={
+                      showPassword
+                        ? t('proxies.modal.add_proxy.hide_password')
+                        : t('proxies.modal.add_proxy.show_password')
+                    }
+                    className="absolute inset-y-0 right-0 flex items-center px-2.5 text-tf-secondary hover:text-tf-primary"
+                  >
+                    {showPassword ? (
+                      <EyeOff className="h-3.5 w-3.5" />
+                    ) : (
+                      <Eye className="h-3.5 w-3.5" />
+                    )}
+                  </button>
+                </div>
                 {existingHasPassword && (
                   <button
                     type="button"
@@ -1038,7 +1166,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 )}
               </div>
             </div>
-            {(protocol === 'http' || protocol === 'https') && (
+            {experienceMode === 'expert' &&
+              (protocol === 'http' || protocol === 'https') && (
               <p className="text-[11px] text-tf-secondary">
                 {t('proxies.modal.add_proxy.sspi_hint')}
               </p>
