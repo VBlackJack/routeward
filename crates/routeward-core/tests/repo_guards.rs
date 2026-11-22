@@ -711,6 +711,8 @@ fn msi_upgrade_keeps_protection_actions_are_wired_safely() {
     );
 
     let sequence_rows = xml_tags(&wxs, "<Custom ");
+    let actions = xml_tags(&wxs, "<CustomAction");
+    let set_properties = xml_tags(&wxs, "<SetProperty");
     for action in CAPTURE_ACTIONS {
         let row = tag_with_attr(&sequence_rows, "Action", action);
         assert_eq!(
@@ -727,15 +729,42 @@ fn msi_upgrade_keeps_protection_actions_are_wired_safely() {
         decide_condition.contains("NOT REMOVE"),
         "{decide_condition}"
     );
+    assert!(
+        decide_condition.contains("ROUTEWARD_OLD_INSTALLDIR"),
+        "a stale capture must not trigger the migration without an old product: {decide_condition}"
+    );
 
-    let actions = xml_tags(&wxs, "<CustomAction");
     let decide = tag_with_attr(&actions, "Id", DECIDE_ACTION);
     assert_eq!(xml_attr(decide, "Execute"), Some("commit"));
-    assert_eq!(xml_attr(decide, "FileRef"), Some("RouteWardCliExe"));
-    for action in CAPTURE_ACTIONS {
-        let capture = tag_with_attr(&actions, "Id", action);
-        assert_eq!(xml_attr(capture, "Execute"), Some("deferred"));
-        assert_eq!(xml_attr(capture, "Impersonate"), Some("no"));
+    assert_eq!(xml_attr(decide, "DllEntry"), Some("WixQuietExec"));
+    assert!(
+        xml_attr(decide, "FileRef").is_none(),
+        "a FileRef exe action drops the stderr log"
+    );
+
+    for action in CAPTURE_ACTIONS
+        .iter()
+        .chain(std::iter::once(&DECIDE_ACTION))
+    {
+        let custom = tag_with_attr(&actions, "Id", action);
+        assert_eq!(xml_attr(custom, "Return"), Some("ignore"), "{action}");
+        assert_eq!(xml_attr(custom, "Impersonate"), Some("no"), "{action}");
+        if CAPTURE_ACTIONS.contains(action) {
+            assert_eq!(xml_attr(custom, "Execute"), Some("deferred"), "{action}");
+        }
+        let row = tag_with_attr(&sequence_rows, "Action", action);
+        let set_property = tag_with_attr(&set_properties, "Id", action);
+        assert_eq!(
+            xml_attr(set_property, "Before"),
+            Some(*action),
+            "{action}: its SetProperty must run right before it"
+        );
+        assert_eq!(xml_attr(set_property, "Sequence"), Some("execute"));
+        assert_eq!(
+            xml_attr(set_property, "Condition"),
+            xml_attr(row, "Condition"),
+            "{action}: SetProperty and Custom row conditions must match"
+        );
     }
 
     // A brace inside a Formatted value starts a reference; it must be written as an escape.

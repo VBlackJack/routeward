@@ -33,7 +33,7 @@ use routeward_core::pac::PacGenerator;
 use routeward_core::rules::ConnectionRequest;
 use routeward_core::system::protection_state::MAX_PAUSE_SECS;
 use routeward_core::system::upgrade_migration::{
-    migrate_upgrade_state, upgrade_status_path_for_profile,
+    fallback_upgrade_status_path, migrate_upgrade_state, upgrade_status_path_for_profile,
 };
 use routeward_core::system::user_state::{AllUsersCleanupReport, UserCleanupReport};
 use routeward_core::system::windows_service::{
@@ -401,15 +401,38 @@ const MIGRATE_DAEMON_ATTEMPTS: u32 = 5;
 /// Pause between two attempts to reach the new daemon, in milliseconds.
 const MIGRATE_DAEMON_RETRY_DELAY_MS: u64 = 1_000;
 
+/// Calls `call` up to `attempts` times, sleeping `delay` between two attempts. `Ok(true)` is a
+/// success, `Ok(false)` is a definitive refusal (no retry), `Err` is a connection failure that is
+/// retried. Returns whether the daemon accepted the request.
+async fn call_daemon_with_retry<F, Fut, E>(mut call: F, attempts: u32, delay: Duration) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool, E>>,
+{
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(delay).await;
+        }
+        if let Ok(accepted) = call().await {
+            return accepted;
+        }
+    }
+    false
+}
+
 /// Runs `routeward migrate-upgrade-state` (hidden, run by the installer as SYSTEM): when the old
 /// daemon was running and no state file exists yet, turns protection on through the new daemon, or
 /// persists the enabled state directly when the daemon is unreachable. Every outcome is logged
-/// and the command never fails, so it can never break an upgrade.
+/// and the command never fails, so it can never break an upgrade. The captured status file is
+/// deleted on every path, including when the profile path cannot be resolved.
 async fn run_migrate_upgrade_state(constants: &SystemConstants) {
     let profile_path = match constants.ipc.resolve_daemon_profile_path() {
         Ok(path) => path,
         Err(err) => {
             tracing::warn!(error = %err, "cannot resolve the daemon profile path, nothing migrated");
+            if let Some(status_path) = fallback_upgrade_status_path() {
+                let _ = std::fs::remove_file(status_path);
+            }
             return;
         }
     };
@@ -417,21 +440,17 @@ async fn run_migrate_upgrade_state(constants: &SystemConstants) {
         routeward_core::system::protection_state::state_path_for_profile(&profile_path);
     let status_path = upgrade_status_path_for_profile(&profile_path);
     let client = IpcClient::new(constants.ipc.clone());
-    let outcome = migrate_upgrade_state(&state_path, &status_path, || async {
-        for attempt in 0..MIGRATE_DAEMON_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(MIGRATE_DAEMON_RETRY_DELAY_MS)).await;
-            }
-            match client
-                .call_raw(IpcCommand::ToggleEngine { start: true })
-                .await
-            {
-                Ok(resp) if resp.ok => return true,
-                Ok(_) => return false,
-                Err(_) => {}
-            }
-        }
-        false
+    let outcome = migrate_upgrade_state(&state_path, &status_path, || {
+        call_daemon_with_retry(
+            || async {
+                client
+                    .call_raw(IpcCommand::ToggleEngine { start: true })
+                    .await
+                    .map(|resp| resp.ok)
+            },
+            MIGRATE_DAEMON_ATTEMPTS,
+            Duration::from_millis(MIGRATE_DAEMON_RETRY_DELAY_MS),
+        )
     })
     .await;
     tracing::info!(outcome = ?outcome, "upgrade protection state migration finished");
@@ -1413,6 +1432,81 @@ mod tests {
             .render_help()
             .to_string()
             .contains("migrate-upgrade-state"));
+    }
+
+    #[tokio::test]
+    async fn daemon_call_succeeds_on_the_third_attempt() {
+        let calls = std::cell::Cell::new(0u32);
+        let accepted = call_daemon_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                async move {
+                    if n < 3 {
+                        Err(())
+                    } else {
+                        Ok(true)
+                    }
+                }
+            },
+            MIGRATE_DAEMON_ATTEMPTS,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(accepted);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn daemon_call_refusal_is_not_retried() {
+        let calls = std::cell::Cell::new(0u32);
+        let accepted = call_daemon_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                async { Ok::<bool, ()>(false) }
+            },
+            MIGRATE_DAEMON_ATTEMPTS,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(!accepted);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_failed_attempts_fall_back_to_writing_the_enabled_state() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "routeward_cli_migrate_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = root.join("protection_state.json");
+        let status = root.join("upgrade_status.json");
+        std::fs::write(&status, r#"{"ok":true,"result":{"running":true}}"#).unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let outcome = migrate_upgrade_state(&state, &status, || {
+            call_daemon_with_retry(
+                || {
+                    calls.set(calls.get() + 1);
+                    async { Err::<bool, ()>(()) }
+                },
+                MIGRATE_DAEMON_ATTEMPTS,
+                Duration::ZERO,
+            )
+        })
+        .await;
+        assert_eq!(calls.get(), MIGRATE_DAEMON_ATTEMPTS);
+        assert_eq!(
+            outcome,
+            routeward_core::system::upgrade_migration::MigrationOutcome::WrittenDirectly
+        );
+        assert!(state.exists());
+        assert!(!status.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

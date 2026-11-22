@@ -27,9 +27,18 @@ use serde::Deserialize;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// File name of the old daemon status captured by the installer, created beside the profile.
 pub const UPGRADE_STATUS_FILE_NAME: &str = "upgrade_status.json";
+
+/// Oldest a captured status file may be and still be believed, in seconds. A capture that survived
+/// a failed or abandoned upgrade must not turn protection on during a later, unrelated one.
+pub const UPGRADE_STATUS_MAX_AGE_SECS: u64 = 30 * 60;
+
+/// Directory name of the RouteWard data folder under the Windows `ProgramData` directory.
+#[cfg(windows)]
+const PROGRAM_DATA_SUBDIR: &str = "RouteWard";
 
 /// Path of the captured status file beside the daemon profile.
 pub fn upgrade_status_path_for_profile(profile_path: &Path) -> PathBuf {
@@ -49,6 +58,36 @@ struct CapturedStatus {
 struct CapturedDiagnostics {
     #[serde(default)]
     running: bool,
+}
+
+/// Best-effort path of the captured status file when the daemon profile path cannot be resolved:
+/// the `ProgramData` known folder, then the `ProgramData` environment variable. `None` off Windows
+/// or when neither is available. Used only so the stale capture can still be deleted.
+pub fn fallback_upgrade_status_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let base = crate::config::security::resolve_windows_program_data_dir()
+            .ok()
+            .or_else(|| std::env::var_os("ProgramData").map(PathBuf::from))?;
+        Some(
+            base.join(PROGRAM_DATA_SUBDIR)
+                .join(UPGRADE_STATUS_FILE_NAME),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// True when the file was last modified more than the allowed age before `now` (or its
+/// modification time cannot be read, which is treated as stale).
+fn status_file_is_stale(status_path: &Path, now: SystemTime) -> bool {
+    let Ok(modified) = fs::metadata(status_path).and_then(|meta| meta.modified()) else {
+        return true;
+    };
+    now.duration_since(modified)
+        .is_ok_and(|age| age > Duration::from_secs(UPGRADE_STATUS_MAX_AGE_SECS))
 }
 
 /// True only for a well-formed successful status whose diagnostics say the engine was running.
@@ -90,16 +129,37 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let running = fs::read(status_path)
-        .map(|raw| captured_status_says_running(&raw))
-        .unwrap_or(false);
+    migrate_upgrade_state_at(state_path, status_path, SystemTime::now(), start_via_daemon).await
+}
+
+/// Same as [`migrate_upgrade_state`] with an injectable clock: a status file older than
+/// [`UPGRADE_STATUS_MAX_AGE_SECS`] relative to `now` counts as "not running" and is deleted.
+///
+/// When the daemon reports success but the state file still does not exist, the enabled state is
+/// written directly (the file is absent, so nothing can be overwritten).
+pub async fn migrate_upgrade_state_at<F, Fut>(
+    state_path: &Path,
+    status_path: &Path,
+    now: SystemTime,
+    start_via_daemon: F,
+) -> MigrationOutcome
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let running = !status_file_is_stale(status_path, now)
+        && fs::read(status_path)
+            .map(|raw| captured_status_says_running(&raw))
+            .unwrap_or(false);
     let outcome = if state_path.exists() {
         MigrationOutcome::StateAlreadyPersisted
     } else if !running {
         MigrationOutcome::NotRunning
-    } else if start_via_daemon().await {
+    } else if start_via_daemon().await && state_path.exists() {
         MigrationOutcome::PersistedByDaemon
     } else {
+        // Either the daemon was unusable, or it said yes without persisting: write it ourselves.
+        // The state file is absent here, so nothing is overwritten.
         let enabled = ProtectionState {
             protection_enabled: true,
             paused_until_epoch_ms: None,
@@ -170,10 +230,67 @@ mod tests {
     async fn running_with_a_working_daemon_leaves_persistence_to_it() {
         let d = dirs();
         fs::write(&d.status, RUNNING_JSON).unwrap();
-        let outcome = migrate_upgrade_state(&d.state, &d.status, || async { true }).await;
+        let state = d.state.clone();
+        let outcome = migrate_upgrade_state(&d.state, &d.status, move || async move {
+            // The daemon persists the state itself when it accepts the start request.
+            fs::write(&state, "{}").unwrap();
+            true
+        })
+        .await;
         assert_eq!(outcome, MigrationOutcome::PersistedByDaemon);
-        assert!(!d.state.exists(), "the daemon owns the write in that case");
+        assert_eq!(fs::read_to_string(&d.state).unwrap(), "{}");
         assert!(!d.status.exists());
+        let _ = fs::remove_dir_all(&d.root);
+    }
+
+    #[tokio::test]
+    async fn daemon_success_without_a_state_file_falls_back_to_writing_it() {
+        let d = dirs();
+        fs::write(&d.status, RUNNING_JSON).unwrap();
+        let outcome = migrate_upgrade_state(&d.state, &d.status, || async { true }).await;
+        assert_eq!(outcome, MigrationOutcome::WrittenDirectly);
+        assert_eq!(
+            ProtectionState::load_or_default(&d.state),
+            ProtectionState {
+                protection_enabled: true,
+                paused_until_epoch_ms: None
+            }
+        );
+        assert!(!d.status.exists());
+        let _ = fs::remove_dir_all(&d.root);
+    }
+
+    #[tokio::test]
+    async fn stale_capture_is_ignored_and_deleted_but_a_fresh_one_is_used() {
+        let max_age = Duration::from_secs(UPGRADE_STATUS_MAX_AGE_SECS);
+        let d = dirs();
+        fs::write(&d.status, RUNNING_JSON).unwrap();
+        let modified = fs::metadata(&d.status).unwrap().modified().unwrap();
+        let outcome = migrate_upgrade_state_at(
+            &d.state,
+            &d.status,
+            modified + max_age + Duration::from_secs(60),
+            || async {
+                panic!("the daemon must not be called");
+                #[allow(unreachable_code)]
+                false
+            },
+        )
+        .await;
+        assert_eq!(outcome, MigrationOutcome::NotRunning);
+        assert!(!d.state.exists());
+        assert!(!d.status.exists());
+
+        fs::write(&d.status, RUNNING_JSON).unwrap();
+        let modified = fs::metadata(&d.status).unwrap().modified().unwrap();
+        let outcome = migrate_upgrade_state_at(
+            &d.state,
+            &d.status,
+            modified + Duration::from_secs(60),
+            || async { false },
+        )
+        .await;
+        assert_eq!(outcome, MigrationOutcome::WrittenDirectly);
         let _ = fs::remove_dir_all(&d.root);
     }
 
