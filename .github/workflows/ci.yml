@@ -75,6 +75,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Test .deb postinst upgrade handling
+        run: sh tests/linux/postinst-upgrade-test.sh
 
   rust-windows:
     name: Rust Check, Clippy, and Tests (Windows)

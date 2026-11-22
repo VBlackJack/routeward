@@ -15,6 +15,38 @@
 
 set -eu
 
+# Test hooks: ROUTEWARD_STATE_DIR (default /etc/routeward) and ROUTEWARD_CLI
+# (default /usr/bin/routeward) exist only so tests/linux/postinst-upgrade-test.sh can run
+# this script without root; packages never set them.
+#
+# Versions up to 2026.1121.x never persisted the desired protection state, so the daemon
+# restarted by an upgrade would come back with protection off. When the OLD daemon is still
+# running (it is, until the try-restart below), record that state so the new daemon re-applies
+# it. A fresh install and an already-persisted state are left untouched. Never aborts the script.
+carry_protection_over_upgrade() {
+    (
+        umask 077
+        dir="${ROUTEWARD_STATE_DIR:-/etc/routeward}"
+        cli="${ROUTEWARD_CLI:-/usr/bin/routeward}"
+        [ -d "$dir" ] || exit 0
+        [ ! -e "$dir/protection_state.json" ] || exit 0
+        [ -x "$cli" ] || exit 0
+        if command -v timeout >/dev/null 2>&1; then
+            status=$(timeout 10 "$cli" ctl status 2>/dev/null) || exit 0
+        else
+            status=$("$cli" ctl status 2>/dev/null) || exit 0
+        fi
+        printf '%s\n' "$status" | grep -q '"running": true' || exit 0
+        tmp=$(mktemp "$dir/.protection_state.json.XXXXXX" 2>/dev/null) || exit 0
+        if printf '{"protectionEnabled":true}\n' >"$tmp" 2>/dev/null \
+            && mv -f "$tmp" "$dir/protection_state.json" 2>/dev/null; then
+            exit 0
+        fi
+        rm -f "$tmp" 2>/dev/null || true
+        exit 0
+    ) || true
+}
+
 if [ "${1:-}" = "configure" ]; then
     if command -v getent >/dev/null 2>&1 && ! getent group routeward >/dev/null 2>&1; then
         if command -v groupadd >/dev/null 2>&1; then
@@ -24,9 +56,13 @@ if [ "${1:-}" = "configure" ]; then
         fi
     fi
 
+    # $2 is the previously configured version: set only on upgrade, empty on fresh install.
+    if [ -n "${2:-}" ]; then
+        carry_protection_over_upgrade
+    fi
+
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload || true
-        # $2 is the previously configured version: set only on upgrade, empty on fresh install.
         if [ -n "${2:-}" ]; then
             systemctl try-restart routeward.service || true
         fi
