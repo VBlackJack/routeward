@@ -30,10 +30,14 @@ import {
   Trash2,
   X
 } from 'lucide-react';
-import { formatBytes, generateClientId } from '../services/ipc';
+import { formatBytes } from '../services/ipc';
+import { UI_CONFIG } from '../config/constants';
 import {
+  buildSimpleAppRule,
   getFriendlyAppName,
-  resolveSimpleProxyAction
+  localizeEngineRuleName,
+  resolveSimpleProxyAction,
+  resolveSimpleRuleId
 } from '../services/friendly';
 import {
   ConnectionStatus,
@@ -42,12 +46,16 @@ import {
   RoutingRule,
   TrackedConnection
 } from '../types/routeward';
+import { findConnectionToExplain } from '../services/activityWhy';
+import { ActivityWhy } from './ActivityWhy';
 import { ExperienceMode } from './QuickSetupWizardModal';
 
 interface ConnectionsViewProps {
   connections: TrackedConnection[];
   proxies: ProxyNode[];
   chains?: ProxyChain[];
+  /** Saved rules, used so that a repeated quick action replaces the rule it created before. */
+  rules?: RoutingRule[];
   experienceMode?: ExperienceMode;
   engineRunning?: boolean;
   onEnableProtection?: () => void;
@@ -59,8 +67,6 @@ interface ConnectionsViewProps {
   onSwitchToExpert?: () => void;
   onExportActivity?: (format: 'csv' | 'json') => void;
 }
-
-const QUICK_RULE_HIGH_PRIORITY = 8;
 
 type SimpleActivityFilter = 'all' | 'proxied' | 'blocked';
 
@@ -78,6 +84,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
   connections,
   proxies,
   chains = [],
+  rules = [],
   experienceMode = 'expert',
   engineRunning = true,
   onEnableProtection,
@@ -187,30 +194,25 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
       onMissingProxy?.();
       return;
     }
-    onQuickCreateRule({
-      id: generateClientId('rule-quick'),
-      name: `${conn.processName} (${actionType.toUpperCase()})`,
-      enabled: true,
-      priority: QUICK_RULE_HIGH_PRIORITY,
-      processPatterns: [conn.processName],
-      domainPatterns: [],
-      ipCidrs: [],
-      portRanges: [],
-      protocol: 'any',
-      action:
-        actionType === 'proxy' && simpleProxyAction
-          ? simpleProxyAction
-          : { type: actionType === 'proxy' ? 'direct' : actionType }
-    });
+    onQuickCreateRule(
+      buildSimpleAppRule({
+        processName: conn.processName,
+        existingRules: rules,
+        action:
+          actionType === 'proxy' && simpleProxyAction
+            ? simpleProxyAction
+            : { type: actionType === 'proxy' ? 'direct' : actionType }
+      })
+    );
   };
 
   const buildQuickDomainBlockRule = (conn: TrackedConnection) => {
     const domain = conn.resolvedDomain || conn.targetHost;
     onQuickCreateRule({
-      id: generateClientId('rule-domain'),
-      name: `Block ${domain}`,
+      id: resolveSimpleRuleId(rules, [], [domain]),
+      name: t('connections.quick.block_site', { domain }),
       enabled: true,
-      priority: QUICK_RULE_HIGH_PRIORITY,
+      priority: UI_CONFIG.DEFAULT_SITE_RULE_PRIORITY,
       processPatterns: [],
       domainPatterns: [domain],
       ipCidrs: [],
@@ -392,6 +394,13 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                     <div className="text-xs text-tf-secondary">
                       {group.domains.join(', ')}
                     </div>
+                    {(() => {
+                      const failing = findConnectionToExplain(
+                        connections,
+                        group.processName
+                      );
+                      return failing ? <ActivityWhy connection={failing} /> : null;
+                    })()}
                   </div>
 
                 <div className="flex flex-wrap items-center gap-2">
@@ -629,7 +638,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                           {conn.protocol}
                         </td>
                         <td className="px-4 py-3 font-medium text-tf-primary">
-                          {conn.matchedRule}
+                          {localizeEngineRuleName(conn.matchedRule, t)}
                         </td>
                         <td className="px-4 py-3">
                           <span
@@ -762,7 +771,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                       {t('connections.inspector.drawer.matched_rule')}:{' '}
                     </span>
                     <span className="text-tf-green">
-                      {selectedConnection.matchedRule}
+                      {localizeEngineRuleName(selectedConnection.matchedRule, t)}
                     </span>
                   </div>
                   {selectedConnection.errorDetail && (

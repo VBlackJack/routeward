@@ -17,7 +17,7 @@
 pub mod protocol;
 pub mod transport;
 
-use crate::config::{InterceptionMode, IpcConstants};
+use crate::config::IpcConstants;
 use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_DAEMON_IPC_ERROR};
 use crate::interceptor::RouteWardController;
 use crate::ipc::protocol::{
@@ -249,20 +249,20 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
         IpcCommand::GetTelemetry => IpcResponse::success(id, &controller.telemetry.snapshot()),
         IpcCommand::ToggleEngine { start } => {
             if start {
-                if let Err(err) = controller.start_engine() {
+                if let Err(err) = controller.start_protection() {
                     return keyed_error_response(id, &err);
-                }
-                let mode = controller.profile.read().interception_mode;
-                if mode != InterceptionMode::Relay {
-                    if let Err(err) = controller.start_transparent_interceptor() {
-                        controller.stop_engine();
-                        return keyed_error_response(id, &err);
-                    }
                 }
             } else {
                 controller.stop_engine();
             }
+            controller.record_protection_choice(start);
             IpcResponse::success(id, &controller.diagnostics())
+        }
+        IpcCommand::PauseEngine { duration_secs } => {
+            match controller.pause_protection(duration_secs) {
+                Ok(_) => IpcResponse::success(id, &controller.diagnostics()),
+                Err(err) => keyed_error_response(id, &err),
+            }
         }
         IpcCommand::SetInterceptionMode { mode } => {
             controller.set_interception_mode(mode);
@@ -499,10 +499,13 @@ impl IpcCallError {
         }
     }
 
+    /// Localizable error key. A transport failure always maps to `errors.daemon.disconnected`,
+    /// so callers show that text and keep [`Self::message`] (the raw OS detail) for logs only.
     pub fn error_key(&self) -> Option<&str> {
         match self {
             Self::Remote { error_key, .. } => error_key.as_deref(),
-            Self::Transport(_) | Self::Protocol(_) => None,
+            Self::Transport(_) => Some(crate::error::ERR_KEY_DAEMON_DISCONNECTED),
+            Self::Protocol(_) => None,
         }
     }
 }
@@ -566,6 +569,16 @@ impl IpcClient {
         serde_json::from_value(val).map_err(|err| {
             IpcCallError::Protocol(format!("Failed to decode daemon response: {err}"))
         })
+    }
+
+    /// Stops the engine on the daemon and restarts it after `duration_secs` (1 second to 24
+    /// hours); the daemon keeps the deadline, so the pause outlives the caller.
+    pub async fn pause_engine(
+        &self,
+        duration_secs: u64,
+    ) -> Result<crate::interceptor::SystemDiagnostics, IpcCallError> {
+        self.call_typed_detailed(IpcCommand::PauseEngine { duration_secs })
+            .await
     }
 
     pub async fn call_typed<T: DeserializeOwned>(&self, command: IpcCommand) -> RouteWardResult<T> {
@@ -827,5 +840,152 @@ mod tests {
                 "rotated_pw_2026"
             );
         }
+    }
+
+    fn test_controller() -> RouteWardController {
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        profile.enable_logging = false;
+        RouteWardController::new(constants, profile, "en")
+    }
+
+    fn proxy_with_auth(id: &str, auth: ProxyCredentials) -> ProxyNode {
+        ProxyNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 1080,
+            auth: Some(auth),
+            udp_enabled: false,
+            tls: false,
+            tls_skip_verify: false,
+            sni: None,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        }
+    }
+
+    fn stored_has_password(controller: &RouteWardController, id: &str) -> bool {
+        let prof = controller.profile.read();
+        prof.proxies
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.auth.as_ref())
+            .expect("stored credentials")
+            .has_password
+    }
+
+    #[test]
+    fn forged_has_password_without_a_password_is_never_stored() {
+        let controller = test_controller();
+        let forged = || ProxyCredentials {
+            username: "alice".to_string(),
+            password: None,
+            has_password: true,
+        };
+
+        // Insert with a claimed password that was never received.
+        controller.upsert_proxy(proxy_with_auth("p-forged", forged()));
+        assert!(!stored_has_password(&controller, "p-forged"));
+
+        // Update of a proxy that has no stored password stays without one.
+        controller.upsert_proxy(proxy_with_auth("p-forged", forged()));
+        assert!(!stored_has_password(&controller, "p-forged"));
+
+        // A real password is flagged, and survives an update that omits it.
+        controller.upsert_proxy(proxy_with_auth(
+            "p-real",
+            ProxyCredentials::new("bob", "s3cret"),
+        ));
+        assert!(stored_has_password(&controller, "p-real"));
+        controller.upsert_proxy(proxy_with_auth("p-real", forged()));
+        assert!(stored_has_password(&controller, "p-real"));
+        assert_eq!(
+            controller
+                .profile
+                .read()
+                .proxies
+                .iter()
+                .find(|p| p.id == "p-real")
+                .and_then(|p| p.auth.as_ref())
+                .map(|a| a.password_str().to_string()),
+            Some("s3cret".to_string())
+        );
+
+        // The same rule applies when a whole profile is replaced.
+        let mut replacement = controller.profile.read().clone();
+        replacement
+            .proxies
+            .push(proxy_with_auth("p-replaced", forged()));
+        controller.replace_profile(replacement).expect("replace");
+        assert!(!stored_has_password(&controller, "p-replaced"));
+        assert!(stored_has_password(&controller, "p-real"));
+    }
+
+    #[test]
+    fn transport_errors_carry_the_disconnected_key_and_keep_the_raw_detail() {
+        let err = IpcCallError::Transport("os error 2".to_string());
+        assert_eq!(
+            err.error_key(),
+            Some(crate::error::ERR_KEY_DAEMON_DISCONNECTED)
+        );
+        assert_eq!(err.message(), "os error 2");
+        assert_eq!(IpcCallError::Protocol("x".to_string()).error_key(), None);
+    }
+
+    #[tokio::test]
+    async fn pause_engine_is_bounded_reported_in_diagnostics_and_cancelled_by_a_toggle() {
+        let controller = test_controller();
+        let pause = |secs: u64| IpcRequest {
+            id: "pause".to_string(),
+            command: IpcCommand::PauseEngine {
+                duration_secs: secs,
+            },
+        };
+
+        for bad in [0, crate::system::protection_state::MAX_PAUSE_SECS + 1] {
+            let resp = dispatch_command(&controller, pause(bad)).await;
+            assert!(!resp.ok);
+            assert_eq!(
+                resp.error_key.as_deref(),
+                Some(crate::error::ERR_KEY_DAEMON_INVALID_PAUSE)
+            );
+        }
+
+        // Protection that is off cannot be paused; once the user chose "on" it can.
+        let refused = dispatch_command(&controller, pause(600)).await;
+        assert!(!refused.ok);
+        assert_eq!(
+            refused.error_key.as_deref(),
+            Some(crate::error::ERR_KEY_DAEMON_PAUSE_NOT_ACTIVE)
+        );
+        controller.record_protection_choice(true);
+
+        let resp = dispatch_command(&controller, pause(600)).await;
+        assert!(resp.ok);
+        let diag: crate::interceptor::SystemDiagnostics =
+            serde_json::from_value(resp.result.expect("diagnostics")).expect("decode");
+        let deadline = diag.paused_until_epoch_ms.expect("paused deadline");
+        assert!(deadline > crate::system::protection_state::now_epoch_ms());
+        assert!(!diag.running);
+
+        let json = serde_json::to_value(&diag).expect("serialize");
+        assert!(json.get("pausedUntilEpochMs").is_some_and(|v| v.is_u64()));
+
+        // A stop (and equally a start) request cancels the pause.
+        let stop = dispatch_command(
+            &controller,
+            IpcRequest {
+                id: "stop".to_string(),
+                command: IpcCommand::ToggleEngine { start: false },
+            },
+        )
+        .await;
+        assert!(stop.ok);
+        assert!(controller.diagnostics().paused_until_epoch_ms.is_none());
+        let json = serde_json::to_value(controller.diagnostics()).expect("serialize");
+        assert!(json.get("pausedUntilEpochMs").is_some_and(|v| v.is_null()));
     }
 }

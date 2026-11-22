@@ -2,7 +2,51 @@
 
 # Troubleshooting
 
-## 0. Quick Recovery in the Desktop App (Simple Mode)
+## 0. I Have No Internet Anymore
+
+Do these steps in order. Stop as soon as your Internet works again. One action per line.
+
+**Step A - Use the Start menu shortcut (no administrator rights needed)**
+
+- [ ] Open the Start menu.
+- [ ] Type `RouteWard - Restore Internet`.
+- [ ] Click it.
+- [ ] Wait a few seconds, then try a website.
+
+This shortcut runs `routeward recover --pause-at-end`: it turns protection off and restores your Windows proxy settings.
+
+**Step B - Pause from the tray icon**
+
+- [ ] Find the RouteWard icon near the clock (click the small arrow if it is hidden).
+- [ ] Right-click the icon.
+- [ ] Click **Pause 15 min**.
+- [ ] Try a website. Protection resumes by itself when the pause ends.
+
+**Step C - Turn the Windows proxy off by hand**
+
+- [ ] Open Windows **Settings**.
+- [ ] Go to **Network & Internet > Proxy**.
+- [ ] Turn **Use a proxy server** off.
+- [ ] Turn **Use setup script** off.
+- [ ] Try a website.
+
+**Step D - Stop the service (advanced users)**
+
+- [ ] Open a terminal as Administrator.
+- [ ] Run `routeward service stop`.
+- [ ] Try a website.
+
+**Step E - Uninstall (last resort)**
+
+- [ ] Open Windows **Settings > Apps > Installed apps**.
+- [ ] Select **RouteWard** and click **Uninstall**.
+- [ ] Restart the computer.
+
+Uninstalling gives back the proxy settings RouteWard changed (see [Uninstalling the MSI](build.md#uninstalling-the-msi-what-is-cleaned-what-is-not)).
+
+From a terminal, `routeward recover` does the same as the Start menu shortcut.
+
+## 0b. Quick Recovery in the Desktop App (Simple Mode)
 
 If an app or website stops loading while protection is active:
 
@@ -211,3 +255,17 @@ Restart the listed applications (or reload the page or reconnect the session) so
 - **A specific app or website stopped working**: Click **App not working?** on Home in Simple mode to allow that app or website directly in one click.
 - **A website exclusion rule seems ignored**: Check the **Where does a website go?** bar in **My Apps & Sites**. If a broader rule overrides it, RouteWard flags the rule with a 1-click **Move First** button.
 - **Home router (`192.168.x.x`) or Wi-Fi printer cannot be reached**: Enable the 1-click **Router & Printers (Local Network)** pack in **My Apps & Sites**.
+
+## 15. "Exit" Keeps Protecting in the Background
+
+RouteWard normally runs through its Windows service, which starts at boot. Closing the window only hides it in the system tray (a one-time notice explains it). Choosing **Exit** in the tray menu closes the app, but **protection keeps running in the background through the service**, so your apps stay protected and the kill-switch stays active.
+
+To really stop protection:
+
+- [ ] Open RouteWard (or right-click the tray icon).
+- [ ] Click **Pause** (for a set time, resumes by itself, even after a reboot), or turn protection off.
+- [ ] Then choose **Exit** if you also want to close the app.
+
+If you are already locked out, go back to section 0. From a terminal, `routeward ctl pause --seconds 900` pauses protection for 15 minutes.
+
+RouteWard starts with the tray icon at sign-in (minimized, no window). Protection is remembered: if it was on, it comes back on after a reboot.

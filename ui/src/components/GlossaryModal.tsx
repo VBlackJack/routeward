@@ -18,12 +18,19 @@ import React, { useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { BookOpen, Sparkles, Terminal, X } from 'lucide-react';
 import { ModalContainer } from './ModalContainer';
+import { ExperienceMode } from './QuickSetupWizardModal';
 
 interface GlossaryModalProps {
+  /** The technical column is only shown in Expert mode. */
+  experienceMode?: ExperienceMode;
   onClose: () => void;
 }
 
 const GLOSSARY_KEYS = [
+  'service',
+  'port',
+  'ip_address',
+  'protocol',
   'proxy',
   'chain',
   'fake_ip',
@@ -32,8 +39,12 @@ const GLOSSARY_KEYS = [
   'system_proxy'
 ] as const;
 
-export const GlossaryModal: React.FC<GlossaryModalProps> = ({ onClose }) => {
+export const GlossaryModal: React.FC<GlossaryModalProps> = ({
+  experienceMode = 'expert',
+  onClose
+}) => {
   const { t } = useTranslation();
+  const showExpertColumn = experienceMode === 'expert';
   const titleId = useId();
 
   return (
@@ -73,7 +84,11 @@ export const GlossaryModal: React.FC<GlossaryModalProps> = ({ onClose }) => {
               <div className="text-xs font-bold text-tf-accent">
                 {t(`glossary.items.${key}.term`)}
               </div>
-              <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+              <div
+                className={`grid grid-cols-1 gap-2.5 ${
+                  showExpertColumn ? 'md:grid-cols-2' : ''
+                }`}
+              >
                 <div className="rounded-tf-sm border border-tf-green/30 bg-tf-bg/70 p-2.5 text-xs">
                   <div className="mb-1 flex items-center gap-1.5 text-[10px] font-bold uppercase text-tf-green">
                     <Sparkles className="h-3 w-3" />
@@ -83,15 +98,17 @@ export const GlossaryModal: React.FC<GlossaryModalProps> = ({ onClose }) => {
                     {t(`glossary.items.${key}.simple`)}
                   </p>
                 </div>
-                <div className="rounded-tf-sm border border-tf-cyan/30 bg-tf-bg/70 p-2.5 text-xs">
-                  <div className="mb-1 flex items-center gap-1.5 font-mono text-[10px] font-bold uppercase text-tf-cyan">
-                    <Terminal className="h-3 w-3" />
-                    <span>{t('app.experience_mode.expert')}</span>
+                {showExpertColumn && (
+                  <div className="rounded-tf-sm border border-tf-cyan/30 bg-tf-bg/70 p-2.5 text-xs">
+                    <div className="mb-1 flex items-center gap-1.5 font-mono text-[10px] font-bold uppercase text-tf-cyan">
+                      <Terminal className="h-3 w-3" />
+                      <span>{t('app.experience_mode.expert')}</span>
+                    </div>
+                    <p className="font-mono text-[11px] leading-relaxed text-tf-secondary">
+                      {t(`glossary.items.${key}.expert`)}
+                    </p>
                   </div>
-                  <p className="font-mono text-[11px] leading-relaxed text-tf-secondary">
-                    {t(`glossary.items.${key}.expert`)}
-                  </p>
-                </div>
+                )}
               </div>
             </div>
           ))}

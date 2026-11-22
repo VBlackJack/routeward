@@ -36,7 +36,6 @@ import {
 import {
   buildDefaultPacUrl,
   DEFAULT_PROFILE_DATA,
-  SYSTEM_CONSTANTS,
   UI_CONFIG
 } from './config/constants';
 import {
@@ -47,13 +46,33 @@ import {
 import { useThemeForge } from './theme/ThemeForgeContext';
 import {
   InterceptionMode,
-  PortRange,
   ProfileSummary,
   ProxyChain,
-  ToastNotification,
-  TransportProtocol
+  RoutingRule,
+  ToastNotification
 } from './types/routeward';
-import { resolveSimpleProxyAction } from './services/friendly';
+import {
+  applyProxyRemovalToRule,
+  getFriendlyAppName,
+  isSimpleCreatedRuleId,
+  normalizeProxyImportText,
+  planProxyRemoval,
+  slugifyRuleKey
+} from './services/friendly';
+import {
+  computeProtectionHealth,
+  formatPauseEnd,
+  PROTECTION_HEALTH_TEXTS,
+  resolveProxyReachability
+} from './services/protectionHealth';
+import {
+  diffSecurityChanges,
+  isUseCaseApplied,
+  planShieldToggle,
+  planUseCase,
+  ShieldMix,
+  SHIELD_SETTING_LABEL_KEYS
+} from './services/protectionPresets';
 import {
   DashboardUseCaseId,
   DashboardView
@@ -75,6 +94,14 @@ import {
 } from './components/QuickSetupWizardModal';
 import { GlossaryModal } from './components/GlossaryModal';
 import { TroubleshootModal } from './components/TroubleshootModal';
+import { ConfirmApplyModal } from './components/ConfirmApplyModal';
+
+interface PendingConfirm {
+  title: string;
+  intro: string;
+  changes: string[];
+  onConfirm: () => void;
+}
 
 export const App: React.FC = () => {
   const { t, i18n } = useTranslation();
@@ -121,10 +148,20 @@ export const App: React.FC = () => {
   const [startingDaemon, setStartingDaemon] = useState(false);
   const [togglingEngine, setTogglingEngine] = useState(false);
   const togglingEngineRef = useRef(false);
-  const [pauseUntilMs, setPauseUntilMs] = useState<number | null>(null);
-  const [pauseRemainingSec, setPauseRemainingSec] = useState<number | null>(
+  const [wizardCompleted, setWizardCompleted] = useState(
+    () =>
+      window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED) ===
+      'true'
+  );
+  const [showServiceNotice, setShowServiceNotice] = useState(false);
+  const [verifyRequestId, setVerifyRequestId] = useState(0);
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(
     null
   );
+  /** The user's own anti-leak mix, kept while the all-in-one shield is on. */
+  const [rememberedShieldMix, setRememberedShieldMix] =
+    useState<ShieldMix | null>(null);
+  const prevPausedUntilRef = useRef<number | null>(null);
   const [draggingFile, setDraggingFile] = useState(false);
   const dragDepthRef = useRef(0);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
@@ -212,10 +249,9 @@ export const App: React.FC = () => {
         if (err.errorKey && i18n.exists(err.errorKey)) {
           return t(err.errorKey);
         }
-        if (err.message && !/^HTTP \d+$/.test(err.message)) {
-          return err.message;
-        }
       }
+      // Technical detail stays in the console; the person only sees a plain sentence.
+      console.warn('RouteWard request failed', err);
       return t(fallbackKey);
     },
     [i18n, t]
@@ -297,6 +333,14 @@ export const App: React.FC = () => {
     handleSetLanguage(i18n.language.startsWith('fr') ? 'en' : 'fr');
   };
 
+  const markServiceNoticeShown = () => {
+    try {
+      window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.SERVICE_NOTICE_SHOWN, 'true');
+    } catch {
+      // Storage can be unavailable; the notice then simply shows again next time.
+    }
+  };
+
   const handleStartDaemon = async (): Promise<boolean> => {
     if (startingDaemon) return false;
     setStartingDaemon(true);
@@ -304,6 +348,24 @@ export const App: React.FC = () => {
       const res = await routewardClient.startDaemon();
       if (res.connected) {
         pushToast(t('app.toast.daemon.started'), 'success');
+        if (res.fallbackReasonKey) {
+          // The service could not be set up: say so, protection will not survive a restart.
+          pushToast(t(res.fallbackReasonKey), 'warning');
+        }
+        let noticeSeen = false;
+        try {
+          noticeSeen =
+            window.localStorage.getItem(
+              UI_CONFIG.STORAGE_KEYS.SERVICE_NOTICE_SHOWN
+            ) === 'true';
+        } catch {
+          noticeSeen = false;
+        }
+        if (!noticeSeen) {
+          // One-time explanation that protection now lives in the background.
+          setShowServiceNotice(true);
+          markServiceNoticeShown();
+        }
         return true;
       }
       pushToast(t('app.toast.daemon.start_failed'), 'warning');
@@ -320,7 +382,7 @@ export const App: React.FC = () => {
           ipc_error: 'app.toast.daemon.ipc_error',
           not_elevated: 'app.toast.daemon.not_elevated',
           config_invalid: 'app.toast.daemon.config_invalid',
-          daemon_exited: 'app.toast.daemon.daemon_exited',
+          daemon_exited: 'app.toast.daemon.daemon_exited'
         };
         const key = err.errorKey ? errorToastMap[err.errorKey] : undefined;
         if (key) {
@@ -328,7 +390,7 @@ export const App: React.FC = () => {
           return false;
         }
       }
-      pushToast(t('app.toast.daemon.start_failed'), 'error');
+      pushErrorToast(err, 'app.toast.daemon.start_failed');
       return false;
     } finally {
       setStartingDaemon(false);
@@ -343,76 +405,84 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleToggleEngine = useCallback(async (targetState: boolean): Promise<boolean> => {
-    if (togglingEngineRef.current) return false;
+  /**
+   * Start button of the home hero and of the service banner. On the very first run only the
+   * service starts and the setup assistant opens (it decides what to protect); afterwards the
+   * service starts and protection is switched on, like the tray does.
+   */
+  const handleStartFromHome = async () => {
+    if (startingDaemon || togglingEngineRef.current) return;
+    if (!wizardCompleted) {
+      const connected = await handleStartDaemon();
+      if (connected) {
+        setShowWizardModal(true);
+      }
+      return;
+    }
+    await handleStartAndEnableProtection();
+  };
+
+  const handleToggleEngine = useCallback(
+    async (targetState: boolean): Promise<boolean> => {
+      if (togglingEngineRef.current) return false;
+      togglingEngineRef.current = true;
+      setTogglingEngine(true);
+      try {
+        const diag = await routewardClient.toggleEngine(targetState);
+        if (targetState && diag && diag.running === false) {
+          pushToast(t('app.toast.engine.start_failed'), 'error');
+          return false;
+        }
+        return true;
+      } catch (err) {
+        pushErrorToast(err, 'app.toast.engine.start_failed');
+        return false;
+      } finally {
+        togglingEngineRef.current = false;
+        setTogglingEngine(false);
+      }
+    },
+    [pushErrorToast, pushToast, t]
+  );
+
+  /** Pauses protection in the daemon: it resumes by itself, even if this window is closed. */
+  const handleTemporaryPause = async (minutes: number) => {
+    if (togglingEngineRef.current) return;
     togglingEngineRef.current = true;
     setTogglingEngine(true);
     try {
-      await routewardClient.toggleEngine(targetState);
-      if (targetState) {
-        setPauseUntilMs(null);
-        setPauseRemainingSec(null);
-      }
-      return true;
+      const diag = await routewardClient.pauseEngine(
+        minutes * UI_CONFIG.SECONDS_PER_MINUTE
+      );
+      pushToast(
+        diag && diag.pausedUntilEpochMs !== null
+          ? t('app.toast.engine.paused_until', {
+              time: formatPauseEnd(diag.pausedUntilEpochMs, i18n.language)
+            })
+          : t('app.toast.engine.paused_temporarily', { minutes }),
+        'info'
+      );
     } catch (err) {
-      if (err instanceof HttpResponseError) {
-        const engineErrorToastMap: Record<string, string> = {
-          'errors.interceptor.driver_missing':
-            'app.toast.engine.driver_missing',
-          'errors.interceptor.open_failed': 'app.toast.engine.open_failed',
-          'errors.interceptor.not_root': 'app.toast.engine.not_root',
-          'errors.interceptor.nft_missing': 'app.toast.engine.nft_missing',
-          'errors.interceptor.nft_failed': 'app.toast.engine.nft_failed'
-        };
-        const key = err.errorKey
-          ? engineErrorToastMap[err.errorKey]
-          : undefined;
-        pushToast(t(key ?? 'app.toast.engine.start_failed'), 'error');
-        return false;
-      }
-      pushToast(t('app.toast.engine.start_failed'), 'error');
-      return false;
+      pushErrorToast(err, 'app.toast.engine.start_failed');
     } finally {
       togglingEngineRef.current = false;
       setTogglingEngine(false);
     }
-  }, [pushToast, t]);
-
-  const handleTemporaryPause = async (minutes: number) => {
-    const ok = await handleToggleEngine(false);
-    if (!ok) return;
-    const deadline = Date.now() + minutes * 60 * 1000;
-    setPauseUntilMs(deadline);
-    setPauseRemainingSec(minutes * 60);
-    pushToast(
-      t('app.toast.engine.paused_temporarily', { minutes }),
-      'info'
-    );
   };
 
+  // The daemon ends a pause by itself: say so when the deadline passes while the window is open.
   useEffect(() => {
-    if (pauseUntilMs === null) {
-      return;
+    const previous = prevPausedUntilRef.current;
+    prevPausedUntilRef.current = diagnostics.pausedUntilEpochMs;
+    if (
+      previous !== null &&
+      diagnostics.pausedUntilEpochMs === null &&
+      diagnostics.running &&
+      Date.now() >= previous - UI_CONFIG.PAUSE_RESUME_TOAST_TOLERANCE_MS
+    ) {
+      pushToast(t('app.toast.engine.resumed_automatically'), 'success');
     }
-    const tick = () => {
-      const remaining = Math.max(
-        0,
-        Math.ceil((pauseUntilMs - Date.now()) / 1000)
-      );
-      setPauseRemainingSec(remaining);
-      if (remaining <= 0) {
-        setPauseUntilMs(null);
-        setPauseRemainingSec(null);
-        void handleToggleEngine(true).then((resumed) => {
-          if (resumed) {
-            pushToast(t('app.toast.engine.resumed_automatically'), 'success');
-          }
-        });
-      }
-    };
-    const timer = window.setInterval(tick, 1000);
-    return () => window.clearInterval(timer);
-  }, [pauseUntilMs, handleToggleEngine, pushToast, t]);
+  }, [diagnostics.pausedUntilEpochMs, diagnostics.running, pushToast, t]);
 
   useEffect(() => {
     let cancelled = false;
@@ -619,129 +689,202 @@ export const App: React.FC = () => {
     }
   };
 
+  const policyOrDefault = profile.securityPolicy || {
+    killSwitchEnabled: true,
+    blockUdpOnTcpOnlyProxy: true,
+    strictDnsNoLocalFallback: true
+  };
+
+  /** Applies a card and offers an undo that restores the previous switches and rules. */
   const applyUseCase = async (useCase: DashboardUseCaseId) => {
-    const enabledProxies = profile.proxies.filter((p) => p.enabled);
-    const hasEnabledProxy = enabledProxies.length > 0;
-    const enabledChains = hasEnabledProxy
-      ? profile.chains.filter(
-          (c) =>
-            c.enabled &&
-            c.proxyIds.some((pid) => enabledProxies.some((p) => p.id === pid))
-        )
-      : [];
-    const simpleProxyAction = resolveSimpleProxyAction(
-      profile.proxies,
-      profile.chains
+    const plan = planUseCase(useCase, {
+      t,
+      proxies: profile.proxies,
+      chains: profile.chains
+    });
+    const { changed, previous } = diffSecurityChanges(
+      policyOrDefault,
+      plan.security
     );
-    const primaryProxyId = enabledProxies[0]?.id;
-    let skippedProxyRule = false;
+    const previousRules = plan.rules
+      .map((rule) => profile.rules.find((r) => r.id === rule.id))
+      .filter((rule): rule is RoutingRule => Boolean(rule));
+    const createdRuleIds = plan.rules
+      .filter((rule) => !profile.rules.some((r) => r.id === rule.id))
+      .map((rule) => rule.id);
 
-    const applyPresetById = async (presetId: string) => {
-      const preset = SYSTEM_CONSTANTS.rulePresets.find((p) => p.id === presetId);
-      if (!preset) return;
-      let actType = preset.suggestedActionType as
-        | 'proxy'
-        | 'chain'
-        | 'direct'
-        | 'block';
-      let targetId: string | undefined;
-      if (actType === 'proxy') {
-        if (simpleProxyAction) {
-          actType = simpleProxyAction.type;
-          targetId = simpleProxyAction.targetId;
-        } else {
-          targetId = primaryProxyId;
-        }
-      } else if (actType === 'chain') {
-        if (enabledChains[0]?.id) {
-          targetId = enabledChains[0].id;
-        } else if (primaryProxyId) {
-          actType = 'proxy';
-          targetId = primaryProxyId;
-        }
+    try {
+      if (changed.length > 0) {
+        await routewardClient.updateSecurityPolicy(plan.security);
       }
-      if ((actType === 'proxy' || actType === 'chain') && !targetId) {
-        skippedProxyRule = true;
-        return;
+      for (const rule of plan.rules) {
+        await routewardClient.upsertRule(rule);
       }
-      await routewardClient.upsertRule({
-        id: `rule-uc-${preset.id}`,
-        name: t(`${preset.i18nKey}.name`),
-        enabled: true,
-        priority: preset.priority,
-        processPatterns: [...preset.processPatterns],
-        domainPatterns: [...preset.domainPatterns],
-        ipCidrs: [...preset.ipCidrs],
-        portRanges: [...preset.portRanges] as PortRange[],
-        protocol: preset.protocol as TransportProtocol,
-        action: targetId ? { type: actType, targetId } : { type: actType }
-      });
-    };
-
-    if (useCase === 'privacy') {
-      await routewardClient.updateSecurityPolicy({
-        killSwitchEnabled: true,
-        strictDnsNoLocalFallback: true
-      });
-      await applyPresetById('preset-privacy-browsers');
-      await applyPresetById('preset-block-os-telemetry');
-      await applyPresetById('preset-rfc1918-direct');
-    } else if (useCase === 'work') {
-      await routewardClient.updateSecurityPolicy({
-        strictDnsNoLocalFallback: true
-      });
-      await applyPresetById('preset-dev-toolchains');
-      await applyPresetById('preset-rfc1918-direct');
-    } else if (useCase === 'gaming') {
-      const gamingApp = SYSTEM_CONSTANTS.visualAppCatalog.find(
-        (c) => c.id === 'app-gaming'
-      );
-      if (gamingApp) {
-        await routewardClient.upsertRule({
-          id: `rule-visual-${gamingApp.id}`,
-          name: t(`${gamingApp.i18nKey}.name`),
-          enabled: true,
-          priority: gamingApp.priority,
-          processPatterns: [...gamingApp.processPatterns],
-          domainPatterns: [],
-          ipCidrs: [],
-          portRanges: [],
-          protocol: 'any',
-          action: { type: 'direct' }
-        });
-      }
-      await applyPresetById('preset-privacy-browsers');
-    } else if (useCase === 'strict') {
-      await routewardClient.updateSecurityPolicy({
-        killSwitchEnabled: true,
-        blockUdpOnTcpOnlyProxy: true,
-        strictDnsNoLocalFallback: true,
-        blockQuicUdp443: true,
-        blockEncryptedDnsBypass: true
-      });
-      await applyPresetById('preset-block-os-telemetry');
+    } catch (err) {
+      pushErrorToast(err);
+      return;
     }
 
     pushToast(
       t(
-        skippedProxyRule
+        plan.skippedProxyRule
           ? 'app.toast.usecase.applied_direct_no_proxy'
           : 'app.toast.usecase.applied'
       ),
-      skippedProxyRule ? 'info' : 'success'
+      plan.skippedProxyRule ? 'info' : 'success',
+      {
+        label: t('app.toast.undo'),
+        onAction: () => {
+          runMutation(
+            async () => {
+              if (changed.length > 0) {
+                await routewardClient.updateSecurityPolicy(previous);
+              }
+              for (const id of createdRuleIds) {
+                await routewardClient.removeRule(id);
+              }
+              for (const rule of previousRules) {
+                await routewardClient.upsertRule(rule);
+              }
+            },
+            () => pushToast(t('app.toast.undo_applied'), 'info')
+          );
+        }
+      }
     );
+  };
+
+  /** Several settings change at once, so a plain-language summary is shown first. */
+  const handleApplyUseCase = (useCase: DashboardUseCaseId) => {
+    const plan = planUseCase(useCase, {
+      t,
+      proxies: profile.proxies,
+      chains: profile.chains
+    });
+    if (
+      isUseCaseApplied(
+        useCase,
+        policyOrDefault,
+        profile.rules,
+        profile.proxies,
+        profile.chains
+      )
+    ) {
+      pushToast(t('app.toast.usecase.already_applied'), 'info');
+      return;
+    }
+    const { changed } = diffSecurityChanges(policyOrDefault, plan.security);
+    const newRules = plan.rules.filter(
+      (rule) => !profile.rules.some((r) => r.id === rule.id && r.enabled)
+    );
+    setPendingConfirm({
+      title: t('dashboard.confirm.usecase_title', {
+        name: t(`dashboard.simple.uc_${useCase}_title`)
+      }),
+      intro: t('dashboard.confirm.intro'),
+      changes: [
+        ...changed.map((key) => t(SHIELD_SETTING_LABEL_KEYS[key])),
+        ...newRules.map((rule) =>
+          t('dashboard.confirm.rule_line', { name: rule.name })
+        )
+      ],
+      onConfirm: () => {
+        void applyUseCase(useCase);
+      }
+    });
+  };
+
+  /** The all-in-one shield: turning it on asks first, turning it off restores the earlier mix. */
+  const handleToggleAllShields = (next: boolean) => {
+    const plan = planShieldToggle(policyOrDefault, next, rememberedShieldMix);
+    const apply = () => {
+      runMutation(
+        () => routewardClient.updateSecurityPolicy(plan.apply),
+        () => {
+          setRememberedShieldMix(plan.remember);
+          pushToast(
+            t(
+              next
+                ? 'app.toast.shield.turned_on'
+                : 'app.toast.shield.turned_off'
+            ),
+            next ? 'success' : 'info',
+            {
+              label: t('app.toast.undo'),
+              onAction: () => {
+                runMutation(
+                  () => routewardClient.updateSecurityPolicy(plan.undo),
+                  () => {
+                    setRememberedShieldMix(next ? null : rememberedShieldMix);
+                    pushToast(t('app.toast.undo_applied'), 'info');
+                  }
+                );
+              }
+            }
+          );
+        }
+      );
+    };
+    if (!next) {
+      apply();
+      return;
+    }
+    const { changed } = diffSecurityChanges(policyOrDefault, plan.apply);
+    setPendingConfirm({
+      title: t('dashboard.confirm.shield_title'),
+      intro: t('dashboard.confirm.intro'),
+      changes: changed.map((key) => t(SHIELD_SETTING_LABEL_KEYS[key])),
+      onConfirm: apply
+    });
+  };
+
+  const [unreachableProxyIds, setUnreachableProxyIds] = useState<string[]>([]);
+  const [reachableProxyIds, setReachableProxyIds] = useState<string[]>([]);
+
+  /** Remembers which proxies failed their last test (the daemon keeps no failure flag). */
+  const recordProxyTestReport = (
+    proxyId: string,
+    report: { reachable: boolean } | null
+  ) => {
+    if (!report) return;
+    setUnreachableProxyIds((prev) => {
+      const without = prev.filter((id) => id !== proxyId);
+      return report.reachable ? without : [...without, proxyId];
+    });
+    setReachableProxyIds((prev) => {
+      const without = prev.filter((id) => id !== proxyId);
+      return report.reachable ? [...without, proxyId] : without;
+    });
+  };
+
+  const testAndRecordProxy = async (proxyId: string) => {
+    const report = await routewardClient.testProxy(proxyId).catch(() => null);
+    recordProxyTestReport(proxyId, report);
+    return report;
+  };
+
+  /** Tests every enabled proxy that appeared since `knownIds`, like a proxy added by hand. */
+  const testAddedProxies = (knownIds: Set<string>) => {
+    if (!diagnostics.daemonConnected) return;
+    routewardClient
+      .getProfile()
+      .proxies.filter((p) => p.enabled && !knownIds.has(p.id))
+      .forEach((p) => {
+        void testAndRecordProxy(p.id);
+      });
   };
 
   const handleToggleSimpleFailover = async (
     enabled: boolean,
     chain: ProxyChain | null
   ) => {
-    if (!chain) return;
+    // Only the chain managed by the Simple screen is touched: Expert chains are never adopted.
+    if (!chain || chain.id !== UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID) return;
     try {
       if (enabled) {
         await routewardClient.upsertChain(chain);
         const rulesToMigrate = profile.rules.filter(
-          (r) => r.action.type === 'proxy'
+          (r) => isSimpleCreatedRuleId(r.id) && r.action.type === 'proxy'
         );
         for (const rule of rulesToMigrate) {
           await routewardClient.upsertRule({
@@ -752,19 +895,29 @@ export const App: React.FC = () => {
         pushToast(t('proxies.simple.failover_applied_toast'), 'success');
       } else {
         const primaryProxyId = profile.proxies.find((p) => p.enabled)?.id;
+        // Every rule that still points at the chain must move before the chain disappears.
         const rulesToRestore = profile.rules.filter(
           (r) => r.action.type === 'chain' && r.action.targetId === chain.id
         );
         for (const rule of rulesToRestore) {
-          await routewardClient.upsertRule({
-            ...rule,
-            action: primaryProxyId
-              ? { type: 'proxy', targetId: primaryProxyId }
-              : { type: 'direct' }
-          });
+          await routewardClient.upsertRule(
+            primaryProxyId
+              ? { ...rule, action: { type: 'proxy', targetId: primaryProxyId } }
+              : { ...rule, enabled: false }
+          );
         }
         await routewardClient.removeChain(chain.id);
-        pushToast(t('proxies.simple.failover_disabled_toast'), 'info');
+        const disabledCount = primaryProxyId
+          ? 0
+          : rulesToRestore.filter((r) => r.enabled).length;
+        pushToast(
+          disabledCount > 0
+            ? t('proxies.simple.failover_disabled_rules_toast', {
+                count: disabledCount
+              })
+            : t('proxies.simple.failover_disabled_toast'),
+          'info'
+        );
       }
     } catch (err) {
       pushErrorToast(err);
@@ -773,40 +926,77 @@ export const App: React.FC = () => {
 
   const handleRemoveProxyWithCleanup = async (proxyId: string) => {
     const removedProxy = profile.proxies.find((p) => p.id === proxyId) ?? null;
+    const plan = planProxyRemoval(
+      proxyId,
+      profile.proxies,
+      profile.chains,
+      profile.rules
+    );
+    const removedFailoverChain = plan.removeFailoverChain
+      ? (profile.chains.find((c) => c.id === UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID) ??
+        null)
+      : null;
     try {
-      const remainingEnabled = profile.proxies.filter(
-        (p) => p.enabled && p.id !== proxyId
-      );
-      const failoverChain = profile.chains.find(
-        (c) => c.id === UI_CONFIG.SIMPLE_FAILOVER_CHAIN_ID
-      );
-      if (failoverChain && remainingEnabled.length < 2) {
-        const fallbackId = remainingEnabled[0]?.id;
-        const rulesUsingFailover = profile.rules.filter(
-          (r) =>
-            r.action.type === 'chain' && r.action.targetId === failoverChain.id
-        );
-        for (const rule of rulesUsingFailover) {
-          await routewardClient.upsertRule({
-            ...rule,
-            action: fallbackId
-              ? { type: 'proxy', targetId: fallbackId }
-              : { type: 'direct' }
-          });
-        }
-        await routewardClient.removeChain(failoverChain.id);
+      // Rules first: they move to the new primary proxy, or are turned off when none is left.
+      // They are never switched to a direct connection (that would expose the real IP address).
+      for (const rule of plan.affectedRules) {
+        await routewardClient.upsertRule(applyProxyRemovalToRule(rule, plan));
+      }
+      if (removedFailoverChain) {
+        await routewardClient.removeChain(removedFailoverChain.id);
       }
       await routewardClient.removeProxy(proxyId);
+      setUnreachableProxyIds((prev) => prev.filter((id) => id !== proxyId));
+
+      let message = t('app.toast.proxy.deleted');
+      if (plan.newPrimary && plan.affectedRules.length > 0) {
+        message = t('proxies.delete.toast_retargeted', {
+          count: plan.affectedRules.length,
+          name: plan.newPrimary.name
+        });
+      } else if (!plan.newPrimary && plan.affectedEnabledCount > 0) {
+        message = t('proxies.delete.toast_disabled', {
+          count: plan.affectedEnabledCount
+        });
+      }
+
+      // The UI never holds a proxy password: a restored proxy needs it typed again.
+      const hadPassword = Boolean(removedProxy?.auth?.hasPassword);
+      const restoredProxy = removedProxy
+        ? {
+            ...removedProxy,
+            auth: removedProxy.auth
+              ? {
+                  username: removedProxy.auth.username,
+                  hasPassword: false
+                }
+              : null
+          }
+        : null;
       pushToast(
-        t('app.toast.proxy.deleted'),
+        message,
         'warning',
-        removedProxy
+        restoredProxy
           ? {
               label: t('app.toast.undo'),
               onAction: () => {
                 runMutation(
-                  () => routewardClient.upsertProxy(removedProxy),
-                  () => pushToast(t('app.toast.undo_applied'), 'info')
+                  async () => {
+                    await routewardClient.upsertProxy(restoredProxy);
+                    if (removedFailoverChain) {
+                      await routewardClient.upsertChain(removedFailoverChain);
+                    }
+                    for (const rule of plan.affectedRules) {
+                      await routewardClient.upsertRule(rule);
+                    }
+                  },
+                  () =>
+                    pushToast(
+                      hadPassword
+                        ? t('proxies.delete.undo_password_needed')
+                        : t('app.toast.undo_applied'),
+                      hadPassword ? 'warning' : 'info'
+                    )
                 );
               }
             }
@@ -818,9 +1008,35 @@ export const App: React.FC = () => {
   };
 
   const handleSetPrimaryProxy = async (proxyId: string) => {
+    const oldPrimaryId = profile.proxies.find((p) => p.enabled)?.id;
     try {
       await routewardClient.setPrimaryProxy(proxyId);
-      pushToast(t('app.toast.proxy.primary_changed'), 'success');
+      const newPrimaryId = routewardClient
+        .getProfile()
+        .proxies.find((p) => p.enabled)?.id;
+      // Only rules created from Simple screens follow the primary proxy: Expert rules stay put.
+      let movedCount = 0;
+      if (oldPrimaryId && newPrimaryId === proxyId && oldPrimaryId !== proxyId) {
+        const rulesToMove = profile.rules.filter(
+          (r) =>
+            isSimpleCreatedRuleId(r.id) &&
+            r.action.type === 'proxy' &&
+            r.action.targetId === oldPrimaryId
+        );
+        for (const rule of rulesToMove) {
+          await routewardClient.upsertRule({
+            ...rule,
+            action: { type: 'proxy', targetId: proxyId }
+          });
+          movedCount += 1;
+        }
+      }
+      pushToast(
+        movedCount > 0
+          ? t('proxies.primary.toast_rules_moved', { count: movedCount })
+          : t('app.toast.proxy.primary_changed'),
+        'success'
+      );
     } catch (err) {
       pushErrorToast(err);
     }
@@ -832,7 +1048,10 @@ export const App: React.FC = () => {
       return;
     }
     try {
-      const raw = (await navigator.clipboard.readText()).trim();
+      const raw = normalizeProxyImportText(
+        (await navigator.clipboard.readText()).trim(),
+        UI_CONFIG.DEFAULT_LINK_PROXY_PROTOCOL
+      );
       if (!raw || !raw.includes('://')) {
         pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
         return;
@@ -841,14 +1060,7 @@ export const App: React.FC = () => {
       const count = await routewardClient.importProxyUris(raw);
       if (count > 0) {
         pushToast(`${t('app.toast.proxy.imported_uris')} (${count})`, 'success');
-        if (diagnostics.daemonConnected) {
-          const added = routewardClient
-            .getProfile()
-            .proxies.find((p) => !beforeIds.has(p.id) && p.enabled);
-          if (added) {
-            void routewardClient.testProxy(added.id).catch(() => {});
-          }
-        }
+        testAddedProxies(beforeIds);
       } else {
         pushToast(t('app.toast.proxy.clipboard_empty'), 'warning');
       }
@@ -857,16 +1069,56 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleApplyUseCase = async (
-    useCase: DashboardUseCaseId
-  ): Promise<boolean> => {
+  /** "Let through" from the troubleshooter: one direct rule per app or site, with an undo. */
+  const allowDirect = (params: {
+    id: string;
+    name: string;
+    processPatterns: string[];
+    domainPatterns: string[];
+    toastKey: string;
+    subject: string;
+  }) => {
+    const previousRule = profile.rules.find((r) => r.id === params.id) ?? null;
+    runMutation(
+      () =>
+        routewardClient.upsertRule({
+          id: params.id,
+          name: params.name,
+          enabled: true,
+          priority: UI_CONFIG.TROUBLESHOOT_RULE_PRIORITY,
+          processPatterns: params.processPatterns,
+          domainPatterns: params.domainPatterns,
+          ipCidrs: [],
+          portRanges: [],
+          protocol: 'any',
+          action: { type: 'direct' }
+        }),
+      () => {
+        pushToast(t(params.toastKey, { name: params.subject }), 'success', {
+          label: t('app.toast.undo'),
+          onAction: () => {
+            runMutation(
+              () =>
+                previousRule
+                  ? routewardClient.upsertRule(previousRule)
+                  : routewardClient.removeRule(params.id),
+              () => pushToast(t('app.toast.undo_applied'), 'info')
+            );
+          }
+        });
+        setShowTroubleshootModal(false);
+      }
+    );
+  };
+
+  /** The setup is saved: the assistant no longer opens by itself. Closing it does not count. */
+  const markWizardCompleted = () => {
     try {
-      await applyUseCase(useCase);
-      return true;
-    } catch (err) {
-      pushErrorToast(err);
-      return false;
+      window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED, 'true');
+    } catch {
+      // Storage can be unavailable; the assistant then simply offers itself again.
     }
+    setWizardCompleted(true);
   };
 
   const handleExportProfile = () => {
@@ -968,14 +1220,33 @@ export const App: React.FC = () => {
     reader.readAsText(file);
   };
 
-  const securityPolicy = profile.securityPolicy || {
-    killSwitchEnabled: true,
-    blockUdpOnTcpOnlyProxy: true,
-    strictDnsNoLocalFallback: true
-  };
+  const securityPolicy = policyOrDefault;
 
   const isEngineRunning = diagnostics.daemonConnected && diagnostics.running;
   const activePrimaryProxy = profile.proxies.find((p) => p.enabled) ?? null;
+  const proxyReachability = resolveProxyReachability(
+    activePrimaryProxy,
+    unreachableProxyIds,
+    reachableProxyIds,
+    proxyOutageDetected
+  );
+  const health = computeProtectionHealth({
+    diagnostics,
+    primaryProxy: activePrimaryProxy,
+    proxyReachability
+  });
+  const healthTexts = PROTECTION_HEALTH_TEXTS[health.state];
+  const healthTime =
+    health.pausedUntilEpochMs !== null
+      ? formatPauseEnd(health.pausedUntilEpochMs, i18n.language)
+      : '';
+
+  // A different primary proxy starts with a clean slate: the old outage no longer applies.
+  const primaryProxyId = activePrimaryProxy?.id ?? null;
+  useEffect(() => {
+    setProxyOutageDetected(false);
+    setOutageDismissedForKey(null);
+  }, [primaryProxyId]);
   const recentKillSwitchFailure = connections.find(
     (c) =>
       c.status === 'blocked' &&
@@ -1005,17 +1276,19 @@ export const App: React.FC = () => {
     { id: 'settings', icon: Settings }
   ];
 
-  const statusPillClass = !diagnostics.daemonConnected
-    ? 'bg-tf-red/15 text-tf-red border-tf-red/40'
-    : isEngineRunning
+  const statusPillClass =
+    health.tone === 'ok'
       ? 'bg-tf-green/15 text-tf-green border-tf-green/40'
-      : 'bg-tf-orange/15 text-tf-orange border-tf-orange/40';
-
-  const statusPillText = !diagnostics.daemonConnected
-    ? t('app.header.status.disconnected')
-    : isEngineRunning
-      ? t('app.header.status.protected')
-      : t('app.header.status.paused');
+      : health.tone === 'warn'
+        ? 'bg-tf-orange/15 text-tf-orange border-tf-orange/40'
+        : 'bg-tf-red/15 text-tf-red border-tf-red/40';
+  const statusDotClass =
+    health.tone === 'ok'
+      ? 'bg-tf-green'
+      : health.tone === 'warn'
+        ? 'bg-tf-orange'
+        : 'bg-tf-red';
+  const statusPillText = t(healthTexts.pill, { time: healthTime });
 
   return (
     <div
@@ -1077,15 +1350,7 @@ export const App: React.FC = () => {
                 <span
                   className={`flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-bold ${statusPillClass}`}
                 >
-                  <span
-                    className={`h-1.5 w-1.5 rounded-full ${
-                      !diagnostics.daemonConnected
-                        ? 'bg-tf-red'
-                        : isEngineRunning
-                          ? 'bg-tf-green'
-                          : 'bg-tf-orange'
-                    }`}
-                  />
+                  <span className={`h-1.5 w-1.5 rounded-full ${statusDotClass}`} />
                   {statusPillText}
                 </span>
               </div>
@@ -1177,7 +1442,8 @@ export const App: React.FC = () => {
       </header>
 
       {/* Persistent Daemon Disconnected / Non-Elevated Warning Banner */}
-      {!diagnostics.daemonConnected && (
+      {!diagnostics.daemonConnected &&
+        !(experienceMode === 'simple' && activeTab === 'home') && (
         <div className="border-b border-tf-red/40 bg-tf-red/15 px-6 py-2.5">
           <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 text-xs lg:flex-nowrap">
             <div className="flex items-center gap-2.5 lg:min-w-0 lg:flex-1">
@@ -1207,7 +1473,7 @@ export const App: React.FC = () => {
                   type="button"
                   disabled={startingDaemon}
                   onClick={() => {
-                    void handleStartDaemon();
+                    void handleStartFromHome();
                   }}
                   className="tf-btn-accent flex items-center gap-1.5 px-3 py-1 text-xs disabled:opacity-60"
                 >
@@ -1236,7 +1502,7 @@ export const App: React.FC = () => {
         <div className="border-b border-tf-orange/40 bg-tf-orange/15 px-6 py-2.5">
           <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-2.5 text-xs">
             <ShieldAlert className="h-4 w-4 shrink-0 text-tf-orange" />
-            <div>
+            <div className="min-w-0 flex-1">
               <span className="font-bold text-tf-orange">
                 {t('app.daemon_banner.not_elevated_title')}
               </span>{' '}
@@ -1244,6 +1510,78 @@ export const App: React.FC = () => {
                 - {t('app.daemon_banner.not_elevated_desc')}
               </span>
             </div>
+            {diagnostics.osName === 'WINDOWS' && (
+              <button
+                type="button"
+                disabled={startingDaemon}
+                onClick={() => {
+                  void handleStartDaemon();
+                }}
+                className="tf-btn-accent flex items-center gap-1.5 px-3 py-1 text-xs disabled:opacity-60"
+              >
+                <Power className="h-3 w-3" />
+                {startingDaemon
+                  ? t('app.daemon_banner.starting_button')
+                  : t('app.daemon_banner.not_elevated_button')}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'home' &&
+        diagnostics.daemonConnected &&
+        !diagnostics.running &&
+        diagnostics.autoStartErrorKey !== null &&
+        i18n.exists(diagnostics.autoStartErrorKey) && (
+          <div
+            role="alert"
+            className="border-b border-tf-red/40 bg-tf-red/15 px-6 py-2.5"
+          >
+            <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="flex items-center gap-2.5">
+                <AlertTriangle className="h-4 w-4 shrink-0 text-tf-red" />
+                <div>
+                  <span className="font-bold text-tf-red">
+                    {t('app.auto_start_error.title')}
+                  </span>{' '}
+                  <span className="text-tf-primary">
+                    - {t(diagnostics.autoStartErrorKey)}
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={togglingEngine}
+                onClick={() => {
+                  void handleToggleEngine(true);
+                }}
+                className="tf-btn-accent px-3 py-1 text-xs disabled:opacity-60"
+              >
+                {t('app.auto_start_error.retry')}
+              </button>
+            </div>
+          </div>
+        )}
+
+      {showServiceNotice && (
+        <div role="status" className="border-b border-tf-cyan/40 bg-tf-cyan/10 px-6 py-2.5">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 text-xs">
+            <div>
+              <span className="font-bold text-tf-cyan">
+                {t('app.service_notice.title')}
+              </span>{' '}
+              <span className="text-tf-primary">
+                - {t('app.service_notice.desc')}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowServiceNotice(false)}
+              className="tf-surface-alt px-3 py-1 text-xs font-semibold text-tf-primary hover:border-tf-accent"
+            >
+              {t('app.service_notice.dismiss')}
+            </button>
           </div>
         </div>
       )}
@@ -1258,10 +1596,15 @@ export const App: React.FC = () => {
               <AlertTriangle className="h-4 w-4 shrink-0 text-tf-orange" />
               <div>
                 <span className="font-bold text-tf-orange">
-                  {t('app.outage_banner.title')}
+                  {securityPolicy.killSwitchEnabled
+                    ? t('app.outage_banner.title')
+                    : t('app.outage_banner.title_no_killswitch')}
                 </span>{' '}
                 <span className="text-tf-primary">
-                  - {t('app.outage_banner.desc')}
+                  -{' '}
+                  {securityPolicy.killSwitchEnabled
+                    ? t('app.outage_banner.desc')
+                    : t('app.outage_banner.desc_no_killswitch')}
                 </span>
               </div>
             </div>
@@ -1269,12 +1612,14 @@ export const App: React.FC = () => {
               <button
                 type="button"
                 onClick={() => {
-                  void handleTemporaryPause(15);
+                  void handleTemporaryPause(UI_CONFIG.OUTAGE_PAUSE_MINUTES);
                   setOutageDismissedForKey(outageKey);
                 }}
                 className="tf-btn-accent px-3 py-1 text-xs"
               >
-                {t('app.outage_banner.pause_15m')}
+                {t('app.outage_banner.pause_15m', {
+                  minutes: UI_CONFIG.OUTAGE_PAUSE_MINUTES
+                })}
               </button>
               <button
                 type="button"
@@ -1360,18 +1705,21 @@ export const App: React.FC = () => {
             securityPolicy={securityPolicy}
             experienceMode={experienceMode}
             proxies={profile.proxies}
+            chains={profile.chains}
             rules={profile.rules}
+            health={health}
+            verifyRequestId={verifyRequestId}
             startingProtection={startingDaemon || togglingEngine}
-            pauseRemainingSec={pauseRemainingSec}
             onToggleEngine={() => {
               void handleToggleEngine(!isEngineRunning);
             }}
             onTemporaryPause={handleTemporaryPause}
-            onStartAndEnableProtection={handleStartAndEnableProtection}
+            onStartAndEnableProtection={handleStartFromHome}
             onApplyUseCase={handleApplyUseCase}
             onTestPrimaryProxy={async (proxyId) => {
               try {
                 const report = await routewardClient.testProxy(proxyId);
+                recordProxyTestReport(proxyId, report);
                 if (report?.reachable) {
                   setProxyOutageDetected(false);
                   pushToast(t('app.toast.proxy.tested'), 'success');
@@ -1404,6 +1752,7 @@ export const App: React.FC = () => {
             rules={profile.rules}
             proxies={profile.proxies}
             chains={profile.chains}
+            osName={diagnostics.osName}
             experienceMode={experienceMode}
             onEvaluateRule={(req) => routewardClient.evaluateRule(req)}
             onAddRule={(rule) => {
@@ -1481,10 +1830,15 @@ export const App: React.FC = () => {
             proxies={profile.proxies}
             chains={profile.chains}
             rules={profile.rules}
+            unreachableProxyIds={unreachableProxyIds}
             experienceMode={experienceMode}
+            onDetectExistingProxies={() =>
+              routewardClient.detectExistingProxiesStrict()
+            }
             onTestProxy={async (id) => {
               try {
                 const report = await routewardClient.testProxy(id);
+                recordProxyTestReport(id, report);
                 if (report?.reachable) {
                   pushToast(t('app.toast.proxy.tested'), 'success');
                 } else {
@@ -1496,7 +1850,10 @@ export const App: React.FC = () => {
             }}
             onTestAllProxies={async () => {
               try {
-                await routewardClient.testAllProxies();
+                const reports = await routewardClient.testAllProxies();
+                reports.forEach((report) =>
+                  recordProxyTestReport(report.proxyId, report)
+                );
                 pushToast(t('app.toast.proxy.tested'));
               } catch (err) {
                 pushErrorToast(err);
@@ -1513,12 +1870,13 @@ export const App: React.FC = () => {
                     node.enabled &&
                     diagnostics.daemonConnected
                   ) {
-                    void routewardClient.testProxy(node.id).catch(() => {});
+                    void testAndRecordProxy(node.id);
                   }
                 }
               );
             }}
             onImportUris={(text) => {
+              const knownIds = new Set(profile.proxies.map((p) => p.id));
               runMutation(
                 () => routewardClient.importProxyUris(text),
                 (count) => {
@@ -1526,6 +1884,9 @@ export const App: React.FC = () => {
                     pushToast(
                       `${t('app.toast.proxy.imported_uris')} (${count})`
                     );
+                    testAddedProxies(knownIds);
+                  } else {
+                    pushToast(t('proxies.import.none_added'), 'warning');
                   }
                 }
               );
@@ -1553,6 +1914,7 @@ export const App: React.FC = () => {
             connections={connections}
             proxies={profile.proxies}
             chains={profile.chains}
+            rules={profile.rules}
             experienceMode={experienceMode}
             engineRunning={isEngineRunning}
             onEnableProtection={() => {
@@ -1613,6 +1975,7 @@ export const App: React.FC = () => {
             onUpdateSecurityPolicy={(partial) => {
               runMutation(() => routewardClient.updateSecurityPolicy(partial));
             }}
+            onToggleAllShields={handleToggleAllShields}
             onSetInterceptionMode={(mode: InterceptionMode) => {
               runMutation(() => routewardClient.setInterceptionMode(mode));
             }}
@@ -1753,54 +2116,58 @@ export const App: React.FC = () => {
       )}
 
       {showGlossaryModal && (
-        <GlossaryModal onClose={() => setShowGlossaryModal(false)} />
+        <GlossaryModal
+          experienceMode={experienceMode}
+          onClose={() => setShowGlossaryModal(false)}
+        />
       )}
 
       {showTroubleshootModal && (
         <TroubleshootModal
           connections={connections}
+          health={health}
+          onTestProxy={() => {
+            if (activePrimaryProxy) {
+              void testAndRecordProxy(activePrimaryProxy.id).then((report) => {
+                setProxyOutageDetected(!report?.reachable);
+                pushToast(
+                  report?.reachable
+                    ? t('app.toast.proxy.tested')
+                    : t('app.toast.proxy.unreachable'),
+                  report?.reachable ? 'success' : 'error'
+                );
+              });
+            }
+          }}
+          onPauseProtection={(minutes) => {
+            void handleTemporaryPause(minutes);
+            setShowTroubleshootModal(false);
+          }}
+          onChangeProxy={() => {
+            setShowTroubleshootModal(false);
+            setActiveTab('proxy');
+          }}
           onAllowAppDirect={(conn) => {
-            runMutation(
-              () =>
-                routewardClient.upsertRule({
-                  id: generateClientId('rule-unblock-app'),
-                  name: `${conn.processName} (DIRECT)`,
-                  enabled: true,
-                  priority: UI_CONFIG.TROUBLESHOOT_RULE_PRIORITY,
-                  processPatterns: [conn.processName],
-                  domainPatterns: [],
-                  ipCidrs: [],
-                  portRanges: [],
-                  protocol: 'any',
-                  action: { type: 'direct' }
-                }),
-              () => {
-                pushToast(t('app.toast.rule.created'), 'success');
-                setShowTroubleshootModal(false);
-              }
-            );
+            const name = getFriendlyAppName(conn.processName).displayName;
+            allowDirect({
+              id: `rule-unblock-app-${slugifyRuleKey(conn.processName)}`,
+              name: t('troubleshoot.rules.app_direct', { name }),
+              processPatterns: [conn.processName],
+              domainPatterns: [],
+              toastKey: 'troubleshoot.toast.app_allowed',
+              subject: name
+            });
           }}
           onAllowSiteDirect={(conn) => {
             const domain = conn.resolvedDomain || conn.targetHost;
-            runMutation(
-              () =>
-                routewardClient.upsertRule({
-                  id: generateClientId('rule-unblock-site'),
-                  name: `${domain} (DIRECT)`,
-                  enabled: true,
-                  priority: UI_CONFIG.TROUBLESHOOT_RULE_PRIORITY,
-                  processPatterns: [],
-                  domainPatterns: [domain],
-                  ipCidrs: [],
-                  portRanges: [],
-                  protocol: 'any',
-                  action: { type: 'direct' }
-                }),
-              () => {
-                pushToast(t('app.toast.rule.created'), 'success');
-                setShowTroubleshootModal(false);
-              }
-            );
+            allowDirect({
+              id: `rule-unblock-site-${slugifyRuleKey(domain)}`,
+              name: t('troubleshoot.rules.site_direct', { name: domain }),
+              processPatterns: [],
+              domainPatterns: [domain],
+              toastKey: 'troubleshoot.toast.site_allowed',
+              subject: domain
+            });
           }}
           onClose={() => setShowTroubleshootModal(false)}
         />
@@ -1819,21 +2186,30 @@ export const App: React.FC = () => {
             await routewardClient.upsertProxy(node);
             return routewardClient.getProfile().proxies;
           }}
-          onTestProxy={(proxyId) => routewardClient.testProxy(proxyId)}
-          onDetectExistingProxies={() => routewardClient.detectExistingProxies()}
+          onRemoveProxy={(proxyId) => routewardClient.removeProxy(proxyId)}
+          onSetPrimaryProxy={async (proxyId) => {
+            await routewardClient.setPrimaryProxy(proxyId);
+            return routewardClient.getProfile().proxies;
+          }}
+          onTestProxy={(proxyId) => testAndRecordProxy(proxyId)}
+          onDetectExistingProxies={() =>
+            routewardClient.detectExistingProxiesStrict()
+          }
           onEnableProtection={async () => {
-            if (diagnostics.daemonConnected && !diagnostics.running) {
-              await handleToggleEngine(true);
+            const current = routewardClient.getDiagnostics();
+            if (!current.daemonConnected) {
+              return false;
             }
+            if (current.running) {
+              return true;
+            }
+            return handleToggleEngine(true);
           }}
           onAddRule={(rule) => routewardClient.upsertRule(rule)}
           onSelectMode={(mode) => handleSetExperienceMode(mode)}
           onError={(err) => pushErrorToast(err)}
           onComplete={(hasEnabledProxy) => {
-            window.localStorage.setItem(
-              UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED,
-              'true'
-            );
+            markWizardCompleted();
             pushToast(
               t(
                 hasEnabledProxy === false
@@ -1843,13 +2219,27 @@ export const App: React.FC = () => {
               hasEnabledProxy === false ? 'info' : 'success'
             );
           }}
-          onClose={() => {
-            window.localStorage.setItem(
-              UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED,
-              'true'
-            );
+          onConfigSaved={markWizardCompleted}
+          onVerifyProtection={() => {
             setShowWizardModal(false);
+            setActiveTab('home');
+            setVerifyRequestId((prev) => prev + 1);
           }}
+          onClose={() => setShowWizardModal(false)}
+        />
+      )}
+
+      {pendingConfirm && (
+        <ConfirmApplyModal
+          title={pendingConfirm.title}
+          intro={pendingConfirm.intro}
+          changes={pendingConfirm.changes}
+          onConfirm={() => {
+            const confirmed = pendingConfirm;
+            setPendingConfirm(null);
+            confirmed.onConfirm();
+          }}
+          onCancel={() => setPendingConfirm(null)}
         />
       )}
 
@@ -1872,6 +2262,7 @@ export const App: React.FC = () => {
 
       {showCommandPalette && (
         <CommandPaletteModal
+          experienceMode={experienceMode}
           onClose={() => setShowCommandPalette(false)}
           onNavigate={(tab) => setActiveTab(tab)}
           onToggleEngine={() => {

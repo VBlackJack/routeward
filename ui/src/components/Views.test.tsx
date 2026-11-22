@@ -15,9 +15,10 @@
  */
 
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import i18n from '../i18n';
+import { UI_CONFIG } from '../config/constants';
 import { formatProxyUri, parseSingleProxyUri } from '../services/uri';
 import { ConnectionsView } from './ConnectionsView';
 import { DashboardView } from './DashboardView';
@@ -405,7 +406,9 @@ describe('Core UI view components', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:10853',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'fr'
+      activeLocale: 'fr',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     };
     const securityPolicy: SecurityPolicyConfig = {
       killSwitchEnabled: true,
@@ -475,16 +478,17 @@ describe('Core UI view components', () => {
       i18n.t('rules.simple.target_app_placeholder')
     );
     fireEvent.change(targetInput, { target: { value: 'spotify.exe' } });
+    const dialog = within(screen.getByRole('dialog'));
     fireEvent.click(
-      screen.getByRole('button', { name: i18n.t('connections.simple.route_direct') })
+      dialog.getByRole('button', { name: i18n.t('connections.simple.route_direct') })
     );
-    fireEvent.click(
-      screen.getByRole('button', { name: i18n.t('rules.modal.add.submit') })
-    );
+    fireEvent.click(dialog.getByRole('button', { name: i18n.t('rules.modal.add.submit') }));
 
     expect(onAddRule).toHaveBeenCalledTimes(1);
     expect(onAddRule.mock.calls[0][0].processPatterns).toEqual(['spotify.exe']);
     expect(onAddRule.mock.calls[0][0].action).toEqual({ type: 'direct' });
+    expect(onAddRule.mock.calls[0][0].id).toBe('rule-app-spotify-exe');
+    expect(onAddRule.mock.calls[0][0].priority).toBe(UI_CONFIG.SIMPLE_APP_RULE_PRIORITY);
   });
 
   it('ProxiesView and ConnectionsView adapt cleanly to simple mode', () => {
@@ -582,7 +586,9 @@ describe('Core UI view components', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:10853',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'fr'
+      activeLocale: 'fr',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     };
     const logs: LogEntry[] = [
       {
@@ -818,7 +824,9 @@ describe('Core UI view components', () => {
           relayHttpEndpoint: '127.0.0.1:10809',
           dnsEndpoint: '127.0.0.1:1053',
           fakeIpCidr: '198.18.0.0/15',
-          activeLocale: 'en'
+          activeLocale: 'en',
+          pausedUntilEpochMs: null,
+          autoStartErrorKey: null
         }}
         securityPolicy={{
           killSwitchEnabled: true,
@@ -944,7 +952,7 @@ describe('Core UI view components', () => {
     expect(onAddRule).toHaveBeenCalledTimes(1);
     const createdRule = onAddRule.mock.calls[0][0] as RoutingRule;
     expect(createdRule.processPatterns).toEqual(['msedge.exe']);
-    expect(createdRule.domainPatterns).toEqual(['meshcore.net', '*.meshcore.net']);
+    expect(createdRule.domainPatterns).toEqual(['*.meshcore.net']);
     expect(createdRule.action).toEqual({ type: 'proxy', targetId: 'p-ext' });
 
     // Reopening this combined process+domain rule stays in simple mode with both values prefilled
@@ -973,7 +981,7 @@ describe('Core UI view components', () => {
     ).toHaveValue('msedge.exe');
     expect(
       screen.getByPlaceholderText(i18n.t('rules.simple.optional_site_placeholder'))
-    ).toHaveValue('meshcore.net, *.meshcore.net');
+    ).toHaveValue('*.meshcore.net');
   });
 
   it('DashboardView and QuickSetupWizardModal default to Direct Filter Mode without dummy 127.0.0.1:1080', async () => {
@@ -999,7 +1007,9 @@ describe('Core UI view components', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:5353',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'en'
+      activeLocale: 'en',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     };
     const securityPolicy: SecurityPolicyConfig = {
       killSwitchEnabled: true,
@@ -1164,13 +1174,14 @@ describe('Core UI view components', () => {
     expect(
       screen.getByRole('button', { name: i18n.t('proxies.simple.paste_link_button') })
     ).toBeInTheDocument();
-    expect(screen.getByText(`${i18n.t('proxies.simple.status_ok')} (31 ms)`)).toBeInTheDocument();
+    expect(screen.getByText(i18n.t('proxies.simple.status_ok'))).toBeInTheDocument();
+    expect(screen.queryByText(/ms\)/)).not.toBeInTheDocument();
 
     // Deleting a referenced proxy shows an inline warning and requires confirmation
     fireEvent.click(screen.getByRole('button', { name: i18n.t('proxies.card.action.delete') }));
     expect(onRemoveProxy).not.toHaveBeenCalled();
     expect(
-      screen.getByText(i18n.t('proxies.simple.in_use_warning', { count: 1 }))
+      screen.getByText(i18n.t('proxies.delete.warning_disable', { count: 1 }))
     ).toBeInTheDocument();
     fireEvent.click(
       screen.getByRole('button', {
@@ -1181,10 +1192,15 @@ describe('Core UI view components', () => {
 
     // Quick-paste URI in Add Proxy modal auto-fills fields and validates ports
     fireEvent.click(screen.getByRole('button', { name: i18n.t('proxies.simple.add') }));
-    fireEvent.change(
-      screen.getByLabelText(i18n.t('proxies.modal.add_proxy.quick_paste_label')),
-      { target: { value: 'https://alice:pw@edge.example.com:8443#AutoFilled' } }
+    const quickPasteInput = screen.getByLabelText(
+      i18n.t('proxies.modal.add_proxy.quick_paste_label')
     );
+    fireEvent.change(quickPasteInput, {
+      target: { value: 'https://alice:pw@edge.example.com:8443#AutoFilled' }
+    });
+    // Nothing is parsed while typing: the link is read when the field is left.
+    expect(screen.getByLabelText(i18n.t('proxies.modal.add_proxy.host_label'))).toHaveValue('');
+    fireEvent.blur(quickPasteInput);
     expect(screen.getByLabelText(i18n.t('proxies.modal.add_proxy.name_label'))).toHaveValue(
       'AutoFilled'
     );
@@ -1219,7 +1235,9 @@ describe('Core UI view components', () => {
           relayHttpEndpoint: '127.0.0.1:10809',
           dnsEndpoint: '127.0.0.1:10853',
           fakeIpCidr: '198.18.0.0/15',
-          activeLocale: 'en'
+          activeLocale: 'en',
+          pausedUntilEpochMs: null,
+          autoStartErrorKey: null
         }}
         securityPolicy={{
           killSwitchEnabled: true,
@@ -1453,7 +1471,9 @@ describe('Core UI view components', () => {
           relayHttpEndpoint: '127.0.0.1:10809',
           dnsEndpoint: '127.0.0.1:5353',
           fakeIpCidr: '198.18.0.0/15',
-          activeLocale: 'fr'
+          activeLocale: 'fr',
+          pausedUntilEpochMs: null,
+          autoStartErrorKey: null
         }}
         dnsCount={0}
         securityPolicy={{
@@ -1645,7 +1665,9 @@ describe('Core UI view components', () => {
           relayHttpEndpoint: '127.0.0.1:10809',
           dnsEndpoint: '127.0.0.1:5353',
           fakeIpCidr: '198.18.0.0/15',
-          activeLocale: 'fr'
+          activeLocale: 'fr',
+          pausedUntilEpochMs: null,
+          autoStartErrorKey: null
         }}
         dnsCount={0}
         securityPolicy={{

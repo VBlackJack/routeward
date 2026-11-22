@@ -105,7 +105,13 @@ Le daemon ouvre `\\.\pipe\routeward-daemon` avec une DACL explicite autorisant u
 > **Important (Élévation du compte Windows UAC) :** En lancement interactif via `routeward.exe daemon`, le daemon doit tourner sous le même compte utilisateur que l'interface ou `routeward ctl`, sauf si `--allow-sid <SID>` est fourni explicitement.
 
 ### Mode Service Windows (SCM) & Empaquetage
-Pour une exécution persistante sous `LocalSystem`, enregistrez RouteWard comme service Windows en autorisant le SID de votre compte utilisateur sur le Named Pipe :
+Le service Windows est la manière normale d'exécuter RouteWard. Avec le MSI, rien n'est à enregistrer à la main : la première fois que vous cliquez sur **Démarrer** dans l'application ou dans la barre système, RouteWard installe le service (une seule demande d'administrateur Windows), puis le service démarre automatiquement avec l'ordinateur. La protection est mémorisée : si elle était active, elle revient après un redémarrage, et une pause reprend toute seule à son terme, même après un redémarrage. RouteWard lui-même démarre à l'ouverture de session avec la seule icône de la barre système (réduit, sans fenêtre).
+
+Choisir **Quitter** dans la barre système ferme seulement l'application bureau ; le service continue de protéger en arrière-plan. Pour vraiment arrêter, utilisez **Pause** ou désactivez la protection avant de quitter (voir [Dépannage](troubleshooting.md)).
+
+Le MSI ajoute aussi un raccourci du menu Démarrer, **RouteWard - Restore Internet**, qui lance `routeward recover --pause-at-end` sans droits d'administrateur : il désactive la protection et rétablit les paramètres de proxy Windows. Depuis un terminal, `routeward recover` est l'équivalent, et `routeward ctl pause --seconds N` met la protection en pause pendant `N` secondes.
+
+Pour une installation manuelle ou scriptée (ZIP, développement), vous pouvez enregistrer vous-même RouteWard comme service Windows sous `LocalSystem` en autorisant le SID de votre compte utilisateur sur le Named Pipe :
 
 `install-service.ps1` copie d'abord `routeward.exe`, `routeward-desktop.exe` et les fichiers WinDivert fournis depuis le dossier d'extraction (modifiable par l'utilisateur) vers `%ProgramFiles%\RouteWard` (modifiable avec `-InstallDir`), puis enregistre la copie installée. `routeward.exe service install` refuse de son côté un binaire de service dont le dossier, ou un dossier parent, est modifiable par des non-administrateurs, car le service s'exécute sous `LocalSystem`.
 

@@ -4,12 +4,25 @@
 
 Outil de routage réseau par processus et de chaînage de proxies écrit en Rust, avec une interface bureau native basée sur `tao` + `wry` (WebView2) et **ThemeForge**.
 
+## Premiers Pas (Aucune Connaissance Réseau Requise)
+
+Un **proxy** est un serveur intermédiaire sur Internet : vos applications lui parlent, et il parle aux sites web à leur place, donc les sites voient l'adresse du proxy et non la vôtre. RouteWard décide, application par application, ce qui passe par lui.
+
+1. Installez RouteWard avec le programme d'installation `.msi`.
+2. Ouvrez **RouteWard** depuis le menu Démarrer.
+3. Suivez l'assistant de configuration : collez le lien du proxy qui vous a été donné, ou choisissez **Pas de proxy** si vous n'en avez pas.
+4. Cliquez sur **Démarrer** (la première fois, Windows demande une seule fois l'accord d'un administrateur, pour installer le service d'arrière-plan), puis cochez **Vérifier ma protection**.
+
+La protection démarre toute seule à chaque démarrage et est mémorisée après un redémarrage. Fermer la fenêtre garde RouteWard dans la zone de notification. Si vous perdez un jour votre connexion Internet, utilisez le raccourci du menu Démarrer **RouteWard - Restore Internet** ou suivez le [Dépannage, section 0](docs/fr/troubleshooting.md#0-je-nai-plus-internet).
+
 ## Licence et Auteur
 
 - **Auteur :** Julien Bombled
 - **Licence :** Apache License, Version 2.0 (voir [LICENSE](LICENSE) et [NOTICE](NOTICE))
 
-## Fonctionnalités et État Actuel
+## Aperçu Technique : Fonctionnalités et État Actuel (pour les Lecteurs Techniques)
+
+> Tout ce qui suit s'adresse aux lecteurs techniques. Pour simplement utiliser RouteWard, la section ci-dessus et le [guide de dépannage](docs/fr/troubleshooting.md) suffisent.
 
 - **Interception Transparente OS (`routeward-core::interceptor`)** : Capture le trafic sortant double pile **IPv4 et IPv6** TCP, UDP et DNS (port `53`) d'applications non modifiées via **WinDivert 2.2** sous Windows et **`nftables` (`table ip` + `table ip6`) + `TPROXY`** sous Linux, en plus des écouteurs locaux SOCKS5 (`127.0.0.1:10808` / `[::1]:10808`) et HTTP CONNECT (`127.0.0.1:10809` / `[::1]:10809`).
 - **Attribution de Processus (`routeward-core::process`)** : Associe les sockets TCP et UDP IPv4/IPv6 actifs aux PID et chemins d'exécutables via la couche `SOCKET` WinDivert + l'API Windows IP Helper (`GetExtendedTcpTable` / `GetExtendedUdpTable` pour `AF_INET` et `AF_INET6`) et Linux **`NETLINK_SOCK_DIAG`** (`AF_INET` / `AF_INET6`) avec repli `/proc/net/{tcp,udp,tcp6,udp6}` + `/proc/<pid>/exe`.

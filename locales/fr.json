@@ -13,13 +13,13 @@
       "cancel": "Annuler"
     },
     "launcher": {
-      "button": "Lancer App via Proxy",
+      "button": "Lancer une app via proxy",
       "modal": {
-        "title": "Lancer un Exécutable via RouteWard",
+        "title": "Lancer un exécutable via RouteWard",
         "subtitle": "Démarre un programme cible avec injection automatique des variables d'environnement ALL_PROXY, HTTP_PROXY et HTTPS_PROXY vers le relais local.",
-        "executable_label": "Chemin ou Nom de l'Exécutable",
+        "executable_label": "Chemin ou nom de l'exécutable",
         "executable_placeholder": "ex. curl.exe, firefox.exe ou C:\\Program Files\\App\\app.exe",
-        "args_label": "Arguments de ligne de commande (Optionnel)",
+        "args_label": "Arguments de ligne de commande (facultatif)",
         "args_help": "Un argument par ligne. Les espaces à l'intérieur d'une ligne sont conservés tels quels et les lignes vides sont ignorées.",
         "args_placeholder": "https://api.ipify.org?format=json",
         "submit": "Lancer avec RouteWard",
@@ -27,69 +27,67 @@
       }
     },
     "system_proxy": {
-      "active": "Proxy Système Actif",
-      "inactive": "Proxy Système Off",
+      "active": "Proxy système actif",
+      "inactive": "Proxy système désactivé",
       "tooltip": "Activer / Désactiver le Proxy Système Windows (127.0.0.1:10809)"
     },
     "experience_mode": {
       "simple": "Simple",
-      "expert": "Avancé",
+      "expert": "Expert",
       "tooltip": "Basculer entre l'interface simplifiée par cas d'usage et les outils techniques complets"
     },
     "help": {
-      "wizard_button": "Aide rapide",
-      "glossary_button": "Lexique & Aide"
+      "wizard_button": "Assistant de configuration",
+      "glossary_button": "Lexique et aide"
     },
     "daemon_banner": {
-      "disconnected_title": "Démon Privilégié RouteWard Déconnecté",
-      "disconnected_desc": "Le pont de l'interface ne parvient pas à joindre le démon (lancez 'routeward daemon' en Administrateur ou root). Reconnexion automatique active.",
-      "simple_disconnected_title": "Service de protection arrêté",
-      "simple_disconnected_desc": "Démarrez le service en un clic pour activer le filtrage et la protection de vos applications.",
-      "simple_disconnected_non_windows": "Le service de fond n'est pas encore lancé. Démarrez RouteWard en administrateur (root) pour activer la protection.",
-      "reconnecting_badge": "Reconnexion auto",
+      "disconnected_title": "Le service de fond de RouteWard n'est pas démarré",
+      "disconnected_desc": "RouteWard ne parvient pas à joindre son service de fond. Démarrez-le avec le bouton, ou redémarrez RouteWard. Il essaie de se reconnecter tout seul.",
+      "simple_disconnected_title": "Protection arrêtée",
+      "simple_disconnected_desc": "Démarrez la protection en un clic pour appliquer vos règles par application.",
+      "simple_disconnected_non_windows": "Le service de fond n'est pas encore démarré. Lancez RouteWard en administrateur (root) pour activer la protection.",
+      "reconnecting_badge": "Reconnexion",
       "retry_button": "Réessayer",
-      "start_button": "Démarrer le Service",
+      "start_button": "Démarrer la protection",
       "starting_button": "Démarrage...",
-      "not_elevated_title": "Démon Lancé Sans Privilèges Élevés",
-      "not_elevated_desc": "Le démon connecté tourne sans privilèges Administrateur ou root. L'interception transparente des paquets système requiert l'élévation."
+      "not_elevated_title": "RouteWard a besoin des droits d'administrateur",
+      "not_elevated_desc": "Sans eux, RouteWard ne peut pas filtrer vos applications. Cliquez sur le bouton et acceptez la demande de Windows.",
+      "not_elevated_button": "Autoriser"
     },
     "outage_banner": {
       "title": "Votre proxy ne répond plus - Internet est bloqué par sécurité",
-      "desc": "Le coupe-circuit empêche votre vraie IP de fuiter. Mettez en pause 15 min ou vérifiez votre proxy.",
-      "pause_15m": "Pause 15 min",
+      "desc": "Le coupe-circuit empêche votre vraie adresse IP de s'afficher. Mettez la protection en pause un moment ou vérifiez votre proxy.",
+      "pause_15m": "Pause {{minutes}} min",
       "check_proxy": "Changer de proxy",
-      "dismiss": "Masquer"
+      "dismiss": "Masquer",
+      "title_no_killswitch": "Votre proxy ne répond plus",
+      "desc_no_killswitch": "Les applications qui l'utilisent peuvent ne plus se connecter. Mettez la protection en pause un moment ou vérifiez votre proxy."
     },
     "header": {
       "brand": {
         "title": "RouteWard",
-        "subtitle": "Intercepteur Réseau par Processus Multi-Plateforme"
+        "subtitle": "Intercepteur réseau par processus multiplateforme"
       },
       "engine": {
         "running": "Intercepteur Actif",
         "stopped": "Intercepteur en Pause",
         "start": "Activer la protection",
-        "pause": "Mettre en pause",
+        "pause": "Désactiver",
         "start_protection": "Démarrer la protection",
         "starting_protection": "Démarrage..."
       },
-      "status": {
-        "protected": "Protégé",
-        "paused": "En pause",
-        "disconnected": "Service arrêté"
-      },
       "mode": {
-        "hybrid": "Hybride (Fake-IP + Pilote/Relais)",
-        "driver": "Pilote Noyau (WinDivert / eBPF)",
-        "relay": "Relais Local Espace Utilisateur"
+        "hybrid": "Hybride (Fake-IP + pilote/relais)",
+        "driver": "Pilote noyau (WinDivert / eBPF)",
+        "relay": "Relais local en espace utilisateur"
       },
       "language": {
         "en": "English",
         "fr": "Français"
       },
       "profile": {
-        "import": "Importer un Profil",
-        "export": "Exporter le Profil"
+        "import": "Importer un profil",
+        "export": "Exporter le profil"
       }
     },
     "nav": {
@@ -98,10 +96,10 @@
         "tab": "Accueil"
       },
       "apps": {
-        "tab": "Mes Apps & Sites"
+        "tab": "Mes apps et sites"
       },
       "proxy": {
-        "tab": "Mon Proxy"
+        "tab": "Mon proxy"
       },
       "activity": {
         "tab": "Activité"
@@ -118,8 +116,8 @@
         "label": "Pool Fake-IP"
       },
       "killswitch": {
-        "active": "Kill-Switch Armé",
-        "inactive": "Kill-Switch Désactivé"
+        "active": "Kill-switch armé",
+        "inactive": "Kill-switch désactivé"
       },
       "shortcut": {
         "hint": "Appuyez sur Ctrl+K pour les commandes rapides"
@@ -127,135 +125,139 @@
     },
     "toast": {
       "rule": {
-        "created": "Règle de routage créée et appliquée immédiatement",
-        "updated": "Règle de routage mise à jour",
-        "deleted": "Règle de routage supprimée"
+        "created": "Règle enregistrée et active immédiatement",
+        "updated": "Règle mise à jour",
+        "deleted": "Règle supprimée"
       },
       "proxy": {
-        "added": "Serveur proxy ajouté au profil",
-        "deleted": "Serveur proxy supprimé",
-        "imported_uris": "Serveurs proxies importés depuis la liste d'URI",
-        "copied_uri": "URI du proxy copiée dans le presse-papiers",
-        "tested": "Test de latence et de santé du proxy terminé",
-        "unreachable": "Le proxy n'a pas répondu - vérifiez l'adresse, le port et le protocole",
-        "required_for_rule": "Ajoutez et activez d'abord un serveur proxy externe pour router un flux via proxy",
-        "primary_changed": "Proxy principal mis à jour",
-        "clipboard_empty": "Aucun lien proxy trouvé dans le presse-papiers (attendu : socks5://, http:// ou https://)"
+        "added": "Proxy ajouté",
+        "deleted": "Proxy supprimé",
+        "imported_uris": "Proxies importés depuis votre liste",
+        "copied_uri": "Lien du proxy copié",
+        "tested": "Test du proxy terminé : il répond",
+        "unreachable": "Le proxy n'a pas répondu. Vérifiez son adresse, son port et son type.",
+        "required_for_rule": "Ajoutez d'abord un proxy pour faire passer une application par un proxy",
+        "primary_changed": "Proxy principal modifié",
+        "clipboard_empty": "Aucun lien de proxy trouvé dans le presse-papiers (il ressemble à socks5://adresse:port, http://adresse:port ou https://adresse:port)"
       },
       "connection": {
-        "terminated": "Socket de connexion terminé",
-        "os_scanned": "Sockets TCP réels du système analysés et importés",
-        "exported": "Activité réseau exportée"
+        "terminated": "Connexion fermée",
+        "os_scanned": "Connexions actives actualisées",
+        "exported": "Activité exportée"
       },
       "system": {
-        "proxy_enabled": "Proxy Système Windows activé sur le relais local",
-        "proxy_disabled": "Proxy Système Windows désactivé",
-        "proxy_error": "Échec de la mise à jour du Proxy Système Windows",
-        "pac_enabled": "Auto-configuration PAC Windows activée",
-        "pac_disabled": "Auto-configuration PAC Windows désactivée",
-        "pac_error": "Échec de mise à jour de la configuration PAC Windows",
-        "pac_copied": "URL PAC locale copiée dans le presse-papiers",
-        "autostart_enabled": "RouteWard démarrera automatiquement à l'ouverture de session",
-        "autostart_disabled": "Lancement automatique à l'ouverture de session désactivé",
-        "autostart_error": "Échec de mise à jour du démarrage automatique",
-        "process_launched": "Processus démarré avec injection proxy",
-        "process_launch_error": "Échec du lancement du processus via le proxy"
+        "proxy_enabled": "Réglage proxy de Windows activé",
+        "proxy_disabled": "Réglage proxy de Windows désactivé",
+        "proxy_error": "RouteWard n'a pas pu modifier le réglage proxy de Windows",
+        "pac_enabled": "Configuration automatique du proxy activée",
+        "pac_disabled": "Configuration automatique du proxy désactivée",
+        "pac_error": "RouteWard n'a pas pu modifier la configuration automatique du proxy",
+        "pac_copied": "Adresse copiée",
+        "autostart_enabled": "RouteWard démarrera à l'ouverture de votre session Windows",
+        "autostart_disabled": "RouteWard ne démarrera plus avec Windows",
+        "autostart_error": "RouteWard n'a pas pu modifier le démarrage avec Windows",
+        "process_launched": "Programme démarré via le proxy",
+        "process_launch_error": "RouteWard n'a pas pu démarrer ce programme"
       },
       "wizard": {
-        "completed": "Configuration appliquée avec succès via l'Assistant",
-        "completed_direct_no_proxy": "Mode Filtrage Direct actif (aucun serveur proxy externe configuré pour le moment)"
+        "completed": "Votre configuration est enregistrée",
+        "completed_direct_no_proxy": "Configuration enregistrée. Pas encore de proxy : votre adresse IP reste visible et seules vos règles par application s'appliquent."
       },
       "dns": {
-        "flushed": "Cache DNS Fake-IP purgé"
+        "flushed": "Mémoire DNS vidée"
       },
       "profile": {
-        "imported": "Profil de configuration importé",
-        "import_error": "Fichier JSON de profil invalide",
-        "exported": "Profil exporté au format JSON",
-        "saved_named": "Profil nommé enregistré",
-        "switched": "Profil actif basculé",
-        "auto_switched": "Profil basculé automatiquement pour ce réseau",
+        "imported": "Profil importé",
+        "import_error": "Ce fichier n'est pas un profil RouteWard valide",
+        "exported": "Profil exporté",
+        "saved_named": "Profil enregistré",
+        "switched": "Profil changé",
+        "auto_switched": "Profil changé automatiquement pour ce réseau",
         "deleted": "Profil supprimé",
-        "reset_done": "Réglages par défaut rétablis (ancien profil sauvegardé)",
-        "error": "Échec de l'opération sur le profil"
+        "reset_done": "Réglages par défaut rétablis (votre ancien profil a été sauvegardé)",
+        "error": "L'action sur le profil a échoué"
       },
       "foxyproxy": {
         "imported": "Règles et proxies FoxyProxy importés",
-        "import_error": "Fichier ou JSON FoxyProxy invalide"
+        "import_error": "Ce fichier FoxyProxy n'est pas valide"
       },
       "usecase": {
         "applied": "Scénario appliqué",
-        "applied_direct_no_proxy": "Règles de filtrage direct appliquées (ajoutez un proxy externe dans Serveur Proxy pour créer un tunnel)"
+        "applied_direct_no_proxy": "Scénario appliqué sans proxy : ajoutez un proxy dans \"Mon Proxy\" pour masquer votre adresse IP",
+        "already_applied": "Ce scénario est déjà appliqué"
       },
       "engine": {
-        "driver_missing": "Le pilote WinDivert est absent du dossier d'installation (exécutez tools/fetch-windivert.ps1)",
-        "open_failed": "Impossible d'ouvrir le filtre réseau (droits Administrateur requis)",
-        "not_root": "Privilèges root requis pour l'interception transparente",
-        "nft_missing": "Binaire nftables (nft) introuvable",
-        "nft_failed": "Échec de la configuration des règles nftables",
-        "start_failed": "Impossible de changer l'état de protection",
-        "paused_temporarily": "Protection mise en pause temporairement ({{minutes}} min)",
-        "resumed_automatically": "Protection réactivée automatiquement"
+        "start_failed": "La protection n'a pas pu être modifiée. Réessayez.",
+        "paused_temporarily": "Protection en pause pendant {{minutes}} min",
+        "resumed_automatically": "La protection est réactivée",
+        "paused_until": "Protection en pause jusqu'à {{time}}"
       },
       "daemon": {
-        "started": "Service privilégié démarré et connecté",
-        "uac_cancelled": "Autorisation administrateur annulée",
-        "start_failed": "Impossible de démarrer le service automatiquement",
-        "access_denied": "Le service tourne sans autorisation pour cette session",
-        "insecure_profile": "Démarrage refusé : droits ou propriétaire non sécurisés sur %ProgramData%\\RouteWard",
-        "ipc_error": "Échec d'ouverture du canal IPC local du démon",
-        "not_elevated": "Le démon n'a pas reçu les privilèges administrateur",
-        "config_invalid": "Impossible de charger le profil de configuration du démon",
-        "daemon_exited": "Le démon privilégié s'est arrêté pendant le démarrage"
+        "started": "RouteWard fonctionne maintenant en arrière-plan",
+        "uac_cancelled": "Vous avez annulé la demande d'administrateur : rien n'a été démarré",
+        "start_failed": "RouteWard n'a pas pu démarrer. Réessayez.",
+        "access_denied": "RouteWard fonctionne, mais votre session Windows n'a pas le droit de l'utiliser. Redémarrez RouteWard.",
+        "insecure_profile": "RouteWard n'a pas démarré car son dossier de données peut être modifié par d'autres utilisateurs. Réinstallez RouteWard pour le réparer.",
+        "ipc_error": "RouteWard a démarré mais n'a pas pu se connecter à sa protection. Redémarrez RouteWard.",
+        "not_elevated": "Windows n'a pas donné les droits d'administrateur à RouteWard. Réessayez et acceptez la demande.",
+        "config_invalid": "RouteWard n'a pas pu lire ses réglages. Restaurez un profil sauvegardé ou réinitialisez vos réglages.",
+        "daemon_exited": "RouteWard s'est arrêté au démarrage. Réessayez ; si cela continue, réinstallez RouteWard."
       },
       "error": {
-        "generic": "L'opération a échoué"
+        "generic": "Quelque chose s'est mal passé. Réessayez."
       },
       "undo": "Annuler",
       "undo_applied": "Action annulée",
-      "dismiss": "Fermer la notification"
+      "dismiss": "Fermer la notification",
+      "shield": {
+        "turned_on": "Bouclier tout-en-un activé",
+        "turned_off": "Bouclier tout-en-un désactivé (vos réglages précédents sont rétablis)"
+      }
+    },
+    "auto_start_error": {
+      "title": "La protection n'a pas pu démarrer toute seule",
+      "retry": "Réessayer"
+    },
+    "service_notice": {
+      "title": "RouteWard fonctionne désormais en arrière-plan",
+      "desc": "Il démarre avec Windows, et fermer la fenêtre le laisse actif dans la zone de notification. Si vous perdez un jour votre connexion Internet, ouvrez \" Restaurer Internet \" depuis le menu Démarrer.",
+      "dismiss": "J'ai compris"
     }
   },
   "command_palette": {
     "modal": {
       "search_placeholder": "Rechercher une commande, une vue, une règle, un proxy ou un thème (Échap pour fermer)...",
       "empty": "Aucune commande ou ressource correspondante.",
-      "group_navigation": "Navigation Rapide",
-      "group_actions": "Actions du Moteur",
-      "group_themes": "Palettes ThemeForge",
+      "group_navigation": "Navigation rapide",
+      "group_actions": "Actions rapides",
+      "group_themes": "Palettes de couleurs",
       "title": "Palette de commandes"
     },
     "actions": {
-      "toggle_engine": "Démarrer / Mettre en pause le moteur d'interception",
+      "toggle_engine": "Activer ou désactiver la protection",
       "test_all_proxies": "Tester la latence et l'IP de sortie de tous les proxies",
       "flush_dns": "Vider le cache DNS anti-fuite Fake-IP",
-      "toggle_killswitch": "Activer / Désactiver le Kill-Switch strict",
-      "open_themeforge": "Ouvrir ThemeForge Studio",
+      "toggle_killswitch": "Activer ou désactiver le kill-switch strict",
+      "open_themeforge": "Personnaliser les couleurs (ThemeForge)",
       "switch_language": "Basculer la langue de l'interface (FR / EN)"
     }
   },
   "dashboard": {
     "health_banner": {
-      "protected_title": "Tout fonctionne - Votre connexion est protégée",
-      "protected_desc": "RouteWard intercepte automatiquement le trafic de vos applications selon vos règles et empêche toute fuite d'adresse IP ou de DNS.",
-      "paused_title": "Protection en pause - Vos applications se connectent en direct",
-      "paused_desc": "Le moteur d'interception est actuellement arrêté. Cliquez sur \"Activer la protection\" pour réactiver le routage via votre proxy.",
-      "quick_wizard_cta": "Configuration Guidée en 3 Clics",
-      "choose_apps_cta": "Choisir mes Applications",
-      "switch_expert_cta": "Voir les Diagnostics Avancés (Expert)",
-      "status_badge_ok": "Bouclier Actif",
-      "status_badge_off": "Inactif"
+      "quick_wizard_cta": "Ouvrir l'assistant de configuration",
+      "choose_apps_cta": "Choisir mes applications",
+      "switch_expert_cta": "Afficher les outils experts"
     },
     "simple": {
-      "metric_protected_apps": "Règles d'Apps Protégées",
-      "metric_leaks_blocked": "Fuites & Blocs Stoppés",
-      "metric_protected_traffic": "Trafic Total Traité",
-      "proxy_summary_label": "Serveur Proxy Actif",
-      "direct_filter_mode_title": "Mode Filtrage Direct (Sans Proxy Externe)",
-      "direct_filter_mode_desc": "Le filtrage actif, le blocage des pisteurs et vos règles locales s'appliquent directement sur votre connexion Internet.",
-      "configure_proxy_cta": "Configurer un Proxy",
-      "add_optional_proxy_cta": "Ajouter un Proxy Externe (Optionnel)",
-      "test_proxy_cta": "Vérifier la Connexion",
+      "metric_protected_apps": "Règles d'apps protégées",
+      "metric_leaks_blocked": "Fuites et blocages stoppés",
+      "metric_protected_traffic": "Trafic total traité",
+      "proxy_summary_label": "Serveur proxy actif",
+      "direct_filter_mode_title": "Sans proxy (connexion directe)",
+      "direct_filter_mode_desc": "Aucun proxy n'est configuré. Ajoutez-en un si vous voulez que les sites voient son adresse à la place de la vôtre.",
+      "configure_proxy_cta": "Configurer un proxy",
+      "add_optional_proxy_cta": "Ajouter un proxy (facultatif)",
+      "test_proxy_cta": "Vérifier la connexion",
       "testing_proxy": "Vérification...",
       "proxy_status_ok": "Fonctionne",
       "proxy_status_failed": "Injoignable",
@@ -275,8 +277,8 @@
       "verify_paused_notice": "La protection est actuellement en pause. Activez-la pour protéger vos applications.",
       "verify_close": "Fermer le bilan",
       "verify_ip_label": "Adresse IP",
-      "verify_ip_masked": "Masquée via proxy",
-      "verify_ip_direct": "Connexion directe (Mode Filtrage)",
+      "verify_ip_masked": "Masquée via le proxy",
+      "verify_ip_direct": "Connexion directe (sans proxy)",
       "verify_ip_unreachable": "Proxy injoignable",
       "verify_before_after": "Avant (Direct) : {{directIp}} -> Après (Proxy) : {{exitIp}}",
       "verify_ip_same_warning": "Attention : l'IP du proxy est identique à votre IP directe ({{exitIp}})",
@@ -288,14 +290,17 @@
       "verify_fix_all": "Tout activer",
       "use_cases_title": "Que voulez-vous faire aujourd'hui ?",
       "use_cases_subtitle": "Choisissez un scénario prêt à l'emploi pour configurer vos applications et votre protection en un clic.",
-      "uc_privacy_title": "Navigation Privée",
+      "uc_privacy_title": "Navigation privée",
       "uc_privacy_desc": "Masque votre IP dans les navigateurs web et bloque la télémétrie système.",
-      "uc_work_title": "Télétravail & Outils Dev",
+      "uc_work_title": "Télétravail et outils de développement",
       "uc_work_desc": "Protège navigateurs et outils de travail tout en gardant votre réseau local en direct.",
-      "uc_gaming_title": "Jeux & Appels Vidéo",
+      "uc_gaming_title": "Jeux et appels vidéo",
       "uc_gaming_desc": "Garde les jeux en direct pour une latence minimale tout en protégeant vos navigateurs.",
-      "uc_strict_title": "Verrouillage Anti-Fuite Maximal",
-      "uc_strict_desc": "Active toutes les protections anti-fuite (coupe-circuit, DNS protégé et blocage des fuites réseau)."
+      "uc_strict_title": "Verrouillage anti-fuite maximal",
+      "uc_strict_desc": "Active toutes les protections anti-fuite (coupe-circuit, DNS protégé et blocage des fuites).",
+      "resume_now": "Reprendre maintenant",
+      "verify_ip_paused": "Non masquée (protection en pause)",
+      "verify_ip_unverified": "Pas encore vérifiée : testez votre proxy"
     },
     "tooltips": {
       "active_connections": "Nombre de programmes sur votre ordinateur qui échangent actuellement des données avec Internet.",
@@ -308,15 +313,15 @@
     },
     "kpi": {
       "active_connections": {
-        "label": "Connexions Actives",
+        "label": "Connexions actives",
         "subtext": "Sockets de processus suivis simultanément"
       },
       "download_speed": {
-        "label": "Débit Descendant",
+        "label": "Débit descendant",
         "subtext": "Bande passante entrante totale"
       },
       "upload_speed": {
-        "label": "Débit Montant",
+        "label": "Débit montant",
         "subtext": "Bande passante sortante totale"
       },
       "dns_mappings": {
@@ -326,21 +331,21 @@
     },
     "chart": {
       "bandwidth": {
-        "title": "Débit Réseau en Temps Réel",
+        "title": "Débit réseau en temps réel",
         "download": "Entrant (RX)",
         "upload": "Sortant (TX)",
         "empty": "En attente d'activité réseau..."
       },
       "distribution": {
-        "title": "Répartition des Actions",
-        "proxied": "Via Proxy",
+        "title": "Répartition des actions",
+        "proxied": "Via proxy",
         "direct": "Direct",
         "blocked": "Bloqué"
       }
     },
     "top_talkers": {
       "panel": {
-        "title": "Processus les Plus Actifs (Top-Talkers)",
+        "title": "Processus les plus actifs",
         "subtitle": "Consommation réseau et sockets actifs par exécutable",
         "sockets": "sockets",
         "empty": "Aucun trafic de processus enregistré."
@@ -348,29 +353,95 @@
     },
     "security_shield": {
       "panel": {
-        "title": "Bouclier de Confidentialité & Anti-Fuite",
+        "title": "Bouclier de confidentialité et anti-fuite",
         "subtitle": "Politiques de sécurité zéro-fuite",
-        "killswitch_title": "Kill-Switch Proxy Strict",
+        "killswitch_title": "Kill-switch proxy strict",
         "killswitch_desc": "Bloque le trafic sortant si le proxy ou la chaîne cible est injoignable",
-        "udp_guard_title": "Protection Anti-Fuite UDP",
+        "udp_guard_title": "Protection anti-fuite UDP",
         "udp_guard_desc": "Bloque les paquets UDP non supportés sur les proxies TCP uniquement",
-        "dns_guard_title": "Résolution DNS Distante via Fake-IP",
+        "dns_guard_title": "Résolution DNS distante via Fake-IP",
         "dns_guard_desc": "Intercepte les requêtes DNS vers 198.18.0.0/15 et résout côté proxy",
-        "killswitch_aria": "Activer ou désactiver le Kill-Switch strict",
+        "killswitch_aria": "Activer ou désactiver le kill-switch strict",
         "udp_guard_aria": "Activer ou désactiver la protection anti-fuite UDP",
         "dns_guard_aria": "Activer ou désactiver la résolution DNS distante via Fake-IP"
       }
     },
     "system": {
       "status": {
-        "title": "Diagnostics des Sous-Systèmes",
-        "os_label": "Système d'Exploitation",
-        "relay_tcp_label": "Relais Local SOCKS5/TCP",
-        "relay_http_label": "Relais Local HTTP",
+        "title": "Diagnostics des sous-systèmes",
+        "os_label": "Système d'exploitation",
+        "relay_tcp_label": "Relais local SOCKS5/TCP",
+        "relay_http_label": "Relais local HTTP",
         "dns_server_label": "Écouteur DNS Fake-IP",
-        "admin_elevated": "Privilèges Élevés (Hooks Noyau Prêts)",
-        "admin_standard": "Utilisateur Standard (Relais Local Actif)",
+        "admin_elevated": "Privilèges élevés (hooks noyau prêts)",
+        "admin_standard": "Utilisateur standard (relais local actif)",
         "admin_unknown": "État inconnu (daemon non joint)"
+      }
+    },
+    "health": {
+      "service_stopped": {
+        "pill": "Service arrêté",
+        "title": "RouteWard n'est pas démarré",
+        "desc": "Vos applications se connectent directement et votre adresse IP est visible. Démarrez la protection pour activer RouteWard.",
+        "badge": "Arrêté"
+      },
+      "stopped": {
+        "pill": "Protection désactivée",
+        "title": "La protection est désactivée",
+        "desc": "Vos applications se connectent directement et votre adresse IP est visible. Activez la protection pour appliquer vos règles.",
+        "badge": "Désactivée"
+      },
+      "paused": {
+        "pill": "En pause jusqu'à {{time}}",
+        "title": "Protection en pause jusqu'à {{time}}",
+        "desc": "Vos applications se connectent directement jusque-là et votre adresse IP est visible. La protection reprend toute seule, ou vous pouvez la reprendre maintenant.",
+        "badge": "En pause"
+      },
+      "error": {
+        "pill": "Erreur",
+        "title": "La protection n'a pas pu démarrer",
+        "desc": "RouteWard n'a pas pu activer la protection. Réessayez ; si cela continue, redémarrez RouteWard.",
+        "badge": "Erreur"
+      },
+      "active_proxy_ok": {
+        "pill": "Protégé",
+        "title": "Protégé : votre proxy répond",
+        "desc": "Les applications qui ont une règle proxy passent par votre proxy : les sites voient l'adresse du proxy et non la vôtre. Les autres applications se connectent directement.",
+        "badge": "Protégé"
+      },
+      "active_proxy_untested": {
+        "pill": "Active",
+        "title": "La protection est activée",
+        "desc": "Votre proxy n'a pas encore été testé : nous ne pouvons pas confirmer que votre adresse IP est masquée. Testez le proxy pour en être sûr.",
+        "badge": "Non vérifié"
+      },
+      "active_proxy_unreachable": {
+        "pill": "Proxy injoignable",
+        "title": "Votre proxy ne répond pas",
+        "desc": "Les applications qui l'utilisent peuvent ne plus se connecter. Testez le proxy, mettez la protection en pause un moment ou changez de proxy.",
+        "badge": "Problème"
+      },
+      "active_no_proxy": {
+        "pill": "Active, sans proxy",
+        "title": "Active sans proxy",
+        "desc": "Votre adresse IP reste visible. Seules vos règles par application (bloquer ou connexion directe) s'appliquent.",
+        "badge": "Sans proxy"
+      }
+    },
+    "confirm": {
+      "intro": "Ces changements vont être appliqués. Vous pourrez les annuler juste après.",
+      "usecase_title": "Appliquer \" {{name}} \" ?",
+      "shield_title": "Activer le bouclier tout-en-un ?",
+      "rule_line": "Ajouter la règle : {{name}}",
+      "undo_hint": "Un bouton \" Annuler \" apparaît après le changement.",
+      "cancel": "Annuler",
+      "apply": "Appliquer",
+      "setting": {
+        "kill_switch": "Couper l'accès à Internet des applications si le proxy ne répond plus (coupe-circuit)",
+        "udp_guard": "Bloquer les appels et jeux que le proxy ne peut pas transporter",
+        "dns_guard": "Résoudre les noms de sites via le proxy et non via votre fournisseur d'accès",
+        "quic_guard": "Forcer les navigateurs à utiliser la connexion sécurisée standard (bloque QUIC)",
+        "encrypted_dns_guard": "Empêcher les applications d'utiliser leurs propres serveurs DNS privés"
       }
     }
   },
@@ -382,15 +453,15 @@
       "filter_all": "Tout",
       "filter_proxied": "Protégées",
       "filter_blocked": "Bloquées",
-      "route_proxy": "Via Proxy",
-      "route_direct": "Direct",
+      "route_proxy": "Via le proxy",
+      "route_direct": "Connexion normale",
       "route_blocked": "Bloquer",
       "count_connections_one": "{{count}} connexion",
       "count_connections_other": "{{count}} connexions",
       "no_apps": "Aucune activité d'application ne correspond à votre filtre.",
       "empty_paused_cta": "Activer la protection pour voir l'activité",
       "empty_refresh_cta": "Actualiser les applications actives",
-      "switch_expert_cta": "Afficher les sockets bruts et PIDs (Avancé)"
+      "switch_expert_cta": "Afficher les outils experts"
     },
     "toolbar": {
       "search": {
@@ -464,6 +535,9 @@
         "terminate_socket": "Fermer la Connexion Active",
         "close": "Fermer l'Inspecteur"
       }
+    },
+    "quick": {
+      "block_site": "Bloquer {{domain}}"
     }
   },
   "proxies": {
@@ -472,9 +546,9 @@
       "desc": "Configurez ci-dessous votre propre serveur proxy externe SOCKS5, HTTP ou HTTPS (tunnel SSH, Tor, passerelle VPN ou proxy d'entreprise). Sans proxy actif, RouteWard fonctionne en Mode Filtrage Direct."
     },
     "simple": {
-      "title": "Mon Serveur Proxy",
+      "title": "Mon proxy",
       "subtitle": "Ajoutez votre serveur proxy ou lien d'abonnement et vérifiez qu'il répond correctement.",
-      "add": "Ajouter un Proxy",
+      "add": "Ajouter un proxy",
       "paste_link_button": "Coller un lien proxy",
       "paste_clipboard_button": "Coller du presse-papiers",
       "set_primary": "Passer en principal",
@@ -488,7 +562,6 @@
       "status_ok": "Fonctionne",
       "status_untested": "Non vérifié",
       "test_connection": "Vérifier la connexion",
-      "in_use_warning": "Utilisé par {{count}} règle(s)",
       "failover_title": "Bascule automatique sur proxy de secours",
       "failover_desc": "Si votre proxy principal ne répond plus, RouteWard bascule automatiquement vers vos autres proxies actifs.",
       "failover_chain_name": "Proxy de Secours Automatique",
@@ -499,7 +572,12 @@
       "detect_button": "Détecter un proxy existant",
       "detecting": "Recherche...",
       "detect_empty": "Aucun proxy local ou système détecté sur cet ordinateur.",
-      "detect_import": "Importer"
+      "detect_failed": "La détection a échoué, réessayez.",
+      "detect_import": "Importer",
+      "status_unreachable": "Ne répond pas",
+      "import_title": "Ajouter des liens de proxy",
+      "import_subtitle": "Collez un lien de proxy par ligne, par exemple socks5://utilisateur:motdepasse@proxy.example.com:1080 ou 192.168.1.10:8080",
+      "failover_disabled_rules_toast": "Secours automatique désactivé. Aucun proxy n'est disponible pour {{count}} règle(s) : elles ont été désactivées."
     },
     "section": {
       "servers": {
@@ -540,7 +618,8 @@
         "tls_insecure": "TLS Non vérifié",
         "password_set": "Mot de passe défini",
         "untested": "Non testé",
-        "exit_ip": "IP de sortie"
+        "exit_ip": "IP de sortie",
+        "unreachable": "Ne répond pas"
       }
     },
     "modal": {
@@ -566,7 +645,10 @@
         "tls_skip_verify_label": "Ignorer la vérification du certificat TLS (Non sécurisé - labo uniquement)",
         "sspi_hint": "Astuce : pour les proxies NTLM/Negotiate, laissez vide pour la session Windows ou saisissez DOMAINE\\identifiant",
         "submit": "Enregistrer le Proxy",
-        "cancel": "Annuler"
+        "cancel": "Annuler",
+        "quick_paste_invalid": "Lien non reconnu. Exemple : socks5://utilisateur:motdepasse@proxy.example.com:1080 ou 192.168.1.10:8080",
+        "show_password": "Afficher le mot de passe",
+        "hide_password": "Masquer le mot de passe"
       },
       "import_uri": {
         "title": "Import en Lot de Proxies (URI ou Abonnement Base64)",
@@ -587,6 +669,24 @@
         "submit": "Enregistrer la Chaîne",
         "cancel": "Annuler"
       }
+    },
+    "delete": {
+      "warning_retarget_one": "{{count}} règle utilise ce proxy. Elle passera sur \"{{name}}\".",
+      "warning_retarget_other": "{{count}} règles utilisent ce proxy. Elles passeront sur \"{{name}}\".",
+      "warning_disable_one": "{{count}} règle utilise ce proxy et il n'en reste aucun autre. Elle sera désactivée : ses applications suivront alors vos autres règles ou le comportement par défaut.",
+      "warning_disable_other": "{{count}} règles utilisent ce proxy et il n'en reste aucun autre. Elles seront désactivées : leurs applications suivront alors vos autres règles ou le comportement par défaut.",
+      "toast_retargeted_one": "Proxy supprimé. {{count}} règle utilise maintenant \"{{name}}\".",
+      "toast_retargeted_other": "Proxy supprimé. {{count}} règles utilisent maintenant \"{{name}}\".",
+      "toast_disabled_one": "Proxy supprimé. {{count}} règle a été désactivée car il ne reste aucun proxy. Ajoutez-en un pour la réutiliser.",
+      "toast_disabled_other": "Proxy supprimé. {{count}} règles ont été désactivées car il ne reste aucun proxy. Ajoutez-en un pour les réutiliser.",
+      "undo_password_needed": "Proxy restauré. Son mot de passe n'a pas été conservé : modifiez-le pour le saisir à nouveau."
+    },
+    "primary": {
+      "toast_rules_moved_one": "Proxy principal mis à jour. {{count}} règle suit le nouveau proxy principal.",
+      "toast_rules_moved_other": "Proxy principal mis à jour. {{count}} règles suivent le nouveau proxy principal."
+    },
+    "import": {
+      "none_added": "Aucun proxy n'a été ajouté : les liens n'ont pas été reconnus. Exemple : socks5://utilisateur:motdepasse@proxy.example.com:1080"
     }
   },
   "rules": {
@@ -610,11 +710,11 @@
       "optional_app_label": "Uniquement pour ces applications (Optionnel, ex. msedge.exe)",
       "optional_app_placeholder": "msedge.exe (laisser vide pour toutes les apps)",
       "action_label": "Comment doit-elle se connecter ?",
-      "action_badge_proxy": "Via Proxy",
+      "action_badge_proxy": "Via le proxy",
       "action_badge_direct": "Connexion normale",
       "action_badge_block": "Bloqué",
-      "action_badge_chain": "Via Proxy (Secours)",
-      "show_advanced_options": "Afficher les champs avancés (priorité, CIDR, ports)",
+      "action_badge_chain": "Via le proxy (secours)",
+      "show_advanced_options": "Afficher plus d'options (priorité, adresses, ports)",
       "hide_advanced_options": "Revenir au formulaire simple",
       "detected_apps_title": "Applications sur cet ordinateur",
       "detected_apps_subtitle": "Choisissez une application déjà installée ou ouverte sans taper de nom de fichier.",
@@ -635,7 +735,18 @@
       "tester_title": "Par où passe un site ?",
       "tester_placeholder": "Collez un site web (ex. https://www.exemple.com)",
       "tester_button": "Vérifier",
-      "tester_rule_label": "Règle appliquée : {{name}}"
+      "tester_rule_label": "Règle appliquée : {{name}}",
+      "pack_telemetry_apps_name": "Télémétrie (programmes)",
+      "pack_telemetry_sites_name": "Télémétrie (sites)",
+      "error_no_criteria": "Choisissez au moins une application, un site ou une adresse. Sans cela, cette règle s'appliquerait à tout votre trafic.",
+      "app_name_completed": "Nom complet utilisé : {{name}}",
+      "app_not_running_warning": "Aucune application en cours d'exécution ne correspond à \"{{app}}\". La règle s'appliquera dès que cette application démarrera.",
+      "targets_addresses_one": "{{count}} plage d'adresses",
+      "targets_addresses_other": "{{count}} plages d'adresses",
+      "targets_more": "+{{count}} autres",
+      "protocol_any": "Tous",
+      "addresses_label": "Adresses ou réseaux (séparés par des virgules, ex. 192.168.1.10)",
+      "tester_hosts_hint": "L'adresse seule et sa version \"www.\" sont vérifiées."
     },
     "header": {
       "title": "Règles de Routage par Processus et Destination",
@@ -670,9 +781,9 @@
       "section_title": "Mes Applications - Routage Visuel en 1 Clic",
       "section_subtitle": "Choisissez comment chaque catégorie d'application doit se connecter à Internet, sans avoir à connaître les noms de fichiers .exe ou les ports.",
       "status_default": "Par défaut : Connexion normale",
-      "action_proxy": "Via Proxy Externe",
+      "action_proxy": "Via le proxy",
       "action_direct": "Connexion normale",
-      "action_block": "Bloquer Internet",
+      "action_block": "Bloquer",
       "browsers": {
         "name": "Navigateurs Web",
         "desc": "Firefox, Chrome, Brave, Edge, Opera, Vivaldi"
@@ -778,30 +889,34 @@
         "submit": "Convertir et importer",
         "cancel": "Annuler"
       }
+    },
+    "generated": {
+      "default_policy": "Comportement par défaut",
+      "app_on_sites": "{{app}} sur {{sites}}"
     }
   },
   "dns": {
     "header": {
-      "title": "Moteur DNS Anti-Fuite Fake-IP",
+      "title": "Moteur DNS anti-fuite Fake-IP",
       "subtitle": "Associe les requêtes DNS à des IP virtuelles RFC 2544 (198.18.0.0/15) pour éviter toute fuite DNS locale et conserver le nom de domaine exact.",
-      "flush_button": "Vider le Cache Fake-IP"
+      "flush_button": "Vider le cache Fake-IP"
     },
     "allocate": {
       "placeholder": "Saisir un nom de domaine (ex. stealth.torproject.org)",
-      "submit": "Allouer Fake-IP"
+      "submit": "Allouer une Fake-IP"
     },
     "table": {
       "fake_ip": {
-        "header": "Fake-IP Virtuelle"
+        "header": "Fake-IP virtuelle"
       },
       "domain": {
-        "header": "Nom de Domaine Original"
+        "header": "Nom de domaine d'origine"
       },
       "hits": {
         "header": "Requêtes"
       },
       "expires": {
-        "header": "TTL Restant"
+        "header": "TTL restant"
       },
       "empty": {
         "message": "La table Fake-IP est actuellement vide."
@@ -814,7 +929,7 @@
       "filter_info": "INFO",
       "filter_warn": "WARN",
       "filter_error": "ERROR",
-      "clear": "Effacer le Journal"
+      "clear": "Effacer le journal"
     },
     "table": {
       "timestamp": "Horodatage",
@@ -863,77 +978,89 @@
         "started": "Service Windows démarré",
         "stopped": "Service Windows arrêté"
       }
+    },
+    "recover": {
+      "title": "Rétablissement de votre connexion Internet...",
+      "engine_stopped": "La protection a été désactivée en arrière-plan.",
+      "daemon_unreachable": "RouteWard n'a pas pu être joint en arrière-plan : il n'a donc pas pu être désactivé d'ici.",
+      "engine_stop_failed": "La protection en arrière-plan n'a pas pu être désactivée. Elle risque de se réactiver plus tard.",
+      "internet_restored": "Votre connexion Internet normale est rétablie.",
+      "next_step": "Ouvrez RouteWard pour réactiver la protection.",
+      "failed": "RouteWard n'a pas pu rétablir vos réglages Internet. Suivez les étapes \"Je n'ai plus Internet\" du guide de dépannage de RouteWard, ou ouvrez les Paramètres Windows, allez dans Réseau et Internet, puis Proxy, et désactivez le proxy.",
+      "press_enter": "Appuyez sur Entrée pour fermer cette fenêtre."
     }
   },
   "errors": {
     "config": {
-      "load_failed": "Impossible de charger le fichier de configuration",
-      "save_failed": "Impossible de sauvegarder le profil de configuration sur le disque",
-      "invalid_json": "Structure JSON invalide dans la configuration"
+      "load_failed": "RouteWard n'a pas pu lire son fichier de réglages. Restaurez un profil enregistré ou réinitialisez vos réglages, puis réessayez.",
+      "save_failed": "RouteWard n'a pas pu enregistrer vos modifications. Vérifiez que votre disque n'est pas plein ni en lecture seule, puis réessayez.",
+      "invalid_json": "Le fichier de réglages est abîmé ou n'a pas le format attendu. Restaurez un profil enregistré ou réinitialisez vos réglages."
     },
     "proxy": {
-      "not_found": "L'identifiant de proxy spécifié est introuvable",
-      "chain_empty": "La chaîne de proxies doit contenir au moins un saut",
-      "handshake_failed": "Échec de la négociation avec le proxy (vérifiez le protocole SOCKS5 / HTTP, l'adresse et le port)",
-      "connection_timeout": "Délai d'attente dépassé : le proxy ne répond pas (vérifiez l'adresse, le port et votre connexion)",
-      "auth_rejected": "Identifiant ou mot de passe refusé par le serveur proxy",
-      "udp_not_supported": "Le serveur proxy en amont ne supporte pas SOCKS5 UDP ASSOCIATE",
-      "invalid_uri": "Format de lien proxy invalide (attendu : socks5://, http:// ou https://hote:port)"
+      "not_found": "Ce proxy n'existe plus. Actualisez la liste et choisissez-en un autre.",
+      "chain_empty": "Un groupe de proxies doit contenir au moins un proxy. Ajoutez-en un avant d'enregistrer.",
+      "handshake_failed": "Le proxy a répondu de façon inattendue. Vérifiez que son type, son adresse et son port sont corrects.",
+      "connection_timeout": "Le proxy n'a pas répondu à temps. Vérifiez son adresse et son port, ainsi que votre connexion Internet.",
+      "auth_rejected": "Le proxy a refusé votre identifiant ou votre mot de passe. Vérifiez-les puis réessayez.",
+      "udp_not_supported": "Ce proxy ne peut pas transporter les appels, les jeux et les autres échanges en temps réel. Choisissez un autre proxy pour ces applications.",
+      "invalid_uri": "Ce lien n'est pas un lien de proxy valide. Il doit ressembler à socks5://adresse:port, http://adresse:port ou https://adresse:port."
     },
     "rule": {
-      "blocked_by_policy": "Connexion bloquée par une règle de routage"
+      "blocked_by_policy": "Cette connexion a été bloquée par l'une de vos règles. Modifiez ou supprimez la règle si ce n'était pas voulu."
     },
     "interceptor": {
-      "driver_missing": "Bibliothèque ou pilote WinDivert introuvable (exécutez tools/fetch-windivert.ps1)",
-      "open_failed": "Impossible d'ouvrir le filtre noyau WinDivert (droits Administrateur requis)",
-      "not_root": "Privilèges root requis sous Linux pour l'interception nftables (EUID != 0)",
-      "nft_missing": "Binaire nftables (nft) introuvable sur le système",
-      "nft_failed": "Échec de l'exécution de la commande nftables",
-      "tproxy_conflict": "Refus de démarrer l'interception UDP TPROXY : la priorité ip rule, le fwmark ou la table de routage configurée est déjà utilisée"
+      "driver_missing": "Le composant réseau de RouteWard est introuvable, très probablement parce que votre antivirus l'a placé en quarantaine. Restaurez-le depuis votre antivirus, autorisez RouteWard dans ses réglages, puis redémarrez RouteWard (ou réinstallez-le).",
+      "open_failed": "Le composant réseau de RouteWard n'a pas pu démarrer. Votre antivirus le bloque peut-être : vérifiez sa quarantaine et sa liste d'autorisations, puis redémarrez RouteWard.",
+      "not_root": "RouteWard a besoin des droits administrateur (root) pour filtrer le trafic réseau sur ce système. Lancez-le en tant qu'administrateur.",
+      "nft_missing": "Un outil dont RouteWard a besoin pour filtrer le trafic réseau est absent de ce système. Installez le paquet qui le fournit, puis redémarrez RouteWard.",
+      "nft_failed": "Le système a refusé les réglages de filtrage réseau de RouteWard. Redémarrez RouteWard et vérifiez qu'aucun autre outil de pare-feu n'entre en conflit.",
+      "tproxy_conflict": "Un autre programme utilise déjà les réglages réseau dont RouteWard a besoin pour le trafic UDP. Fermez ce programme ou modifiez les réglages réseau avancés de RouteWard, puis réessayez."
     },
     "daemon": {
-      "already_running": "Une autre instance du démon RouteWard est déjà en cours d'exécution",
-      "untrusted_pipe_owner": "Refus de communiquer avec le canal du démon RouteWard : il appartient à un compte non fiable",
-      "pipe_squatted": "Un autre processus occupe le nom du canal du démon RouteWard : le démon ne peut pas démarrer",
-      "group_missing": "Le groupe Unix configuré pour le socket du démon n'existe pas sur le système",
-      "not_elevated": "Les privilèges Administrateur ou root sont requis pour lancer routeward daemon",
-      "ipc_error": "Erreur de communication IPC avec le démon",
-      "disconnected": "Le démon privilégié RouteWard n'est pas connecté",
-      "io_timeout": "Délai dépassé lors de la communication avec le démon RouteWard",
-      "insecure_profile": "Refus de démarrer : le dossier ou le fichier de profil a un propriétaire ou des droits d'écriture non sécurisés",
-      "cleanup_refused_active": "Refus d'exécuter cleanup pendant qu'un démon RouteWard est actif (arrêtez le démon d'abord ou utilisez --force)"
+      "already_running": "RouteWard protège déjà cet ordinateur en arrière-plan. Utilisez cette instance, ou arrêtez-la avant d'en démarrer une autre.",
+      "untrusted_pipe_owner": "RouteWard a refusé de se connecter à sa protection en arrière-plan, car elle n'appartient pas à un compte de confiance. Redémarrez votre ordinateur ; si le problème continue, réinstallez RouteWard.",
+      "pipe_squatted": "Un autre programme empêche la protection en arrière-plan de RouteWard de démarrer. Redémarrez votre ordinateur ; si le problème continue, réinstallez RouteWard.",
+      "group_missing": "Le groupe d'utilisateurs prévu pour RouteWard n'existe pas sur ce système. Créez-le ou modifiez le réglage, puis redémarrez RouteWard.",
+      "not_elevated": "La protection en arrière-plan de RouteWard a besoin des droits administrateur (root) pour démarrer. Lancez-la en tant qu'administrateur, ou installez le service RouteWard.",
+      "ipc_error": "RouteWard n'a pas pu communiquer avec sa protection en arrière-plan. Réessayez ; si cela continue, redémarrez RouteWard.",
+      "disconnected": "RouteWard ne parvient pas à joindre sa protection en arrière-plan pour le moment. Vérifiez qu'elle fonctionne, puis réessayez.",
+      "io_timeout": "La protection en arrière-plan de RouteWard n'a pas répondu à temps. Patientez un instant puis réessayez.",
+      "insecure_profile": "RouteWard a refusé de démarrer, car son dossier de réglages peut être modifié par d'autres utilisateurs. Réinstallez RouteWard pour réparer ses droits d'accès.",
+      "cleanup_refused_active": "Nettoyage refusé : la protection est encore active. Arrêtez-la d'abord, ou relancez la commande avec --force.",
+      "invalid_pause": "Cette durée de pause n'est pas valide. Choisissez une durée comprise entre 1 seconde et 24 heures.",
+      "pause_not_active": "La protection est désactivée : il n'y a rien à mettre en pause. Activez d'abord la protection."
     },
     "service": {
-      "insecure_binary_location": "Enregistrement du service Windows refusé : l'exécutable RouteWard ou son dossier est modifiable par des non-administrateurs. Installez-le sous Program Files."
+      "insecure_binary_location": "RouteWard ne peut pas être installé comme service d'arrière-plan depuis ce dossier, car d'autres utilisateurs pourraient le modifier. Installez RouteWard dans Program Files puis réessayez."
     },
     "system": {
-      "registry_write_failed": "Impossible de modifier les paramètres de proxy Windows de l'utilisateur courant",
-      "pac_url_invalid": "L'URL du PAC doit pointer vers le serveur local de RouteWard (http://127.0.0.1:<port>/...)",
-      "executable_path_empty": "Le chemin de l'exécutable est vide ou n'a pas pu être déterminé",
-      "launch_failed": "Impossible de démarrer le programme sélectionné",
-      "backup_failed": "Impossible d'enregistrer les paramètres de proxy précédents : ils n'ont pas été modifiés",
-      "purge_failed": "Impossible de supprimer le dossier de données RouteWard",
-      "purge_unsupported": "La suppression du dossier de données RouteWard avec cette commande n'est disponible que sous Windows"
+      "registry_write_failed": "RouteWard n'a pas pu modifier vos réglages Internet de Windows. Fermez les autres programmes qui les gèrent, puis réessayez.",
+      "pac_url_invalid": "L'adresse de configuration automatique doit pointer vers RouteWard sur cet ordinateur (http://127.0.0.1:port/...).",
+      "executable_path_empty": "Le chemin du programme est vide ou introuvable. Choisissez à nouveau le programme.",
+      "launch_failed": "RouteWard n'a pas pu démarrer le programme choisi. Vérifiez que son fichier existe toujours.",
+      "backup_failed": "RouteWard n'a pas pu enregistrer vos réglages Internet précédents ; il les a donc laissés tels quels. Réessayez.",
+      "purge_failed": "RouteWard n'a pas pu supprimer son dossier de données. Fermez RouteWard puis réessayez.",
+      "purge_unsupported": "La suppression du dossier de données de RouteWard de cette façon n'est disponible que sous Windows."
     },
     "desktop": {
-      "ui_init": "RouteWard n'a pas pu initialiser sa fenêtre WebView. Vérifiez que Microsoft Edge WebView2 Runtime est installé et que votre dossier utilisateur est accessible en écriture."
+      "ui_init": "RouteWard n'a pas pu ouvrir sa fenêtre. Installez ou réparez Microsoft Edge WebView2 Runtime, vérifiez que votre dossier utilisateur n'est pas en lecture seule, puis relancez RouteWard."
     }
   },
   "themeforge": {
     "modal": {
-      "title": "ThemeForge Studio - Palette & Teinte d'Accent",
+      "title": "ThemeForge Studio - Palette et teinte d'accent",
       "subtitle": "Sélectionnez l'une des palettes canoniques Oklab de ThemeForge ou Contraste Élevé, ainsi qu'une teinte d'accent.",
-      "accent_label": "Teinte d'Accent",
-      "preview_label": "Aperçu des Jetons Sémantiques",
-      "import_palette": "Charger une Palette JSON ThemeForge v1",
+      "accent_label": "Teinte d'accent",
+      "preview_label": "Aperçu des jetons sémantiques",
+      "import_palette": "Charger une palette JSON ThemeForge v1",
       "import_error": "Fichier JSON de palette ThemeForge v1 invalide",
       "close": "Fermer"
     },
     "families": {
       "Root": "Racine (Dracula / Drakul)",
-      "Dark": "Sombre (Oklab L* Uniforme)",
-      "Light": "Surfaces Claires",
-      "Alt": "Signature Alternative"
+      "Dark": "Sombre (Oklab L* uniforme)",
+      "Light": "Surfaces claires",
+      "Alt": "Signature alternative"
     },
     "accents": {
       "Default": "Accent par défaut",
@@ -949,26 +1076,26 @@
   },
   "wizard": {
     "modal": {
-      "title": "Assistant de Configuration Rapide",
-      "subtitle": "Configurez RouteWard en 3 étapes simples, même sans connaissances réseau.",
+      "title": "Assistant de configuration",
+      "subtitle": "Configurez RouteWard en 3 étapes simples, sans connaissances en réseau.",
       "step_indicator": "Étape",
       "step1_title": "1. Quel est votre objectif principal ?",
-      "step1_privacy_title": "Confidentialité & Navigation Anonyme",
-      "step1_privacy_desc": "Masquer mon adresse IP sur mes navigateurs et messageries tout en bloquant les pisteurs.",
-      "step1_work_title": "Télétravail & Outils de Développement",
+      "step1_privacy_title": "Confidentialité et navigation privée",
+      "step1_privacy_desc": "Faire passer navigateurs et messageries par votre proxy (pour masquer votre adresse IP) et bloquer la télémétrie de Windows.",
+      "step1_work_title": "Télétravail et outils de développement",
       "step1_work_desc": "Passer mes outils (Git, VS Code, Terminal, Navigateur) par un proxy d'entreprise ou SSH.",
-      "step1_gaming_title": "Jeux en Ligne & Performances",
-      "step1_gaming_desc": "Laisser mes jeux en connexion directe ultra-rapide et router uniquement Discord/Navigateur.",
-      "step2_title": "2. Quel serveur Proxy souhaitez-vous utiliser ?",
-      "step2_use_existing": "Utiliser le serveur proxy externe configuré",
-      "step2_no_proxy_title": "Aucun proxy externe configuré - Mode Filtrage Direct prêt",
-      "step2_no_proxy_desc": "RouteWard n'embarque pas de serveur proxy interne. Poursuivez sans proxy pour filtrer pisteurs et règles locales en direct, ou ajoutez votre propre proxy externe ci-dessous.",
-      "step2_skip_direct_cta": "Continuer sans proxy (Filtrage Direct)",
-      "step2_detect_button": "Détecter un proxy existant",
-      "step2_paste_uri": "Ou collez un lien de connexion (socks5://, http://, https:// ou abonnement Base64) :",
+      "step1_gaming_title": "Jeux en ligne et performances",
+      "step1_gaming_desc": "Garder les jeux en connexion directe rapide et faire passer les navigateurs par votre proxy.",
+      "step2_title": "2. Quel proxy souhaitez-vous utiliser ?",
+      "step2_use_existing": "Utiliser le proxy déjà configuré",
+      "step2_no_proxy_title": "Pas encore de proxy : votre adresse IP restera visible",
+      "step2_no_proxy_desc": "RouteWard n'inclut pas de proxy. Vous pouvez continuer sans proxy (seules vos règles par application s'appliqueront) ou ajouter le vôtre ci-dessous.",
+      "step2_skip_direct_cta": "Continuer sans proxy",
+      "step2_detect_button": "Chercher un proxy sur cet ordinateur",
+      "step2_paste_uri": "Ou collez un lien de proxy (par exemple socks5://adresse:1080) :",
       "step2_uri_placeholder": "socks5://user:pass@proxy.example.com:1080#MonProxyExterne",
       "step2_tab_link": "Coller un lien",
-      "step2_tab_manual": "Saisir adresse & port",
+      "step2_tab_manual": "Saisir adresse et port",
       "step2_manual_name": "Nom du proxy (optionnel)",
       "step2_manual_host": "Adresse du serveur (hôte ou IP)",
       "step2_manual_port": "Port",
@@ -978,89 +1105,130 @@
       "step2_test_button": "Tester la connexion",
       "step2_test_ok": "Connexion réussie ({{ms}} ms)",
       "step2_test_failed": "Impossible de joindre ce proxy. Vérifiez l'adresse, le port et le protocole.",
-      "step3_title": "3. Niveau d'interface préféré",
-      "step3_summary_title": "Résumé de votre configuration",
-      "step3_summary_with_proxy": "Votre objectif sera appliqué avec votre proxy externe.",
-      "step3_summary_direct": "Mode Filtrage Direct : blocage des pisteurs et règles locales sans proxy externe.",
-      "step3_enable_now": "Activer la protection immédiatement en appliquant",
-      "step3_simple_title": "Mode Simple (Recommandé pour débuter)",
-      "step3_simple_desc": "Explications claires, sélecteur d'applications par icônes et diagnostic visuel rassurant.",
-      "step3_expert_title": "Mode Expert (SysAdmin Linux / Windows)",
+      "step3_title": "3. Choisissez votre interface",
+      "step3_summary_title": "Ce qui va se passer",
+      "step3_summary_with_proxy": "Votre objectif sera appliqué avec votre proxy.",
+      "step3_summary_direct": "Sans proxy : votre adresse IP reste visible et seules vos règles par application s'appliquent.",
+      "step3_enable_now": "Activer la protection tout de suite",
+      "step3_simple_title": "Mode simple (recommandé pour la plupart des gens)",
+      "step3_simple_desc": "Explications en langage clair, cartes par application et résumé de protection lisible.",
+      "step3_expert_title": "Mode expert (administrateurs système)",
       "step3_expert_desc": "Accès complet aux tables de sockets PID, règles CIDR/Ports, Fake-IP RFC 2544 et journaux temps réel.",
       "back": "Précédent",
       "next": "Suivant",
-      "finish": "Appliquer ma Configuration"
+      "finish": "Appliquer ma configuration",
+      "step2_detect_failed": "La recherche d'un proxy a échoué. Vous pouvez coller un lien ou saisir l'adresse vous-même.",
+      "step2_link_unreadable": "Ce lien est illisible, rien n'a été enregistré. Un lien de proxy ressemble à socks5://utilisateur:motdepasse@adresse:1080 ou http://adresse:8080. Vérifiez-le et réessayez."
+    },
+    "summary": {
+      "games_direct": "Vos jeux gardent une connexion directe rapide.",
+      "no_proxy_ip_visible": "Sans proxy, votre adresse IP reste visible.",
+      "browsers_via_proxy": "Vos navigateurs web passeront par votre proxy.",
+      "work_tools_via_proxy": "Vos outils de développement passeront par votre proxy.",
+      "block_telemetry": "La télémétrie de Windows (rapports envoyés à Microsoft en arrière-plan) sera bloquée.",
+      "local_network_direct": "Votre réseau local (maison ou bureau) reste en connexion directe."
+    },
+    "done": {
+      "title": "Votre configuration est enregistrée",
+      "body_with_proxy": "La protection est activée. Vérifiez que votre proxy masque bien votre adresse IP.",
+      "body_no_proxy": "La protection est activée, sans proxy : votre adresse IP reste visible et seules vos règles par application s'appliquent.",
+      "body_saved_only": "Votre configuration est enregistrée. La protection est toujours désactivée : activez-la depuis l'accueil quand vous le souhaitez.",
+      "protection_failed_title": "Configuration enregistrée, mais la protection n'a pas pu démarrer",
+      "protection_failed_body": "Votre configuration est conservée. Réessayez maintenant, ou fermez cette fenêtre et démarrez la protection depuis l'accueil.",
+      "retry": "Réessayer",
+      "verify": "Vérifier ma protection",
+      "close": "Fermer"
     }
   },
   "glossary": {
     "modal": {
       "title": "Comprendre RouteWard - Guide & Lexique",
-      "subtitle": "Explications simples des concepts réseau pour les débutants et rappels techniques pour les administrateurs.",
+      "subtitle": "Explications simples des mots utilisés dans RouteWard.",
       "close": "J'ai compris"
     },
     "items": {
       "proxy": {
-        "term": "Serveur Proxy (SOCKS5 / HTTP / HTTPS)",
+        "term": "Serveur proxy",
         "simple": "Un serveur intermédiaire qui relaye votre connexion Internet. Les sites web voient l'adresse IP du proxy au lieu de la vôtre.",
         "expert": "Tunnel de transport L4/L7 supportant l'encapsulation TCP, UDP Associate (RFC 1928) et HTTP CONNECT."
       },
       "chain": {
-        "term": "Chaîne de Proxies & Groupes Intelligents",
+        "term": "Proxies de secours",
         "simple": "Permet de traverser plusieurs proxies à la suite pour plus d'anonymat, ou de basculer automatiquement sur un proxy de secours si le premier est lent.",
         "expert": "Chaînage multi-sauts séquentiel (Entry -> Exit), bascule haute-disponibilité (Failover) ou sélection dynamique par RTT minimal."
       },
       "fake_ip": {
-        "term": "DNS Anti-Fuite (Fake-IP 198.18.0.0/15)",
-        "simple": "Empêche votre fournisseur d'accès Internet de savoir quels sites vous consultez en attribuant une adresse virtuelle temporaire à chaque domaine.",
+        "term": "DNS protégé",
+        "simple": "Empêche votre fournisseur d'accès de voir quels sites vous recherchez, en utilisant une adresse temporaire de substitution pour chaque nom de site.",
         "expert": "Allocateur RFC 2544 bidirectionnel en mémoire qui intercepte les requêtes DNS et permet au moteur de règles de matcher le FQDN exact sur des flux TCP/UDP bruts."
       },
       "killswitch": {
-        "term": "Kill-Switch (Coupe-Circuit d'Urgence)",
+        "term": "Coupe-circuit (kill-switch)",
         "simple": "Un garde-fou qui bloque immédiatement Internet pour une application si le proxy se déconnecte, évitant que votre vraie IP ne fuite.",
         "expert": "Politique d'abandon strict (DROP) lorsque le noeud en amont est injoignable ou lorsqu'un flux UDP tente de traverser un proxy TCP uniquement."
       },
       "rules": {
-        "term": "Règles de Routage par Application",
+        "term": "Règles pour chaque application",
         "simple": "Vos instructions : par exemple \"Firefox passe par le Proxy\", \"Steam se connecte en Direct\" et \"La télémétrie Windows est Bloquée\".",
         "expert": "Moteur d'évaluation déterministe par priorité croissante supportant les globs d'exécutables, masques de domaines, sous-réseaux CIDR IPv4/IPv6 et plages de ports."
       },
       "system_proxy": {
-        "term": "Proxy Système vs Lanceur d'Application",
+        "term": "Réglage proxy de Windows ou une application via le proxy",
         "simple": "Le \"Proxy Système\" configure tout Windows en 1 clic. Le \"Lanceur\" démarre uniquement un logiciel précis à travers le proxy.",
         "expert": "Modification du registre HKCU Internet Settings ou injection ciblée des variables d'environnement ALL_PROXY / HTTP_PROXY / HTTPS_PROXY sur le processus enfant."
+      },
+      "service": {
+        "term": "Service",
+        "simple": "Un programme qui tourne en arrière-plan, même quand la fenêtre de RouteWard est fermée. C'est lui qui maintient votre protection.",
+        "expert": "Service Windows (ou démon) qui héberge le moteur d'interception, avec un canal IPC par pipe nommé vers l'interface."
+      },
+      "port": {
+        "term": "Port",
+        "simple": "Un numéro placé après l'adresse d'un proxy, comme un numéro de porte après une adresse de rue (par exemple 1080).",
+        "expert": "Port TCP/UDP (1-65535) du proxy en amont ou de la destination."
+      },
+      "ip_address": {
+        "term": "Adresse IP",
+        "simple": "L'adresse que les sites voient quand vous vous connectez, un peu comme un numéro de téléphone. Un proxy affiche la sienne à la place de la vôtre.",
+        "expert": "Adresse source IPv4/IPv6 publique des connexions sortantes, remplacée par l'adresse de sortie du proxy lorsqu'elles sont routées."
+      },
+      "protocol": {
+        "term": "Protocole",
+        "simple": "La \" langue \" que parle un proxy (SOCKS5, HTTP...). Votre fournisseur de proxy vous dit lequel choisir.",
+        "expert": "Protocole de négociation du proxy : SOCKS4, SOCKS5 (RFC 1928, UDP Associate optionnel), HTTP CONNECT, HTTPS."
       }
     }
   },
   "settings": {
     "header": {
-      "title": "Réglages & Outils",
+      "title": "Réglages et outils",
       "subtitle": "Personnalisez la langue, l'apparence, la protection anti-fuite et les diagnostics système."
     },
     "general": {
-      "title": "Général & Apparence",
+      "title": "Général et apparence",
       "language_label": "Langue d'affichage",
       "theme_label": "Thème de couleurs",
       "theme_open": "Personnaliser ThemeForge",
-      "help_title": "Aide Guidée",
-      "help_desc": "Besoin d'un rappel ? Relancez l'assistant en 3 étapes ou consultez le lexique simplifié."
+      "help_title": "Aide guidée",
+      "help_desc": "Besoin d'un rappel ? Rouvrez l'assistant de configuration ou consultez le lexique en langage clair."
     },
     "security": {
-      "title": "Protection Anti-Fuite",
-      "simple_shield_title": "Bouclier Anti-Fuite Tout-en-Un",
+      "title": "Protection anti-fuite",
+      "simple_shield_title": "Bouclier anti-fuite tout-en-un",
       "simple_shield_desc": "Garde votre vraie IP masquée si le proxy coupe, stoppe les fuites UDP et bloque les contournements DNS.",
-      "simple_shield_on": "Toutes protections actives",
+      "simple_shield_on": "Toutes les protections sont actives",
       "simple_shield_off": "Protection partielle",
       "block_quic_title": "Bloquer QUIC (UDP 443)",
       "block_quic_desc": "Force les navigateurs à utiliser le TCP HTTPS standard plutôt que QUIC UDP.",
-      "block_dot_title": "Bloquer Contournement DNS Chiffré (Port 853)",
+      "block_dot_title": "Bloquer le contournement du DNS chiffré (port 853)",
       "block_dot_desc": "Empêche les apps de contourner le DNS Fake-IP via des serveurs DoT/DoQ externes."
     },
     "system": {
-      "title": "Intégration Système & Profil",
+      "title": "Intégration système et profil",
       "subtitle": "Mode d'interception avancé, proxy système, auto-config PAC, démarrage et sauvegarde JSON.",
-      "interception_mode_label": "Mode du Moteur d'Interception",
+      "interception_mode_label": "Mode du moteur d'interception",
       "system_proxy_label": "Proxy Système Windows (Relais HTTP)",
-      "pac_title": "Auto-Configuration PAC Windows (Edge & Navigateurs)",
+      "pac_title": "Configuration automatique PAC de Windows (Edge et navigateurs)",
       "pac_desc": "Sert un script PAC local FindProxyForURL reflétant vos règles (127.0.0.1 uniquement).",
       "pac_enabled": "PAC Actif",
       "pac_disabled": "PAC Inactif",
@@ -1069,11 +1237,11 @@
       "autostart_desc": "Lance RouteWard automatiquement dans la barre système à l'ouverture de votre session Windows.",
       "autostart_enabled": "Activé",
       "autostart_disabled": "Désactivé",
-      "launcher_title": "Lancer un Programme via Proxy",
+      "launcher_title": "Lancer un programme via proxy",
       "launcher_desc": "Démarre un exécutable avec ALL_PROXY et HTTPS_PROXY préconfigurés.",
-      "profile_title": "Sauvegarde de Profil (JSON)",
+      "profile_title": "Sauvegarde du profil (JSON)",
       "profile_desc": "Importez ou exportez tous vos proxies, règles et préférences.",
-      "advanced_tools_title": "Outils avancés & intégration système",
+      "advanced_tools_title": "Outils avancés et intégration système",
       "advanced_tools_desc": "Proxy système Windows, script PAC, lancement ciblé et sauvegarde JSON.",
       "advanced_tools_show": "Afficher",
       "advanced_tools_hide": "Masquer",
@@ -1083,7 +1251,7 @@
       "reset_confirm": "Confirmer la réinitialisation"
     },
     "profiles": {
-      "title": "Profils Nommés (Bascule Rapide)",
+      "title": "Profils nommés (bascule rapide)",
       "subtitle": "Enregistrez plusieurs jeux de proxies et règles (Bureau, Edge, Labo) et basculez ici ou via la barre système.",
       "save_placeholder": "Nom du profil (ex. Edge Entreprise)",
       "save_button": "Enregistrer comme profil",
@@ -1101,11 +1269,11 @@
       "auto_network_remove": "Retirer"
     },
     "diagnostics": {
-      "title": "Diagnostics Techniques",
+      "title": "Diagnostics techniques",
       "hide_title": "Masquer les diagnostics",
       "subtab_overview": "Vue d'ensemble",
       "subtab_dns": "Cache DNS Fake-IP",
-      "subtab_logs": "Journaux d'Événements"
+      "subtab_logs": "Journaux d'événements"
     }
   },
   "format": {
@@ -1119,40 +1287,80 @@
   "troubleshoot": {
     "modal": {
       "title": "Une app ou un site ne marche plus ?",
-      "subtitle": "Voici les dernières connexions bloquées ou en erreur. Autorisez une app en Direct en 1 clic pour la débloquer immédiatement.",
+      "subtitle": "Voici les dernières connexions bloquées ou en échec. Laissez passer une application en un clic pour la débloquer.",
       "empty": "Aucune connexion bloquée ou en erreur n'a été détectée récemment.",
-      "allow_app_direct": "Laisser passer l'app en Direct",
+      "allow_app_direct": "Laisser passer l'application",
       "allow_site_direct": "Laisser passer ce site",
-      "close": "Fermer"
+      "close": "Fermer",
+      "empty_paused": "La protection est en pause jusqu'à {{time}} : rien n'est bloqué pendant la pause.",
+      "empty_stopped": "RouteWard ne protège pas pour le moment, donc il ne bloque rien. Démarrez la protection depuis l'accueil pour appliquer vos règles.",
+      "allow_warning": "Laisser passer une application la fait se connecter directement : son adresse IP devient visible."
     },
     "reasons": {
       "blocked_by_rule": "Bloqué par une règle de protection active.",
-      "killswitch": "Bloqué par le coupe-circuit anti-fuite car le proxy ne répondait plus.",
+      "killswitch": "Bloqué par le coupe-circuit car le proxy ne répondait plus.",
       "auth": "Le serveur proxy a refusé l'identifiant ou le mot de passe.",
       "timeout": "Le serveur proxy a mis trop de temps à répondre.",
       "unreachable": "Impossible de joindre le serveur proxy configuré.",
-      "dns": "L'adresse du site n'a pas pu être résolue par le DNS protégé.",
-      "udp": "Cette app utilise un protocole (UDP/QUIC) bloqué par la protection anti-fuite.",
+      "dns": "L'adresse du site n'a pas pu être trouvée via la connexion protégée.",
+      "udp": "Cette application utilise un trafic (appels, jeux) que votre proxy ne peut pas transporter : il a été bloqué.",
       "generic": "Connexion bloquée ou interrompue par la protection."
+    },
+    "rules": {
+      "app_direct": "{{name}} - connexion directe",
+      "site_direct": "{{name}} - connexion directe"
+    },
+    "toast": {
+      "app_allowed": "{{name}} se connecte maintenant directement",
+      "site_allowed": "{{name}} se connecte maintenant directement"
+    },
+    "proxy_down": {
+      "title": "Votre proxy ne répond pas",
+      "desc": "La plupart de ces problèmes viennent du proxy et non de vos règles. Testez-le d'abord.",
+      "test": "Tester le proxy",
+      "pause": "Pause {{minutes}} min",
+      "change": "Changer de proxy"
+    },
+    "why": {
+      "button": "Pourquoi ?",
+      "rule": "Règle appliquée : {{name}}",
+      "no_rule": "Aucune de vos règles ne s'est appliquée : c'est le comportement par défaut."
     }
   },
   "tray": {
     "status": {
-      "offline": "RouteWard - Service arrêté",
+      "offline": "RouteWard - Non démarré",
       "protected": "RouteWard - Protégé",
-      "paused": "RouteWard - En pause"
+      "paused": "RouteWard - Protection désactivée",
+      "paused_until": "RouteWard - En pause jusqu'à {time}"
     },
     "menu": {
-      "pause": "Mettre en pause",
-      "pause_15m": "Pause 15 minutes",
+      "pause": "Désactiver la protection",
+      "pause_15m": "Pause de 15 min",
       "enable": "Activer la protection",
-      "start_service": "Démarrer le service",
+      "resume_now": "Reprendre maintenant",
+      "start_service": "Démarrer la protection",
       "open": "Ouvrir RouteWard",
       "quit": "Quitter"
     },
     "alert": {
-      "outage_title": "RouteWard - Proxy injoignable",
-      "outage_body": "Internet est bloqué par sécurité pour éviter une fuite IP. Faites un clic droit ici pour mettre en pause 15 min ou ouvrir RouteWard."
+      "outage_title": "RouteWard - Problème de connexion",
+      "outage_body": "Votre accès à Internet est coupé volontairement pour que votre vraie adresse reste cachée. Cliquez ici pour ouvrir RouteWard, ou utilisez l'icône RouteWard près de l'horloge pour mettre la protection en pause 15 min.",
+      "outage_body_open": "Votre proxy ne répond pas : certaines connexions échouent. Cliquez ici pour ouvrir RouteWard."
+    },
+    "notice": {
+      "title": "RouteWard",
+      "restored_body": "RouteWard n'est pas lancé, votre connexion normale a été rétablie.",
+      "exit_background_title": "RouteWard continue de vous protéger",
+      "exit_background_body": "La protection continue en arrière-plan. Pour la mettre en pause, utilisez l'icône RouteWard près de l'horloge. Si Internet ne fonctionne plus, ouvrez le menu Démarrer et choisissez \"RouteWard - Restore Internet\".",
+      "close_to_tray_title": "RouteWard est toujours actif",
+      "close_to_tray_body": "RouteWard reste actif ici, près de l'horloge. Cliquez sur l'icône pour le rouvrir, ou faites un clic droit pour quitter.",
+      "service_install_failed": "La protection en arrière-plan n'a pas pu être installée. RouteWard fonctionne pour l'instant, mais la protection ne reviendra pas après un redémarrage.",
+      "uac_cancelled": "L'autorisation a été refusée, la protection n'a donc pas été démarrée.",
+      "access_denied": "RouteWard est actif, mais ce compte n'a pas le droit de le contrôler.",
+      "start_failed": "RouteWard n'a pas pu démarrer la protection. Ouvrez RouteWard pour plus de détails.",
+      "toggle_failed": "RouteWard n'a pas pu modifier la protection. Ouvrez RouteWard pour plus de détails.",
+      "pause_failed": "RouteWard n'a pas pu mettre la protection en pause. Ouvrez RouteWard pour plus de détails."
     }
   }
 }

@@ -37,10 +37,21 @@ import {
 } from 'lucide-react';
 import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
 import { generateClientId, routewardClient } from '../services/ipc';
-import { normalizeDomainPatterns } from '../services/domain';
 import {
+  expandSiteCheckHosts,
+  isWindowsPlatform,
+  normalizeDomainPatterns,
+  normalizeProcessList
+} from '../services/domain';
+import {
+  buildSimpleAppRule,
   findShadowingRule,
-  resolveSimpleProxyAction
+  getFriendlyAppName,
+  localizeEngineRuleName,
+  resolveEffectiveAppRule,
+  resolveSimpleProxyAction,
+  resolveSimpleRuleId,
+  toSimpleActionChoice
 } from '../services/friendly';
 import {
   ConnectionRequest,
@@ -76,6 +87,13 @@ interface RulesViewProps {
   ) => Promise<FoxyProxyImportResult | null>;
   onListSystemApps?: () => Promise<SystemApplicationEntry[]>;
   onMissingProxy?: () => void;
+  /** Operating system name reported by the daemon; the browser user agent is used when absent. */
+  osName?: string;
+}
+
+interface SiteCheckEntry {
+  host: string;
+  result: RuleEvaluationResult | null;
 }
 
 function parsePortSpec(spec: string): PortRange[] {
@@ -139,7 +157,8 @@ export const RulesView: React.FC<RulesViewProps> = ({
   onRemoveRule,
   onImportFoxyProxy,
   onListSystemApps,
-  onMissingProxy
+  onMissingProxy,
+  osName
 }) => {
   const { t } = useTranslation();
   const addRuleModalTitleId = useId();
@@ -164,8 +183,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const [simPort, setSimPort] = useState<number>(UI_CONFIG.DEFAULT_TEST_PORT);
   const [simResult, setSimResult] = useState<RuleEvaluationResult | null>(null);
   const [simpleSiteQuery, setSimpleSiteQuery] = useState('');
-  const [simpleSiteResult, setSimpleSiteResult] =
-    useState<RuleEvaluationResult | null>(null);
+  const [simpleSiteResults, setSimpleSiteResults] = useState<SiteCheckEntry[]>(
+    []
+  );
+  const windows = isWindowsPlatform(osName);
 
   // Add / Edit Rule & Presets modal state
   const [showModal, setShowModal] = useState(false);
@@ -192,6 +213,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
   const [simpleOptionalDomains, setSimpleOptionalDomains] = useState('');
   const [simpleOptionalApps, setSimpleOptionalApps] = useState('');
   const [showAdvancedFields, setShowAdvancedFields] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
 
   // System apps picker state
   const [showAppPicker, setShowAppPicker] = useState(false);
@@ -235,44 +257,56 @@ export const RulesView: React.FC<RulesViewProps> = ({
       onMissingProxy?.();
       return;
     }
-    const slug = app.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-    onAddRule({
-      id: `rule-app-${slug}`,
-      name: app.name,
-      enabled: true,
-      priority: UI_CONFIG.DEFAULT_RULE_PRIORITY - 10,
-      processPatterns: [app.name],
-      domainPatterns: [],
-      ipCidrs: [],
-      portRanges: [],
-      protocol: 'any',
-      action:
-        chosenAction === 'proxy' && simpleProxyAction
-          ? simpleProxyAction
-          : { type: chosenAction === 'proxy' ? 'direct' : chosenAction }
-    });
+    onAddRule(
+      buildSimpleAppRule({
+        processName: app.name,
+        existingRules: rules,
+        action:
+          chosenAction === 'proxy' && simpleProxyAction
+            ? simpleProxyAction
+            : { type: chosenAction === 'proxy' ? 'direct' : chosenAction }
+      })
+    );
   };
+
+  const isPackActive = (pack: (typeof UI_CONFIG.SIMPLE_PROTECTION_PACKS)[number]) =>
+    pack.rules.every((part) => rules.find((r) => r.id === part.id)?.enabled);
 
   const handleToggleProtectionPack = (
     pack: (typeof UI_CONFIG.SIMPLE_PROTECTION_PACKS)[number]
   ) => {
-    const existing = rules.find((r) => r.id === pack.id);
-    if (existing) {
-      onToggleRule(existing.id);
+    if (isPackActive(pack)) {
+      pack.rules.forEach((part) => onToggleRule(part.id));
       return;
     }
-    onAddRule({
-      id: pack.id,
-      name: t(pack.titleKey),
-      enabled: true,
-      priority: pack.priority,
-      processPatterns: [...pack.processPatterns],
-      domainPatterns: [...pack.domainPatterns],
-      ipCidrs: [...pack.ipCidrs],
-      portRanges: [],
-      protocol: 'any',
-      action: { type: pack.actionType }
-    });
+    for (const part of pack.rules) {
+      const existing = rules.find((r) => r.id === part.id);
+      // A rule saved by an older version combined programs and websites, which the engine ANDs:
+      // it is replaced by the split rule instead of being switched back on as it was.
+      const isLegacyCombined =
+        Boolean(existing) &&
+        (part.processPatterns.length === 0 || part.domainPatterns.length === 0) &&
+        existing!.processPatterns.length > 0 &&
+        existing!.domainPatterns.length > 0;
+      if (existing && !isLegacyCombined) {
+        if (!existing.enabled) {
+          onToggleRule(existing.id);
+        }
+        continue;
+      }
+      onAddRule({
+        id: part.id,
+        name: t(part.nameKey),
+        enabled: true,
+        priority: pack.priority,
+        processPatterns: [...part.processPatterns],
+        domainPatterns: [...part.domainPatterns],
+        ipCidrs: [...part.ipCidrs],
+        portRanges: [],
+        protocol: 'any',
+        action: { type: pack.actionType }
+      });
+    }
   };
 
   const appendProcessPattern = (appName: string, mode: 'simple' | 'advanced') => {
@@ -329,6 +363,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
     setSimpleOptionalDomains('');
     setSimpleOptionalApps('');
     setShowAdvancedFields(false);
+    setFormError(null);
     setShowModal(true);
   };
 
@@ -366,6 +401,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
       hasDomainsOnly ? rule.processPatterns.join(', ') : ''
     );
     setShowAdvancedFields(needsAdvanced);
+    setFormError(null);
     setShowModal(true);
   };
 
@@ -375,6 +411,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
     setEditingRequiresAdvanced(false);
     setShowAdvancedFields(false);
     setShowAppPicker(false);
+    setFormError(null);
     setShowModal(false);
   };
 
@@ -397,13 +434,17 @@ export const RulesView: React.FC<RulesViewProps> = ({
     const host =
       normalized.primaryDomain ||
       (normalized.patterns[0] || raw).replace(/^\*\./, '');
-    const res = await onEvaluateRule({
-      processName: 'msedge.exe',
-      targetHost: host,
-      targetPort: UI_CONFIG.DEFAULT_TEST_PORT,
-      protocol: 'tcp'
-    });
-    setSimpleSiteResult(res);
+    const entries: SiteCheckEntry[] = [];
+    for (const checkedHost of expandSiteCheckHosts(host)) {
+      const result = await onEvaluateRule({
+        processName: UI_CONFIG.SITE_TESTER_PROCESS,
+        targetHost: checkedHost,
+        targetPort: UI_CONFIG.DEFAULT_TEST_PORT,
+        protocol: 'tcp'
+      });
+      entries.push({ host: checkedHost, result });
+    }
+    setSimpleSiteResults(entries);
   };
 
   const handleApplyPreset = (
@@ -488,37 +529,92 @@ export const RulesView: React.FC<RulesViewProps> = ({
     }
   };
 
+  const splitList = (raw: string) =>
+    raw
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+
+  /** Application and website lists the Simple form currently describes, as they will be saved. */
+  const readSimpleTargets = () => {
+    const siteTarget = normalizeDomainPatterns(simpleTargetValue);
+    const optionalSites = normalizeDomainPatterns(simpleOptionalDomains);
+    return simpleTargetType === 'app'
+      ? {
+          processes: normalizeProcessList(simpleTargetValue, windows),
+          domains: optionalSites.patterns,
+          primaryDomain: optionalSites.primaryDomain
+        }
+      : {
+          processes: normalizeProcessList(simpleOptionalApps, windows),
+          domains: siteTarget.patterns,
+          primaryDomain: siteTarget.primaryDomain
+        };
+  };
+
+  const buildSimpleRuleName = (targets: {
+    processes: string[];
+    domains: string[];
+    primaryDomain: string | null;
+  }): string => {
+    if (targets.processes.length > 0 && targets.domains.length > 0) {
+      return t('rules.generated.app_on_sites', {
+        app: getFriendlyAppName(targets.processes[0]).displayName,
+        sites: targets.domains.join(', ')
+      });
+    }
+    if (targets.processes.length > 0) {
+      return targets.processes
+        .map((proc) => getFriendlyAppName(proc).displayName)
+        .join(', ');
+    }
+    if (targets.domains.length > 0) {
+      return targets.primaryDomain ?? targets.domains.join(', ');
+    }
+    return '';
+  };
+
+  const handleShowAdvancedFields = () => {
+    const targets = readSimpleTargets();
+    setProcessesText(targets.processes.join(', '));
+    setDomainsText(targets.domains.join(', '));
+    if (!ruleName.trim()) {
+      setRuleName(buildSimpleRuleName(targets));
+    }
+    setFormError(null);
+    setShowAdvancedFields(true);
+  };
+
   const handleCreateRule = (e: React.FormEvent) => {
     e.preventDefault();
-    const splitList = (raw: string) =>
-      raw
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
 
     const isSimpleSubmit = experienceMode === 'simple' && !showAdvancedFields;
+    const simpleTargets = readSimpleTargets();
     const effectiveProcesses = isSimpleSubmit
-      ? simpleTargetType === 'app'
-        ? splitList(simpleTargetValue)
-        : splitList(simpleOptionalApps)
-      : splitList(processesText);
-    const normalizedSiteTarget = normalizeDomainPatterns(simpleTargetValue);
-    const normalizedOptionalSites = normalizeDomainPatterns(simpleOptionalDomains);
+      ? simpleTargets.processes
+      : normalizeProcessList(
+          processesText,
+          windows && experienceMode === 'simple'
+        );
     const effectiveDomains = isSimpleSubmit
-      ? simpleTargetType === 'site'
-        ? normalizedSiteTarget.patterns
-        : normalizedOptionalSites.patterns
+      ? simpleTargets.domains
       : splitList(domainsText);
+    const effectiveCidrs = isSimpleSubmit ? [] : splitList(cidrsText);
 
-    const autoSimpleName =
-      effectiveProcesses.length > 0 && effectiveDomains.length > 0
-        ? `${effectiveProcesses[0]} (${effectiveDomains.join(', ')})`
-        : simpleTargetType === 'site' && normalizedSiteTarget.primaryDomain
-          ? normalizedSiteTarget.primaryDomain
-          : simpleTargetValue.trim();
+    // A Simple rule without any app, site or address would match all traffic (and block everything
+    // when its action is Block), so it is refused with a plain message.
+    if (
+      experienceMode === 'simple' &&
+      effectiveProcesses.length === 0 &&
+      effectiveDomains.length === 0 &&
+      effectiveCidrs.length === 0
+    ) {
+      setFormError(t('rules.simple.error_no_criteria'));
+      return;
+    }
 
     const effectiveName = isSimpleSubmit
-      ? ruleName.trim() || autoSimpleName
+      ? ruleName.trim() || buildSimpleRuleName(simpleTargets)
       : ruleName.trim();
     if (!effectiveName) return;
 
@@ -554,8 +650,14 @@ export const RulesView: React.FC<RulesViewProps> = ({
       resolvedAction = { type: actionType };
     }
 
+    const ruleId =
+      editingRuleId ??
+      (isSimpleSubmit
+        ? resolveSimpleRuleId(rules, effectiveProcesses, effectiveDomains)
+        : generateClientId('rule'));
+
     onAddRule({
-      id: editingRuleId ?? generateClientId('rule'),
+      id: ruleId,
       name: effectiveName,
       enabled: editingRuleId ? editingRuleEnabled : true,
       priority: isSimpleSubmit
@@ -563,11 +665,11 @@ export const RulesView: React.FC<RulesViewProps> = ({
           ? priority
           : effectiveDomains.length > 0
             ? UI_CONFIG.DEFAULT_SITE_RULE_PRIORITY
-            : UI_CONFIG.DEFAULT_RULE_PRIORITY
+            : UI_CONFIG.SIMPLE_APP_RULE_PRIORITY
         : priority,
       processPatterns: effectiveProcesses,
       domainPatterns: effectiveDomains,
-      ipCidrs: isSimpleSubmit ? [] : splitList(cidrsText),
+      ipCidrs: effectiveCidrs,
       portRanges: isSimpleSubmit ? [] : parsePortSpec(portsText),
       protocol: isSimpleSubmit ? 'any' : protocol,
       action: resolvedAction
@@ -769,8 +871,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
             </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
               {UI_CONFIG.SIMPLE_PROTECTION_PACKS.map((pack) => {
-                const existing = rules.find((r) => r.id === pack.id);
-                const active = Boolean(existing?.enabled);
+                const active = isPackActive(pack);
                 return (
                   <div
                     key={pack.id}
@@ -852,27 +953,15 @@ export const RulesView: React.FC<RulesViewProps> = ({
                       )
                       .slice(0, 24)
                       .map((app) => {
-                        const slug = app.name
-                          .toLowerCase()
-                          .replace(/[^a-z0-9]+/g, '-');
-                        const appRule = rules.find(
-                          (r) =>
-                            r.enabled &&
-                            (r.id === `rule-app-${slug}` ||
-                              (r.domainPatterns.length === 0 &&
-                                r.processPatterns.some(
-                                  (p) =>
-                                    p.toLowerCase() === app.name.toLowerCase()
-                                )))
-                        );
+                        // Highlight what really applies: the winning rule by priority,
+                        // be it this app's own rule or a category rule that lists it.
+                        const appRule = resolveEffectiveAppRule(app.name, rules);
                         const activeAppAction:
                           | 'proxy'
                           | 'direct'
                           | 'block'
                           | null = appRule
-                          ? appRule.action.type === 'chain'
-                            ? 'proxy'
-                            : appRule.action.type
+                          ? toSimpleActionChoice(appRule.action)
                           : null;
                         return (
                           <div
@@ -992,7 +1081,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
               <CheckCircle2 className="h-4 w-4" />
               {t('rules.simulator.matched_rule')}:{' '}
               <span className="text-tf-primary">
-                {simResult.matchedRuleName}
+                {localizeEngineRuleName(simResult.matchedRuleName, t)}
               </span>
             </span>
             <span className="font-mono text-tf-accent">
@@ -1044,31 +1133,46 @@ export const RulesView: React.FC<RulesViewProps> = ({
                 {t('rules.simple.tester_button')}
               </button>
             </div>
-            {simpleSiteResult && (
-              <div className="tf-surface-alt flex flex-wrap items-center gap-2.5 px-3 py-2 text-xs">
-                <span
-                  className={`rounded px-2.5 py-0.5 text-[11px] font-bold ${
-                    simpleSiteResult.action.type === 'block'
-                      ? 'bg-tf-red/20 text-tf-red'
-                      : simpleSiteResult.action.type === 'direct'
-                        ? 'bg-tf-green/20 text-tf-green'
-                        : 'bg-tf-accent/20 text-tf-accent'
-                  }`}
-                >
-                  {simpleSiteResult.action.type === 'block'
-                    ? t('rules.simple.action_badge_block')
-                    : simpleSiteResult.action.type === 'direct'
-                      ? t('rules.simple.action_badge_direct')
-                      : simpleSiteResult.action.type === 'chain'
-                        ? t('rules.simple.action_badge_chain')
-                        : t('rules.simple.action_badge_proxy')}
-                </span>
-                <span className="text-tf-secondary">
-                  {t('rules.simple.tester_rule_label', {
-                    name: simpleSiteResult.matchedRuleName
-                  })}
-                </span>
-              </div>
+            <p className="text-[11px] text-tf-secondary">
+              {t('rules.simple.tester_hosts_hint')}
+            </p>
+            {simpleSiteResults.map(
+              (entry) =>
+                entry.result && (
+                  <div
+                    key={entry.host}
+                    className="tf-surface-alt flex flex-wrap items-center gap-2.5 px-3 py-2 text-xs"
+                  >
+                    <span className="font-mono text-[11px] font-semibold text-tf-primary">
+                      {entry.host}
+                    </span>
+                    <span
+                      className={`rounded px-2.5 py-0.5 text-[11px] font-bold ${
+                        entry.result.action.type === 'block'
+                          ? 'bg-tf-red/20 text-tf-red'
+                          : entry.result.action.type === 'direct'
+                            ? 'bg-tf-green/20 text-tf-green'
+                            : 'bg-tf-accent/20 text-tf-accent'
+                      }`}
+                    >
+                      {entry.result.action.type === 'block'
+                        ? t('rules.simple.action_badge_block')
+                        : entry.result.action.type === 'direct'
+                          ? t('rules.simple.action_badge_direct')
+                          : entry.result.action.type === 'chain'
+                            ? t('rules.simple.action_badge_chain')
+                            : t('rules.simple.action_badge_proxy')}
+                    </span>
+                    <span className="text-tf-secondary">
+                      {t('rules.simple.tester_rule_label', {
+                        name: localizeEngineRuleName(
+                          entry.result.matchedRuleName,
+                          t
+                        )
+                      })}
+                    </span>
+                  </div>
+                )
             )}
           </form>
 
@@ -1083,10 +1187,28 @@ export const RulesView: React.FC<RulesViewProps> = ({
             ) : (
               <div className="divide-y divide-tf-border">
                 {rules.map((rule) => {
-                  const targets = [
+                  const namedTargets = [
                     ...rule.processPatterns,
-                    ...rule.domainPatterns,
-                    ...rule.ipCidrs
+                    ...rule.domainPatterns
+                  ];
+                  const shownTargets = namedTargets.slice(
+                    0,
+                    UI_CONFIG.SIMPLE_RULE_TARGETS_PREVIEW
+                  );
+                  const hiddenTargetCount =
+                    namedTargets.length - shownTargets.length;
+                  const targetSummary = [
+                    ...shownTargets,
+                    ...(hiddenTargetCount > 0
+                      ? [t('rules.simple.targets_more', { count: hiddenTargetCount })]
+                      : []),
+                    ...(rule.ipCidrs.length > 0
+                      ? [
+                          t('rules.simple.targets_addresses', {
+                            count: rule.ipCidrs.length
+                          })
+                        ]
+                      : [])
                   ];
                   const blocker = findShadowingRule(rule, rules);
                   return (
@@ -1109,8 +1231,8 @@ export const RulesView: React.FC<RulesViewProps> = ({
                             {rule.name}
                           </div>
                           <div className="font-mono text-[11px] text-tf-secondary">
-                            {targets.length > 0
-                              ? targets.join(', ')
+                            {targetSummary.length > 0
+                              ? targetSummary.join(', ')
                               : t('rules.table.targets.any')}
                           </div>
                           {blocker && (
@@ -1343,6 +1465,11 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
             {experienceMode === 'simple' && !showAdvancedFields ? (
               <>
+                {formError && (
+                  <p role="alert" className="text-xs font-semibold text-tf-red">
+                    {formError}
+                  </p>
+                )}
                 <div className="flex gap-2">
                   <button
                     type="button"
@@ -1407,7 +1534,10 @@ export const RulesView: React.FC<RulesViewProps> = ({
                     type="text"
                     required
                     value={simpleTargetValue}
-                    onChange={(e) => setSimpleTargetValue(e.target.value)}
+                    onChange={(e) => {
+                      setSimpleTargetValue(e.target.value);
+                      setFormError(null);
+                    }}
                     placeholder={
                       simpleTargetType === 'app'
                         ? t('rules.simple.target_app_placeholder')
@@ -1415,10 +1545,53 @@ export const RulesView: React.FC<RulesViewProps> = ({
                     }
                     className="tf-input mt-1 w-full px-3 py-1.5 text-sm"
                   />
+                  {simpleTargetType === 'app' &&
+                    (() => {
+                      const typed = splitList(simpleTargetValue);
+                      const completed = normalizeProcessList(
+                        simpleTargetValue,
+                        windows
+                      );
+                      const changed = completed.filter(
+                        (name, idx) =>
+                          typed[idx] !== undefined &&
+                          name.toLowerCase() !== typed[idx].toLowerCase()
+                      );
+                      const unmatched = detectedAppsLoaded
+                        ? completed.filter(
+                            (name) =>
+                              !systemApps.some(
+                                (app) =>
+                                  app.running &&
+                                  app.name.toLowerCase() === name.toLowerCase()
+                              )
+                          )
+                        : [];
+                      return (
+                        <>
+                          {changed.length > 0 && (
+                            <p className="mt-1 text-[11px] font-semibold text-tf-green">
+                              {t('rules.simple.app_name_completed', {
+                                name: changed.join(', ')
+                              })}
+                            </p>
+                          )}
+                          {unmatched.length > 0 && (
+                            <p className="mt-1 text-[11px] font-semibold text-tf-orange">
+                              {t('rules.simple.app_not_running_warning', {
+                                app: unmatched.join(', ')
+                              })}
+                            </p>
+                          )}
+                        </>
+                      );
+                    })()}
                   {simpleTargetType === 'site' &&
                     (() => {
                       const preview = normalizeDomainPatterns(simpleTargetValue);
-                      return preview.normalizedFromUrl && preview.primaryDomain ? (
+                      return (preview.normalizedFromUrl ||
+                        preview.coversSubdomains) &&
+                        preview.primaryDomain ? (
                         <p className="mt-1 text-[11px] font-semibold text-tf-green">
                           {t('rules.simple.url_preview', {
                             domain: preview.primaryDomain
@@ -1485,7 +1658,9 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         const preview = normalizeDomainPatterns(
                           simpleOptionalDomains
                         );
-                        return preview.normalizedFromUrl && preview.primaryDomain ? (
+                        return (preview.normalizedFromUrl ||
+                          preview.coversSubdomains) &&
+                          preview.primaryDomain ? (
                           <p className="mt-1 text-[11px] font-semibold text-tf-green">
                             {t('rules.simple.url_preview', {
                               domain: preview.primaryDomain
@@ -1582,7 +1757,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => setShowAdvancedFields(true)}
+                  onClick={handleShowAdvancedFields}
                   className="text-xs font-semibold text-tf-cyan hover:underline"
                 >
                   {t('rules.simple.show_advanced_options')}
@@ -1599,6 +1774,11 @@ export const RulesView: React.FC<RulesViewProps> = ({
                     {t('rules.simple.hide_advanced_options')}
                   </button>
                 )}
+            {formError && (
+              <p role="alert" className="text-xs font-semibold text-tf-red">
+                {formError}
+              </p>
+            )}
             <div className="grid grid-cols-3 gap-3">
               <div className="col-span-2">
                 <label htmlFor={`${formId}-f1`} className="block text-xs text-tf-secondary">
@@ -1707,7 +1887,9 @@ export const RulesView: React.FC<RulesViewProps> = ({
               </div>
               <div>
                 <label htmlFor={`${formId}-f4`} className="block text-xs text-tf-secondary">
-                  {t('rules.modal.add.cidrs_label')}
+                  {experienceMode === 'simple'
+                    ? t('rules.simple.addresses_label')
+                    : t('rules.modal.add.cidrs_label')}
                 </label>
                 <input id={`${formId}-f4`}
                   type="text"
@@ -1742,9 +1924,15 @@ export const RulesView: React.FC<RulesViewProps> = ({
                   onChange={(e) =>
                     setProtocol(e.target.value as TransportProtocol)
                   }
-                  className="tf-input mt-1 w-full px-2 py-1.5 text-sm uppercase"
+                  className={`tf-input mt-1 w-full px-2 py-1.5 text-sm ${
+                    experienceMode === 'simple' ? '' : 'uppercase'
+                  }`}
                 >
-                  <option value="any">ANY</option>
+                  <option value="any">
+                    {experienceMode === 'simple'
+                      ? t('rules.simple.protocol_any')
+                      : 'ANY'}
+                  </option>
                   <option value="tcp">TCP</option>
                   <option value="udp">UDP</option>
                 </select>
@@ -1764,16 +1952,30 @@ export const RulesView: React.FC<RulesViewProps> = ({
                       setActionTargetId(enabledChains[0]?.id || '');
                     }
                   }}
-                  className="tf-input mt-1 w-full px-2 py-1.5 text-sm uppercase"
+                  className={`tf-input mt-1 w-full px-2 py-1.5 text-sm ${
+                    experienceMode === 'simple' ? '' : 'uppercase'
+                  }`}
                 >
                   <option value="proxy" disabled={!hasEnabledProxy}>
-                    PROXY
+                    {experienceMode === 'simple'
+                      ? t('connections.simple.route_proxy')
+                      : 'PROXY'}
                   </option>
                   <option value="chain" disabled={enabledChains.length === 0}>
-                    CHAIN
+                    {experienceMode === 'simple'
+                      ? t('rules.simple.action_badge_chain')
+                      : 'CHAIN'}
                   </option>
-                  <option value="direct">DIRECT</option>
-                  <option value="block">BLOCK</option>
+                  <option value="direct">
+                    {experienceMode === 'simple'
+                      ? t('connections.simple.route_direct')
+                      : 'DIRECT'}
+                  </option>
+                  <option value="block">
+                    {experienceMode === 'simple'
+                      ? t('connections.simple.route_blocked')
+                      : 'BLOCK'}
+                  </option>
                 </select>
               </div>
             </div>

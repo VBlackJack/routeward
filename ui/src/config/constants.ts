@@ -35,7 +35,8 @@ export const UI_CONFIG = {
     PROFILE: 'routeward_active_profile',
     EXPERIENCE_MODE: 'routeward_ux_mode',
     WIZARD_COMPLETED: 'routeward_wizard_done',
-    NETWORK_PROFILE_RULES: 'routeward_network_profiles'
+    NETWORK_PROFILE_RULES: 'routeward_network_profiles',
+    SERVICE_NOTICE_SHOWN: 'routeward_service_notice_shown'
   },
   NETWORK_POLL_INTERVAL_MS: 15000,
   TELEMETRY_REFRESH_INTERVAL_MS: 1000,
@@ -52,8 +53,42 @@ export const UI_CONFIG = {
   ACCENT_HOVER_LIGHTNESS_DELTA: 18,
   ACCENT_PRESSED_LIGHTNESS_DELTA: -18,
   DEFAULT_PROXY_PORT: 1080,
+  /** Default port suggested for each proxy protocol when the user has not typed one. */
+  DEFAULT_PROXY_PORT_BY_PROTOCOL: {
+    socks5: 1080,
+    socks4: 1080,
+    http: 8080,
+    https: 8080
+  } as const,
+  /** Protocol assumed for a proxy link typed without a scheme when the user picked none. */
+  DEFAULT_LINK_PROXY_PROTOCOL: 'http' as const,
   DEFAULT_RULE_PRIORITY: 50,
+  /** Priority of Simple rules that target one website (above every category rule and pack but the LAN bypass). */
   DEFAULT_SITE_RULE_PRIORITY: 8,
+  /**
+   * Priority of Simple rules that target one application: above the category cards (16-22),
+   * below the protection packs (5-14) so the local network bypass and ad blocking keep working.
+   */
+  SIMPLE_APP_RULE_PRIORITY: 15,
+  /** Prefixes of the rule ids created from Simple entry points (the only rules Simple actions may retarget). */
+  SIMPLE_RULE_ID_PREFIXES: {
+    APP: 'rule-app-',
+    SITE: 'rule-site-',
+    VISUAL: 'rule-visual-',
+    WIZARD: 'rule-wiz-',
+    QUICK: 'rule-quick-',
+    USE_CASE: 'rule-uc-'
+  } as const,
+  /** Name the engine gives the implicit fallback rule; shown through a localized label. */
+  ENGINE_DEFAULT_RULE_NAME: 'Default Profile Policy',
+  /** Process used by the Simple site tester to evaluate a website. */
+  SITE_TESTER_PROCESS: 'msedge.exe',
+  /** Value of the OS name reported by the daemon on Windows. */
+  WINDOWS_OS_NAME: 'WINDOWS',
+  WINDOWS_USER_AGENT_PATTERN: /windows/i,
+  WINDOWS_EXECUTABLE_SUFFIX: '.exe',
+  /** Longest list of targets printed on one Simple rule row before it is summarized. */
+  SIMPLE_RULE_TARGETS_PREVIEW: 4,
   DEFAULT_TEST_PORT: 443,
   TOKEN_HEADER: 'X-RouteWard-Token',
   SSE_RECONNECT_DELAY_MS: 1500,
@@ -71,13 +106,25 @@ export const UI_CONFIG = {
   TOAST_DURATION_MS: 3200,
   /** Extended auto-dismiss delay for toasts that carry an Undo action. */
   TOAST_UNDO_DURATION_MS: 6000,
+  /** Seconds in one minute, used to turn a pause length in minutes into the daemon's seconds. */
+  SECONDS_PER_MINUTE: 60,
+  /** Pause length (minutes) offered by the outage banner and the troubleshooter. */
+  OUTAGE_PAUSE_MINUTES: 15,
+  /** A pause that ended up to this long before now (ms) counts as having run its course. */
+  PAUSE_RESUME_TOAST_TOLERANCE_MS: 5000,
+  /** Delay between two refreshes of the pause countdown (milliseconds). */
+  PAUSE_COUNTDOWN_TICK_MS: 1000,
   /** Quick temporary pause durations (in minutes) shown in Simple mode. */
   TEMPORARY_PAUSE_OPTIONS_MINUTES: [15, 60] as const,
   /** Stable identifier of the automatic backup-proxy failover chain managed in Simple mode. */
   SIMPLE_FAILOVER_CHAIN_ID: 'chain-simple-failover',
   /** Priority for high-priority quick unblock rules created from troubleshooting. */
   TROUBLESHOOT_RULE_PRIORITY: 6,
-  /** 1-click protection and compatibility packs offered in Simple mode (works even without a proxy). */
+  /**
+   * 1-click protection and compatibility packs offered in Simple mode (works even without a proxy).
+   * Each pack owns one or more rules; the engine ANDs processes and domains inside one rule, so a
+   * pack that targets both programs and websites is split into one rule per criterion.
+   */
   SIMPLE_PROTECTION_PACKS: [
     {
       id: 'rule-pack-local-lan',
@@ -85,15 +132,21 @@ export const UI_CONFIG = {
       descKey: 'rules.simple.pack_lan_desc',
       actionType: 'direct' as const,
       priority: 5,
-      processPatterns: [] as readonly string[],
-      domainPatterns: ['localhost', '*.local', '*.lan'] as readonly string[],
-      ipCidrs: [
-        '127.0.0.0/8',
-        '10.0.0.0/8',
-        '172.16.0.0/12',
-        '192.168.0.0/16',
-        '169.254.0.0/16'
-      ] as readonly string[]
+      rules: [
+        {
+          id: 'rule-pack-local-lan',
+          nameKey: 'rules.simple.pack_lan_title',
+          processPatterns: [] as readonly string[],
+          domainPatterns: ['localhost', '*.local', '*.lan'] as readonly string[],
+          ipCidrs: [
+            '127.0.0.0/8',
+            '10.0.0.0/8',
+            '172.16.0.0/12',
+            '192.168.0.0/16',
+            '169.254.0.0/16'
+          ] as readonly string[]
+        }
+      ]
     },
     {
       id: 'rule-pack-ads-trackers',
@@ -101,17 +154,23 @@ export const UI_CONFIG = {
       descKey: 'rules.simple.pack_ads_desc',
       actionType: 'block' as const,
       priority: 13,
-      processPatterns: [] as readonly string[],
-      domainPatterns: [
-        '*.doubleclick.net',
-        '*.googlesyndication.com',
-        '*.google-analytics.com',
-        '*.adservice.google.com',
-        '*.adsrvr.org',
-        '*.taboola.com',
-        '*.outbrain.com'
-      ] as readonly string[],
-      ipCidrs: [] as readonly string[]
+      rules: [
+        {
+          id: 'rule-pack-ads-trackers',
+          nameKey: 'rules.simple.pack_ads_title',
+          processPatterns: [] as readonly string[],
+          domainPatterns: [
+            '*.doubleclick.net',
+            '*.googlesyndication.com',
+            '*.google-analytics.com',
+            '*.adservice.google.com',
+            '*.adsrvr.org',
+            '*.taboola.com',
+            '*.outbrain.com'
+          ] as readonly string[],
+          ipCidrs: [] as readonly string[]
+        }
+      ]
     },
     {
       id: 'rule-pack-telemetry',
@@ -119,17 +178,29 @@ export const UI_CONFIG = {
       descKey: 'rules.simple.pack_telemetry_desc',
       actionType: 'block' as const,
       priority: 12,
-      processPatterns: [
-        'CompatTelRunner.exe',
-        'DiagTrack',
-        'crashpad_handler.exe'
-      ] as readonly string[],
-      domainPatterns: [
-        '*.telemetry.*',
-        '*.events.data.microsoft.com',
-        '*.sentry.io'
-      ] as readonly string[],
-      ipCidrs: [] as readonly string[]
+      rules: [
+        {
+          id: 'rule-pack-telemetry',
+          nameKey: 'rules.simple.pack_telemetry_apps_name',
+          processPatterns: [
+            'CompatTelRunner.exe',
+            'crashpad_handler.exe'
+          ] as readonly string[],
+          domainPatterns: [] as readonly string[],
+          ipCidrs: [] as readonly string[]
+        },
+        {
+          id: 'rule-pack-telemetry-sites',
+          nameKey: 'rules.simple.pack_telemetry_sites_name',
+          processPatterns: [] as readonly string[],
+          domainPatterns: [
+            '*.telemetry.*',
+            '*.events.data.microsoft.com',
+            '*.sentry.io'
+          ] as readonly string[],
+          ipCidrs: [] as readonly string[]
+        }
+      ]
     },
     {
       id: 'rule-pack-social-focus',
@@ -137,20 +208,26 @@ export const UI_CONFIG = {
       descKey: 'rules.simple.pack_social_desc',
       actionType: 'block' as const,
       priority: 14,
-      processPatterns: [] as readonly string[],
-      domainPatterns: [
-        'tiktok.com',
-        '*.tiktok.com',
-        'instagram.com',
-        '*.instagram.com',
-        'x.com',
-        '*.x.com',
-        'facebook.com',
-        '*.facebook.com',
-        'reddit.com',
-        '*.reddit.com'
-      ] as readonly string[],
-      ipCidrs: [] as readonly string[]
+      rules: [
+        {
+          id: 'rule-pack-social-focus',
+          nameKey: 'rules.simple.pack_social_title',
+          processPatterns: [] as readonly string[],
+          domainPatterns: [
+            'tiktok.com',
+            '*.tiktok.com',
+            'instagram.com',
+            '*.instagram.com',
+            'x.com',
+            '*.x.com',
+            'facebook.com',
+            '*.facebook.com',
+            'reddit.com',
+            '*.reddit.com'
+          ] as readonly string[],
+          ipCidrs: [] as readonly string[]
+        }
+      ]
     }
   ] as const,
   /** Priority gap used when reordering rules. */
@@ -170,6 +247,7 @@ export const UI_CONFIG = {
     STATE: '/api/state',
     EVENTS: '/api/events',
     ENGINE_TOGGLE: '/api/engine/toggle',
+    ENGINE_PAUSE: '/api/engine/pause',
     ENGINE_MODE: '/api/engine/mode',
     PROFILE_REPLACE: '/api/profile/replace',
     THEME: '/api/theme',

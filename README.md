@@ -4,12 +4,25 @@
 
 Process-aware network routing and proxy chaining toolkit written in Rust, with a native desktop interface built on `tao` + `wry` (WebView2) and **ThemeForge**.
 
+## Getting Started (No Networking Knowledge Needed)
+
+A **proxy** is a middleman server on the Internet: your apps talk to it, and it talks to websites for them, so websites see the proxy's address instead of yours. RouteWard decides, app by app, what goes through it.
+
+1. Install RouteWard with the `.msi` installer.
+2. Open **RouteWard** from the Start menu.
+3. Follow the setup assistant: paste the proxy link you were given, or choose **No proxy** if you do not have one.
+4. Click **Start** (the first time, Windows asks for administrator approval once, to install the background service), then check **Verify my protection**.
+
+Protection starts by itself at every boot and is remembered after a restart. Closing the window keeps RouteWard in the system tray. If you ever lose your Internet connection, use the Start menu shortcut **RouteWard - Restore Internet** or follow [Troubleshooting, section 0](docs/troubleshooting.md#0-i-have-no-internet-anymore).
+
 ## License and Author
 
 - **Author:** Julien Bombled
 - **License:** Apache License, Version 2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE))
 
-## Current Capabilities and Status
+## Technical Overview: Capabilities and Status (for Technical Readers)
+
+> Everything below is aimed at technical readers. To simply use RouteWard, the section above and the [Troubleshooting guide](docs/troubleshooting.md) are enough.
 
 - **Transparent OS Interception (`routeward-core::interceptor`)**: Captures outbound dual-stack **IPv4 and IPv6** TCP, UDP, and port `53` DNS traffic from unmodified applications via **WinDivert 2.2** on Windows and **`nftables` (`table ip` + `table ip6`) + `TPROXY`** on Linux, alongside explicit local SOCKS5 (`127.0.0.1:10808` / `[::1]:10808`) and HTTP CONNECT (`127.0.0.1:10809` / `[::1]:10809`) relay listeners.
 - **Process Attribution (`routeward-core::process`)**: Maps active IPv4 and IPv6 TCP and UDP sockets to owning PIDs and executable paths using WinDivert `SOCKET` + Windows IP Helper (`GetExtendedTcpTable` / `GetExtendedUdpTable` for `AF_INET` and `AF_INET6`) and Linux **`NETLINK_SOCK_DIAG`** (`AF_INET` / `AF_INET6`) with `/proc/net/{tcp,udp,tcp6,udp6}` + `/proc/<pid>/exe` fallback.

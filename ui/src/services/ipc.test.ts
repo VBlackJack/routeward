@@ -59,6 +59,35 @@ describe('RouteWardClientService', () => {
     expect(parsed?.name).toBe('Broken%ZZLabel');
   });
 
+  it('hands back the fallback reason of the daemon start route', async () => {
+    const client = new RouteWardClientService();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          started: true,
+          connected: true,
+          fallbackReasonKey: 'tray.notice.service_install_failed'
+        })
+      })
+    );
+    vi.spyOn(client, 'fetchState').mockResolvedValue(undefined as never);
+    const res = await client.startDaemon();
+    expect(res.fallbackReasonKey).toBe('tray.notice.service_install_failed');
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ started: true, connected: true })
+      })
+    );
+    expect((await client.startDaemon()).fallbackReasonKey).toBeUndefined();
+  });
+
   it('throws HttpResponseError on HTTP 4xx/5xx without marking daemon disconnected', async () => {
     const client = new RouteWardClientService();
     client.applyFullState({

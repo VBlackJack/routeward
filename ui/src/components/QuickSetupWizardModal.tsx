@@ -23,6 +23,8 @@ import {
   Gamepad2,
   Radar,
   Shield,
+  ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Terminal,
   Wand2,
@@ -31,7 +33,15 @@ import {
 import { ModalContainer } from './ModalContainer';
 import { SYSTEM_CONSTANTS, UI_CONFIG } from '../config/constants';
 import { generateClientId } from '../services/ipc';
-import { resolveSimpleProxyAction } from '../services/friendly';
+import {
+  normalizeProxyImportText,
+  resolveSimpleProxyAction
+} from '../services/friendly';
+import {
+  buildWizardSummaryKeys,
+  countAddedProxies,
+  getWizardPresetIds
+} from '../services/wizardPlan';
 import {
   DetectedProxyCandidate,
   ProxyChain,
@@ -56,14 +66,24 @@ interface QuickSetupWizardModalProps {
     uriText: string
   ) => Promise<ProxyNode[] | number | void> | void;
   onAddProxy?: (proxy: ProxyNode) => Promise<ProxyNode[] | void> | void;
+  /** Deletes a proxy this wizard created (a failed attempt is replaced, not kept). */
+  onRemoveProxy?: (proxyId: string) => Promise<unknown> | void;
+  /** Makes a proxy the primary one and returns the fresh proxy list. */
+  onSetPrimaryProxy?: (proxyId: string) => Promise<ProxyNode[] | void> | void;
   onTestProxy?: (
     proxyId: string
   ) => Promise<ProxyHealthReport | null | void> | void;
   onDetectExistingProxies?: () => Promise<DetectedProxyCandidate[]>;
-  onEnableProtection?: () => Promise<unknown> | void;
+  /** Resolves to `false` when protection could not be started. */
+  onEnableProtection?: () => Promise<boolean | void> | boolean | void;
   onAddRule: (rule: RoutingRule) => Promise<unknown> | void;
   onSelectMode: (mode: ExperienceMode) => void;
+  /** Called once the setup is saved and, when asked, protection is running. */
   onComplete: (hasEnabledProxy?: boolean) => void;
+  /** Called when the setup is saved but protection could not start (no success message). */
+  onConfigSaved?: () => void;
+  /** Called when the user asks to check the protection after the setup. */
+  onVerifyProtection?: () => void;
   /** Called when applying the wizard fails; the modal stays open so the user can retry. */
   onError?: (err: unknown) => void;
   onClose: () => void;
@@ -71,18 +91,24 @@ interface QuickSetupWizardModalProps {
 
 const TOTAL_WIZARD_STEPS = 3;
 
+type WizardOutcome = 'done' | 'protection_failed';
+
 export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   proxies,
   chains,
   currentMode,
   onImportUris,
   onAddProxy,
+  onRemoveProxy,
+  onSetPrimaryProxy,
   onTestProxy,
   onDetectExistingProxies,
   onEnableProtection,
   onAddRule,
   onSelectMode,
   onComplete,
+  onConfigSaved,
+  onVerifyProtection,
   onError,
   onClose
 }) => {
@@ -95,6 +121,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   const [proxyInputMode, setProxyInputMode] =
     useState<WizardProxyInputMode>('link');
   const [customUri, setCustomUri] = useState('');
+  const [linkError, setLinkError] = useState(false);
   const [manualName, setManualName] = useState('');
   const [manualProtocol, setManualProtocol] = useState<ProxyProtocol>('socks5');
   const [manualHost, setManualHost] = useState('');
@@ -109,15 +136,21 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
     { ok: true; ms: number } | { ok: false } | null
   >(null);
   const [detectingProxies, setDetectingProxies] = useState(false);
+  const [detectFailed, setDetectFailed] = useState(false);
   const [detectedCandidates, setDetectedCandidates] = useState<
     DetectedProxyCandidate[] | null
   >(null);
   const [persistedProxyList, setPersistedProxyList] = useState<ProxyNode[] | null>(
     null
   );
+  /** Proxies this wizard created from typed input: a new attempt replaces them. */
+  const [draftProxyIds, setDraftProxyIds] = useState<string[]>([]);
   const [enableProtectionNow, setEnableProtectionNow] = useState(true);
   const [selectedMode, setSelectedMode] = useState<ExperienceMode>(currentMode);
   const [applying, setApplying] = useState(false);
+  const [outcome, setOutcome] = useState<WizardOutcome | null>(null);
+  const [finishedWithProxy, setFinishedWithProxy] = useState(false);
+  const [protectionStarted, setProtectionStarted] = useState(false);
 
   const effectiveExistingProxies = persistedProxyList ?? proxies;
   const enabledExistingProxies = effectiveExistingProxies.filter((p) => p.enabled);
@@ -127,76 +160,151 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
     (proxyInputMode === 'link' && Boolean(customUri.trim())) ||
     (proxyInputMode === 'manual' && Boolean(manualHost.trim()));
 
-  const persistCurrentProxyInput = async (): Promise<ProxyNode[] | null> => {
-    if (proxyInputMode === 'link' && customUri.trim()) {
-      const importResult = await onImportUris(customUri.trim());
-      if (Array.isArray(importResult)) {
-        setPersistedProxyList(importResult);
-        setCustomUri('');
-        return importResult;
-      }
-      return effectiveExistingProxies;
+  const summaryKeys = buildWizardSummaryKeys(goal, hasPlannedProxy);
+
+  /** Moves `proxyId` to the front of the list: the first enabled proxy is the primary one. */
+  const promoteToPrimary = async (
+    list: ProxyNode[],
+    proxyId: string
+  ): Promise<ProxyNode[]> => {
+    const firstEnabled = list.find((p) => p.enabled);
+    if (!firstEnabled || firstEnabled.id === proxyId) {
+      return list;
     }
-    if (proxyInputMode === 'manual' && manualHost.trim()) {
-      const parsedPort = Number(manualPort.trim());
-      if (
-        !Number.isInteger(parsedPort) ||
-        parsedPort < 1 ||
-        parsedPort > UI_CONFIG.MAX_PORT
-      ) {
-        setManualPortError(t('proxies.modal.add_proxy.port_error'));
+    if (onSetPrimaryProxy) {
+      const updated = await onSetPrimaryProxy(proxyId);
+      if (Array.isArray(updated)) {
+        return updated;
+      }
+    }
+    const target = list.find((p) => p.id === proxyId);
+    return target ? [target, ...list.filter((p) => p.id !== proxyId)] : list;
+  };
+
+  /** Removes the proxies an earlier attempt of this wizard created. */
+  const discardPreviousDrafts = async (): Promise<ProxyNode[]> => {
+    let list = effectiveExistingProxies;
+    if (draftProxyIds.length === 0) {
+      return list;
+    }
+    for (const id of draftProxyIds) {
+      if (onRemoveProxy) {
+        await onRemoveProxy(id);
+      }
+    }
+    list = list.filter((p) => !draftProxyIds.includes(p.id));
+    setDraftProxyIds([]);
+    setPersistedProxyList(list);
+    return list;
+  };
+
+  /**
+   * Saves the typed proxy. The new proxy replaces a draft from an earlier failed attempt and
+   * becomes the primary proxy. Returns null (and keeps the input) when nothing could be saved.
+   */
+  const persistCurrentProxyInput = async (): Promise<{
+    list: ProxyNode[];
+    draft: ProxyNode | null;
+  } | null> => {
+    const typedLink = proxyInputMode === 'link' && Boolean(customUri.trim());
+    const typedManual = proxyInputMode === 'manual' && Boolean(manualHost.trim());
+    if (!typedLink && !typedManual) {
+      return { list: effectiveExistingProxies, draft: null };
+    }
+
+    if (typedLink) {
+      setLinkError(false);
+      const baseList = await discardPreviousDrafts();
+      const importResult = await onImportUris(
+        normalizeProxyImportText(
+          customUri.trim(),
+          UI_CONFIG.DEFAULT_LINK_PROXY_PROTOCOL
+        )
+      );
+      let added: ProxyNode[] = [];
+      let nextList = baseList;
+      if (Array.isArray(importResult)) {
+        nextList = importResult;
+        const known = new Set(baseList.map((p) => p.id));
+        added = importResult.filter((p) => !known.has(p.id));
+        if (countAddedProxies(baseList, importResult) === 0) {
+          setLinkError(true);
+          setStep(2);
+          return null;
+        }
+      } else if (importResult === 0) {
+        setLinkError(true);
         setStep(2);
         return null;
       }
-      const cleanHost = manualHost.trim();
-      const cleanUser = manualUsername.trim();
-      const effectiveTls = manualProtocol === 'https';
-      const newNode: ProxyNode = {
-        id: generateClientId('proxy'),
-        name:
-          manualName.trim() ||
-          `${manualProtocol.toUpperCase()} ${cleanHost}:${parsedPort}`,
-        protocol: manualProtocol,
-        host: cleanHost,
-        port: parsedPort,
-        auth:
-          cleanUser || manualPassword
-            ? {
-                username: cleanUser,
-                ...(manualPassword ? { password: manualPassword } : {}),
-                hasPassword: Boolean(manualPassword)
-              }
-            : null,
-        udpEnabled: manualProtocol === 'socks5',
-        tls: effectiveTls,
-        tlsSkipVerify: false,
-        sni: effectiveTls ? cleanHost : null,
-        enabled: true,
-        lastLatencyMs: null,
-        exitIp: null
-      };
-      if (onAddProxy) {
-        const addResult = await onAddProxy(newNode);
-        const nextList = Array.isArray(addResult)
-          ? addResult
-          : [...effectiveExistingProxies, newNode];
-        setPersistedProxyList(nextList);
-        setManualHost('');
-        return nextList;
+      const draft = added.find((p) => p.enabled) ?? added[0] ?? null;
+      if (draft) {
+        nextList = await promoteToPrimary(nextList, draft.id);
+        setDraftProxyIds(added.map((p) => p.id));
       }
+      setPersistedProxyList(nextList);
+      setCustomUri('');
+      return { list: nextList, draft };
+    }
+
+    const parsedPort = Number(manualPort.trim());
+    if (
+      !Number.isInteger(parsedPort) ||
+      parsedPort < 1 ||
+      parsedPort > UI_CONFIG.MAX_PORT
+    ) {
+      setManualPortError(t('proxies.modal.add_proxy.port_error'));
+      setStep(2);
+      return null;
+    }
+    const baseList = await discardPreviousDrafts();
+    const cleanHost = manualHost.trim();
+    const cleanUser = manualUsername.trim();
+    const effectiveTls = manualProtocol === 'https';
+    const newNode: ProxyNode = {
+      id: generateClientId('proxy'),
+      name:
+        manualName.trim() ||
+        `${manualProtocol.toUpperCase()} ${cleanHost}:${parsedPort}`,
+      protocol: manualProtocol,
+      host: cleanHost,
+      port: parsedPort,
+      auth:
+        cleanUser || manualPassword
+          ? {
+              username: cleanUser,
+              ...(manualPassword ? { password: manualPassword } : {}),
+              hasPassword: Boolean(manualPassword)
+            }
+          : null,
+      udpEnabled: manualProtocol === 'socks5',
+      tls: effectiveTls,
+      tlsSkipVerify: false,
+      sni: effectiveTls ? cleanHost : null,
+      enabled: true,
+      lastLatencyMs: null,
+      exitIp: null
+    };
+    let nextList: ProxyNode[];
+    if (onAddProxy) {
+      const addResult = await onAddProxy(newNode);
+      nextList = Array.isArray(addResult) ? addResult : [...baseList, newNode];
+    } else {
       const authPrefix = cleanUser
         ? `${encodeURIComponent(cleanUser)}${manualPassword ? `:${encodeURIComponent(manualPassword)}` : ''}@`
         : '';
       const fallbackUri = `${manualProtocol}://${authPrefix}${cleanHost}:${parsedPort}#${encodeURIComponent(newNode.name)}`;
       const importResult = await onImportUris(fallbackUri);
-      if (Array.isArray(importResult)) {
-        setPersistedProxyList(importResult);
-        setManualHost('');
-        return importResult;
-      }
-      return effectiveExistingProxies;
+      nextList = Array.isArray(importResult) ? importResult : baseList;
     }
-    return effectiveExistingProxies;
+    const saved = nextList.find((p) => p.id === newNode.id) ?? null;
+    if (saved) {
+      nextList = await promoteToPrimary(nextList, saved.id);
+      setDraftProxyIds([saved.id]);
+    }
+    setPersistedProxyList(nextList);
+    setManualHost('');
+    return { list: nextList, draft: saved };
   };
 
   const handleTestProxyInWizard = async () => {
@@ -205,6 +313,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
     setExistingTestFeedback(null);
     try {
       let currentList = effectiveExistingProxies;
+      let draft: ProxyNode | null = null;
       const hasDraftInput =
         (proxyInputMode === 'link' && Boolean(customUri.trim())) ||
         (proxyInputMode === 'manual' && Boolean(manualHost.trim()));
@@ -213,12 +322,11 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
         if (!persisted) {
           return;
         }
-        currentList = persisted;
+        currentList = persisted.list;
+        draft = persisted.draft;
       }
       const enabledList = currentList.filter((p) => p.enabled);
-      const target = hasDraftInput
-        ? enabledList[enabledList.length - 1]
-        : enabledList[0];
+      const target = draft ?? enabledList[0];
       if (!target) {
         setExistingTestFeedback({ ok: false });
         return;
@@ -243,9 +351,13 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
   const handleDetectInWizard = async () => {
     if (!onDetectExistingProxies || detectingProxies) return;
     setDetectingProxies(true);
+    setDetectFailed(false);
     try {
       const found = await onDetectExistingProxies();
       setDetectedCandidates(found);
+    } catch {
+      setDetectedCandidates(null);
+      setDetectFailed(true);
     } finally {
       setDetectingProxies(false);
     }
@@ -261,14 +373,40 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
     setDetectedCandidates(null);
   };
 
+  /** Starts protection; `false` means the engine did not start (the setup itself is saved). */
+  const startProtection = async (): Promise<boolean> => {
+    if (!onEnableProtection) {
+      return false;
+    }
+    const started = await onEnableProtection();
+    return started !== false;
+  };
+
+  const handleRetryProtection = async () => {
+    if (applying) return;
+    setApplying(true);
+    try {
+      if (await startProtection()) {
+        setProtectionStarted(true);
+        setOutcome('done');
+        onComplete(finishedWithProxy);
+      }
+    } catch (err) {
+      onError?.(err);
+    } finally {
+      setApplying(false);
+    }
+  };
+
   const applySelectedGoalRules = async () => {
     if (applying) return;
     setApplying(true);
     try {
-      const postImportProxies = await persistCurrentProxyInput();
-      if (!postImportProxies) {
+      const persisted = await persistCurrentProxyInput();
+      if (!persisted) {
         return;
       }
+      const postImportProxies = persisted.list;
 
       const enabledProxies = postImportProxies.filter((p) => p.enabled);
       const simpleProxyAction = resolveSimpleProxyAction(
@@ -308,22 +446,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
         }
       }
 
-      const presetsToApply: string[] =
-        goal === 'privacy'
-          ? [
-              ...(hasEnabledProxy ? ['preset-privacy-browsers'] : []),
-              'preset-block-os-telemetry',
-              'preset-rfc1918-direct'
-            ]
-          : goal === 'work'
-            ? [
-                ...(hasEnabledProxy ? ['preset-dev-toolchains'] : []),
-                'preset-rfc1918-direct'
-              ]
-            : [
-                ...(hasEnabledProxy ? ['preset-privacy-browsers'] : []),
-                'preset-rfc1918-direct'
-              ];
+      const presetsToApply = getWizardPresetIds(goal, hasEnabledProxy);
 
       for (const pid of presetsToApply) {
         const preset = findPreset(pid);
@@ -371,11 +494,18 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
       }
 
       onSelectMode(selectedMode);
+      setFinishedWithProxy(hasEnabledProxy);
       if (enableProtectionNow && onEnableProtection) {
-        await onEnableProtection();
+        if (!(await startProtection())) {
+          // The setup is saved; the success message must not claim protection is on.
+          setOutcome('protection_failed');
+          onConfigSaved?.();
+          return;
+        }
+        setProtectionStarted(true);
       }
+      setOutcome('done');
       onComplete(hasEnabledProxy);
-      onClose();
     } catch (err) {
       onError?.(err);
     } finally {
@@ -421,9 +551,16 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
         </div>
 
         {/* Step 1: Goal */}
-        {step === 1 && (
-          <div className="mt-5 space-y-3">
-            <h3 className="text-xs font-bold uppercase tracking-wider text-tf-accent">
+        {outcome === null && step === 1 && (
+          <div
+            role="radiogroup"
+            aria-labelledby={`${manualFormId}-goal-title`}
+            className="mt-5 space-y-3"
+          >
+            <h3
+              id={`${manualFormId}-goal-title`}
+              className="text-xs font-bold uppercase tracking-wider text-tf-accent"
+            >
               {t('wizard.modal.step1_title')}
             </h3>
             {(
@@ -454,6 +591,8 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
                 <button
                   key={item.id}
                   type="button"
+                  role="radio"
+                  aria-checked={active}
                   onClick={() => setGoal(item.id)}
                   className={`flex w-full items-start gap-3.5 rounded-tf-md border p-3.5 text-left transition ${
                     active
@@ -480,7 +619,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
         )}
 
         {/* Step 2: Proxy Connection */}
-        {step === 2 && (
+        {outcome === null && step === 2 && (
           <div className="mt-5 space-y-4">
             <h3 className="text-xs font-bold uppercase tracking-wider text-tf-accent">
               {t('wizard.modal.step2_title')}
@@ -596,6 +735,12 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
               )}
             </div>
 
+            {detectFailed && (
+              <p role="alert" className="text-[11px] font-semibold text-tf-orange">
+                {t('wizard.modal.step2_detect_failed')}
+              </p>
+            )}
+
             {detectedCandidates !== null && (
               <div className="tf-surface-alt space-y-2 p-3 text-xs">
                 {detectedCandidates.length === 0 ? (
@@ -637,10 +782,19 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
                   id={uriTextareaId}
                   rows={3}
                   value={customUri}
-                  onChange={(e) => setCustomUri(e.target.value)}
+                  onChange={(e) => {
+                    setCustomUri(e.target.value);
+                    setLinkError(false);
+                  }}
                   placeholder={t('wizard.modal.step2_uri_placeholder')}
+                  aria-invalid={linkError}
                   className="tf-input w-full p-2.5 font-mono text-xs"
                 />
+                {linkError && (
+                  <p role="alert" className="mt-1.5 text-xs font-semibold text-tf-red">
+                    {t('wizard.modal.step2_link_unreadable')}
+                  </p>
+                )}
               </div>
             ) : (
               <div className="space-y-2.5">
@@ -796,14 +950,24 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
         )}
 
         {/* Step 3: Interface Experience Mode */}
-        {step === 3 && (
+        {outcome === null && step === 3 && (
           <div className="mt-5 space-y-3">
-            <h3 className="text-xs font-bold uppercase tracking-wider text-tf-accent">
+            <h3
+              id={`${manualFormId}-mode-title`}
+              className="text-xs font-bold uppercase tracking-wider text-tf-accent"
+            >
               {t('wizard.modal.step3_title')}
             </h3>
+            <div
+              role="radiogroup"
+              aria-labelledby={`${manualFormId}-mode-title`}
+              className="space-y-3"
+            >
 
             <button
               type="button"
+              role="radio"
+              aria-checked={selectedMode === 'simple'}
               onClick={() => setSelectedMode('simple')}
               className={`flex w-full items-start gap-3.5 rounded-tf-md border p-4 text-left transition ${
                 selectedMode === 'simple'
@@ -827,6 +991,8 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
 
             <button
               type="button"
+              role="radio"
+              aria-checked={selectedMode === 'expert'}
               onClick={() => setSelectedMode('expert')}
               className={`flex w-full items-start gap-3.5 rounded-tf-md border p-4 text-left transition ${
                 selectedMode === 'expert'
@@ -847,6 +1013,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
                 <CheckCircle2 className="h-4 w-4 text-tf-cyan" />
               )}
             </button>
+            </div>
 
             <div className="rounded-tf-md border border-tf-border bg-tf-surface-alt p-3 text-xs">
               <div className="font-bold text-tf-primary">
@@ -857,6 +1024,11 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
                   ? t('wizard.modal.step3_summary_with_proxy')
                   : t('wizard.modal.step3_summary_direct')}
               </p>
+              <ul className="mt-1.5 list-disc space-y-0.5 pl-4 text-[11px] text-tf-secondary">
+                {summaryKeys.map((key) => (
+                  <li key={key}>{t(key)}</li>
+                ))}
+              </ul>
               {onEnableProtection && (
                 <label
                   htmlFor={`${manualFormId}-enable-now`}
@@ -876,7 +1048,67 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
           </div>
         )}
 
+        {outcome !== null && (
+          <div className="mt-5 space-y-4">
+            <div className="flex items-start gap-3">
+              {outcome === 'done' ? (
+                <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-tf-green" />
+              ) : (
+                <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-tf-orange" />
+              )}
+              <div>
+                <h3 className="text-sm font-bold text-tf-primary">
+                  {outcome === 'done'
+                    ? t('wizard.done.title')
+                    : t('wizard.done.protection_failed_title')}
+                </h3>
+                <p className="mt-1 text-xs text-tf-secondary">
+                  {outcome === 'protection_failed'
+                    ? t('wizard.done.protection_failed_body')
+                    : !protectionStarted
+                      ? t('wizard.done.body_saved_only')
+                      : finishedWithProxy
+                        ? t('wizard.done.body_with_proxy')
+                        : t('wizard.done.body_no_proxy')}
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-tf-border pt-4">
+              {outcome === 'protection_failed' && (
+                <button
+                  type="button"
+                  disabled={applying}
+                  onClick={() => {
+                    void handleRetryProtection();
+                  }}
+                  className="tf-btn-accent px-5 py-2 text-xs font-bold disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t('wizard.done.retry')}
+                </button>
+              )}
+              {outcome === 'done' && protectionStarted && onVerifyProtection && (
+                <button
+                  type="button"
+                  onClick={onVerifyProtection}
+                  className="tf-btn-accent flex items-center gap-2 px-5 py-2 text-xs font-bold"
+                >
+                  <ShieldCheck className="h-4 w-4" />
+                  {t('wizard.done.verify')}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onClose}
+                className="tf-surface-alt px-4 py-2 text-xs font-semibold text-tf-secondary hover:text-tf-primary"
+              >
+                {t('wizard.done.close')}
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Footer Controls */}
+        {outcome === null && (
         <div className="mt-6 flex items-center justify-between border-t border-tf-border pt-4">
           {step > 1 ? (
             <button
@@ -912,6 +1144,7 @@ export const QuickSetupWizardModal: React.FC<QuickSetupWizardModalProps> = ({
             </button>
           )}
         </div>
+        )}
       </div>
     </ModalContainer>
   );

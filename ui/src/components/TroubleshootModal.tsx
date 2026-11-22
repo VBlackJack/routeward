@@ -18,11 +18,24 @@ import React, { useId, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CheckCircle2, Globe, LifeBuoy, ShieldAlert, X } from 'lucide-react';
 import { getFriendlyAppName, getHumanErrorKey } from '../services/friendly';
+import {
+  formatPauseEnd,
+  ProtectionHealth
+} from '../services/protectionHealth';
 import { TrackedConnection } from '../types/routeward';
+import { UI_CONFIG } from '../config/constants';
 import { ModalContainer } from './ModalContainer';
 
 interface TroubleshootModalProps {
   connections: TrackedConnection[];
+  /** Shared protection state, used to explain an empty list (paused, stopped). */
+  health?: ProtectionHealth;
+  /** Tests the proxy that is currently in use. */
+  onTestProxy?: () => void;
+  /** Pauses protection for the given number of minutes. */
+  onPauseProtection?: (minutes: number) => void;
+  /** Opens the proxy screen. */
+  onChangeProxy?: () => void;
   onAllowAppDirect: (conn: TrackedConnection) => void;
   onAllowSiteDirect: (conn: TrackedConnection) => void;
   onClose: () => void;
@@ -30,14 +43,27 @@ interface TroubleshootModalProps {
 
 const MAX_RECENT_ISSUES = 8;
 
+/** Reasons that mean "the proxy does not answer" rather than "a rule blocked it". */
+const PROXY_DOWN_REASON_KEYS: readonly string[] = [
+  'troubleshoot.reasons.killswitch',
+  'troubleshoot.reasons.timeout',
+  'troubleshoot.reasons.unreachable'
+];
+
 export const TroubleshootModal: React.FC<TroubleshootModalProps> = ({
   connections,
+  health,
+  onTestProxy,
+  onPauseProtection,
+  onChangeProxy,
   onAllowAppDirect,
   onAllowSiteDirect,
   onClose
 }) => {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const titleId = useId();
+  // A pause only makes sense while protection is filtering traffic; without a known state, offer it.
+  const canPause = health === undefined || health.engineActive;
 
   const recentIssues = useMemo(() => {
     const seen = new Set<string>();
@@ -55,6 +81,21 @@ export const TroubleshootModal: React.FC<TroubleshootModalProps> = ({
     }
     return items;
   }, [connections]);
+
+  const proxyDownCount = recentIssues.filter((conn) =>
+    PROXY_DOWN_REASON_KEYS.includes(getHumanErrorKey(conn.errorDetail))
+  ).length;
+  const mostlyProxyDown =
+    recentIssues.length > 0 && proxyDownCount * 2 > recentIssues.length;
+
+  const emptyMessage =
+    health?.state === 'paused' && health.pausedUntilEpochMs !== null
+      ? t('troubleshoot.modal.empty_paused', {
+          time: formatPauseEnd(health.pausedUntilEpochMs, i18n.language)
+        })
+      : health?.state === 'service_stopped' || health?.state === 'stopped'
+        ? t('troubleshoot.modal.empty_stopped')
+        : t('troubleshoot.modal.empty');
 
   return (
     <ModalContainer
@@ -88,10 +129,61 @@ export const TroubleshootModal: React.FC<TroubleshootModalProps> = ({
         </div>
 
         <div className="mt-4 flex-1 space-y-2.5 overflow-y-auto pr-1">
+          {mostlyProxyDown && (
+            <div
+              role="alert"
+              className="space-y-2 rounded-tf-md border border-tf-orange/40 bg-tf-orange/10 p-3.5"
+            >
+              <div className="text-xs font-bold text-tf-orange">
+                {t('troubleshoot.proxy_down.title')}
+              </div>
+              <p className="text-[11px] text-tf-primary">
+                {t('troubleshoot.proxy_down.desc')}
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                {onTestProxy && (
+                  <button
+                    type="button"
+                    onClick={onTestProxy}
+                    className="tf-btn-accent px-3 py-1.5 text-[11px] font-bold"
+                  >
+                    {t('troubleshoot.proxy_down.test')}
+                  </button>
+                )}
+                {onPauseProtection && canPause && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onPauseProtection(UI_CONFIG.OUTAGE_PAUSE_MINUTES)
+                    }
+                    className="tf-surface px-3 py-1.5 text-[11px] font-semibold text-tf-primary hover:border-tf-orange"
+                  >
+                    {t('troubleshoot.proxy_down.pause', {
+                      minutes: UI_CONFIG.OUTAGE_PAUSE_MINUTES
+                    })}
+                  </button>
+                )}
+                {onChangeProxy && (
+                  <button
+                    type="button"
+                    onClick={onChangeProxy}
+                    className="tf-surface px-3 py-1.5 text-[11px] font-semibold text-tf-primary hover:border-tf-accent"
+                  >
+                    {t('troubleshoot.proxy_down.change')}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+          {recentIssues.length > 0 && (
+            <p className="text-[11px] text-tf-secondary">
+              {t('troubleshoot.modal.allow_warning')}
+            </p>
+          )}
           {recentIssues.length === 0 ? (
             <div className="tf-surface-alt flex flex-col items-center gap-2 p-6 text-center text-xs text-tf-secondary">
               <CheckCircle2 className="h-6 w-6 text-tf-green" />
-              <span>{t('troubleshoot.modal.empty')}</span>
+              <span>{emptyMessage}</span>
             </div>
           ) : (
             recentIssues.map((conn) => {

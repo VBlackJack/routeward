@@ -5,6 +5,21 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+### Added
+- Background protection model: the desired protection state is persisted by the daemon (`protection_state.json`) and re-applied at daemon start, so protection survives Exit and reboot; pauses are held by the daemon (`PauseEngine` IPC, `/api/engine/pause`, `routeward ctl pause --seconds N`) and resume on their own, even after a reboot.
+- Windows: the first **Start protection** installs and starts the RouteWard service with a single UAC prompt (`routeward service install --start --allow-sid`), enables sign-in autostart with `--minimized` (tray only), and falls back to a spawned daemon only when no service exists.
+- Recovery: `routeward recover [--pause-at-end]` turns protection off and restores the RouteWard-owned Windows proxy settings without admin rights, with a **RouteWard - Restore Internet** Start menu shortcut in the MSI and a new "I have no Internet anymore" troubleshooting section.
+- Desktop: single-instance guard, self-heal of the system proxy/PAC when the daemon becomes unreachable (re-applied when it returns), one-time notices for close-to-tray and Exit, tray balloons for failed actions, clickable balloons, OS language as the default locale.
+- Desktop UI: one protection health model shared by the header, Home and checklist (Stopped, Paused until HH:MM, Active with or without a reachable proxy, Error), a per-app "Why?" panel in Activity, confirmation and undo for multi-setting presets, and a beginner "Getting started" section in the README.
+
+### Changed
+- Desktop UI (Simple mode): one rule per app or site (deterministic ids, single-app priority above category cards), bare domains cover subdomains, app names without `.exe` are completed on Windows, plain-language error and tray texts, sentence case and unified vocabulary.
+
+### Fixed
+- Proxy deletion and **Make Primary** retarget Simple rules to the new primary (or disable them) instead of leaving dangling targets or switching to direct; undoing a proxy deletion no longer claims a stored password; `has_password` is computed from the password actually received.
+- Setup assistant: an unreadable proxy link is kept with an explanation, a failed proxy is replaced on retry, and a failed protection start is reported instead of a success toast.
+- "Show advanced fields" no longer drops the simple input (which could create a match-all rule), and Activity quick actions update the existing rule instead of adding one that never wins.
+
 ## [v2026.1121.01] - 2026-11-21
 
 ### Added

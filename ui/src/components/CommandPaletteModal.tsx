@@ -31,10 +31,13 @@ import {
 } from 'lucide-react';
 import { useThemeForge } from '../theme/ThemeForgeContext';
 import { ModalContainer } from './ModalContainer';
+import { ExperienceMode } from './QuickSetupWizardModal';
 
 export type NavTabId = 'home' | 'apps' | 'proxy' | 'activity' | 'settings';
 
 interface CommandPaletteModalProps {
+  /** Simple mode hides the commands that need networking vocabulary. */
+  experienceMode?: ExperienceMode;
   onClose: () => void;
   onNavigate: (tab: NavTabId) => void;
   onToggleEngine: () => void;
@@ -47,6 +50,8 @@ interface CommandPaletteModalProps {
 
 interface PaletteItem {
   id: string;
+  /** Hidden from the list in Simple mode. */
+  expertOnly?: boolean;
   group: string;
   label: string;
   badge?: string;
@@ -56,6 +61,7 @@ interface PaletteItem {
 }
 
 export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
+  experienceMode = 'expert',
   onClose,
   onNavigate,
   onToggleEngine,
@@ -134,6 +140,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       },
       {
         id: 'act-test-proxies',
+        expertOnly: true,
         group: actGroup,
         label: t('command_palette.actions.test_all_proxies'),
         icon: Zap,
@@ -141,6 +148,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       },
       {
         id: 'act-killswitch',
+        expertOnly: true,
         group: actGroup,
         label: t('command_palette.actions.toggle_killswitch'),
         icon: Shield,
@@ -148,6 +156,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       },
       {
         id: 'act-flush-dns',
+        expertOnly: true,
         group: actGroup,
         label: t('command_palette.actions.flush_dns'),
         icon: Globe,
@@ -179,9 +188,13 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       onSelect: () => setTheme(pal.name)
     }));
 
-    return [...navItems, ...actionItems, ...themeItems];
+    const everything = [...navItems, ...actionItems, ...themeItems];
+    return experienceMode === 'simple'
+      ? everything.filter((item) => !item.expertOnly)
+      : everything;
   }, [
     t,
+    experienceMode,
     palettes,
     onNavigate,
     onToggleEngine,

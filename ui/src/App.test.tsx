@@ -80,7 +80,7 @@ describe('App navigation and accessible modals', () => {
     expect(screen.getAllByRole('tab')[1]).toHaveAttribute('aria-selected', 'true');
 
     // Switching to Advanced mode reveals the persistent technical footer
-    fireEvent.click(screen.getByRole('button', { pressed: false, name: /avanc|advanced/i }));
+    fireEvent.click(screen.getByRole('button', { pressed: false, name: /expert/i }));
     expect(screen.getByRole('contentinfo')).toBeInTheDocument();
   });
 
@@ -111,7 +111,9 @@ describe('App navigation and accessible modals', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:5353',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'fr'
+      activeLocale: 'fr',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     });
     const startDaemonSpy = vi
       .spyOn(routewardClient, 'startDaemon')
@@ -122,7 +124,7 @@ describe('App navigation and accessible modals', () => {
     // Never auto-open wizard over disconnected banner
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     const startBtn = screen.getByRole('button', {
-      name: /démarrer le service|start service/i
+      name: /démarrer la protection|start protection/i
     });
     fireEvent.click(startBtn);
     await waitFor(() => expect(startDaemonSpy).toHaveBeenCalledTimes(1));
@@ -138,7 +140,9 @@ describe('App navigation and accessible modals', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:5353',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'fr'
+      activeLocale: 'fr',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     });
     cleanup();
     renderApp();
@@ -156,7 +160,9 @@ describe('App navigation and accessible modals', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:5353',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'fr'
+      activeLocale: 'fr',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     });
     vi.spyOn(routewardClient, 'startDaemon').mockRejectedValue(
       new HttpResponseError(
@@ -169,13 +175,13 @@ describe('App navigation and accessible modals', () => {
     renderApp();
 
     const startBtn = screen.getByRole('button', {
-      name: /démarrer le service|start service/i
+      name: /démarrer la protection|start protection/i
     });
     fireEvent.click(startBtn);
 
     await waitFor(() => {
       expect(
-        screen.getByText(/droits ou propriétaire non sécurisés|insecure ownership or permissions/i)
+        screen.getByText(/dossier de données|data folder/i)
       ).toBeInTheDocument();
     });
   });
@@ -265,7 +271,9 @@ describe('App navigation and accessible modals', () => {
       relayHttpEndpoint: '127.0.0.1:10809',
       dnsEndpoint: '127.0.0.1:5353',
       fakeIpCidr: '198.18.0.0/15',
-      activeLocale: 'en'
+      activeLocale: 'en',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
     });
     const startDaemonSpy = vi
       .spyOn(routewardClient, 'startDaemon')
@@ -282,7 +290,9 @@ describe('App navigation and accessible modals', () => {
         relayHttpEndpoint: '127.0.0.1:10809',
         dnsEndpoint: '127.0.0.1:5353',
         fakeIpCidr: '198.18.0.0/15',
-        activeLocale: 'en'
+        activeLocale: 'en',
+        pausedUntilEpochMs: null,
+        autoStartErrorKey: null
       });
 
     renderApp();

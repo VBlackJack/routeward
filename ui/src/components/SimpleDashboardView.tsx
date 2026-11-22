@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Activity,
@@ -37,6 +37,15 @@ import {
 } from 'lucide-react';
 import { formatBytes } from '../services/format';
 import {
+  computeProtectionHealth,
+  formatPauseEnd,
+  PROTECTION_HEALTH_TEXTS,
+  ProtectionHealth
+} from '../services/protectionHealth';
+import { isUseCaseApplied } from '../services/protectionPresets';
+import { usePauseCountdown } from '../services/usePauseCountdown';
+import {
+  ProxyChain,
   ProxyHealthReport,
   ProxyNode,
   RoutingRule,
@@ -51,9 +60,12 @@ interface SimpleDashboardViewProps {
   diagnostics: SystemDiagnostics;
   securityPolicy: SecurityPolicyConfig;
   proxies: ProxyNode[];
+  chains?: ProxyChain[];
   rules: RoutingRule[];
+  health?: ProtectionHealth;
+  /** Changes each time a protection check is requested from outside (for example the wizard). */
+  verifyRequestId?: number;
   startingProtection: boolean;
-  pauseRemainingSec: number | null;
   onToggleEngine?: () => void;
   onTemporaryPause?: (minutes: number) => Promise<void> | void;
   onStartAndEnableProtection?: () => Promise<void> | void;
@@ -78,9 +90,11 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
   diagnostics,
   securityPolicy,
   proxies,
+  chains = [],
   rules,
+  health: healthProp,
+  verifyRequestId = 0,
   startingProtection,
-  pauseRemainingSec,
   onToggleEngine,
   onTemporaryPause,
   onStartAndEnableProtection,
@@ -95,7 +109,7 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
   onNavigateRules,
   onSwitchToExpert
 }) => {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [testingPrimaryProxy, setTestingPrimaryProxy] = useState(false);
   const [lastProxyTestStatus, setLastProxyTestStatus] = useState<
     'ok' | 'failed' | null
@@ -106,15 +120,41 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
   const [verifiedDirectIp, setVerifiedDirectIp] = useState<string | null>(null);
   const [applyingUseCase, setApplyingUseCase] =
     useState<DashboardUseCaseId | null>(null);
-  const [lastAppliedUseCase, setLastAppliedUseCase] =
-    useState<DashboardUseCaseId | null>(null);
 
-  const isEngineRunning = diagnostics.daemonConnected && diagnostics.running;
   const primaryProxy = proxies.find((p) => p.enabled) ?? null;
+  const health =
+    healthProp ??
+    computeProtectionHealth({
+      diagnostics,
+      primaryProxy,
+      proxyReachability: 'unknown'
+    });
+  const isEngineRunning = health.engineActive;
+  const healthTexts = PROTECTION_HEALTH_TEXTS[health.state];
+  const healthTime =
+    health.pausedUntilEpochMs !== null
+      ? formatPauseEnd(health.pausedUntilEpochMs, i18n.language)
+      : '';
+  const pauseRemainingSec = usePauseCountdown(health.pausedUntilEpochMs);
+  const toneBorder =
+    health.tone === 'ok'
+      ? 'border-l-tf-green'
+      : health.tone === 'warn'
+        ? 'border-l-tf-orange'
+        : 'border-l-tf-red';
+  const toneBadge =
+    health.tone === 'ok'
+      ? 'bg-tf-green/20 text-tf-green'
+      : health.tone === 'warn'
+        ? 'bg-tf-orange/20 text-tf-orange'
+        : 'bg-tf-red/20 text-tf-red';
 
+  // The proxy changed or protection switched: earlier results describe another situation.
   useEffect(() => {
     setLastProxyTestStatus(null);
-  }, [primaryProxy?.id]);
+    setVerifiedExitIp(null);
+    setVerifiedDirectIp(null);
+  }, [primaryProxy?.id, isEngineRunning]);
 
   const handleTestPrimaryProxyClick = async (proxyId: string) => {
     if (!onTestPrimaryProxy || testingPrimaryProxy) return;
@@ -157,6 +197,14 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
     }
   };
 
+  const verifyProtectionRef = useRef(handleVerifyProtection);
+  verifyProtectionRef.current = handleVerifyProtection;
+  useEffect(() => {
+    if (verifyRequestId > 0) {
+      void verifyProtectionRef.current();
+    }
+  }, [verifyRequestId]);
+
   const handleApplyUseCaseClick = async (id: DashboardUseCaseId) => {
     if (!onApplyUseCase || applyingUseCase) return;
     let maybePromise: Promise<boolean | void> | boolean | void;
@@ -171,22 +219,17 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
     ) {
       setApplyingUseCase(id);
       try {
-        const result = await maybePromise;
-        if (result !== false) {
-          setLastAppliedUseCase(id);
-        }
+        await maybePromise;
       } catch {
-        // Error toast is handled by caller; do not mark scenario as applied.
+        // The caller shows the error; the badge only follows the real profile state.
       } finally {
         setApplyingUseCase(null);
       }
-    } else if (maybePromise !== false) {
-      setLastAppliedUseCase(id);
     }
   };
 
   const stepServiceReady = diagnostics.daemonConnected;
-  const stepProtectionReady = isEngineRunning;
+  const stepProtectionReady = health.engineActive;
   const stepConfigReady = rules.length > 0 || Boolean(primaryProxy);
   const showReadinessChecklist = !(
     stepServiceReady &&
@@ -206,20 +249,14 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
     <div className="space-y-6">
       {/* Focused Hero Protection Banner (1 primary CTA + optional temporary pause) */}
       <div
-        className={`tf-card space-y-4 border-l-4 p-5 ${
-          isEngineRunning ? 'border-l-tf-green' : 'border-l-tf-red'
-        }`}
+        className={`tf-card space-y-4 border-l-4 p-5 ${toneBorder}`}
       >
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-start gap-3.5">
             <div
-              className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-tf-lg ${
-                isEngineRunning
-                  ? 'bg-tf-green/20 text-tf-green'
-                  : 'bg-tf-red/20 text-tf-red'
-              }`}
+              className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-tf-lg ${toneBadge}`}
             >
-              {isEngineRunning ? (
+              {health.tone === 'ok' ? (
                 <ShieldCheck className="h-6 w-6" />
               ) : (
                 <ShieldAlert className="h-6 w-6" />
@@ -228,24 +265,14 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
             <div>
               <div className="flex flex-wrap items-center gap-2">
                 <h2 className="text-sm font-bold text-tf-primary">
-                  {isEngineRunning
-                    ? t('dashboard.health_banner.protected_title')
-                    : !diagnostics.daemonConnected
-                      ? t('app.daemon_banner.simple_disconnected_title')
-                      : t('dashboard.health_banner.paused_title')}
+                  {t(healthTexts.title, { time: healthTime })}
                 </h2>
                 <span
-                  className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${
-                    isEngineRunning
-                      ? 'bg-tf-green/20 text-tf-green'
-                      : 'bg-tf-red/20 text-tf-red'
-                  }`}
+                  className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${toneBadge}`}
                 >
-                  {isEngineRunning
-                    ? t('dashboard.health_banner.status_badge_ok')
-                    : t('dashboard.health_banner.status_badge_off')}
+                  {t(healthTexts.badge)}
                 </span>
-                {!isEngineRunning &&
+                {health.state === 'paused' &&
                   pauseRemainingSec !== null &&
                   pauseRemainingSec > 0 && (
                     <span className="inline-flex items-center gap-1 rounded-full bg-tf-orange/20 px-2 py-0.5 font-mono text-[10px] font-bold text-tf-orange">
@@ -259,13 +286,10 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
                   )}
               </div>
               <p className="mt-1 max-w-2xl text-xs text-tf-secondary">
-                {isEngineRunning
-                  ? t('dashboard.health_banner.protected_desc')
-                  : !diagnostics.daemonConnected
-                    ? diagnostics.osName === 'WINDOWS'
-                      ? t('app.daemon_banner.simple_disconnected_desc')
-                      : t('app.daemon_banner.simple_disconnected_non_windows')
-                    : t('dashboard.health_banner.paused_desc')}
+                {health.state === 'service_stopped' &&
+                diagnostics.osName !== 'WINDOWS'
+                  ? t('app.daemon_banner.simple_disconnected_non_windows')
+                  : t(healthTexts.desc, { time: healthTime })}
               </p>
             </div>
           </div>
@@ -292,8 +316,9 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
               <>
                 <button
                   type="button"
+                  disabled={startingProtection}
                   onClick={onToggleEngine}
-                  className={`flex items-center gap-2 rounded-tf-md px-4 py-2 text-xs font-bold transition ${
+                  className={`flex items-center gap-2 rounded-tf-md px-4 py-2 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
                     isEngineRunning
                       ? 'border border-tf-orange/40 bg-tf-orange/15 text-tf-orange hover:bg-tf-orange/25'
                       : 'bg-tf-green text-tf-bg hover:opacity-90'
@@ -302,7 +327,9 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
                   <Power className="h-3.5 w-3.5" />
                   {isEngineRunning
                     ? t('app.header.engine.pause')
-                    : t('app.header.engine.start')}
+                    : health.state === 'paused'
+                      ? t('dashboard.simple.resume_now')
+                      : t('app.header.engine.start')}
                 </button>
                 {isEngineRunning && onTemporaryPause && (
                   <div className="flex items-center gap-1">
@@ -424,14 +451,18 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
                             ? 'text-tf-red'
                             : sameAsDirect
                               ? 'text-tf-orange'
-                              : isEngineRunning
+                              : isEngineRunning &&
+                                  primaryProxy &&
+                                  (lastProxyTestStatus === 'ok' || health.ipHidden)
                                 ? 'text-tf-green'
                                 : 'text-tf-orange'
                       }`}
                     >
                       {verifyingProtection
                         ? t('dashboard.simple.verify_checking')
-                        : !primaryProxy
+                        : !isEngineRunning
+                          ? t('dashboard.simple.verify_ip_paused')
+                          : !primaryProxy
                           ? t('dashboard.simple.verify_ip_direct')
                           : lastProxyTestStatus === 'failed'
                             ? t('dashboard.simple.verify_ip_unreachable')
@@ -439,11 +470,14 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
                               ? t('dashboard.simple.verify_ip_same_warning', {
                                   exitIp: effectiveExitIp
                                 })
-                              : `${t('dashboard.simple.verify_ip_masked')}${
-                                  effectiveExitIp ? ` (${effectiveExitIp})` : ''
-                                }`}
+                              : lastProxyTestStatus === 'ok' || health.ipHidden
+                                ? `${t('dashboard.simple.verify_ip_masked')}${
+                                    effectiveExitIp ? ` (${effectiveExitIp})` : ''
+                                  }`
+                                : t('dashboard.simple.verify_ip_unverified')}
                     </div>
                     {!verifyingProtection &&
+                      isEngineRunning &&
                       verifiedDirectIp &&
                       effectiveExitIp &&
                       !sameAsDirect && (
@@ -746,7 +780,13 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
             ]
           ).map((card) => {
             const CardIcon = card.icon;
-            const isApplied = lastAppliedUseCase === card.id;
+            const isApplied = isUseCaseApplied(
+              card.id,
+              securityPolicy,
+              rules,
+              proxies,
+              chains
+            );
             const isApplying = applyingUseCase === card.id;
             return (
               <button

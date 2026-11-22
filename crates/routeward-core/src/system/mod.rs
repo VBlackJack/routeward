@@ -15,6 +15,7 @@
  */
 
 pub mod discovery;
+pub mod protection_state;
 pub mod purge;
 pub mod user_state;
 pub mod windows_service;
@@ -56,6 +57,19 @@ const DEFAULT_NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
 const WIN_RUN_REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
 const AUTOSTART_VALUE_NAME: &str = user_state::VALUE_AUTOSTART;
+/// Argument the sign-in autostart entry passes to the desktop app: it starts in the tray only,
+/// without opening its window.
+pub const AUTOSTART_MINIMIZED_ARG: &str = "--minimized";
+
+/// Command line stored in the sign-in autostart entry: the quoted executable path followed by
+/// [`AUTOSTART_MINIMIZED_ARG`].
+pub fn autostart_command_line(exe_path: &str) -> String {
+    format!(
+        "\"{}\" {AUTOSTART_MINIMIZED_ARG}",
+        exe_path.trim().trim_matches('"')
+    )
+}
+
 /// Token `reg query` prints for a DWORD value; it is not localized.
 const REG_DWORD_TYPE_TOKEN: &str = "REG_DWORD";
 
@@ -446,7 +460,7 @@ impl SystemProxyManager {
                         detail: "Autostart executable path cannot be empty".to_string(),
                     });
                 }
-                let quoted = format!("\"{trimmed}\"");
+                let command_line = autostart_command_line(trimmed);
                 Self::run_reg_add(&[
                     "add",
                     WIN_RUN_REG_PATH,
@@ -455,7 +469,7 @@ impl SystemProxyManager {
                     "/t",
                     "REG_SZ",
                     "/d",
-                    &quoted,
+                    &command_line,
                     "/f",
                 ])?;
             } else {
@@ -510,6 +524,19 @@ impl SystemProxyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autostart_command_line_quotes_the_path_and_starts_minimized() {
+        let exe = r"C:\Program Files\RouteWard\routeward-desktop.exe";
+        let line = autostart_command_line(exe);
+        assert_eq!(line, format!("\"{exe}\" --minimized"));
+        // Surrounding quotes and spaces in the input never end up doubled.
+        assert_eq!(
+            autostart_command_line(&format!("  \"{exe}\"  ")),
+            format!("\"{exe}\" --minimized")
+        );
+        assert!(user_state::autostart_points_to_routeward(&line));
+    }
 
     #[test]
     fn display_command_quotes_only_the_arguments_that_need_it() {
