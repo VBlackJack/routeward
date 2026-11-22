@@ -1683,6 +1683,11 @@
         "body": "A ready-made protection ({{rule}}) blocks traffic that this app uses.",
         "fix": "Add an exception for this app, or turn that protection off."
       },
+      "appBlockedByRule": {
+        "title": "{{app}} is blocked by one of your rules",
+        "body": "The rule {{rule}} blocks traffic that this app uses.",
+        "fix": "Edit that rule or add an exception for this app."
+      },
       "ruleShadowed": {
         "title": "The rule {{rule}} never applies",
         "body": "Another rule with a lower number decides first, so this one is never reached.",

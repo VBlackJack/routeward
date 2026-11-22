@@ -29,6 +29,8 @@ use std::collections::BTreeMap;
 
 /// Most findings produced per code (the worst offenders first).
 const MAX_FINDINGS_PER_CODE: usize = 5;
+/// Prefix of the rule ids that belong to a protection pack.
+const PACK_RULE_ID_PREFIX: &str = "rule-pack-";
 /// Prefix of the rule ids that Simple mode owns.
 const SIMPLE_RULE_ID_PREFIXES: &[&str] = &[
     "rule-app-",
@@ -58,6 +60,7 @@ pub enum FindingCode {
     DefaultPolicyBlocking,
     AppBlockedBySimpleRule,
     AppBlockedByPack,
+    AppBlockedByRule,
     RuleShadowed,
     QuicOrDohBlockedInfo,
     UnattributedDropsHigh,
@@ -319,6 +322,10 @@ fn is_simple_rule(rule_id: &str) -> bool {
         .any(|prefix| rule_id.starts_with(prefix))
 }
 
+fn is_pack_rule(rule_id: &str) -> bool {
+    rule_id.starts_with(PACK_RULE_ID_PREFIX)
+}
+
 fn is_name_destination(destination: &str) -> bool {
     destination.parse::<std::net::IpAddr>().is_err()
 }
@@ -339,8 +346,10 @@ fn check_policy_blocks(input: &AnalyzerInput, out: &mut Vec<Finding>) {
                 let rule_id = entry.matched_rule_id.clone().unwrap_or_default();
                 if is_simple_rule(&rule_id) {
                     (FindingCode::AppBlockedBySimpleRule, rule_id)
-                } else {
+                } else if is_pack_rule(&rule_id) {
                     (FindingCode::AppBlockedByPack, rule_id)
+                } else {
+                    (FindingCode::AppBlockedByRule, rule_id)
                 }
             }
             _ => continue,
@@ -367,7 +376,7 @@ fn check_policy_blocks(input: &AnalyzerInput, out: &mut Vec<Finding>) {
             rule_id: rule_known.then(|| rule_id.clone()),
         };
         let fix = match code {
-            FindingCode::AppBlockedBySimpleRule if rule_known => {
+            FindingCode::AppBlockedBySimpleRule | FindingCode::AppBlockedByRule if rule_known => {
                 FixAction::EditRule { id: rule_id }
             }
             _ => FixAction::Unblock {
@@ -820,6 +829,27 @@ mod tests {
     }
 
     #[test]
+    fn custom_rule_blocks_are_not_attributed_to_a_pack() {
+        let mut fx = Fixture::new();
+        let mut custom = blocked(BlockReason::RuleBlock, "curl.exe", 4);
+        custom.matched_rule_id = Some("rule-test-block".to_string());
+        fx.blocked.push(custom);
+        let findings = fx.run();
+        assert_eq!(codes(&findings), vec![FindingCode::AppBlockedByRule]);
+        assert_eq!(
+            findings[0].fix,
+            FixAction::EditRule {
+                id: "rule-test-block".to_string()
+            }
+        );
+        assert_eq!(findings[0].subject.app.as_deref(), Some("curl.exe"));
+        assert_eq!(
+            findings[0].subject.rule_id.as_deref(),
+            Some("rule-test-block")
+        );
+    }
+
+    #[test]
     fn quic_and_encrypted_dns_blocks_are_informational() {
         let mut fx = Fixture::new();
         fx.blocked
@@ -988,6 +1018,7 @@ mod tests {
                 "appBlockedBySimpleRule",
             ),
             (FindingCode::AppBlockedByPack, "appBlockedByPack"),
+            (FindingCode::AppBlockedByRule, "appBlockedByRule"),
             (FindingCode::RuleShadowed, "ruleShadowed"),
             (FindingCode::QuicOrDohBlockedInfo, "quicOrDohBlockedInfo"),
             (FindingCode::UnattributedDropsHigh, "unattributedDropsHigh"),

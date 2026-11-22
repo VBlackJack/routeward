@@ -1683,6 +1683,11 @@
         "body": "Une protection toute faite ({{rule}}) bloque du trafic que cette application utilise.",
         "fix": "Ajoutez une exception pour cette application, ou désactivez cette protection."
       },
+      "appBlockedByRule": {
+        "title": "{{app}} est bloqué par l'une de vos règles",
+        "body": "La règle {{rule}} bloque du trafic que cette application utilise.",
+        "fix": "Modifiez cette règle ou ajoutez une exception pour cette application."
+      },
       "ruleShadowed": {
         "title": "La règle {{rule}} ne s'applique jamais",
         "body": "Une autre règle avec un numéro plus bas décide en premier, celle-ci n'est donc jamais atteinte.",

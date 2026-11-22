@@ -337,6 +337,31 @@ describe('AnalyzerPanel', () => {
     }
   ];
 
+  it('renders a custom rule block with the rule name and an edit rule fix', () => {
+    const onFix = vi.fn();
+    const customRules = [{ id: 'rule-test-block', name: 'Test block example.com' }] as never[];
+    const ruleFindings: Finding[] = [
+      {
+        code: 'appBlockedByRule',
+        severity: 'warning',
+        subject: { app: 'curl.exe', ruleId: 'rule-test-block' },
+        evidenceCount: 2,
+        fix: { type: 'editRule', id: 'rule-test-block' }
+      }
+    ];
+    render(
+      <AnalyzerPanel findings={ruleFindings} proxies={[]} rules={customRules} analyzed onRun={vi.fn()} onFix={onFix} />
+    );
+    expect(
+      screen.getByText(i18n.t('analyzer.findings.appBlockedByRule.title', { app: 'curl.exe' }))
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(i18n.t('analyzer.findings.appBlockedByRule.body', { rule: 'Test block example.com' }))
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('analyzer.action.edit_rule') }));
+    expect(onFix).toHaveBeenCalledWith({ type: 'editRule', id: 'rule-test-block' });
+  });
+
   it('renders localized findings with the proxy name and a fix button when one exists', () => {
     const onFix = vi.fn();
     render(
@@ -392,6 +417,7 @@ describe('locale coverage of analyzer findings', () => {
       'defaultPolicyBlocking',
       'appBlockedBySimpleRule',
       'appBlockedByPack',
+      'appBlockedByRule',
       'ruleShadowed',
       'quicOrDohBlockedInfo',
       'unattributedDropsHigh',

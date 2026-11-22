@@ -440,6 +440,7 @@ mod tests {
                 "defaultPolicyBlocking",
                 "appBlockedBySimpleRule",
                 "appBlockedByPack",
+                "appBlockedByRule",
                 "ruleShadowed",
                 "quicOrDohBlockedInfo",
                 "unattributedDropsHigh",
