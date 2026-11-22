@@ -1187,6 +1187,19 @@ export class RouteWardClientService {
     }
   }
 
+  /** Clears the operating system's own DNS resolver cache (not the Fake-IP table). */
+  public async flushOsDnsCache(): Promise<void> {
+    try {
+      await this.requestJson<{ ok: boolean }>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_FLUSH_OS_DNS,
+        'POST',
+        {}
+      );
+    } catch (err) {
+      this.handleRequestFailure(err);
+    }
+  }
+
   public async clearLogs(): Promise<void> {
     try {
       await this.requestJson<{ ok: boolean }>(

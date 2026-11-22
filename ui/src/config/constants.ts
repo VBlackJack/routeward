@@ -129,8 +129,15 @@ export const UI_CONFIG = {
     APP: 'rule-unblock-app-',
     SITE: 'rule-unblock-site-'
   } as const,
+  /** Suffixes appended to an exception id so variants never replace each other. */
+  UNBLOCK_RULE_ID_SUFFIXES: {
+    PROXY: '-proxy',
+    TEMPORARY: '-tmp'
+  } as const,
   /** Refresh period of the Blocked tab while it is open (milliseconds). */
   BLOCKED_REFRESH_INTERVAL_MS: 3000,
+  /** How often the remaining time of a temporary rule is refreshed (milliseconds). */
+  TEMPORARY_RULE_TICK_MS: 30_000,
   /** Half-width of the time window opened by "See logs" from a connection (milliseconds). */
   LOG_JUMP_WINDOW_MS: 30000,
   /** Number of log lines requested per page from the daemon. */
@@ -293,6 +300,7 @@ export const UI_CONFIG = {
     SCAN_OS: '/api/scan-os',
     DNS_ALLOCATE: '/api/dns/allocate',
     DNS_FLUSH: '/api/dns/flush',
+    SYSTEM_FLUSH_OS_DNS: '/api/system/flush-os-dns',
     LOGS_CLEAR: '/api/logs/clear',
     LOGS_QUERY: '/api/logs/query',
     BLOCKED: '/api/blocked',

@@ -78,6 +78,7 @@ export type UnblockOptionKind =
   | 'exceptionSite'
   | 'exceptionAppSite'
   | 'disableRule'
+  | 'cannotOutrank'
   | 'testProxy'
   | 'openProxy'
   | 'pause'
@@ -154,6 +155,10 @@ const OPTION_KEYS: Record<string, { title: string; desc: string }> = {
     title: 'unblock.option.exception_app_site_direct.title',
     desc: 'unblock.option.exception_app_site_direct.desc'
   },
+  'cannotOutrank:direct': {
+    title: 'unblock.option.cannot_outrank.title',
+    desc: 'unblock.option.cannot_outrank.desc'
+  },
   'disableRule:direct': {
     title: 'unblock.option.disable_rule.title',
     desc: 'unblock.option.disable_rule.desc'
@@ -222,6 +227,14 @@ export function isInPlaceRule(rule: RoutingRule | null): boolean {
   );
 }
 
+/**
+ * True when no exception can win against the blocking rule: a rule at priority 0 (or below)
+ * cannot be outranked, and a tie would lose on declared order.
+ */
+export function cannotOutrankRule(blockingRule: RoutingRule | null): boolean {
+  return blockingRule !== null && blockingRule.priority <= 0;
+}
+
 function isIpAddress(value: string): boolean {
   return IPV4_PATTERN.test(value) || value.includes(':');
 }
@@ -257,6 +270,7 @@ function commandOption(fix: BlockFix): UnblockOption | null {
     case 'pause':
       return makeOption('pause', 'direct', {
         command: 'pause',
+        risk: 'unprotected',
         params: { minutes: String(UI_CONFIG.OUTAGE_PAUSE_MINUTES) }
       });
     case 'flushDns':
@@ -293,10 +307,14 @@ export function listUnblockOptions(
         break;
       }
       case 'exception': {
+        if (cannotOutrankRule(blockingRule)) {
+          options.push(makeOption('cannotOutrank', 'direct', { command: 'none' }));
+          break;
+        }
         options.push(
+          makeOption('exceptionAppSite', 'direct', { supportsDuration: true }),
           makeOption('exceptionApp', 'direct', { supportsDuration: true }),
-          makeOption('exceptionSite', 'direct', { supportsDuration: true }),
-          makeOption('exceptionAppSite', 'direct', { supportsDuration: true })
+          makeOption('exceptionSite', 'direct', { supportsDuration: true })
         );
         if (info.reason === 'defaultPolicyBlock' && proxyAvailable) {
           options.push(
@@ -318,6 +336,12 @@ export function listUnblockOptions(
         break;
       }
       case 'appDirect': {
+        if (cannotOutrankRule(blockingRule)) {
+          if (!options.some((o) => o.kind === 'cannotOutrank')) {
+            options.push(makeOption('cannotOutrank', 'direct', { command: 'none' }));
+          }
+          break;
+        }
         options.push(
           makeOption('exceptionApp', 'direct', {
             risk: 'unprotected',
@@ -352,6 +376,7 @@ function buildException(
   option: UnblockOption,
   priority: number,
   action: RuleAction,
+  temporary: boolean,
   ctx: UnblockContext
 ): RoutingRule {
   const appName = getFriendlyAppName(target.processName).displayName;
@@ -378,6 +403,14 @@ function buildException(
     id = `${UI_CONFIG.UNBLOCK_RULE_ID_PREFIXES.SITE}${siteSlug}`;
   } else {
     id = `${UI_CONFIG.UNBLOCK_RULE_ID_PREFIXES.APP}${appSlug}-site-${siteSlug}`;
+  }
+  // A proxy exception never replaces a direct one, and a temporary one never replaces a
+  // permanent one: each variant has its own id.
+  if (option.route === 'proxy') {
+    id += UI_CONFIG.UNBLOCK_RULE_ID_SUFFIXES.PROXY;
+  }
+  if (temporary) {
+    id += UI_CONFIG.UNBLOCK_RULE_ID_SUFFIXES.TEMPORARY;
   }
   return {
     id,
@@ -438,11 +471,18 @@ export function buildUnblockPlan(
     upsert = { ...blockingRule, enabled: false };
   } else {
     const action = exceptionAction(option.route, ctx);
-    if (!action) {
+    if (!action || cannotOutrankRule(blockingRule)) {
       return null;
     }
-    upsert = buildException(target, option, exceptionPriority(blockingRule), action, ctx);
     expiresAt = option.supportsDuration ? resolveExpiry(duration, now) : null;
+    upsert = buildException(
+      target,
+      option,
+      exceptionPriority(blockingRule),
+      action,
+      expiresAt !== null,
+      ctx
+    );
     if (expiresAt) {
       upsert.expiresAt = expiresAt;
     }
@@ -467,6 +507,56 @@ export function buildPreviewRequest(target: UnblockTarget): ConnectionRequest {
     targetPort: target.targetPort,
     protocol: target.protocol
   };
+}
+
+function patternsOverlap(a: string[], b: string[]): boolean {
+  if (a.length === 0 || b.length === 0) {
+    return true;
+  }
+  const lowered = new Set(a.map((p) => p.toLowerCase()));
+  return (
+    b.some((p) => lowered.has(p.toLowerCase())) ||
+    a.some((p) => p.includes('*')) ||
+    b.some((p) => p.includes('*'))
+  );
+}
+
+/**
+ * The user's enabled proxy rules (Simple app/site rules and any other rule that sends traffic to
+ * a proxy or chain) that a direct exception of the plan would outrank for other traffic of the
+ * same app or site. Equal priority counts: a tie is decided by declared order.
+ */
+export function findOutrankedProxyRules(
+  plan: UnblockPlan,
+  existingRules: RoutingRule[]
+): RoutingRule[] {
+  const outranked = new Map<string, RoutingRule>();
+  for (const exception of plan.upserts) {
+    if (
+      !exception.id.startsWith('rule-unblock-') ||
+      !exception.enabled ||
+      exception.action.type !== 'direct'
+    ) {
+      continue;
+    }
+    for (const rule of existingRules) {
+      if (
+        rule.id === exception.id ||
+        !rule.enabled ||
+        (rule.action.type !== 'proxy' && rule.action.type !== 'chain') ||
+        rule.priority < exception.priority ||
+        !patternsOverlap(exception.processPatterns, rule.processPatterns) ||
+        !patternsOverlap(
+          [...exception.domainPatterns, ...exception.ipCidrs],
+          [...rule.domainPatterns, ...rule.ipCidrs]
+        )
+      ) {
+        continue;
+      }
+      outranked.set(rule.id, rule);
+    }
+  }
+  return Array.from(outranked.values());
 }
 
 /** One plain-language line per rule change, for the confirmation dialog. */
@@ -498,6 +588,12 @@ export function describePlanChanges(
   for (const id of plan.removeIds) {
     const existing = existingRules.find((r) => r.id === id);
     lines.push(t('unblock.diff.removed', { name: existing?.name ?? id }));
+  }
+  const outranked = findOutrankedProxyRules(plan, existingRules);
+  if (outranked.length > 0) {
+    lines.push(
+      t('unblock.diff.outranks', { names: outranked.map((r) => r.name).join(', ') })
+    );
   }
   return lines;
 }

@@ -45,6 +45,7 @@ import {
 } from './services/ipc';
 import { useThemeForge } from './theme/ThemeForgeContext';
 import {
+  BlockedSummaryEntry,
   Finding,
   FixAction,
   InterceptionMode,
@@ -1258,6 +1259,8 @@ export const App: React.FC = () => {
     []
   );
 
+  const [blockedFocus, setBlockedFocus] = useState<Partial<BlockedSummaryEntry> | null>(null);
+
   const openBlockedTab = () => {
     setActivitySubtab('blocked');
     setActiveTab('activity');
@@ -1310,6 +1313,7 @@ export const App: React.FC = () => {
         });
         break;
       case 'unblock':
+        setBlockedFocus(fix.key);
         openBlockedTab();
         break;
       case 'editRule':
@@ -1349,8 +1353,8 @@ export const App: React.FC = () => {
           break;
         case 'flushDns':
           runMutation(
-            () => routewardClient.flushFakeIps(),
-            () => pushToast(t('app.toast.dns.flushed'), 'info')
+            () => routewardClient.flushOsDnsCache(),
+            () => pushToast(t('app.toast.dns.os_flushed'), 'info')
           );
           break;
         default:
@@ -1878,7 +1882,10 @@ export const App: React.FC = () => {
             }}
             onOpenWizard={() => setShowWizardModal(true)}
             onOpenTroubleshoot={() => setShowTroubleshootModal(true)}
-            onOpenBlocked={openBlockedTab}
+            onOpenBlocked={() => {
+              setBlockedFocus(null);
+              openBlockedTab();
+            }}
             onNavigateRules={() => setActiveTab('apps')}
             onSwitchToExpert={() => handleSetExperienceMode('expert')}
           />
@@ -2075,6 +2082,8 @@ export const App: React.FC = () => {
               })
             }
             onOpenCheckup={openCheckup}
+            focus={blockedFocus}
+            onClearFocus={() => setBlockedFocus(null)}
           />
         )}
 

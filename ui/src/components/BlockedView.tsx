@@ -52,6 +52,27 @@ interface BlockedViewProps {
   ) => void;
   onSeeLogs: (entry: BlockedSummaryEntry) => void;
   onOpenCheckup?: () => void;
+  /** Narrows the list to one app and destination (set by a check-up fix). */
+  focus?: Partial<BlockedSummaryEntry> | null;
+  onClearFocus?: () => void;
+}
+
+/** Entries that match the focus (app, then destination when given), or all of them if none do. */
+export function applyBlockedFocus(
+  entries: BlockedSummaryEntry[],
+  focus?: Partial<BlockedSummaryEntry> | null
+): { entries: BlockedSummaryEntry[]; focused: boolean } {
+  if (!focus || (!focus.processName && !focus.destination)) {
+    return { entries, focused: false };
+  }
+  const same = (a: string | undefined, b: string | undefined) =>
+    !a || (b ?? '').toLowerCase() === a.toLowerCase();
+  const matching = entries.filter(
+    (e) => same(focus.processName, e.processName) && same(focus.destination, e.destination)
+  );
+  return matching.length > 0
+    ? { entries: matching, focused: true }
+    : { entries, focused: false };
 }
 
 interface AppGroup {
@@ -106,11 +127,14 @@ export const BlockedView: React.FC<BlockedViewProps> = ({
   onRefresh,
   onChoose,
   onSeeLogs,
-  onOpenCheckup
+  onOpenCheckup,
+  focus = null,
+  onClearFocus
 }) => {
   const { t } = useTranslation();
   const [openKey, setOpenKey] = useState<string | null>(null);
-  const groups = useMemo(() => groupBlockedEntries(entries), [entries]);
+  const focused = useMemo(() => applyBlockedFocus(entries, focus), [entries, focus]);
+  const groups = useMemo(() => groupBlockedEntries(focused.entries), [focused.entries]);
   const unattributed =
     (counters?.droppedUnattributedSyn ?? 0) + (counters?.droppedUnattributedUdp ?? 0);
 
@@ -150,6 +174,21 @@ export const BlockedView: React.FC<BlockedViewProps> = ({
         <p role="alert" className="text-xs text-tf-red">
           {t('blocked.error')}
         </p>
+      )}
+
+      {focused.focused && (
+        <div className="flex flex-wrap items-center gap-3 text-xs text-tf-secondary">
+          <span>{t('blocked.focus.notice')}</span>
+          {onClearFocus && (
+            <button
+              type="button"
+              onClick={onClearFocus}
+              className="tf-surface-alt px-3 py-1 text-xs font-semibold text-tf-primary hover:border-tf-accent"
+            >
+              {t('blocked.focus.clear')}
+            </button>
+          )}
+        </div>
       )}
 
       {groups.length === 0 ? (

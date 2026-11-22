@@ -164,7 +164,8 @@
         "completed_direct_no_proxy": "Setup saved. No proxy yet: your IP address stays visible and only your app rules apply."
       },
       "dns": {
-        "flushed": "DNS memory cleared"
+        "flushed": "DNS memory cleared",
+        "os_flushed": "Windows DNS cache cleared"
       },
       "profile": {
         "imported": "Profile imported",
@@ -691,6 +692,11 @@
     }
   },
   "rules": {
+    "temporary": {
+      "badge": "Temporary - {{time}} left",
+      "minutes": "{{count}} min",
+      "hours_minutes": "{{hours}} h {{minutes}} min"
+    },
     "simple": {
       "title": "My Apps & Websites",
       "subtitle": "Pick which apps or websites go through your proxy, connect directly, or stay blocked.",
@@ -1018,9 +1024,16 @@
     },
     "blocked": {
       "header": "Blocked connections",
-      "empty": "Nothing has been blocked."
+      "empty": "Nothing has been blocked.",
+      "counters": "Dropped without a known app: {{syn}} connection attempts, {{udp}} UDP packets."
+    },
+    "ctl": {
+      "empty_result": "Nothing to show."
     },
     "logs": {
+      "invalid_level": "Unknown log level: {{value}}.",
+      "invalid_since": "Unreadable time value: {{value}}.",
+      "more_available": "More lines are available. Continue with the cursor {{cursor}}.",
       "empty": "No log line matches."
     },
     "export": {
@@ -1411,6 +1424,10 @@
     }
   },
   "blocked": {
+    "focus": {
+      "notice": "Showing only what the check-up pointed to.",
+      "clear": "Show everything"
+    },
     "title": "Blocked connections",
     "subtitle": "Everything RouteWard stopped, grouped by app and site, with the reason in plain words.",
     "checkup": "Run a check-up",
@@ -1468,9 +1485,9 @@
         "title": "Safety cutoff: the proxy settings are incomplete",
         "body": "This app should use a proxy that does not exist or is turned off. Open the proxy list and choose one that is on."
       },
-      "killSwitchUdpUnsupported": {
+      "udpProxyUnsupported": {
         "title": "Your proxy cannot carry this kind of traffic",
-        "body": "Calls, games and some streaming use UDP, a type of traffic this proxy does not support. The connection was stopped to avoid leaking your real address."
+        "body": "Calls, games and some streaming use UDP, a type of traffic this proxy cannot carry. The connection was stopped so it could not leave without the proxy. This is not a proxy outage."
       },
       "killSwitchDirectUdpFailed": {
         "title": "Safety cutoff on direct traffic",
@@ -1554,6 +1571,10 @@
         "title": "Turn off the rule: {{rule}}",
         "desc": "This rule also covers other apps and sites. They will no longer be protected by it."
       },
+      "cannot_outrank": {
+        "title": "This rule cannot be overruled",
+        "desc": "It has the highest priority, so no exception can beat it. Turn the rule off, or change it in the rules list."
+      },
       "app_direct_unprotected": {
         "title": "Let this app go out directly (unprotected)",
         "desc": "Warning: the app connects without the proxy, so your real address is exposed. The safety cutoff stays on for everything else."
@@ -1568,11 +1589,11 @@
       },
       "pause": {
         "title": "Pause protection for {{minutes}} minutes",
-        "desc": "Everything connects directly for a while, then protection resumes by itself."
+        "desc": "Everything connects directly for a while, so websites see your real address. Protection then resumes by itself."
       },
       "flush_dns": {
-        "title": "Clear the DNS cache",
-        "desc": "Forgets the temporary stand-in addresses RouteWard handed out."
+        "title": "Clear the Windows DNS cache",
+        "desc": "Makes Windows forget the old addresses it remembered, so the app asks again and gets fresh ones."
       },
       "restart_app": {
         "title": "Then restart the app",
@@ -1589,7 +1610,8 @@
       "changed": "Change the rule: {{name}}",
       "disabled": "Turn off the rule: {{name}}",
       "removed": "Remove the rule: {{name}}",
-      "expires": "This rule stops by itself at {{time}}."
+      "expires": "This rule stops by itself at {{time}}.",
+      "outranks": "Careful: this exception also overrides your proxy rules for other traffic of the same app or site: {{names}}."
     },
     "confirm": {
       "title": "Unblock {{name}}?",
@@ -1606,6 +1628,12 @@
     }
   },
   "analyzer": {
+    "pause_confirm": {
+      "title": "Pause protection for {{minutes}} minutes?",
+      "intro": "Protection will stop for a while:",
+      "change": "Everything connects directly for {{minutes}} minutes, then protection resumes by itself.",
+      "warning": "While it is paused, websites see your real address and nothing is blocked."
+    },
     "title": "Check-up",
     "subtitle": "RouteWard looks at what was blocked and at your settings, then tells you what to do.",
     "run": "Run the check-up",
@@ -1673,7 +1701,7 @@
       "fakeIpGuardHits": {
         "title": "An app kept using an expired stand-in address",
         "body": "RouteWard stopped {{count}} connections to addresses it had handed out earlier.",
-        "fix": "Clear the DNS cache in Settings, then restart the app."
+        "fix": "Use Unblock on the blocked item to clear the Windows DNS cache, then restart the app."
       },
       "protectionPausedOrStopped": {
         "title": "Protection is paused or stopped",
@@ -1704,6 +1732,17 @@
       "col_section": "Part",
       "col_size": "Size",
       "total": "Total",
+      "redaction": {
+        "passwords": "passwords",
+        "authHeaders": "login headers",
+        "tokens": "access tokens",
+        "urlSecrets": "secrets inside web addresses",
+        "userPaths": "user folder names",
+        "usernames": "user names",
+        "machineName": "computer name",
+        "exitIp": "proxy exit address",
+        "domains": "website names"
+      },
       "redactions": "Removed or hidden: {{list}}.",
       "never_sent": "Check the list, then download. RouteWard does not send the file anywhere.",
       "close": "Close",

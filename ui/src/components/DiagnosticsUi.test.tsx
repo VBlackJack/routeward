@@ -408,3 +408,71 @@ describe('locale coverage of analyzer findings', () => {
     }
   });
 });
+
+describe('review fixes in the diagnostics screens', () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage('en');
+  });
+  afterEach(() => cleanup());
+
+  it('renders the manifest redaction codes in plain words and keeps an unknown code as is', async () => {
+    const codes = [
+      'passwords',
+      'authHeaders',
+      'tokens',
+      'urlSecrets',
+      'userPaths',
+      'usernames',
+      'machineName',
+      'exitIp',
+      'domains'
+    ];
+    const bundle: DiagnosticBundle = {
+      manifest: {
+        version: 1,
+        os: 'windows',
+        sections: [{ name: 'system', bytes: 10 }],
+        redactions: [...codes, 'brandNewRedaction']
+      },
+      system: {}
+    };
+    render(
+      <DiagnosticExportModal onCollect={vi.fn().mockResolvedValue(bundle)} onClose={vi.fn()} />
+    );
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('diagnostics.export.prepare') }));
+    await screen.findByRole('button', { name: i18n.t('diagnostics.export.download') });
+    const expected = [
+      ...codes.map((code) => i18n.t(`diagnostics.export.redaction.${code}`)),
+      'brandNewRedaction'
+    ].join(', ');
+    for (const code of codes) {
+      expect(i18n.exists(`diagnostics.export.redaction.${code}`)).toBe(true);
+    }
+    expect(
+      screen.getByText(i18n.t('diagnostics.export.redactions', { list: expected }))
+    ).toBeInTheDocument();
+  });
+
+  it('asks for a confirmation before the analyzer pauses protection', () => {
+    const onFix = vi.fn();
+    const findings: Finding[] = [
+      {
+        code: 'protectionPausedOrStopped',
+        severity: 'warning',
+        subject: {},
+        evidenceCount: 1,
+        fix: { type: 'pauseProtection' }
+      }
+    ];
+    render(
+      <AnalyzerPanel findings={findings} proxies={[]} rules={[]} analyzed onRun={vi.fn()} onFix={onFix} />
+    );
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('analyzer.action.pause') }));
+    expect(onFix).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('dashboard.confirm.cancel') }));
+    expect(onFix).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('analyzer.action.pause') }));
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('dashboard.confirm.apply') }));
+    expect(onFix).toHaveBeenCalledWith({ type: 'pauseProtection' });
+  });
+});

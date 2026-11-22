@@ -104,7 +104,10 @@ export function filterLogEntries(
     if (filter.level !== 'ALL' && LEVEL_RANK[entry.level] < LEVEL_RANK[filter.level]) {
       return false;
     }
-    if (filter.component && entry.component !== filter.component) {
+    if (
+      filter.component &&
+      entry.component.toLowerCase() !== filter.component.toLowerCase()
+    ) {
       return false;
     }
     if (

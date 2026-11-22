@@ -41,6 +41,14 @@ describe('blocked, logs, diagnostics and preview calls', () => {
     expect(fetchMock.mock.calls[0][1].method).toBe('GET');
   });
 
+  it('clears the OS DNS cache with POST /api/system/flush-os-dns, never the Fake-IP route', async () => {
+    const fetchMock = mockFetch({ ok: true });
+    await new RouteWardClientService().flushOsDnsCache();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/system/flush-os-dns');
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+  });
+
   it('passes since and limit as query parameters when asked', async () => {
     const fetchMock = mockFetch({ entries: [], counters: {} });
     await new RouteWardClientService().getBlocked({ since: 1000, limit: 50 });

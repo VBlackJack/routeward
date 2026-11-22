@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-import React from 'react';
+import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, CheckCircle, Info, Stethoscope } from 'lucide-react';
+import { UI_CONFIG } from '../config/constants';
 import { formatLogTime } from '../services/format';
 import {
   FixAction,
@@ -25,6 +26,7 @@ import {
   ProxyNode,
   RoutingRule
 } from '../types/routeward';
+import { ConfirmApplyModal } from './ConfirmApplyModal';
 
 interface AnalyzerPanelProps {
   findings: Finding[];
@@ -75,6 +77,7 @@ export const AnalyzerPanel: React.FC<AnalyzerPanelProps> = ({
   onExport
 }) => {
   const { t, i18n } = useTranslation();
+  const [confirmingPause, setConfirmingPause] = useState<FixAction | null>(null);
 
   const textFor = (finding: Finding, part: 'title' | 'body' | 'fix'): string => {
     const key = `analyzer.findings.${finding.code}.${part}`;
@@ -173,7 +176,11 @@ export const AnalyzerPanel: React.FC<AnalyzerPanelProps> = ({
                 <div className="flex justify-end">
                   <button
                     type="button"
-                    onClick={() => onFix(finding.fix)}
+                    onClick={() =>
+                      finding.fix.type === 'pauseProtection'
+                        ? setConfirmingPause(finding.fix)
+                        : onFix(finding.fix)
+                    }
                     className="tf-surface-alt px-3 py-1.5 text-xs font-semibold text-tf-accent hover:border-tf-accent"
                   >
                     {t(buttonKey)}
@@ -184,6 +191,24 @@ export const AnalyzerPanel: React.FC<AnalyzerPanelProps> = ({
           );
         })}
       </ul>
+      {confirmingPause && (
+        <ConfirmApplyModal
+          title={t('analyzer.pause_confirm.title', {
+            minutes: UI_CONFIG.OUTAGE_PAUSE_MINUTES
+          })}
+          intro={t('analyzer.pause_confirm.intro')}
+          changes={[
+            t('analyzer.pause_confirm.change', { minutes: UI_CONFIG.OUTAGE_PAUSE_MINUTES })
+          ]}
+          warning={t('analyzer.pause_confirm.warning')}
+          onConfirm={() => {
+            const fix = confirmingPause;
+            setConfirmingPause(null);
+            onFix(fix);
+          }}
+          onCancel={() => setConfirmingPause(null)}
+        />
+      )}
     </div>
   );
 };

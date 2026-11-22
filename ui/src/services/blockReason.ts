@@ -50,7 +50,7 @@ export const KNOWN_BLOCK_REASONS: readonly BlockReason[] = [
   'killSwitchProxyAuthRejected',
   'killSwitchProxyHandshake',
   'killSwitchProxyMisconfigured',
-  'killSwitchUdpUnsupported',
+  'udpProxyUnsupported',
   'killSwitchDirectUdpFailed',
   'fragmentedUdpBlocked',
   'unknownProcessPolicy',
@@ -76,7 +76,7 @@ const REASON_TABLE: Record<
   killSwitchProxyAuthRejected: { severity: 'critical', fixes: ['openProxy', 'testProxy'] },
   killSwitchProxyHandshake: { severity: 'critical', fixes: PROXY_OUTAGE_FIXES },
   killSwitchProxyMisconfigured: { severity: 'critical', fixes: ['openProxy'] },
-  killSwitchUdpUnsupported: { severity: 'warning', fixes: ['appDirect', 'openProxy'] },
+  udpProxyUnsupported: { severity: 'warning', fixes: ['appDirect', 'openProxy'] },
   killSwitchDirectUdpFailed: { severity: 'warning', fixes: ['testProxy', 'openProxy'] },
   fragmentedUdpBlocked: { severity: 'warning', fixes: ['appDirect', 'openProxy'] },
   unknownProcessPolicy: { severity: 'info', fixes: ['explainOnly'] },
@@ -103,9 +103,19 @@ export function isKnownBlockReason(
   );
 }
 
+/** The reasons caused by an unhealthy upstream proxy (and nothing else). */
+const PROXY_OUTAGE_REASONS: ReadonlySet<BlockReason> = new Set<BlockReason>([
+  'killSwitchProxyUnreachable',
+  'killSwitchProxyRefused',
+  'killSwitchProxyTimeout',
+  'killSwitchProxyAuthRejected',
+  'killSwitchProxyHandshake',
+  'killSwitchProxyMisconfigured'
+]);
+
 /** True for the kill switch reasons caused by an unhealthy upstream proxy. */
 export function isProxyOutageReason(reason: BlockReason | undefined): boolean {
-  return Boolean(reason && reason.startsWith('killSwitchProxy'));
+  return reason !== undefined && PROXY_OUTAGE_REASONS.has(reason);
 }
 
 /**

@@ -23,6 +23,7 @@ import {
   buildUnblockPlan,
   describePlanChanges,
   exceptionPriority,
+  findOutrankedProxyRules,
   listUnblockOptions,
   UNBLOCK_DURATIONS,
   UnblockContext,
@@ -270,6 +271,12 @@ describe('unblock options by reason', () => {
     expect(unprotected?.supportsDuration).toBe(true);
   });
 
+  it('flags the pause option as risky, like the unprotected exception', () => {
+    const outage = target({ blockReason: 'killSwitchProxyUnreachable' });
+    const pause = listUnblockOptions(outage, ctx([])).find((o) => o.kind === 'pause');
+    expect(pause?.risk).toBe('unprotected');
+  });
+
   it('only opens the proxy for rejected credentials and misconfiguration', () => {
     const auth = listUnblockOptions(
       target({ blockReason: 'killSwitchProxyAuthRejected' }),
@@ -301,7 +308,7 @@ describe('unblock options by reason', () => {
   });
 
   it('offers an app direct exception or the proxy settings for UDP limits', () => {
-    for (const reason of ['fragmentedUdpBlocked', 'killSwitchUdpUnsupported'] as BlockReason[]) {
+    for (const reason of ['fragmentedUdpBlocked', 'udpProxyUnsupported'] as BlockReason[]) {
       const options = listUnblockOptions(target({ blockReason: reason }), ctx([]));
       expect(options.map((o) => o.kind)).toEqual(['exceptionApp', 'openProxy']);
     }
@@ -387,5 +394,160 @@ describe('preview request and diff lines', () => {
     expect(lines[1]).toMatch(/^unblock\.diff\.expires/);
     const disabled = buildUnblockPlan(blocked, findOption(options, 'disableRule'), 'always', context)!;
     expect(describePlanChanges(disabled, [pack], t)[0]).toMatch(/^unblock\.diff\.disabled/);
+  });
+});
+
+describe('exception ids keep permanent, temporary, direct and proxy rules apart', () => {
+  const pack = rule({ id: 'rule-pack-ads', priority: 3, name: 'Ads pack' });
+  const blocked = target({ matchedRuleId: 'rule-pack-ads' });
+  const permanentDirect = rule({
+    id: 'rule-unblock-app-chrome-exe',
+    priority: 2,
+    action: { type: 'direct' },
+    processPatterns: ['chrome.exe']
+  });
+
+  it('adds a separate -tmp rule instead of rewriting a permanent Direct exception', () => {
+    const context = ctx([pack, permanentDirect]);
+    const option = findOption(listUnblockOptions(blocked, context), 'exceptionApp');
+    const plan = buildUnblockPlan(blocked, option, 'minutes15', context)!;
+    expect(plan.upserts).toHaveLength(1);
+    expect(plan.upserts[0].id).toBe('rule-unblock-app-chrome-exe-tmp');
+    expect(plan.upserts[0].expiresAt).toBeTruthy();
+    expect(plan.removeIds).toEqual([]);
+    expect(plan.undoRemoveIds).toEqual(['rule-unblock-app-chrome-exe-tmp']);
+    expect(plan.undoUpserts).toEqual([]);
+  });
+
+  it('keeps the plain id for a permanent exception, and -tmp for a site exception too', () => {
+    const context = ctx([pack]);
+    const options = listUnblockOptions(blocked, context);
+    const permanent = buildUnblockPlan(blocked, findOption(options, 'exceptionApp'), 'always', context)!;
+    expect(permanent.upserts[0].id).toBe('rule-unblock-app-chrome-exe');
+    const site = buildUnblockPlan(blocked, findOption(options, 'exceptionSite'), 'hour1', context)!;
+    expect(site.upserts[0].id).toBe('rule-unblock-site-example-com-tmp');
+  });
+
+  it('a proxy exception does not replace a direct one', () => {
+    const noRule = target({ blockReason: 'defaultPolicyBlock' });
+    const context = ctx([permanentDirect]);
+    const options = listUnblockOptions(noRule, context);
+    const proxyPlan = buildUnblockPlan(
+      noRule,
+      findOption(options, 'exceptionApp', 'proxy'),
+      'always',
+      context
+    )!;
+    expect(proxyPlan.upserts[0].id).toBe('rule-unblock-app-chrome-exe-proxy');
+    expect(proxyPlan.upserts[0].action.type).toBe('proxy');
+    expect(proxyPlan.undoRemoveIds).toEqual(['rule-unblock-app-chrome-exe-proxy']);
+    const tmpProxy = buildUnblockPlan(
+      noRule,
+      findOption(options, 'exceptionApp', 'proxy'),
+      'hour1',
+      context
+    )!;
+    expect(tmpProxy.upserts[0].id).toBe('rule-unblock-app-chrome-exe-proxy-tmp');
+  });
+});
+
+describe('a blocking rule that cannot be outranked', () => {
+  const top = rule({ id: 'rule-pack-top', priority: 0, name: 'Top pack' });
+  const blocked = target({ matchedRuleId: 'rule-pack-top' });
+
+  it('offers no exception, only the explanation and turning the rule off', () => {
+    const options = listUnblockOptions(blocked, ctx([top]));
+    expect(options.some((o) => o.kind.startsWith('exception'))).toBe(false);
+    const cannot = options.find((o) => o.kind === 'cannotOutrank');
+    expect(cannot?.command).toBe('none');
+    expect(options.some((o) => o.kind === 'disableRule')).toBe(true);
+    expect(buildUnblockPlan(blocked, cannot!, 'always', ctx([top]))).toBeNull();
+  });
+
+  it('also stops the unprotected exception of a proxy outage', () => {
+    const outage = target({ blockReason: 'killSwitchProxyTimeout', matchedRuleId: 'rule-pack-top' });
+    const options = listUnblockOptions(outage, ctx([top]));
+    expect(options.some((o) => o.kind === 'exceptionApp')).toBe(false);
+    expect(options.some((o) => o.kind === 'cannotOutrank')).toBe(true);
+  });
+
+  it('puts the app and site exception first, then app, then site', () => {
+    const pack = rule({ id: 'rule-pack-ads', priority: 3 });
+    const kinds = listUnblockOptions(target({ matchedRuleId: 'rule-pack-ads' }), ctx([pack]))
+      .filter((o) => o.kind.startsWith('exception'))
+      .map((o) => o.kind);
+    expect(kinds).toEqual(['exceptionAppSite', 'exceptionApp', 'exceptionSite']);
+  });
+});
+
+describe('proxy rules an exception would outrank', () => {
+  const pack = rule({ id: 'rule-pack-ads', priority: 3, name: 'Ads pack' });
+  const blocked = target({ matchedRuleId: 'rule-pack-ads' });
+  const siteViaProxy = rule({
+    id: 'rule-site-example-com',
+    name: 'Example via proxy',
+    priority: 20,
+    domainPatterns: ['example.com'],
+    action: { type: 'proxy', targetId: 'p1' }
+  });
+  const appViaProxy = rule({
+    id: 'rule-app-chrome-exe',
+    name: 'Chrome via proxy',
+    priority: 15,
+    processPatterns: ['chrome.exe'],
+    action: { type: 'proxy', targetId: 'p1' }
+  });
+  const otherApp = rule({
+    id: 'rule-app-firefox-exe',
+    priority: 15,
+    processPatterns: ['firefox.exe'],
+    action: { type: 'proxy', targetId: 'p1' }
+  });
+  const stronger = rule({
+    id: 'rule-expert-first',
+    priority: 1,
+    action: { type: 'proxy', targetId: 'p1' }
+  });
+  const expert = rule({
+    id: 'rule-expert-proxy',
+    name: 'Expert proxy',
+    priority: 40,
+    action: { type: 'chain', targetId: 'c1' }
+  });
+
+  it('lists Simple app and site rules and other proxy rules, not unrelated or stronger ones', () => {
+    const context = ctx([pack, siteViaProxy, appViaProxy, otherApp, stronger, expert]);
+    const option = findOption(listUnblockOptions(blocked, context), 'exceptionApp');
+    const plan = buildUnblockPlan(blocked, option, 'always', context)!;
+    const ids = findOutrankedProxyRules(plan, context.rules).map((r) => r.id).sort();
+    expect(ids).toEqual(['rule-app-chrome-exe', 'rule-expert-proxy', 'rule-site-example-com']);
+  });
+
+  it('puts them in the confirmation lines', () => {
+    const context = ctx([pack, appViaProxy]);
+    const option = findOption(listUnblockOptions(blocked, context), 'exceptionApp');
+    const plan = buildUnblockPlan(blocked, option, 'always', context)!;
+    const lines = describePlanChanges(plan, context.rules, t);
+    expect(lines.some((l) => l.startsWith('unblock.diff.outranks') && l.includes('Chrome via proxy'))).toBe(true);
+  });
+
+  it('says nothing for a proxy exception or when no proxy rule exists', () => {
+    const noRule = target({ blockReason: 'defaultPolicyBlock' });
+    const context = ctx([appViaProxy]);
+    const proxyPlan = buildUnblockPlan(
+      noRule,
+      findOption(listUnblockOptions(noRule, context), 'exceptionApp', 'proxy'),
+      'always',
+      context
+    )!;
+    expect(findOutrankedProxyRules(proxyPlan, context.rules)).toEqual([]);
+    const bare = ctx([pack]);
+    const plan = buildUnblockPlan(
+      blocked,
+      findOption(listUnblockOptions(blocked, bare), 'exceptionApp'),
+      'always',
+      bare
+    )!;
+    expect(findOutrankedProxyRules(plan, bare.rules)).toEqual([]);
   });
 });

@@ -55,6 +55,8 @@ const DYNAMIC_LOCALE_KEY_PREFIXES: &[&str] = &[
     "blocked.reasons.",
     // AnalyzerPanel.tsx: `analyzer.findings.${code}.title|body|fix` (codes come from the daemon)
     "analyzer.findings.",
+    // DiagnosticExportModal.tsx: `diagnostics.export.redaction.${code}` (codes come from the daemon)
+    "diagnostics.export.redaction.",
     // ConnectionsView.tsx: `connections.table.status.${conn.status}`
     "connections.table.status.",
     // ConnectionsView.tsx: `connections.toolbar.status_filter.${st}`

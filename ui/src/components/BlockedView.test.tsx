@@ -24,7 +24,7 @@ import {
   RoutingRule
 } from '../types/routeward';
 import { BlockedShortcut } from './BlockedShortcut';
-import { BlockedView, groupBlockedEntries } from './BlockedView';
+import { applyBlockedFocus, BlockedView, groupBlockedEntries } from './BlockedView';
 import { useUnblockFlow } from './useUnblockFlow';
 
 function makeEntry(partial: Partial<BlockedSummaryEntry>): BlockedSummaryEntry {
@@ -140,6 +140,37 @@ describe('BlockedView', () => {
     expect(target.matchedRuleId).toBe('rule-app-chrome-exe');
     expect(option.kind).toBe('exceptionApp');
     expect(duration).toBe('minutes15');
+  });
+
+  it('narrows the list to the focused app and destination, with a way back', () => {
+    const onClearFocus = vi.fn();
+    const entries = [
+      makeEntry({ destination: 'a.example' }),
+      makeEntry({ destination: 'b.example' }),
+      makeEntry({ processName: 'slack.exe', destination: 'a.example' })
+    ];
+    render(
+      <BlockedView
+        {...baseProps}
+        entries={entries}
+        focus={{ processName: 'Chrome.exe', destination: 'b.example' }}
+        onClearFocus={onClearFocus}
+      />
+    );
+    expect(screen.getByText('b.example:443')).toBeInTheDocument();
+    expect(screen.queryByText('a.example:443')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: i18n.t('blocked.focus.clear') }));
+    expect(onClearFocus).toHaveBeenCalled();
+  });
+
+  it('shows everything when the focus matches nothing', () => {
+    const entries = [makeEntry({ destination: 'a.example' })];
+    expect(applyBlockedFocus(entries, { processName: 'other.exe' })).toEqual({
+      entries,
+      focused: false
+    });
+    expect(applyBlockedFocus(entries, null).focused).toBe(false);
+    expect(applyBlockedFocus(entries, { processName: 'chrome.exe' }).focused).toBe(true);
   });
 
   it('shows only an explanation for a QUIC block', () => {

@@ -82,7 +82,10 @@ describe('blockReason mapping', () => {
 
   it('recognizes proxy outage reasons only', () => {
     expect(isProxyOutageReason('killSwitchProxyRefused')).toBe(true);
-    expect(isProxyOutageReason('killSwitchUdpUnsupported')).toBe(false);
+    expect(isProxyOutageReason('udpProxyUnsupported')).toBe(false);
+    expect(isProxyOutageReason('killSwitchDirectUdpFailed')).toBe(false);
+    expect(isProxyOutageReason('killSwitchProxyAuthRejected')).toBe(true);
+    expect(isProxyOutageReason('killSwitchProxyMisconfigured')).toBe(true);
     expect(isProxyOutageReason(undefined)).toBe(false);
   });
 

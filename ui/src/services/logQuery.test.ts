@@ -55,6 +55,12 @@ describe('filterLogEntries', () => {
     expect(found.map((e) => e.id)).toEqual(['2', '4']);
   });
 
+  it('matches the component without caring about case', () => {
+    const found = filterLogEntries(entries, { ...EMPTY_LOG_FILTER, component: 'ENGINE' });
+    expect(found.every((e) => e.component === 'engine')).toBe(true);
+    expect(found.length).toBeGreaterThan(0);
+  });
+
   it('filters on one component', () => {
     const found = filterLogEntries(entries, { ...EMPTY_LOG_FILTER, component: 'engine' });
     expect(found.map((e) => e.id)).toEqual(['1', '3']);

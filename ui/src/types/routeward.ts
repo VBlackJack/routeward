@@ -315,7 +315,7 @@ export type BlockReason =
   | 'killSwitchProxyAuthRejected'
   | 'killSwitchProxyHandshake'
   | 'killSwitchProxyMisconfigured'
-  | 'killSwitchUdpUnsupported'
+  | 'udpProxyUnsupported'
   | 'killSwitchDirectUdpFailed'
   | 'fragmentedUdpBlocked'
   | 'unknownProcessPolicy'

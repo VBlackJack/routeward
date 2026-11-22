@@ -45,14 +45,21 @@ const SECTION_LABEL_KEYS: Record<string, string> = {
   logs: 'diagnostics.export.section.logs'
 };
 
+const REDACTION_KEY_PREFIX = 'diagnostics.export.redaction.';
+
 /** Builds the redacted diagnostic file in two steps: choose what goes in, check it, then download. */
 export const DiagnosticExportModal: React.FC<DiagnosticExportModalProps> = ({
   onCollect,
   onClose,
   onDownloaded
 }) => {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const titleId = useId();
+  // The daemon sends stable codes; a code this version does not know is shown as it is.
+  const redactionLabel = (code: string): string => {
+    const key = `${REDACTION_KEY_PREFIX}${code}`;
+    return i18n.exists(key) ? t(key) : code;
+  };
   const [logDays, setLogDays] = useState<number>(UI_CONFIG.DIAGNOSTIC_LOG_DAYS_DEFAULT);
   const [includeConnections, setIncludeConnections] = useState(true);
   const [includeProfile, setIncludeProfile] = useState(true);
@@ -214,7 +221,9 @@ export const DiagnosticExportModal: React.FC<DiagnosticExportModalProps> = ({
             </table>
             {redactions.length > 0 && (
               <p className="text-[11px] text-tf-secondary">
-                {t('diagnostics.export.redactions', { list: redactions.join(', ') })}
+                {t('diagnostics.export.redactions', {
+                  list: redactions.map(redactionLabel).join(', ')
+                })}
               </p>
             )}
             <p className="text-[11px] text-tf-secondary">
