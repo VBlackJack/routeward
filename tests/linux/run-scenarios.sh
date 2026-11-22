@@ -599,6 +599,9 @@ rm -f /run/routeward/routeward.sock
 #                systemd ExecStopPost hook (`cleanup --force --fail-closed-on-crash` with
 #                SERVICE_RESULT=signal) must NOT install the block table: traffic stays open
 # ---------------------------------------------------------------------------
+# The daemon re-applies the remembered protection choice at start; (i2) left it on through
+# its kill -9, so forget it here to start a genuinely idle daemon.
+rm -f /etc/routeward/protection_state.json
 "${BIN}" daemon >/tmp/rw_daemon_i3.out 2>&1 &
 DAEMON_I3_PID=$!
 wait_for_ipc_socket
