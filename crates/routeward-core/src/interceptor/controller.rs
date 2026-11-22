@@ -154,7 +154,16 @@ impl RouteWardController {
 
     pub fn new_daemon(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
         let log_dir = constants.telemetry.resolve_daemon_log_dir();
-        Self::new_with_log_dir(constants, profile, locale, log_dir)
+        let state_path = constants
+            .ipc
+            .resolve_daemon_profile_path()
+            .ok()
+            .map(|path| crate::system::protection_state::state_path_for_profile(&path));
+        let controller = Self::new_with_log_dir(constants, profile, locale, log_dir);
+        match state_path {
+            Some(path) => controller.with_protection_state_path(path),
+            None => controller,
+        }
     }
 
     pub fn new_user_cli(constants: SystemConstants, profile: ProfileConfig, locale: &str) -> Self {
@@ -228,6 +237,7 @@ impl RouteWardController {
             running: Arc::new(AtomicBool::new(false)),
             engine_lifecycle: Arc::new(parking_lot::Mutex::new(())),
             engine_runtime: Arc::new(parking_lot::Mutex::new(None)),
+            protection: Arc::new(super::protection::ProtectionRuntime::new(None)),
         };
 
         controller.telemetry.push_log(
@@ -1394,6 +1404,8 @@ impl RouteWardController {
             dns_endpoint: format!("{}:{}", net.local_bind_host, net.default_dns_listen_port),
             fake_ip_cidr: prof.dns_config.fake_ip_cidr.clone(),
             active_locale: self.i18n.get_locale(),
+            paused_until_epoch_ms: self.paused_until_epoch_ms(),
+            auto_start_error_key: self.auto_start_error_key(),
         }
     }
 
@@ -1995,12 +2007,12 @@ impl RouteWardController {
                             incoming_creds.password = existing_creds.password.clone();
                         }
                     }
-                    incoming_creds.has_password = incoming_creds.has_password();
+                    incoming_creds.has_password = incoming_creds.has_stored_password();
                 }
                 *existing = node;
             } else {
                 if let Some(ref mut incoming_creds) = node.auth {
-                    incoming_creds.has_password = incoming_creds.has_password();
+                    incoming_creds.has_password = incoming_creds.has_stored_password();
                 }
                 prof.proxies.push(node);
             }
@@ -2172,7 +2184,7 @@ impl RouteWardController {
                             }
                         }
                     }
-                    incoming_creds.has_password = incoming_creds.has_password();
+                    incoming_creds.has_password = incoming_creds.has_stored_password();
                 }
             }
             let sec_diff = prof.security_policy != new_profile.security_policy;

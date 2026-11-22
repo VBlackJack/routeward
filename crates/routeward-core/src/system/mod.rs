@@ -15,6 +15,7 @@
  */
 
 pub mod discovery;
+pub mod protection_state;
 pub mod purge;
 pub mod user_state;
 pub mod windows_service;

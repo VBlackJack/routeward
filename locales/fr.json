@@ -863,60 +863,71 @@
         "started": "Service Windows démarré",
         "stopped": "Service Windows arrêté"
       }
+    },
+    "recover": {
+      "title": "Rétablissement de votre connexion Internet...",
+      "engine_stopped": "La protection a été désactivée en arrière-plan.",
+      "daemon_unreachable": "La protection RouteWard n'était pas active en arrière-plan.",
+      "engine_stop_failed": "La protection en arrière-plan n'a pas pu être désactivée. Elle risque de se réactiver plus tard.",
+      "internet_restored": "Votre connexion Internet normale est rétablie.",
+      "next_step": "Ouvrez RouteWard pour réactiver la protection.",
+      "failed": "RouteWard n'a pas pu rétablir vos réglages Internet. Redémarrez votre ordinateur, ou ouvrez les Paramètres Windows, allez dans Réseau et Internet, puis Proxy, et désactivez le proxy.",
+      "press_enter": "Appuyez sur Entrée pour fermer cette fenêtre."
     }
   },
   "errors": {
     "config": {
-      "load_failed": "Impossible de charger le fichier de configuration",
-      "save_failed": "Impossible de sauvegarder le profil de configuration sur le disque",
-      "invalid_json": "Structure JSON invalide dans la configuration"
+      "load_failed": "RouteWard n'a pas pu lire son fichier de réglages. Restaurez un profil enregistré ou réinitialisez vos réglages, puis réessayez.",
+      "save_failed": "RouteWard n'a pas pu enregistrer vos modifications. Vérifiez que votre disque n'est pas plein ni en lecture seule, puis réessayez.",
+      "invalid_json": "Le fichier de réglages est abîmé ou n'a pas le format attendu. Restaurez un profil enregistré ou réinitialisez vos réglages."
     },
     "proxy": {
-      "not_found": "L'identifiant de proxy spécifié est introuvable",
-      "chain_empty": "La chaîne de proxies doit contenir au moins un saut",
-      "handshake_failed": "Échec de la négociation avec le proxy (vérifiez le protocole SOCKS5 / HTTP, l'adresse et le port)",
-      "connection_timeout": "Délai d'attente dépassé : le proxy ne répond pas (vérifiez l'adresse, le port et votre connexion)",
-      "auth_rejected": "Identifiant ou mot de passe refusé par le serveur proxy",
-      "udp_not_supported": "Le serveur proxy en amont ne supporte pas SOCKS5 UDP ASSOCIATE",
-      "invalid_uri": "Format de lien proxy invalide (attendu : socks5://, http:// ou https://hote:port)"
+      "not_found": "Ce proxy n'existe plus. Actualisez la liste et choisissez-en un autre.",
+      "chain_empty": "Un groupe de proxies doit contenir au moins un proxy. Ajoutez-en un avant d'enregistrer.",
+      "handshake_failed": "Le proxy a répondu de façon inattendue. Vérifiez que son type, son adresse et son port sont corrects.",
+      "connection_timeout": "Le proxy n'a pas répondu à temps. Vérifiez son adresse et son port, ainsi que votre connexion Internet.",
+      "auth_rejected": "Le proxy a refusé votre identifiant ou votre mot de passe. Vérifiez-les puis réessayez.",
+      "udp_not_supported": "Ce proxy ne peut pas transporter les appels, les jeux et les autres échanges en temps réel. Choisissez un autre proxy pour ces applications.",
+      "invalid_uri": "Ce lien n'est pas un lien de proxy valide. Il doit ressembler à socks5://adresse:port, http://adresse:port ou https://adresse:port."
     },
     "rule": {
-      "blocked_by_policy": "Connexion bloquée par une règle de routage"
+      "blocked_by_policy": "Cette connexion a été bloquée par l'une de vos règles. Modifiez ou supprimez la règle si ce n'était pas voulu."
     },
     "interceptor": {
-      "driver_missing": "Bibliothèque ou pilote WinDivert introuvable (exécutez tools/fetch-windivert.ps1)",
-      "open_failed": "Impossible d'ouvrir le filtre noyau WinDivert (droits Administrateur requis)",
-      "not_root": "Privilèges root requis sous Linux pour l'interception nftables (EUID != 0)",
-      "nft_missing": "Binaire nftables (nft) introuvable sur le système",
-      "nft_failed": "Échec de l'exécution de la commande nftables",
-      "tproxy_conflict": "Refus de démarrer l'interception UDP TPROXY : la priorité ip rule, le fwmark ou la table de routage configurée est déjà utilisée"
+      "driver_missing": "Le composant réseau de RouteWard est introuvable, très probablement parce que votre antivirus l'a placé en quarantaine. Restaurez-le depuis votre antivirus, autorisez RouteWard dans ses réglages, puis redémarrez RouteWard (ou réinstallez-le).",
+      "open_failed": "Le composant réseau de RouteWard n'a pas pu démarrer. Votre antivirus le bloque peut-être : vérifiez sa quarantaine et sa liste d'autorisations, puis redémarrez RouteWard.",
+      "not_root": "RouteWard a besoin des droits administrateur (root) pour filtrer le trafic réseau sur ce système. Lancez-le en tant qu'administrateur.",
+      "nft_missing": "Un outil dont RouteWard a besoin pour filtrer le trafic réseau est absent de ce système. Installez le paquet qui le fournit, puis redémarrez RouteWard.",
+      "nft_failed": "Le système a refusé les réglages de filtrage réseau de RouteWard. Redémarrez RouteWard et vérifiez qu'aucun autre outil de pare-feu n'entre en conflit.",
+      "tproxy_conflict": "Un autre programme utilise déjà les réglages réseau dont RouteWard a besoin pour le trafic UDP. Fermez ce programme ou modifiez les réglages réseau avancés de RouteWard, puis réessayez."
     },
     "daemon": {
-      "already_running": "Une autre instance du démon RouteWard est déjà en cours d'exécution",
-      "untrusted_pipe_owner": "Refus de communiquer avec le canal du démon RouteWard : il appartient à un compte non fiable",
-      "pipe_squatted": "Un autre processus occupe le nom du canal du démon RouteWard : le démon ne peut pas démarrer",
-      "group_missing": "Le groupe Unix configuré pour le socket du démon n'existe pas sur le système",
-      "not_elevated": "Les privilèges Administrateur ou root sont requis pour lancer routeward daemon",
-      "ipc_error": "Erreur de communication IPC avec le démon",
-      "disconnected": "Le démon privilégié RouteWard n'est pas connecté",
-      "io_timeout": "Délai dépassé lors de la communication avec le démon RouteWard",
-      "insecure_profile": "Refus de démarrer : le dossier ou le fichier de profil a un propriétaire ou des droits d'écriture non sécurisés",
-      "cleanup_refused_active": "Refus d'exécuter cleanup pendant qu'un démon RouteWard est actif (arrêtez le démon d'abord ou utilisez --force)"
+      "already_running": "RouteWard protège déjà cet ordinateur en arrière-plan. Utilisez cette instance, ou arrêtez-la avant d'en démarrer une autre.",
+      "untrusted_pipe_owner": "RouteWard a refusé de se connecter à sa protection en arrière-plan, car elle n'appartient pas à un compte de confiance. Redémarrez votre ordinateur ; si le problème continue, réinstallez RouteWard.",
+      "pipe_squatted": "Un autre programme empêche la protection en arrière-plan de RouteWard de démarrer. Redémarrez votre ordinateur ; si le problème continue, réinstallez RouteWard.",
+      "group_missing": "Le groupe d'utilisateurs prévu pour RouteWard n'existe pas sur ce système. Créez-le ou modifiez le réglage, puis redémarrez RouteWard.",
+      "not_elevated": "La protection en arrière-plan de RouteWard a besoin des droits administrateur (root) pour démarrer. Lancez-la en tant qu'administrateur, ou installez le service RouteWard.",
+      "ipc_error": "RouteWard n'a pas pu communiquer avec sa protection en arrière-plan. Réessayez ; si cela continue, redémarrez RouteWard.",
+      "disconnected": "RouteWard ne parvient pas à joindre sa protection en arrière-plan pour le moment. Vérifiez qu'elle fonctionne, puis réessayez.",
+      "io_timeout": "La protection en arrière-plan de RouteWard n'a pas répondu à temps. Patientez un instant puis réessayez.",
+      "insecure_profile": "RouteWard a refusé de démarrer, car son dossier de réglages peut être modifié par d'autres utilisateurs. Réinstallez RouteWard pour réparer ses droits d'accès.",
+      "cleanup_refused_active": "Nettoyage refusé : la protection est encore active. Arrêtez-la d'abord, ou relancez la commande avec --force.",
+      "invalid_pause": "Cette durée de pause n'est pas valide. Choisissez une durée comprise entre 1 seconde et 24 heures."
     },
     "service": {
-      "insecure_binary_location": "Enregistrement du service Windows refusé : l'exécutable RouteWard ou son dossier est modifiable par des non-administrateurs. Installez-le sous Program Files."
+      "insecure_binary_location": "RouteWard ne peut pas être installé comme service d'arrière-plan depuis ce dossier, car d'autres utilisateurs pourraient le modifier. Installez RouteWard dans Program Files puis réessayez."
     },
     "system": {
-      "registry_write_failed": "Impossible de modifier les paramètres de proxy Windows de l'utilisateur courant",
-      "pac_url_invalid": "L'URL du PAC doit pointer vers le serveur local de RouteWard (http://127.0.0.1:<port>/...)",
-      "executable_path_empty": "Le chemin de l'exécutable est vide ou n'a pas pu être déterminé",
-      "launch_failed": "Impossible de démarrer le programme sélectionné",
-      "backup_failed": "Impossible d'enregistrer les paramètres de proxy précédents : ils n'ont pas été modifiés",
-      "purge_failed": "Impossible de supprimer le dossier de données RouteWard",
-      "purge_unsupported": "La suppression du dossier de données RouteWard avec cette commande n'est disponible que sous Windows"
+      "registry_write_failed": "RouteWard n'a pas pu modifier vos réglages Internet de Windows. Fermez les autres programmes qui les gèrent, puis réessayez.",
+      "pac_url_invalid": "L'adresse de configuration automatique doit pointer vers RouteWard sur cet ordinateur (http://127.0.0.1:port/...).",
+      "executable_path_empty": "Le chemin du programme est vide ou introuvable. Choisissez à nouveau le programme.",
+      "launch_failed": "RouteWard n'a pas pu démarrer le programme choisi. Vérifiez que son fichier existe toujours.",
+      "backup_failed": "RouteWard n'a pas pu enregistrer vos réglages Internet précédents ; il les a donc laissés tels quels. Réessayez.",
+      "purge_failed": "RouteWard n'a pas pu supprimer son dossier de données. Fermez RouteWard puis réessayez.",
+      "purge_unsupported": "La suppression du dossier de données de RouteWard de cette façon n'est disponible que sous Windows."
     },
     "desktop": {
-      "ui_init": "RouteWard n'a pas pu initialiser sa fenêtre WebView. Vérifiez que Microsoft Edge WebView2 Runtime est installé et que votre dossier utilisateur est accessible en écriture."
+      "ui_init": "RouteWard n'a pas pu ouvrir sa fenêtre. Installez ou réparez Microsoft Edge WebView2 Runtime, vérifiez que votre dossier utilisateur n'est pas en lecture seule, puis relancez RouteWard."
     }
   },
   "themeforge": {

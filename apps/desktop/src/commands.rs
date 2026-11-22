@@ -152,6 +152,8 @@ impl DesktopCommandBridge {
             dns_endpoint: format!("{}:{}", net.local_bind_host, net.default_dns_listen_port),
             fake_ip_cidr: default_profile.dns_config.fake_ip_cidr.clone(),
             active_locale: i18n.get_locale(),
+            paused_until_epoch_ms: None,
+            auto_start_error_key: None,
         };
 
         let initial_profiles = vec![ProfileSummary {

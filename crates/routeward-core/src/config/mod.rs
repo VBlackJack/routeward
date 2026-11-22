@@ -928,6 +928,12 @@ impl ProxyCredentials {
         self.password.as_deref().unwrap_or("")
     }
 
+    /// True only when a non-empty password is actually held, ignoring the
+    /// transported `has_password` flag (which a client can set without a password).
+    pub fn has_stored_password(&self) -> bool {
+        self.password.as_ref().is_some_and(|p| !p.is_empty())
+    }
+
     pub fn has_password(&self) -> bool {
         self.has_password || self.password.as_ref().is_some_and(|p| !p.is_empty())
     }

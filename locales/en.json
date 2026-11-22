@@ -863,60 +863,71 @@
         "started": "Windows service started",
         "stopped": "Windows service stopped"
       }
+    },
+    "recover": {
+      "title": "Restoring your Internet connection...",
+      "engine_stopped": "Protection was turned off in the background.",
+      "daemon_unreachable": "RouteWard protection was not running in the background.",
+      "engine_stop_failed": "Background protection could not be turned off. It may turn itself back on later.",
+      "internet_restored": "Your normal Internet connection is restored.",
+      "next_step": "Open RouteWard to turn protection back on.",
+      "failed": "RouteWard could not restore your Internet settings. Restart your computer, or open Windows Settings, go to Network and Internet, then Proxy, and turn off the proxy.",
+      "press_enter": "Press Enter to close this window."
     }
   },
   "errors": {
     "config": {
-      "load_failed": "Failed to load configuration file",
-      "save_failed": "Failed to save profile configuration to disk",
-      "invalid_json": "Invalid JSON structure in configuration"
+      "load_failed": "RouteWard could not read its settings file. Restore a saved profile or reset your settings, then try again.",
+      "save_failed": "RouteWard could not save your changes. Check that your disk is not full or read-only, then try again.",
+      "invalid_json": "The settings file is damaged or not in the expected format. Restore a saved profile or reset your settings."
     },
     "proxy": {
-      "not_found": "Specified proxy identifier was not found",
-      "chain_empty": "Proxy chain must contain at least one upstream hop",
-      "handshake_failed": "Proxy handshake failed (check SOCKS5 / HTTP protocol, address, and port)",
-      "connection_timeout": "Timed out: proxy did not respond (check address, port, and Internet access)",
-      "auth_rejected": "Username or password was rejected by the proxy server",
-      "udp_not_supported": "Upstream proxy does not support SOCKS5 UDP ASSOCIATE",
-      "invalid_uri": "Invalid proxy link format (expected: socks5://, http://, or https://host:port)"
+      "not_found": "This proxy no longer exists. Refresh the list and pick another one.",
+      "chain_empty": "A proxy group needs at least one proxy. Add one before saving.",
+      "handshake_failed": "The proxy answered in an unexpected way. Check that its type, address and port are correct.",
+      "connection_timeout": "The proxy did not answer in time. Check its address and port, and make sure your Internet connection works.",
+      "auth_rejected": "The proxy refused your username or password. Check them and try again.",
+      "udp_not_supported": "This proxy cannot carry calls, games and other real-time traffic. Choose another proxy for these apps.",
+      "invalid_uri": "This is not a valid proxy link. It must look like socks5://address:port, http://address:port or https://address:port."
     },
     "rule": {
-      "blocked_by_policy": "Connection blocked by routing policy rule"
+      "blocked_by_policy": "This connection was blocked by one of your rules. Change or remove the rule if this was not intended."
     },
     "interceptor": {
-      "driver_missing": "WinDivert library or driver not found (run tools/fetch-windivert.ps1)",
-      "open_failed": "Failed to open WinDivert kernel filter (Administrator privileges required)",
-      "not_root": "Root privileges required on Linux for nftables interception (EUID != 0)",
-      "nft_missing": "nftables binary (nft) was not found on the system",
-      "nft_failed": "Failed to execute nftables command",
-      "tproxy_conflict": "Refusing to start UDP TPROXY interception: configured ip rule priority, fwmark, or routing table is already in use"
+      "driver_missing": "RouteWard's network component is missing, most likely because your antivirus moved it to quarantine. Restore it from your antivirus, allow RouteWard there, then restart RouteWard (or reinstall it).",
+      "open_failed": "RouteWard's network component could not start. Your antivirus may be blocking it: check its quarantine and allowed list, then restart RouteWard.",
+      "not_root": "RouteWard needs administrator (root) rights to filter network traffic on this system. Start it as administrator.",
+      "nft_missing": "A tool that RouteWard needs to filter network traffic is missing on this system. Install the package that provides it, then restart RouteWard.",
+      "nft_failed": "The system refused RouteWard's network filtering settings. Restart RouteWard, and check that no other firewall tool is in conflict.",
+      "tproxy_conflict": "Another program already uses the network settings that RouteWard needs for UDP traffic. Close that program or change RouteWard's advanced network settings, then try again."
     },
     "daemon": {
-      "already_running": "Another RouteWard daemon instance is already running",
-      "untrusted_pipe_owner": "Refusing to talk to the RouteWard daemon pipe: it is owned by an untrusted account",
-      "pipe_squatted": "Another process has taken the RouteWard daemon pipe name and the daemon cannot start",
-      "group_missing": "Configured Unix socket group does not exist on the system",
-      "not_elevated": "Administrator or root privileges are required to run routeward daemon",
-      "ipc_error": "Daemon IPC communication error",
-      "disconnected": "Privileged RouteWard daemon is not connected",
-      "io_timeout": "Timed out while communicating with the RouteWard daemon",
-      "insecure_profile": "Refusing to start: profile directory or file has insecure ownership or write permissions",
-      "cleanup_refused_active": "Refusing to run cleanup while a RouteWard daemon is active (stop the daemon first or pass --force)"
+      "already_running": "RouteWard is already protecting this computer in the background. Use that one, or stop it before starting another.",
+      "untrusted_pipe_owner": "RouteWard refused to connect to its background protection because it does not belong to a trusted account. Restart your computer; if this continues, reinstall RouteWard.",
+      "pipe_squatted": "Another program is preventing RouteWard's background protection from starting. Restart your computer; if this continues, reinstall RouteWard.",
+      "group_missing": "The user group set for RouteWard does not exist on this system. Create it or change the setting, then restart RouteWard.",
+      "not_elevated": "RouteWard's background protection needs administrator (root) rights to start. Start it as administrator, or install the RouteWard service.",
+      "ipc_error": "RouteWard could not talk to its background protection. Try again; if it keeps happening, restart RouteWard.",
+      "disconnected": "RouteWard cannot reach its background protection right now. Check that it is running, then try again.",
+      "io_timeout": "RouteWard's background protection did not answer in time. Wait a moment and try again.",
+      "insecure_profile": "RouteWard refused to start because its settings folder can be changed by other users. Reinstall RouteWard to repair its permissions.",
+      "cleanup_refused_active": "Cleanup refused: protection is still running. Stop it first, or run the command again with --force.",
+      "invalid_pause": "This pause length is not valid. Choose a duration between 1 second and 24 hours."
     },
     "service": {
-      "insecure_binary_location": "Refusing to register the Windows service: the RouteWard executable or its folder is writable by non-administrators. Install it under Program Files."
+      "insecure_binary_location": "RouteWard cannot be set up as a background service from this folder, because other users could modify it. Install RouteWard under Program Files and try again."
     },
     "system": {
-      "registry_write_failed": "Could not update the Windows proxy settings of the current user",
-      "pac_url_invalid": "The PAC URL must point to the local RouteWard server (http://127.0.0.1:<port>/...)",
-      "executable_path_empty": "The executable path is empty or could not be determined",
-      "launch_failed": "Could not start the selected program",
-      "backup_failed": "Could not save the previous proxy settings, so they were left unchanged",
-      "purge_failed": "Could not remove the RouteWard data directory",
-      "purge_unsupported": "Removing the RouteWard data directory with this command is only available on Windows"
+      "registry_write_failed": "RouteWard could not change your Windows Internet settings. Close other programs that manage them, then try again.",
+      "pac_url_invalid": "The automatic configuration address must point to RouteWard on this computer (http://127.0.0.1:port/...).",
+      "executable_path_empty": "The program path is empty or could not be found. Choose the program again.",
+      "launch_failed": "RouteWard could not start the selected program. Check that its file still exists.",
+      "backup_failed": "RouteWard could not save your previous Internet settings, so it left them unchanged. Try again.",
+      "purge_failed": "RouteWard could not delete its data folder. Close RouteWard and try again.",
+      "purge_unsupported": "Deleting the RouteWard data folder this way is only available on Windows."
     },
     "desktop": {
-      "ui_init": "RouteWard could not initialize its desktop WebView window. Ensure Microsoft Edge WebView2 Runtime is installed and your user data folder is writable."
+      "ui_init": "RouteWard could not open its window. Install or repair Microsoft Edge WebView2 Runtime, make sure your user folder is not read-only, then start RouteWard again."
     }
   },
   "themeforge": {

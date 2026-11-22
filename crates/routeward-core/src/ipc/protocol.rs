@@ -45,6 +45,11 @@ pub enum IpcCommand {
     ToggleEngine {
         start: bool,
     },
+    /// Stops the engine and starts it again after `durationSecs` (1 second to 24 hours).
+    PauseEngine {
+        #[serde(rename = "durationSecs")]
+        duration_secs: u64,
+    },
     SetInterceptionMode {
         mode: InterceptionMode,
     },

@@ -20,6 +20,7 @@ mod dns_handler;
 pub mod dns_server_exempt;
 pub mod nat;
 pub mod nftables;
+mod protection;
 mod tcp_relay;
 #[cfg(test)]
 mod tests;
@@ -68,6 +69,12 @@ pub struct SystemDiagnostics {
     pub dns_endpoint: String,
     pub fake_ip_cidr: String,
     pub active_locale: String,
+    /// Unix time in milliseconds at which a running pause ends, `null` when not paused.
+    #[serde(default)]
+    pub paused_until_epoch_ms: Option<u64>,
+    /// Error key of the last failed automatic start of protection, `null` when none.
+    #[serde(default)]
+    pub auto_start_error_key: Option<String>,
 }
 
 fn default_daemon_connected() -> bool {
@@ -187,6 +194,8 @@ pub struct RouteWardController {
     pub(super) engine_lifecycle: Arc<parking_lot::Mutex<()>>,
     /// Shutdown signal and task handles of the current engine start, `None` while stopped.
     pub(super) engine_runtime: Arc<parking_lot::Mutex<Option<controller::EngineRuntime>>>,
+    /// Persisted desired protection state and pause timer (only the daemon persists).
+    pub(super) protection: Arc<protection::ProtectionRuntime>,
 }
 
 #[cfg(test)]

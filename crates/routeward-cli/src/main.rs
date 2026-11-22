@@ -31,6 +31,7 @@ use routeward_core::ipc::{wait_for_shutdown_signal, DaemonIpcService, IpcClient}
 use routeward_core::logger::FileLogger;
 use routeward_core::pac::PacGenerator;
 use routeward_core::rules::ConnectionRequest;
+use routeward_core::system::protection_state::MAX_PAUSE_SECS;
 use routeward_core::system::user_state::{AllUsersCleanupReport, UserCleanupReport};
 use routeward_core::system::windows_service::{
     install_windows_service, query_windows_service_status, restore_windows_service,
@@ -131,6 +132,14 @@ enum Commands {
     /// Delete the RouteWard data directory (profile and logs) of this machine; run by the
     /// uninstaller. Needs elevation and refuses while a RouteWard daemon is active
     PurgeData,
+    /// Restore the normal Internet connection of the current user: turn protection off in the
+    /// background (when reachable), then give back the system proxy settings. Needs no
+    /// elevation and never fails because the background service is unreachable
+    Recover {
+        /// Wait for Enter before returning, so a shortcut window stays readable
+        #[arg(long = "pause-at-end")]
+        pause_at_end: bool,
+    },
 }
 
 /// Reads the persisted daemon profile and returns its kill switch setting; any read or parse
@@ -221,6 +230,68 @@ fn run_cleanup_user(constants: &SystemConstants) -> RouteWardResult<UserCleanupR
         "per-user settings cleanup finished"
     );
     Ok(report)
+}
+
+/// What the background protection answered to the "turn protection off" request of `recover`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoverDaemonOutcome {
+    Stopped,
+    Unreachable,
+    Refused,
+}
+
+/// Locale keys of the lines `routeward recover` prints, in order. Restoring the proxy settings
+/// decides the success: an unreachable background service never makes the command fail.
+fn recover_message_keys(daemon: RecoverDaemonOutcome, restored: bool) -> Vec<&'static str> {
+    let mut keys = vec![match daemon {
+        RecoverDaemonOutcome::Stopped => "cli.recover.engine_stopped",
+        RecoverDaemonOutcome::Unreachable => "cli.recover.daemon_unreachable",
+        RecoverDaemonOutcome::Refused => "cli.recover.engine_stop_failed",
+    }];
+    if restored {
+        keys.push("cli.recover.internet_restored");
+        keys.push("cli.recover.next_step");
+    } else {
+        keys.push("cli.recover.failed");
+    }
+    keys
+}
+
+/// Runs `routeward recover`: best-effort turn-off of the background protection, then the same
+/// per-user restore as `cleanup --user`. Needs no elevation.
+async fn run_recover(
+    constants: SystemConstants,
+    locale: &str,
+    pause_at_end: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let i18n = I18nRegistry::new(locale);
+    println!("{}", i18n.t("cli.recover.title"));
+
+    let client = IpcClient::new(constants.ipc.clone());
+    let daemon = match client
+        .call_raw(IpcCommand::ToggleEngine { start: false })
+        .await
+    {
+        Ok(resp) if resp.ok => RecoverDaemonOutcome::Stopped,
+        Ok(_) => RecoverDaemonOutcome::Refused,
+        Err(_) => RecoverDaemonOutcome::Unreachable,
+    };
+    let restore = run_cleanup_user(&constants);
+    let restored = restore.is_ok();
+
+    for key in recover_message_keys(daemon, restored) {
+        if key == "cli.recover.failed" {
+            eprintln!("{}", i18n.t(key));
+        } else {
+            println!("{}", i18n.t(key));
+        }
+    }
+    if pause_at_end && std::io::stdout().is_terminal() {
+        println!("{}", i18n.t("cli.recover.press_enter"));
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+    restore.map(|_| ()).map_err(Into::into)
 }
 
 /// Runs `routeward cleanup --all-users`: gives back the per-user settings of every user whose
@@ -316,6 +387,9 @@ enum ServiceCommands {
         /// Configure manual start instead of automatic start on boot
         #[arg(long)]
         demand_start: bool,
+        /// Start the service once it is installed, in the same elevated invocation
+        #[arg(long)]
+        start: bool,
     },
     /// Re-register the service after an MSI upgrade from the captured old ImagePath
     Restore {
@@ -360,6 +434,12 @@ enum CtlCommands {
     Start,
     /// Stop the relay and transparent OS packet interceptor on the daemon
     Stop,
+    /// Pause protection for a while: the daemon stops the engine and starts it again by itself
+    Pause {
+        /// Pause length in seconds (1 to 86400)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..=MAX_PAUSE_SECS))]
+        seconds: u64,
+    },
     /// List tracked connections from the daemon
     Connections,
     /// List recent log entries from the daemon
@@ -481,6 +561,7 @@ fn ctl_action_label(action: &CtlCommands) -> &'static str {
         CtlCommands::State => "state",
         CtlCommands::Start => "start",
         CtlCommands::Stop => "stop",
+        CtlCommands::Pause { .. } => "pause",
         CtlCommands::Connections => "connections",
         CtlCommands::Logs => "logs",
         CtlCommands::FakeIps => "fake-ips",
@@ -501,6 +582,9 @@ fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, Ip
         CtlCommands::State => IpcCommand::GetState,
         CtlCommands::Start => IpcCommand::ToggleEngine { start: true },
         CtlCommands::Stop => IpcCommand::ToggleEngine { start: false },
+        CtlCommands::Pause { seconds } => IpcCommand::PauseEngine {
+            duration_secs: seconds,
+        },
         CtlCommands::Connections => IpcCommand::ListConnections,
         CtlCommands::Logs => IpcCommand::ListLogs,
         CtlCommands::FakeIps => IpcCommand::ListFakeIps,
@@ -674,6 +758,9 @@ async fn run_daemon_host(
     );
 
     let (local_shutdown_tx, accept_shutdown) = watch::channel(false);
+    // Re-applies the protection the user left on (or a pause that is still running). A failure
+    // is logged and shown in the diagnostics; it never stops the daemon.
+    controller.apply_persisted_protection();
     let pac_shutdown = local_shutdown_tx.subscribe();
     let mut accept_handle = tokio::spawn(async move {
         let _ = service.run_accept_loop_until(accept_shutdown).await;
@@ -749,6 +836,7 @@ fn handle_service_command(
             mut allow_sid,
             allow_current_user,
             demand_start,
+            start,
         } => {
             if allow_current_user {
                 #[cfg(windows)]
@@ -758,9 +846,14 @@ fn handle_service_command(
                 }
             }
             let exe_str = bin_path.as_ref().map(|p| p.to_string_lossy().into_owned());
-            let status = install_windows_service(exe_str.as_deref(), &allow_sid, !demand_start)?;
-            println!("{}", serde_json::to_string_pretty(&status)?);
+            let mut status =
+                install_windows_service(exe_str.as_deref(), &allow_sid, !demand_start)?;
             eprintln!("{}", i18n.t("cli.engine.service.installed"));
+            if start {
+                status = start_windows_service()?;
+                eprintln!("{}", i18n.t("cli.engine.service.started"));
+            }
+            println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(())
         }
         ServiceCommands::Restore {
@@ -884,6 +977,10 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     } = args.command
     {
         return run_daemon_host(constants, &args.locale, duration_secs, &allow_sid, None).await;
+    }
+
+    if let Commands::Recover { pause_at_end } = args.command {
+        return run_recover(constants, &args.locale, pause_at_end).await;
     }
 
     if matches!(args.command, Commands::PurgeData) {
@@ -1055,6 +1152,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Daemon { .. }
         | Commands::Ctl { .. }
         | Commands::Service { .. }
+        | Commands::Recover { .. }
         | Commands::PurgeData => unreachable!(),
     }
 
@@ -1123,6 +1221,87 @@ mod tests {
                 "--all-users must conflict with {other}"
             );
         }
+    }
+
+    #[test]
+    fn recover_parses_with_and_without_pause_at_end() {
+        let plain = CliArgs::try_parse_from(["routeward", "recover"]).expect("parses");
+        assert!(matches!(
+            plain.command,
+            Commands::Recover {
+                pause_at_end: false
+            }
+        ));
+        let paused =
+            CliArgs::try_parse_from(["routeward", "recover", "--pause-at-end"]).expect("parses");
+        assert!(matches!(
+            paused.command,
+            Commands::Recover { pause_at_end: true }
+        ));
+    }
+
+    #[test]
+    fn recover_succeeds_when_the_service_is_unreachable_as_long_as_the_proxy_is_restored() {
+        let ok = recover_message_keys(RecoverDaemonOutcome::Unreachable, true);
+        assert_eq!(
+            ok,
+            vec![
+                "cli.recover.daemon_unreachable",
+                "cli.recover.internet_restored",
+                "cli.recover.next_step"
+            ]
+        );
+        let stopped = recover_message_keys(RecoverDaemonOutcome::Stopped, true);
+        assert_eq!(stopped[0], "cli.recover.engine_stopped");
+        let refused = recover_message_keys(RecoverDaemonOutcome::Refused, false);
+        assert_eq!(
+            refused,
+            vec!["cli.recover.engine_stop_failed", "cli.recover.failed"]
+        );
+    }
+
+    #[test]
+    fn recover_messages_exist_in_both_locales_without_jargon() {
+        for locale in ["en", "fr"] {
+            let i18n = I18nRegistry::new(locale);
+            for key in [
+                "cli.recover.title",
+                "cli.recover.engine_stopped",
+                "cli.recover.daemon_unreachable",
+                "cli.recover.engine_stop_failed",
+                "cli.recover.internet_restored",
+                "cli.recover.next_step",
+                "cli.recover.failed",
+                "cli.recover.press_enter",
+            ] {
+                let text = i18n.t(key);
+                assert_ne!(text, key, "{locale}: missing {key}");
+                let lower = text.to_lowercase();
+                for jargon in ["daemon", "ipc", "démon", "windivert"] {
+                    assert!(!lower.contains(jargon), "{locale}:{key} mentions {jargon}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ctl_pause_parses_and_maps_to_the_pause_command() {
+        let args = CliArgs::try_parse_from(["routeward", "ctl", "pause", "--seconds", "300"])
+            .expect("parses");
+        let Commands::Ctl { action } = args.command else {
+            panic!("expected ctl");
+        };
+        let (label, cmd) = ctl_action_into_ipc(action).expect("maps");
+        assert_eq!(label, "pause");
+        assert!(matches!(
+            cmd,
+            IpcCommand::PauseEngine { duration_secs: 300 }
+        ));
+        assert!(CliArgs::try_parse_from(["routeward", "ctl", "pause"]).is_err());
+        assert!(CliArgs::try_parse_from(["routeward", "ctl", "pause", "--seconds", "0"]).is_err());
+        assert!(
+            CliArgs::try_parse_from(["routeward", "ctl", "pause", "--seconds", "86401"]).is_err()
+        );
     }
 
     #[test]
@@ -1444,12 +1623,40 @@ mod tests {
                         allow_sid,
                         allow_current_user,
                         demand_start,
+                        start,
                     },
             } => {
                 assert!(bin_path.is_none());
                 assert_eq!(allow_sid, vec!["S-1-5-21-1-2-3-1000".to_string()]);
                 assert!(!allow_current_user);
                 assert!(demand_start);
+                assert!(!start, "install must not start the service unless asked");
+            }
+            _ => panic!("unexpected parsed command"),
+        }
+
+        let install_start = CliArgs::try_parse_from([
+            "routeward",
+            "service",
+            "install",
+            "--allow-sid",
+            "S-1-5-21-1-2-3-1000",
+            "--start",
+        ])
+        .expect("parse service install --start");
+        match install_start.command {
+            Commands::Service {
+                action:
+                    ServiceCommands::Install {
+                        allow_sid,
+                        demand_start,
+                        start,
+                        ..
+                    },
+            } => {
+                assert_eq!(allow_sid, vec!["S-1-5-21-1-2-3-1000".to_string()]);
+                assert!(!demand_start);
+                assert!(start);
             }
             _ => panic!("unexpected parsed command"),
         }
