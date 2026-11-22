@@ -16,6 +16,7 @@
 
 pub mod commands;
 pub mod daemon_launcher;
+mod desktop_logs;
 pub mod notices;
 mod routes;
 mod security;
