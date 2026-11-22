@@ -146,7 +146,13 @@ impl RouteWardController {
     /// Records a blocked UDP datagram: one connection record per (client, target, reason) flow
     /// while datagrams keep arriving, every datagram still counted in the blocked summary.
     pub(super) fn record_blocked_udp(&self, client_addr: SocketAddr, record: BlockedRecord) {
-        let route = format!("{ROUTE_BLOCK_LABEL}|{:?}", record.reason);
+        // The name asked about is part of the flow: two different names sent to the same
+        // multicast address are two flows, not one.
+        let route = format!(
+            "{ROUTE_BLOCK_LABEL}|{:?}|{}",
+            record.reason,
+            record.resolved_domain.as_deref().unwrap_or_default()
+        );
         let flow_key = match record.target_host.parse::<IpAddr>() {
             Ok(ip) => udp_flow_key(client_addr, SocketAddr::new(ip, record.target_port), &route),
             Err(_) => format!(
@@ -494,7 +500,7 @@ impl RouteWardController {
                             self.record_blocked_udp(
                                 client_addr,
                                 BlockedRecord::new(
-                                    BlockReason::from_upstream_error(&err),
+                                    BlockReason::from_udp_proxy_error(&err, kill_switch_enabled),
                                     TransportProtocol::Udp,
                                     eval.matched_rule_name,
                                 )
@@ -617,7 +623,7 @@ impl RouteWardController {
                             self.record_blocked_udp(
                                 client_addr,
                                 BlockedRecord::new(
-                                    BlockReason::from_upstream_error(&err),
+                                    BlockReason::from_udp_proxy_error(&err, kill_switch_enabled),
                                     TransportProtocol::Udp,
                                     eval.matched_rule_name,
                                 )

@@ -52,8 +52,9 @@ pub enum BlockReason {
     KillSwitchProxyHandshake,
     /// Kill switch: the rule points to a missing proxy or an empty chain.
     KillSwitchProxyMisconfigured,
-    /// Kill switch: the proxy has no UDP support.
-    KillSwitchUdpUnsupported,
+    /// The proxy cannot carry UDP (no UDP ASSOCIATE, or `blockUdpOnTcpOnlyProxy`). Emitted
+    /// whatever the kill switch state: it is a capability gap, not a proxy outage.
+    UdpProxyUnsupported,
     /// Kill switch: a direct UDP datagram could not be sent.
     KillSwitchDirectUdpFailed,
     /// A fragmented UDP datagram that a proxied rule cannot carry.
@@ -78,7 +79,8 @@ pub enum BlockReason {
 }
 
 impl BlockReason {
-    /// True for the reasons caused by a failing proxy while the kill switch is on.
+    /// True for the reasons caused by a failing proxy while the kill switch is on (a proxy
+    /// outage). `UdpProxyUnsupported` is deliberately excluded.
     pub fn is_kill_switch_proxy(self) -> bool {
         matches!(
             self,
@@ -88,8 +90,19 @@ impl BlockReason {
                 | Self::KillSwitchProxyAuthRejected
                 | Self::KillSwitchProxyHandshake
                 | Self::KillSwitchProxyMisconfigured
-                | Self::KillSwitchUdpUnsupported
         )
+    }
+
+    /// Reason for a proxied UDP datagram that was blocked after an upstream failure. A proxy
+    /// that cannot carry UDP is [`Self::UdpProxyUnsupported`] whatever the kill switch state;
+    /// other failures are kill-switch reasons only when the kill switch is on, otherwise the
+    /// block comes from `blockUdpOnTcpOnlyProxy` and is also [`Self::UdpProxyUnsupported`].
+    pub fn from_udp_proxy_error(err: &RouteWardError, kill_switch_enabled: bool) -> Self {
+        if matches!(err, RouteWardError::UdpAssociateUnsupported { .. }) || !kill_switch_enabled {
+            Self::UdpProxyUnsupported
+        } else {
+            Self::from_upstream_error(err)
+        }
     }
 
     /// Maps the error returned by an outbound open (`open_outbound_stream`, UDP associate) to
@@ -100,7 +113,7 @@ impl BlockReason {
             RouteWardError::ConnectionTimeout { .. } => Self::KillSwitchProxyTimeout,
             RouteWardError::AuthenticationRejected { .. } => Self::KillSwitchProxyAuthRejected,
             RouteWardError::ProtocolHandshake { .. } => Self::KillSwitchProxyHandshake,
-            RouteWardError::UdpAssociateUnsupported { .. } => Self::KillSwitchUdpUnsupported,
+            RouteWardError::UdpAssociateUnsupported { .. } => Self::UdpProxyUnsupported,
             RouteWardError::ProxyNotFound { .. }
             | RouteWardError::EmptyProxyChain { .. }
             | RouteWardError::InvalidProxyUri { .. } => Self::KillSwitchProxyMisconfigured,
@@ -317,6 +330,16 @@ impl BlockedSummaryStore {
 
     /// Aggregates one blocked record. Simulated records and records that are not blocked are ignored.
     pub(super) fn record(&mut self, conn: &TrackedConnection) {
+        self.aggregate(conn, false);
+    }
+
+    /// Aggregates a repeat of a flow whose first record is already stored: the count and the
+    /// last-seen time move, `lastConnectionId` keeps pointing at the stored row.
+    pub(super) fn record_repeat(&mut self, conn: &TrackedConnection) {
+        self.aggregate(conn, true);
+    }
+
+    fn aggregate(&mut self, conn: &TrackedConnection, keep_connection_id: bool) {
         if conn.status != ConnectionStatus::Blocked || conn.simulated {
             return;
         }
@@ -330,7 +353,9 @@ impl BlockedSummaryStore {
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.count += 1;
             entry.last_seen = entry.last_seen.max(conn.started_at);
-            entry.last_connection_id = conn.id.clone();
+            if !keep_connection_id {
+                entry.last_connection_id = conn.id.clone();
+            }
             entry.last_pid = conn.pid;
             entry.last_error_detail = conn.error_detail.clone();
             if conn.proxy_id.is_some() {

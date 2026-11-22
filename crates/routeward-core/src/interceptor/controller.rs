@@ -434,7 +434,9 @@ impl RouteWardController {
                 Duration::from_millis(ticker_ctrl.constants.telemetry.sampling_interval_ms);
             while ticker_ctrl.is_running() {
                 ticker_ctrl.telemetry.tick_bandwidth_sample();
-                ticker_ctrl.sweep_expired_rules_and_save();
+                // Memory only: persisting the profile is the daemon's job (see ipc), so a
+                // `run --profile X` engine never writes the daemon profile file.
+                ticker_ctrl.sweep_expired_rules(Utc::now());
                 if or_shutdown(&mut ticker_signal, tokio::time::sleep(interval))
                     .await
                     .is_none()
@@ -1195,7 +1197,8 @@ impl RouteWardController {
 
     /// Flushes the OS client DNS resolver cache (`dnsapi.dll!DnsFlushResolverCache` / `ipconfig /flushdns`
     /// on Windows; `resolvectl flush-caches` on Linux if `systemd-resolved` is active).
-    pub fn flush_os_dns_cache(&self, stage: &str) {
+    /// Returns whether the flush succeeded.
+    pub fn flush_os_dns_cache(&self, stage: &str) -> bool {
         match crate::dns::flush_os_dns_cache() {
             Ok(method) => {
                 self.telemetry.push_log(
@@ -1206,6 +1209,7 @@ impl RouteWardController {
                         self.i18n.t_english("cli.engine.startup.dns_cache_flushed")
                     ),
                 );
+                true
             }
             Err(detail) => {
                 self.telemetry.push_log(
@@ -1213,6 +1217,7 @@ impl RouteWardController {
                     COMPONENT_DNS,
                     format!("Skipped OS DNS cache flush on {stage}: {detail}"),
                 );
+                false
             }
         }
     }
@@ -1465,8 +1470,18 @@ impl RouteWardController {
 
     /// Removes the rules whose `expiresAt` has passed at `now` from the active profile and returns
     /// their ids. Logs one INFO line, wakes the DNS server refresh and notifies
-    /// [`Self::subscribe_rule_expiry`] subscribers. The caller persists the profile.
+    /// [`Self::subscribe_rule_expiry`] subscribers. It never persists: the daemon does, on the
+    /// notice. The check runs under a read lock, the write lock is taken only when a rule expired.
     pub fn sweep_expired_rules(&self, now: chrono::DateTime<Utc>) -> Vec<String> {
+        let any_expired = self
+            .profile
+            .read()
+            .rules
+            .iter()
+            .any(|r| RuleEngine::is_expired(r, now));
+        if !any_expired {
+            return Vec::new();
+        }
         let removed = {
             let mut prof = self.profile.write();
             let ids = RuleEngine::expired_rule_ids(&prof.rules, now);
@@ -1492,18 +1507,22 @@ impl RouteWardController {
         removed
     }
 
-    /// Periodic sweep: removes expired rules and saves the profile when any was removed.
-    fn sweep_expired_rules_and_save(&self) {
-        if self.sweep_expired_rules(Utc::now()).is_empty() {
-            return;
+    /// Saves the profile after rules expired, for the daemon only (the controller that owns a
+    /// protection state path). Any other controller (`routeward run --profile X`, user CLI,
+    /// tests) returns `None` and writes nothing.
+    pub fn persist_after_rule_expiry(&self) -> Option<RouteWardResult<()>> {
+        if !self.persists_protection_state() {
+            return None;
         }
-        if let Err(err) = self.save_profile_default() {
+        let result = self.save_profile_default();
+        if let Err(err) = &result {
             self.telemetry.push_log(
                 LogLevel::Warn,
                 COMPONENT_RULE,
                 format!("Could not save the profile after removing expired rules: {err}"),
             );
         }
+        Some(result)
     }
 
     /// Subscribes to the ids of the rules removed by the expiry sweeper.
@@ -2376,6 +2395,8 @@ impl RouteWardController {
                 });
             }
         }
+        // A loaded profile may carry rules that already expired: drop them now.
+        self.sweep_expired_rules(Utc::now());
         Ok(())
     }
 

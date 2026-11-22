@@ -242,6 +242,7 @@ impl DesktopCommandBridge {
             &constants.telemetry.log_app_name,
             default_profile.enable_logging,
         );
+        file_logger.set_retention_days(constants.telemetry.log_retention_days);
         let net = &constants.network;
         let (event_tx, _) = tokio::sync::broadcast::channel(BRIDGE_EVENT_CHANNEL_CAPACITY);
         // Next to the other per-user state (the WebView data lives in a sub-directory of it).
@@ -1558,6 +1559,18 @@ impl DesktopCommandBridge {
         self.state.write().fake_ips.clear();
     }
 
+    /// Flushes the operating system DNS resolver cache through the daemon (not the Fake-IP
+    /// table). Returns whether the daemon reported success.
+    pub async fn flush_os_dns_cache(&self) -> Result<bool, IpcCallError> {
+        let reply: serde_json::Value = self
+            .call_daemon_detailed(IpcCommand::FlushOsDnsCache)
+            .await?;
+        Ok(reply
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
+    }
+
     /// Aggregated blocked connections from the daemon (`since` in epoch milliseconds).
     pub async fn list_blocked(
         &self,
@@ -1644,9 +1657,11 @@ impl DesktopCommandBridge {
                         max_log_days: telemetry.diagnostics_max_log_days,
                         logs_max_bytes: telemetry.diagnostics_logs_max_bytes,
                         bundle_max_bytes: telemetry.diagnostics_bundle_max_bytes,
+                        hard_max_bytes: self.constants.ipc.max_line_bytes,
                     },
                     known_domains,
-                    redactor: Redactor::from_environment(),
+                    redactor: Redactor::from_environment()
+                        .with_profile_credentials(&self.state.read().profile),
                 },
             );
         }

@@ -390,7 +390,10 @@ impl TelemetryHub {
     pub fn record_connection(&self, conn: TrackedConnection, is_proxied: bool) {
         match conn.status {
             ConnectionStatus::Blocked => {
-                self.blocked_count.fetch_add(1, Ordering::Relaxed);
+                // A simulated record is hypothetical: it is never counted.
+                if !conn.simulated {
+                    self.blocked_count.fetch_add(1, Ordering::Relaxed);
+                }
                 self.blocked_summary.lock().record(&conn);
             }
             _ => {
@@ -429,7 +432,8 @@ impl TelemetryHub {
             if seen.elapsed() < self.udp_flow_idle_timeout {
                 *seen = now;
                 drop(seen);
-                self.blocked_summary.lock().record(&conn);
+                // The datagram has no stored row: the summary keeps pointing at the first one.
+                self.blocked_summary.lock().record_repeat(&conn);
                 return false;
             }
             *seen = now;

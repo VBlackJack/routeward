@@ -71,6 +71,12 @@ impl RouteWardController {
         self
     }
 
+    /// True for the daemon controller, the only one that persists the profile and the protection
+    /// state.
+    pub(crate) fn persists_protection_state(&self) -> bool {
+        self.protection.path.is_some()
+    }
+
     fn save_protection_state(&self, state: &ProtectionState) {
         let Some(path) = self.protection.path.as_ref() else {
             return;

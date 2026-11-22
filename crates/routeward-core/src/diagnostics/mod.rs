@@ -165,6 +165,7 @@ pub fn collect_diagnostics(
             max_log_days: telemetry.diagnostics_max_log_days,
             logs_max_bytes: telemetry.diagnostics_logs_max_bytes,
             bundle_max_bytes: telemetry.diagnostics_bundle_max_bytes,
+            hard_max_bytes: controller.constants.ipc.max_line_bytes,
         },
         now: Utc::now(),
         os: &diagnostics.os_name,

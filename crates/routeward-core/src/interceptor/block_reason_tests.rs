@@ -26,6 +26,7 @@ use crate::config::{
 use crate::interceptor::nat::{NatSessionEntry, PidResolutionSource};
 use crate::proxy::udp::Socks5UdpTarget;
 use crate::rules::ConnectionRequest;
+use crate::telemetry::BlockedRecord;
 use crate::telemetry::{BlockReason, ConnectionStatus};
 use chrono::{Duration as ChronoDuration, Utc};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -151,6 +152,50 @@ async fn repeated_blocked_datagrams_of_one_flow_make_one_record_and_a_counted_su
     assert_eq!(summary[0].count, 3);
     assert_eq!(summary[0].block_reason, BlockReason::QuicBlocked);
     assert_eq!(summary[0].destination, "203.0.113.10");
+    // The summary points at the one stored row, never at a datagram that was only counted.
+    let stored = blocked_records(&controller);
+    assert_eq!(summary[0].last_connection_id, stored[0].id);
+}
+
+#[test]
+fn simulated_blocked_records_are_not_counted_in_the_blocked_total() {
+    let controller = controller_with(|p| p.default_action = RuleAction::Block);
+    let before = controller.telemetry.snapshot().blocked_count;
+    let simulated = controller.simulate_connection(udp_request(6000));
+    assert!(simulated.simulated);
+    assert_eq!(controller.telemetry.snapshot().blocked_count, before);
+    assert!(controller.telemetry.blocked_summary().is_empty());
+}
+
+#[test]
+fn local_name_guard_flows_are_told_apart_by_the_name_asked() {
+    let controller = controller_with(|_| {});
+    let client: SocketAddr = "192.168.1.20:5353".parse().expect("client");
+    let ask = |qname: &str| {
+        controller.record_blocked_udp(
+            client,
+            BlockedRecord::new(
+                BlockReason::LocalNameGuard,
+                TransportProtocol::Udp,
+                "LocalNameGuard:mDNS",
+            )
+            .process("mdns", "mdns", 0)
+            .target("224.0.0.251", 5353)
+            .with_ip(Some("224.0.0.251".to_string()))
+            .with_domain(Some(qname.to_string())),
+        );
+    };
+    ask("secret.example.com");
+    ask("secret.example.com");
+    ask("other.example.com");
+    assert_eq!(blocked_records(&controller).len(), 2);
+    let counts: u64 = controller
+        .telemetry
+        .blocked_summary()
+        .iter()
+        .map(|s| s.count)
+        .sum();
+    assert_eq!(counts, 3);
 }
 
 #[tokio::test]
@@ -243,6 +288,7 @@ async fn socks5_encrypted_dns_block_matches_predict_outcome() {
     );
     assert_eq!(records[0].matched_rule, ENCRYPTED_DNS_POLICY_RULE_NAME);
     assert_eq!(records[0].protocol, TransportProtocol::Tcp);
+    assert_eq!(records[0].target_ip.as_deref(), Some("203.0.113.10"));
     let logs = controller.telemetry.list_logs();
     let line = logs
         .iter()
@@ -320,6 +366,44 @@ async fn kill_switch_block_carries_the_upstream_failure_and_the_proxy() {
 }
 
 #[tokio::test]
+async fn transparent_session_block_reason_follows_the_policy_name_not_only_the_rule_id() {
+    let controller = std::sync::Arc::new(controller_with(|_| {}));
+    let relay = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+    let client = TcpStream::connect(relay.local_addr().expect("relay addr"))
+        .await
+        .expect("connect");
+    let (server_stream, accepted) = relay.accept().await.expect("accept");
+    controller.nat_table.insert_session(NatSessionEntry {
+        client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        client_port: accepted.port(),
+        orig_dst_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        orig_dst_port: 9,
+        pid: 4242,
+        process_name: "curl.exe".to_string(),
+        process_path: r"C:\curl.exe".to_string(),
+        resolution_source: PidResolutionSource::SocketLayer,
+        action: RuleAction::Block,
+        matched_rule_name: crate::rules::DEFAULT_FALLBACK_RULE_NAME.to_string(),
+        created_at: std::time::Instant::now(),
+    });
+    let reader = tokio::spawn(async move {
+        let mut client = client;
+        let mut buf = Vec::new();
+        let _ = client.read_to_end(&mut buf).await;
+    });
+    let _ = controller
+        .handle_transparent_tcp_client(server_stream, accepted)
+        .await;
+    reader.await.expect("reader");
+    let records = blocked_records(&controller);
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].block_reason,
+        Some(BlockReason::DefaultPolicyBlock)
+    );
+}
+
+#[tokio::test]
 async fn direct_udp_kill_switch_reports_a_kill_switch_reason_with_detail() {
     use crate::dns::codec::{build_rcode_response, parse_dns_query, RCODE_SERVFAIL};
     use tokio::net::UdpSocket;
@@ -364,6 +448,74 @@ async fn direct_udp_kill_switch_reports_a_kill_switch_reason_with_detail() {
         Some(BlockReason::KillSwitchDirectUdpFailed)
     );
     assert!(record.error_detail.is_some());
+}
+
+#[tokio::test]
+async fn udp_through_a_tcp_only_proxy_is_not_a_proxy_outage_with_the_kill_switch_off() {
+    let controller = controller_with(|p| {
+        p.security_policy.kill_switch_enabled = false;
+        p.security_policy.block_udp_on_tcp_only_proxy = true;
+        p.proxies = vec![proxy("tcp-only", 1)];
+        p.rules = vec![rule(
+            "via-proxy",
+            1,
+            RuleAction::Proxy {
+                target_id: "tcp-only".to_string(),
+            },
+        )];
+    });
+    let client: SocketAddr = "10.0.2.15:55200".parse().expect("client");
+    let res = controller
+        .forward_udp_datagram(
+            client,
+            "game.exe",
+            Some(r"C:\game.exe"),
+            9,
+            &Socks5UdpTarget::Ipv4(Ipv4Addr::new(203, 0, 113, 10), 5000),
+            b"probe",
+            false,
+        )
+        .await;
+    assert!(res.is_err());
+    let record = blocked_records(&controller)
+        .into_iter()
+        .find(|c| c.target_port == 5000)
+        .expect("blocked record");
+    let reason = record.block_reason.expect("reason");
+    assert_eq!(reason, BlockReason::UdpProxyUnsupported);
+    assert!(!reason.is_kill_switch_proxy());
+}
+
+#[test]
+fn the_dns_resolution_action_skips_an_expired_proxy_rule() {
+    let controller = controller_with(|p| {
+        p.dns_config.remote_dns_resolution = true;
+        p.proxies = vec![proxy("live", 1)];
+        let mut expired = rule(
+            "expired-proxy",
+            1,
+            RuleAction::Proxy {
+                target_id: "gone".to_string(),
+            },
+        );
+        expired.process_patterns = vec!["nothing.exe".to_string()];
+        expired.expires_at = Some(Utc::now() - ChronoDuration::minutes(1));
+        let mut live = rule(
+            "live-proxy",
+            2,
+            RuleAction::Proxy {
+                target_id: "live".to_string(),
+            },
+        );
+        live.process_patterns = vec!["nothing.exe".to_string()];
+        p.rules = vec![expired, live];
+    });
+    assert_eq!(
+        controller.select_dns_resolution_action("example.com"),
+        RuleAction::Proxy {
+            target_id: "live".to_string()
+        }
+    );
 }
 
 #[test]

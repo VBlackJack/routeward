@@ -30,8 +30,9 @@ use crate::interceptor::nat::SelfPortGuard;
 use crate::proxy::udp::is_expected_relay_source;
 #[cfg(target_os = "linux")]
 use crate::proxy::ProxyConnector;
-use crate::rules::ConnectionRequest;
+use crate::rules::{ConnectionRequest, RuleEngine};
 use crate::telemetry::LogLevel;
+use chrono::Utc;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -587,8 +588,10 @@ impl RouteWardController {
             return prof.default_action.clone();
         }
 
+        let now = Utc::now();
         for rule in &prof.rules {
             if rule.enabled
+                && !RuleEngine::is_expired(rule, now)
                 && matches!(
                     rule.action,
                     RuleAction::Proxy { .. } | RuleAction::Chain { .. }

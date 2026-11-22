@@ -295,8 +295,14 @@ pub fn predict_from_evaluation(
         policy_override = Some(over.reason);
     }
 
-    if policy_override.is_none() && security.kill_switch_enabled {
-        policy_override = kill_switch_prediction(profile, &eval.action, request.protocol, health);
+    if policy_override.is_none() {
+        policy_override = proxy_prediction(
+            profile,
+            &eval.action,
+            request.protocol,
+            health,
+            security.kill_switch_enabled,
+        );
     }
 
     PredictedOutcome {
@@ -305,23 +311,25 @@ pub fn predict_from_evaluation(
     }
 }
 
-/// Whether the kill switch would block a proxied action given what is known about the proxies.
-fn kill_switch_prediction(
+/// Whether a proxied action would be blocked given what is known about the proxies. Outage
+/// reasons need the kill switch; the UDP capability gap applies whatever its state.
+fn proxy_prediction(
     profile: &ProfileConfig,
     action: &RuleAction,
     protocol: TransportProtocol,
     health: &[ProxyHealthReport],
+    kill_switch_enabled: bool,
 ) -> Option<BlockReason> {
     let proxy_ids: Vec<&str> = match action {
         RuleAction::Proxy { target_id } => {
             if !profile.proxies.iter().any(|p| &p.id == target_id) {
-                return Some(BlockReason::KillSwitchProxyMisconfigured);
+                return kill_switch_enabled.then_some(BlockReason::KillSwitchProxyMisconfigured);
             }
             vec![target_id.as_str()]
         }
         RuleAction::Chain { target_id } => {
             let Some(chain) = profile.chains.iter().find(|c| &c.id == target_id) else {
-                return Some(BlockReason::KillSwitchProxyMisconfigured);
+                return kill_switch_enabled.then_some(BlockReason::KillSwitchProxyMisconfigured);
             };
             if chain.proxy_ids.is_empty()
                 || chain
@@ -329,7 +337,7 @@ fn kill_switch_prediction(
                     .iter()
                     .any(|id| !profile.proxies.iter().any(|p| &p.id == id))
             {
-                return Some(BlockReason::KillSwitchProxyMisconfigured);
+                return kill_switch_enabled.then_some(BlockReason::KillSwitchProxyMisconfigured);
             }
             chain.proxy_ids.iter().map(String::as_str).collect()
         }
@@ -339,14 +347,14 @@ fn kill_switch_prediction(
         let Some(report) = health.iter().find(|r| r.proxy_id == id) else {
             continue;
         };
-        if !report.reachable {
+        if !report.reachable && kill_switch_enabled {
             return Some(BlockReason::KillSwitchProxyUnreachable);
         }
         if protocol == TransportProtocol::Udp
             && !report.udp_supported
             && profile.security_policy.block_udp_on_tcp_only_proxy
         {
-            return Some(BlockReason::KillSwitchUdpUnsupported);
+            return Some(BlockReason::UdpProxyUnsupported);
         }
     }
     None

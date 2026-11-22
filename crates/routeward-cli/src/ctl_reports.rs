@@ -37,21 +37,36 @@ const SECONDS_PER_DAY: u64 = 86_400;
 const INDENT: &str = "    ";
 const SECTION_SEPARATOR: &str = ", ";
 
-/// Parses `--level` (case-insensitive).
-pub fn parse_level(raw: &str) -> Result<LogLevel, String> {
+/// Locale keys of the argument errors and notes the log and blocked reports print.
+const KEY_INVALID_LEVEL: &str = "cli.logs.invalid_level";
+const KEY_INVALID_SINCE: &str = "cli.logs.invalid_since";
+const KEY_MORE_AVAILABLE: &str = "cli.logs.more_available";
+const KEY_EMPTY_RESULT: &str = "cli.ctl.empty_result";
+const KEY_BLOCKED_COUNTERS: &str = "cli.blocked.counters";
+
+/// Parses `--level` (case-insensitive). The error is the localized message.
+pub fn parse_level(i18n: &I18nRegistry, raw: &str) -> Result<LogLevel, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "debug" => Ok(LogLevel::Debug),
         "info" => Ok(LogLevel::Info),
         "warn" | "warning" => Ok(LogLevel::Warn),
         "error" => Ok(LogLevel::Error),
-        other => Err(format!(
-            "unknown level '{other}' (debug, info, warn, error)"
+        _ => Err(interpolate(
+            &i18n.t(KEY_INVALID_LEVEL),
+            &[("value", raw.trim().to_string())],
         )),
     }
 }
 
 /// Parses `--since`: a whole number followed by `s`, `m`, `h` or `d` (`90s`, `15m`, `2h`, `1d`).
-pub fn parse_since(raw: &str) -> Result<Duration, String> {
+/// The error is the localized message.
+pub fn parse_since(i18n: &I18nRegistry, raw: &str) -> Result<Duration, String> {
+    let invalid = || {
+        interpolate(
+            &i18n.t(KEY_INVALID_SINCE),
+            &[("value", raw.trim().to_string())],
+        )
+    };
     let trimmed = raw.trim();
     let (digits, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
     let seconds_per_unit = match unit {
@@ -59,19 +74,18 @@ pub fn parse_since(raw: &str) -> Result<Duration, String> {
         "m" => SECONDS_PER_MINUTE,
         "h" => SECONDS_PER_HOUR,
         "d" => SECONDS_PER_DAY,
-        _ => {
-            return Err(format!(
-                "'{raw}': use a number and s, m, h or d (for example 15m)"
-            ))
-        }
+        _ => return Err(invalid()),
     };
-    let amount: u64 = digits
-        .parse()
-        .map_err(|_| format!("'{raw}': use a number and s, m, h or d (for example 15m)"))?;
+    let amount: u64 = digits.parse().map_err(|_| invalid())?;
     amount
         .checked_mul(seconds_per_unit)
         .map(Duration::from_secs)
-        .ok_or_else(|| format!("'{raw}': too large"))
+        .ok_or_else(invalid)
+}
+
+/// The localized message printed when the daemon answers without a result.
+pub fn empty_result_message(i18n: &I18nRegistry) -> String {
+    i18n.t(KEY_EMPTY_RESULT)
 }
 
 /// `{{name}}` placeholders of a locale text replaced by `params`.
@@ -117,10 +131,14 @@ pub fn format_blocked(i18n: &I18nRegistry, response: &BlockedResponse) -> String
     }
     let counters = &response.counters;
     if counters.dropped_unattributed_syn > 0 || counters.dropped_unattributed_udp > 0 {
-        out.push_str(&format!(
-            "droppedUnattributedSyn={} droppedUnattributedUdp={}\n",
-            counters.dropped_unattributed_syn, counters.dropped_unattributed_udp
+        out.push_str(&interpolate(
+            &i18n.t(KEY_BLOCKED_COUNTERS),
+            &[
+                ("syn", counters.dropped_unattributed_syn.to_string()),
+                ("udp", counters.dropped_unattributed_udp.to_string()),
+            ],
         ));
+        out.push('\n');
     }
     out
 }
@@ -182,7 +200,11 @@ pub fn format_logs(i18n: &I18nRegistry, response: &QueryLogsResponse) -> String 
         ));
     }
     if let Some(cursor) = &response.next_cursor {
-        out.push_str(&format!("(older entries exist, cursor {cursor})\n"));
+        out.push_str(&interpolate(
+            &i18n.t(KEY_MORE_AVAILABLE),
+            &[("cursor", cursor.to_string())],
+        ));
+        out.push('\n');
     }
     out
 }
@@ -297,15 +319,53 @@ mod tests {
 
     #[test]
     fn level_and_since_parse_and_reject_garbage() {
-        assert_eq!(parse_level("WARN"), Ok(LogLevel::Warn));
-        assert_eq!(parse_level("warning"), Ok(LogLevel::Warn));
-        assert!(parse_level("loud").is_err());
-        assert_eq!(parse_since("90s"), Ok(Duration::from_secs(90)));
-        assert_eq!(parse_since("15m"), Ok(Duration::from_secs(900)));
-        assert_eq!(parse_since("2h"), Ok(Duration::from_secs(7200)));
-        assert_eq!(parse_since("1d"), Ok(Duration::from_secs(86_400)));
+        let i18n = english();
+        assert_eq!(parse_level(&i18n, "WARN"), Ok(LogLevel::Warn));
+        assert_eq!(parse_level(&i18n, "warning"), Ok(LogLevel::Warn));
+        assert!(parse_level(&i18n, "loud").is_err());
+        assert_eq!(parse_since(&i18n, "90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_since(&i18n, "15m"), Ok(Duration::from_secs(900)));
+        assert_eq!(parse_since(&i18n, "2h"), Ok(Duration::from_secs(7200)));
+        assert_eq!(parse_since(&i18n, "1d"), Ok(Duration::from_secs(86_400)));
         for bad in ["", "m", "15", "-5m", "1.5h", "5x", "99999999999999999999d"] {
-            assert!(parse_since(bad).is_err(), "{bad}");
+            assert!(parse_since(&i18n, bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn argument_errors_and_notes_come_from_the_locale_keys_in_both_languages() {
+        for locale in ["en", "fr"] {
+            let i18n = I18nRegistry::new(locale);
+            assert_eq!(
+                parse_level(&i18n, "loud"),
+                Err(interpolate(
+                    &i18n.t(KEY_INVALID_LEVEL),
+                    &[("value", "loud".to_string())]
+                ))
+            );
+            assert_eq!(
+                parse_since(&i18n, "5x"),
+                Err(interpolate(
+                    &i18n.t(KEY_INVALID_SINCE),
+                    &[("value", "5x".to_string())]
+                ))
+            );
+            assert_eq!(empty_result_message(&i18n), i18n.t(KEY_EMPTY_RESULT));
+            let counters = format_blocked(
+                &i18n,
+                &BlockedResponse {
+                    entries: Vec::new(),
+                    counters: UnattributedDropCounters {
+                        dropped_unattributed_syn: 4,
+                        dropped_unattributed_udp: 9,
+                    },
+                },
+            );
+            assert!(counters.contains(&interpolate(
+                &i18n.t(KEY_BLOCKED_COUNTERS),
+                &[("syn", "4".to_string()), ("udp", "9".to_string())]
+            )));
+            assert!(!counters.contains("droppedUnattributed"));
         }
     }
 
@@ -333,7 +393,10 @@ mod tests {
             },
         );
         assert!(full.contains("3x slack.exe -> slack.com:443 tcp defaultPolicyBlock rule=Default"));
-        assert!(full.contains("droppedUnattributedSyn=4"));
+        assert!(full.contains(&interpolate(
+            &i18n.t(KEY_BLOCKED_COUNTERS),
+            &[("syn", "4".to_string()), ("udp", "0".to_string())]
+        )));
         assert!(!full.contains(&i18n.t("cli.blocked.empty")));
     }
 
@@ -416,7 +479,10 @@ mod tests {
             },
         );
         assert!(out.contains("[WARN] [Proxy] slow answer"));
-        assert!(out.contains("cursor 42"));
+        assert!(out.contains(&interpolate(
+            &i18n.t(KEY_MORE_AVAILABLE),
+            &[("cursor", "42".to_string())]
+        )));
     }
 
     #[test]

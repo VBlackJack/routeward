@@ -311,13 +311,33 @@ fn kill_switch_predicts_udp_without_udp_support() {
     );
     let udp = request(TransportProtocol::Udp, 5000);
     let out = predict(&p, &udp, &[report("p1", true, false)]);
-    assert_eq!(
-        out.policy_override,
-        Some(BlockReason::KillSwitchUdpUnsupported)
-    );
+    assert_eq!(out.policy_override, Some(BlockReason::UdpProxyUnsupported));
     let tcp = request(TransportProtocol::Tcp, 5000);
     assert_eq!(
         predict(&p, &tcp, &[report("p1", true, false)]).policy_override,
+        None
+    );
+}
+
+#[test]
+fn udp_proxy_gap_is_predicted_with_the_kill_switch_off_and_is_not_an_outage() {
+    let mut p = profile(
+        vec![rule(
+            "via-proxy",
+            1,
+            RuleAction::Proxy {
+                target_id: "p1".to_string(),
+            },
+        )],
+        RuleAction::Direct,
+    );
+    p.security_policy.kill_switch_enabled = false;
+    let udp = request(TransportProtocol::Udp, 5000);
+    let out = predict(&p, &udp, &[report("p1", true, false)]);
+    assert_eq!(out.policy_override, Some(BlockReason::UdpProxyUnsupported));
+    p.security_policy.block_udp_on_tcp_only_proxy = false;
+    assert_eq!(
+        predict(&p, &udp, &[report("p1", true, false)]).policy_override,
         None
     );
 }

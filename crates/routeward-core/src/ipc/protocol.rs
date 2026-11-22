@@ -162,6 +162,8 @@ pub enum IpcCommand {
         domain: String,
     },
     FlushFakeIps,
+    /// Flushes the operating system DNS resolver cache (not the Fake-IP table).
+    FlushOsDnsCache,
     ImportFoxyProxyJson {
         json: String,
         #[serde(default, rename = "processPatterns")]

@@ -179,7 +179,8 @@
     "linuxProfilePath": "/etc/routeward/active_profile.json",
     "maxLineBytes": 8388608,
     "idleTimeoutMs": 30000,
-    "reconnectIntervalMs": 2000
+    "reconnectIntervalMs": 2000,
+    "ruleExpirySweepIntervalMs": 1000
   },
   "protocols": {
     "socks5Version": 5,

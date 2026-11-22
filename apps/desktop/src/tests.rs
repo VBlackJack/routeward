@@ -1609,7 +1609,12 @@ fn proxy_outage_follows_the_block_reason_and_ignores_simulations() {
         assert!(is_proxy_outage(&connection(Some(reason), false, None)));
     }
     // A reason that is not a proxy failure never alerts, even with a detail.
-    for reason in ["ruleBlock", "quicBlocked", "defaultPolicyBlock"] {
+    for reason in [
+        "ruleBlock",
+        "quicBlocked",
+        "defaultPolicyBlock",
+        "udpProxyUnsupported",
+    ] {
         assert!(!is_proxy_outage(&connection(
             Some(reason),
             false,
@@ -1627,6 +1632,31 @@ fn proxy_outage_follows_the_block_reason_and_ignores_simulations() {
     assert!(!is_proxy_outage(&connection(None, false, None)));
 }
 
+#[test]
+fn desktop_logs_older_than_the_retention_are_pruned_when_a_day_file_opens() {
+    let dir = std::env::temp_dir().join(format!(
+        "routeward_desktop_retention_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let constants = SystemConstants::load_embedded().expect("constants");
+    let old = dir.join(routeward_core::logger::log_file_name(
+        &constants.telemetry.log_app_name,
+        "20200101",
+    ));
+    std::fs::write(&old, "old").expect("old log");
+    let profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    assert!(profile.enable_logging);
+    let bridge = DesktopCommandBridge::new_with_log_dir(constants, profile, "en", dir.clone());
+    bridge.log_info("opens today's file");
+    assert!(!old.exists(), "a log past the retention must be removed");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn blocked_logs_query_and_diagnostics_routes_are_not_shadowed_by_their_prefixes() {
     let constants = constants_with_private_ipc_endpoint("blocked-routes");
@@ -1640,6 +1670,7 @@ async fn blocked_logs_query_and_diagnostics_routes_are_not_shadowed_by_their_pre
         "/api/diagnostics/analyze",
         "/api/diagnostics/collect",
         "/api/rules/preview",
+        "/api/system/flush-os-dns",
     ] {
         let res = handle_api_route("GET", path, "{}", &bridge, None)
             .await
@@ -1676,6 +1707,7 @@ async fn blocked_logs_query_and_diagnostics_routes_are_not_shadowed_by_their_pre
         ("POST", "/api/diagnostics/analyze", "{}"),
         ("POST", "/api/diagnostics/collect", collect_body),
         ("POST", "/api/rules/preview", preview_body),
+        ("POST", "/api/system/flush-os-dns", ""),
     ];
     for (method, path, body) in cases {
         let res = handle_api_route(method, path, body, &bridge, None)
@@ -1762,6 +1794,7 @@ mod desktop_log_bundle {
         max_log_days: 14,
         logs_max_bytes: 3_145_728,
         bundle_max_bytes: 6_291_456,
+        hard_max_bytes: 8_388_608,
     };
 
     fn sensitive_line() -> String {
@@ -1808,6 +1841,30 @@ mod desktop_log_bundle {
     }
 
     #[test]
+    fn desktop_part_lists_its_redaction_codes_and_keeps_mask_domains_consistent() {
+        let dir = temp_dir("codes");
+        write_log(&dir, "20261122", &sensitive_line());
+
+        let mut plain = base_bundle();
+        plain["manifest"]["maskDomains"] = json!(false);
+        plain["manifest"]["redactions"] = json!(["passwords"]);
+        add_desktop_logs(&mut plain, &source(&dir, false, ROOMY));
+        let codes = plain["manifest"]["redactions"].as_array().expect("codes");
+        assert!(codes.iter().any(|c| c == "passwords"));
+        assert!(codes.iter().any(|c| c == "userPaths"));
+        assert!(!codes.iter().any(|c| c == "domains"));
+        assert_eq!(plain["manifest"]["maskDomains"], false);
+
+        let mut masked = base_bundle();
+        masked["manifest"]["maskDomains"] = json!(false);
+        add_desktop_logs(&mut masked, &source(&dir, true, ROOMY));
+        let codes = masked["manifest"]["redactions"].as_array().expect("codes");
+        assert!(codes.iter().any(|c| c == "domains"));
+        assert_eq!(masked["manifest"]["maskDomains"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn desktop_log_masks_sites_with_the_core_hash_when_asked() {
         let dir = temp_dir("mask");
         write_log(&dir, "20261122", &sensitive_line());
@@ -1834,6 +1891,7 @@ mod desktop_log_bundle {
             max_log_days: 14,
             logs_max_bytes: 200_000,
             bundle_max_bytes: 60_000,
+            hard_max_bytes: 8_388_608,
         };
         let mut bundle = base_bundle();
         add_desktop_logs(&mut bundle, &source(&dir, false, limits));
@@ -1846,6 +1904,7 @@ mod desktop_log_bundle {
             max_log_days: 14,
             logs_max_bytes: 200_000,
             bundle_max_bytes: 400,
+            hard_max_bytes: 8_388_608,
         };
         let mut unchanged = base_bundle();
         add_desktop_logs(&mut unchanged, &source(&dir, false, tight));

@@ -18,7 +18,7 @@
 //! The daemon only builds it; the client decides where to save it.
 
 use super::logs::{list_log_dates, log_dir_bytes, read_file_tail};
-use super::redact::{mask_domain, redact_profile, Redactor, MASK_DOMAINS_LABEL, REDACTION_LABELS};
+use super::redact::{mask_domain, mask_site_rule_id, redact_profile, redaction_codes, Redactor};
 use crate::checker::ProxyHealthReport;
 use crate::config::ProfileConfig;
 use crate::interceptor::SystemDiagnostics;
@@ -60,6 +60,9 @@ pub struct BundleLimits {
     pub max_log_days: u32,
     pub logs_max_bytes: usize,
     pub bundle_max_bytes: usize,
+    /// Absolute size the document may never exceed (the IPC line limit): above it, the large
+    /// optional sections are given up even though the bundle cap is already missed.
+    pub hard_max_bytes: usize,
 }
 
 /// Everything a bundle is built from.
@@ -128,6 +131,15 @@ fn mask_name(redactor: &Redactor, name: &str) -> String {
     }
 }
 
+/// A rule id with its site name masked when the user asked to hide site names.
+fn mask_rule_id(redactor: &Redactor, id: &str) -> String {
+    if redactor.masks_domains() {
+        mask_site_rule_id(id)
+    } else {
+        id.to_string()
+    }
+}
+
 fn redacted_connections(input: &BundleInput, redactor: &Redactor) -> Vec<TrackedConnection> {
     input
         .connections
@@ -136,6 +148,10 @@ fn redacted_connections(input: &BundleInput, redactor: &Redactor) -> Vec<Tracked
             let mut conn = conn.clone();
             conn.process_path = redactor.redact_text(&conn.process_path);
             conn.matched_rule = redactor.redact_text(&conn.matched_rule);
+            conn.matched_rule_id = conn
+                .matched_rule_id
+                .as_deref()
+                .map(|id| mask_rule_id(redactor, id));
             conn.error_detail = conn
                 .error_detail
                 .as_deref()
@@ -158,6 +174,14 @@ fn redacted_blocked(input: &BundleInput, redactor: &Redactor) -> Vec<BlockedSumm
             let mut entry = entry.clone();
             entry.process_path = redactor.redact_text(&entry.process_path);
             entry.destination = mask_name(redactor, &entry.destination);
+            entry.matched_rule = entry
+                .matched_rule
+                .as_deref()
+                .map(|name| redactor.redact_text(name));
+            entry.matched_rule_id = entry
+                .matched_rule_id
+                .as_deref()
+                .map(|id| mask_rule_id(redactor, id));
             entry.last_error_detail = entry
                 .last_error_detail
                 .as_deref()
@@ -227,10 +251,7 @@ fn assemble(input: &BundleInput, redactor: &Redactor, sections: &[(&'static str,
         .iter()
         .map(|(name, value)| json!({ "name": name, "bytes": section_bytes(value) }))
         .collect();
-    let mut redactions: Vec<&str> = REDACTION_LABELS.to_vec();
-    if redactor.masks_domains() {
-        redactions.push(MASK_DOMAINS_LABEL);
-    }
+    let redactions = redaction_codes(redactor.masks_domains());
     let mut root = serde_json::Map::new();
     root.insert(
         "manifest".to_string(),
@@ -252,13 +273,14 @@ fn assemble(input: &BundleInput, redactor: &Redactor, sections: &[(&'static str,
 /// Builds the bundle. The logs are cut (halving their budget) until the whole document fits
 /// `bundle_max_bytes`; when even a small budget does not fit, the logs section is left out.
 pub fn build_bundle(input: &BundleInput) -> Value {
+    let seeded = input
+        .redactor
+        .clone()
+        .with_profile_credentials(input.profile);
     let redactor = if input.options.mask_domains {
-        input
-            .redactor
-            .clone()
-            .with_masked_domains(known_domains(input))
+        seeded.with_masked_domains(known_domains(input))
     } else {
-        input.redactor.clone()
+        seeded
     };
 
     let mut fixed: Vec<(&'static str, Value)> =
@@ -285,7 +307,7 @@ pub fn build_bundle(input: &BundleInput) -> Value {
     ));
 
     if input.options.log_days == 0 {
-        return assemble(input, &redactor, &fixed);
+        return assemble_within_cap(input, &redactor, fixed);
     }
 
     let mut budget = input.limits.logs_max_bytes;
@@ -301,11 +323,36 @@ pub fn build_bundle(input: &BundleInput) -> Value {
         }
         budget /= 2;
     }
-    assemble(input, &redactor, &fixed)
+    assemble_within_cap(input, &redactor, fixed)
+}
+
+/// Sections that may be dropped, in the order they are given up, when the document would still
+/// exceed the absolute limit.
+const DROPPABLE_SECTIONS: [&str; 2] = [SECTION_CONNECTIONS, SECTION_PROFILE];
+
+/// Assembles the sections without logs. The bundle cap is already missed here (the logs were
+/// given up for it); the document is returned whole unless it exceeds `hard_max_bytes`, the
+/// transport limit, in which case the large optional sections are given up (the system and
+/// blocked sections stay).
+fn assemble_within_cap(
+    input: &BundleInput,
+    redactor: &Redactor,
+    mut sections: Vec<(&'static str, Value)>,
+) -> Value {
+    let mut bundle = assemble(input, redactor, &sections);
+    for droppable in DROPPABLE_SECTIONS {
+        if section_bytes(&bundle) <= input.limits.hard_max_bytes {
+            break;
+        }
+        sections.retain(|(name, _)| *name != droppable);
+        bundle = assemble(input, redactor, &sections);
+    }
+    bundle
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::redact::REDACTION_CODE_DOMAINS;
     use super::*;
     use crate::config::{
         InterceptionMode, ProxyCredentials, ProxyNode, ProxyProtocol, TransportProtocol,
@@ -443,6 +490,7 @@ mod tests {
         max_log_days: 14,
         logs_max_bytes: 3 * 1024 * 1024,
         bundle_max_bytes: 6 * 1024 * 1024,
+        hard_max_bytes: 8 * 1024 * 1024,
     };
 
     const ALL: CollectOptions = CollectOptions {
@@ -538,7 +586,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|r| r == MASK_DOMAINS_LABEL));
+            .any(|r| r == REDACTION_CODE_DOMAINS));
         let again = serde_json::to_string(&env.bundle(options, LIMITS)).unwrap();
         // Only the timestamps differ between two runs.
         assert_eq!(
@@ -548,6 +596,84 @@ mod tests {
                 .matches(&mask_domain("secret-site.example.org"))
                 .count()
         );
+    }
+
+    #[test]
+    fn proxy_credentials_are_replaced_in_free_text_and_codes_are_listed() {
+        let env = Env::new(0);
+        fs::write(
+            env.dir.join("RouteWard_20261122.log"),
+            "[2026-11-22 10:00:00 +00:00] [WARN] [Proxy] auth failed for alice with s3cret-pw; user=alice CORP\\alice\n",
+        )
+        .unwrap();
+        let bundle = env.bundle(ALL, LIMITS);
+        let text = serde_json::to_string(&bundle).unwrap();
+        assert!(!text.contains("s3cret-pw"));
+        assert!(!text.contains("alice"));
+        let codes: Vec<&str> = bundle["manifest"]["redactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert_eq!(codes, super::super::redact::redaction_codes(false));
+        assert!(!codes.contains(&"domains"));
+    }
+
+    #[test]
+    fn rule_ids_with_site_names_are_masked_in_every_section_when_asked() {
+        let mut env = Env::new(3);
+        let site_id = "rule-unblock-site-secret-site-example-org-tmp";
+        env.profile.rules[0].id = site_id.to_string();
+        env.connections[0].matched_rule_id = Some(site_id.to_string());
+        env.connections[0].matched_rule = "rule-unblock-site-secret-site-example-org-tmp".into();
+        env.blocked[0].matched_rule_id = Some(site_id.to_string());
+        env.blocked[0].matched_rule = Some("Unblock secret-site.example.org".to_string());
+        env.profile.proxies[0].tls = true;
+        env.profile.proxies[0].sni = Some("sni.secret-site.example.org".to_string());
+
+        let masked = env.bundle(
+            CollectOptions {
+                mask_domains: true,
+                ..ALL
+            },
+            LIMITS,
+        );
+        let text = serde_json::to_string(&masked).unwrap();
+        assert!(!text.contains("secret-site"), "site name leaked: {text}");
+        let code = mask_site_rule_id(site_id);
+        assert_eq!(masked["profile"]["rules"][0]["id"], code);
+        assert_eq!(masked["connections"][0]["matchedRuleId"], code);
+        assert_eq!(masked["blocked"]["entries"][0]["matchedRuleId"], code);
+        assert_eq!(
+            masked["profile"]["proxies"][0]["sni"],
+            mask_domain("sni.secret-site.example.org")
+        );
+        assert!(masked["manifest"]["redactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == REDACTION_CODE_DOMAINS));
+
+        // Without masking the ids stay readable.
+        let plain = env.bundle(ALL, LIMITS);
+        assert_eq!(plain["connections"][0]["matchedRuleId"], site_id);
+    }
+
+    #[test]
+    fn sections_that_exceed_the_transport_limit_are_given_up_before_the_document_is_returned() {
+        let env = Env::new(0);
+        let tiny = BundleLimits {
+            bundle_max_bytes: 1500,
+            hard_max_bytes: 1500,
+            ..LIMITS
+        };
+        // No logs requested: the optional sections go until the document fits the hard limit.
+        let bundle = env.bundle(CollectOptions { log_days: 0, ..ALL }, tiny);
+        assert!(bundle.get("connections").is_none());
+        assert!(bundle.get("system").is_some());
+        assert!(bundle.get("blocked").is_some());
+        assert!(section_bytes(&bundle) <= 3000, "kept only what must stay");
     }
 
     #[test]
@@ -581,6 +707,7 @@ mod tests {
             max_log_days: 14,
             logs_max_bytes: 3 * 1024 * 1024,
             bundle_max_bytes: 300_000,
+            hard_max_bytes: usize::MAX,
         };
         let bundle = env.bundle(ALL, limits);
         assert!(section_bytes(&bundle) <= 300_000);

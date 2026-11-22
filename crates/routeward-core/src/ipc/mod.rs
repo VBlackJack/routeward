@@ -32,6 +32,7 @@ use crate::ipc::transport::{connect_ipc_stream, IpcServer, IpcStream, PeerIdenti
 use crate::pac::FoxyProxyImporter;
 use crate::telemetry::LogLevel;
 use serde::de::DeserializeOwned;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -93,6 +94,24 @@ impl DaemonIpcService {
         mut shutdown: watch::Receiver<bool>,
     ) -> RouteWardResult<()> {
         let mut client_tasks = tokio::task::JoinSet::new();
+        // Expired temporary rules are swept and persisted by the daemon, whatever the engine
+        // state. The task is aborted with the accept loop.
+        let sweep_interval = Duration::from_millis(
+            self.controller
+                .constants
+                .ipc
+                .rule_expiry_sweep_interval_ms
+                .max(1),
+        );
+        let expiry_task = tokio::spawn(run_rule_expiry_persistence(
+            self.controller.clone(),
+            sweep_interval,
+            shutdown.clone(),
+            |ctrl: &RouteWardController| {
+                let _ = ctrl.persist_after_rule_expiry();
+            },
+        ));
+        let _expiry_guard = AbortOnDrop(expiry_task);
         loop {
             while client_tasks.try_join_next().is_some() {}
             tokio::select! {
@@ -119,6 +138,45 @@ impl DaemonIpcService {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Aborts the wrapped task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Sweeps expired rules every `interval` (the first sweep runs at once, which covers a profile
+/// loaded with expired rules) and calls `persist` each time rules were removed, by this timer or
+/// by the engine ticker. Returns on shutdown.
+async fn run_rule_expiry_persistence<F>(
+    controller: RouteWardController,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    persist: F,
+) where
+    F: Fn(&RouteWardController),
+{
+    let mut notices = controller.subscribe_rule_expiry();
+    let mut timer = tokio::time::interval(interval);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = wait_for_shutdown_signal(&mut shutdown) => return,
+            _ = timer.tick() => {
+                controller.sweep_expired_rules(chrono::Utc::now());
+            }
+            notice = notices.recv() => match notice {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    persist(&controller);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     }
@@ -476,6 +534,13 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
         IpcCommand::FlushFakeIps => {
             controller.dns.flush();
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
+        }
+        IpcCommand::FlushOsDnsCache => {
+            let ctrl = controller.clone();
+            match run_blocking(move || ctrl.flush_os_dns_cache("ipc")).await {
+                Ok(flushed) => IpcResponse::success(id, &serde_json::json!({ "ok": flushed })),
+                Err(detail) => IpcResponse::error(Some(id), detail),
+            }
         }
         IpcCommand::ImportFoxyProxyJson {
             json,
@@ -998,6 +1063,84 @@ mod tests {
         RouteWardController::new(constants, profile, "en")
     }
 
+    fn expired_rule(id: &str) -> crate::config::RoutingRule {
+        crate::config::RoutingRule {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            priority: 5,
+            process_patterns: vec![],
+            domain_patterns: vec![],
+            ip_cidrs: vec![],
+            port_ranges: vec![],
+            protocol: crate::config::TransportProtocol::Any,
+            action: crate::config::RuleAction::Direct,
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::seconds(5)),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_daemon_sweeps_and_persists_expired_rules_with_the_engine_stopped() {
+        let controller = test_controller();
+        assert!(!controller.is_running());
+        controller.upsert_rule(expired_rule("tmp-1"));
+        let saves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = saves.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_rule_expiry_persistence(
+            controller.clone(),
+            Duration::from_millis(10),
+            stop_rx,
+            move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        ));
+        for _ in 0..200 {
+            if saves.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(controller
+            .profile
+            .read()
+            .rules
+            .iter()
+            .all(|r| r.id != "tmp-1"));
+        // A later tick with nothing to remove never saves again.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 1);
+        stop_tx.send(true).expect("stop");
+        task.await.expect("task ends on shutdown");
+    }
+
+    #[test]
+    fn only_the_daemon_controller_persists_after_a_rule_expiry() {
+        // A plain engine (`routeward run --profile X`, user CLI, tests) never writes a profile.
+        let controller = test_controller();
+        controller.upsert_rule(expired_rule("tmp-2"));
+        assert_eq!(
+            controller.sweep_expired_rules(chrono::Utc::now()),
+            vec!["tmp-2".to_string()]
+        );
+        assert!(controller.persist_after_rule_expiry().is_none());
+    }
+
+    #[test]
+    fn replacing_a_profile_drops_the_rules_that_already_expired() {
+        let controller = test_controller();
+        let mut incoming = controller.profile.read().redacted_for_ipc();
+        incoming.rules.push(expired_rule("tmp-3"));
+        controller.replace_profile(incoming).expect("valid profile");
+        assert!(controller
+            .profile
+            .read()
+            .rules
+            .iter()
+            .all(|r| r.id != "tmp-3"));
+    }
+
     fn proxy_with_auth(id: &str, auth: ProxyCredentials) -> ProxyNode {
         ProxyNode {
             id: id.to_string(),
@@ -1099,6 +1242,7 @@ mod tests {
     fn diagnostics_commands_parse_from_the_documented_json() {
         let samples = [
             r#"{"id":"1","command":{"type":"list_blocked"}}"#,
+            r#"{"id":"1","command":{"type":"flush_os_dns_cache"}}"#,
             r#"{"id":"1","command":{"type":"list_blocked","since":1,"limit":5}}"#,
             r#"{"id":"1","command":{"type":"query_logs","source":"memory","limit":10}}"#,
             r#"{"id":"1","command":{"type":"query_logs","source":{"daemonFile":{"date":"20261122"}},"minLevel":"WARN","components":["a"],"text":"x","pid":3,"connectionId":"abc","since":1,"until":2,"limit":10,"cursor":"5"}}"#,

@@ -911,6 +911,16 @@ pub async fn handle_api_route(
         return Some((200, json_ct, json));
     }
 
+    if path == "/api/system/flush-os-dns" || path.starts_with("/api/system/flush-os-dns?") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        return Some(match bridge.flush_os_dns_cache().await {
+            Ok(ok) => ok_json_response(&serde_json::json!({ "ok": ok }), json_ct),
+            Err(err) => ipc_error_response(&err, json_ct),
+        });
+    }
+
     if path.starts_with("/api/system/pac") {
         if method == "POST" {
             match serde_json::from_str::<SystemProxyRequest>(body_str) {

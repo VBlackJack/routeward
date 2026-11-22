@@ -39,6 +39,15 @@ const MIN_MACHINE_NAME_CHARS: usize = 3;
 const MIN_AUTH_BLOB_CHARS: usize = 8;
 /// Hex digits kept from the hash that replaces a masked site name.
 const MASKED_HASH_HEX_DIGITS: usize = 8;
+/// Shortest literal word (user name, password) that is replaced everywhere in a text.
+const MIN_LITERAL_WORD_CHARS: usize = 3;
+/// Environment variables that hold the name of the signed-in operating system user.
+const OS_USER_ENV_VARS: [&str; 3] = ["USERNAME", "USER", "LOGNAME"];
+/// Rule ids that embed a site name: `rule-site-<slug>`, `rule-unblock-site-<slug>[-proxy][-tmp]`.
+const SITE_RULE_ID_PATTERN: &str =
+    r"(?i)\b(rule-(?:unblock-)?site-)([a-z0-9-]+?)((?:-proxy)?(?:-tmp)?)\b";
+/// A rule id of an app and site pair: `rule-app-<app>--<site>`.
+const APP_SITE_RULE_ID_PATTERN: &str = r"(?i)\b(rule-app-[a-z0-9-]+?--)([a-z0-9-]+)\b";
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// Prefix of a regular-expression rule pattern.
@@ -52,20 +61,30 @@ const NON_DOMAIN_SUFFIXES: &[&str] = &[
     "xml", "html", "css", "png", "ico", "msi", "cab", "bak", "old", "pdb", "rlib", "rmeta",
 ];
 
-/// Redactions the text and profile redaction apply, for the bundle manifest.
-pub const REDACTION_LABELS: &[&str] = &[
-    "proxy passwords",
-    "proxy user names",
-    "web addresses: user info, query and fragment",
-    "authorization headers and tokens",
-    "token, key and password values",
-    "user folder names in paths",
-    "machine name",
-    "public exit addresses of proxies",
+/// Stable codes of the redactions every bundle applies, listed in its manifest. The UI turns each
+/// code into a sentence (`diagnostics.export.redaction.<code>`), so the codes never change.
+pub const REDACTION_CODES: &[&str] = &[
+    "passwords",
+    "authHeaders",
+    "tokens",
+    "urlSecrets",
+    "userPaths",
+    "usernames",
+    "machineName",
+    "exitIp",
 ];
 
-/// Redaction label added to the manifest when site names are masked.
-pub const MASK_DOMAINS_LABEL: &str = "site names";
+/// Code added to the manifest when site names are masked.
+pub const REDACTION_CODE_DOMAINS: &str = "domains";
+
+/// The redaction codes that apply, `domains` included only when site names are masked.
+pub fn redaction_codes(masks_domains: bool) -> Vec<&'static str> {
+    let mut codes = REDACTION_CODES.to_vec();
+    if masks_domains {
+        codes.push(REDACTION_CODE_DOMAINS);
+    }
+    codes
+}
 
 fn truncated_scheme(scheme: &str) -> String {
     scheme.chars().take(LOG_SCHEME_MAX_CHARS).collect()
@@ -119,7 +138,11 @@ struct Patterns {
     url: Regex,
     windows_user_path: Regex,
     unix_user_path: Regex,
+    root_home_path: Regex,
+    user_pair: Regex,
     domain: Regex,
+    site_rule_id: Regex,
+    app_site_rule_id: Regex,
 }
 
 fn patterns() -> &'static Patterns {
@@ -141,12 +164,20 @@ fn patterns() -> &'static Patterns {
             .expect("url pattern"),
         windows_user_path: Regex::new(r#"(?i)([A-Za-z]:[\\/]+Users[\\/]+)([^\\/\s"':*?<>|]+)"#)
             .expect("windows user path pattern"),
-        unix_user_path: Regex::new(r#"(/(?:home|Users)/)([^/\s"':*?<>|]+)"#)
+        unix_user_path: Regex::new(r#"(/(?:var/home|home|Users)/)([^/\s"':*?<>|]+)"#)
             .expect("unix user path pattern"),
+        root_home_path: Regex::new(r"(^|[^\w.-])/root/").expect("root home path pattern"),
+        user_pair: Regex::new(
+            r#"(?i)\b(user(?:name)?|login|logname)("?\s*[=:]\s*)(\[user\]|"[^"]*"|'[^']*'|[^\s&;,"'})\]]+)"#,
+        )
+        .expect("user pair pattern"),
         domain: Regex::new(
             r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,24}\b",
         )
         .expect("domain pattern"),
+        site_rule_id: Regex::new(SITE_RULE_ID_PATTERN).expect("site rule id pattern"),
+        app_site_rule_id: Regex::new(APP_SITE_RULE_ID_PATTERN)
+            .expect("app and site rule id pattern"),
     })
 }
 
@@ -182,6 +213,34 @@ pub fn mask_domain(domain: &str) -> String {
     }
 }
 
+/// True for a slug that [`mask_domain`] already produced (eight hex digits).
+fn is_masked_slug(slug: &str) -> bool {
+    slug.len() == MASKED_HASH_HEX_DIGITS && slug.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Masks the site name inside a rule id built by the UI (`rule-site-<slug>`,
+/// `rule-unblock-site-<slug>[-proxy][-tmp]`, `rule-app-<app>--<slug>`): the slug becomes a stable
+/// code, so ids stay unique and equal ids stay equal. Any other id is returned unchanged.
+pub fn mask_site_rule_id(id: &str) -> String {
+    let p = patterns();
+    let masked = p.site_rule_id.replace_all(id, |caps: &Captures| {
+        if is_masked_slug(&caps[2]) {
+            caps[0].to_string()
+        } else {
+            format!("{}{}{}", &caps[1], mask_domain(&caps[2]), &caps[3])
+        }
+    });
+    p.app_site_rule_id
+        .replace_all(&masked, |caps: &Captures| {
+            if is_masked_slug(&caps[2]) {
+                caps[0].to_string()
+            } else {
+                format!("{}{}", &caps[1], mask_domain(&caps[2]))
+            }
+        })
+        .into_owned()
+}
+
 /// Masks a domain pattern of a rule (`*.example.com`, `!example.com`, `.example.com`): the
 /// marker is kept, the name is replaced; regular expressions are replaced as a whole.
 pub fn mask_domain_pattern(pattern: &str) -> String {
@@ -215,12 +274,66 @@ pub struct Redactor {
     machine_name: Option<String>,
     mask_domains: bool,
     known_domains: Vec<String>,
+    /// Words replaced everywhere in a text (user names, passwords), longest first.
+    literals: Vec<(String, &'static str)>,
 }
 
 impl Redactor {
-    /// A redactor that knows the machine name of this computer.
+    /// A redactor that knows the machine name and the signed-in user name of this computer.
     pub fn from_environment() -> Self {
-        Self::default().with_machine_name(machine_name_from_environment())
+        let users: Vec<String> = OS_USER_ENV_VARS
+            .iter()
+            .filter_map(|var| std::env::var(var).ok())
+            .collect();
+        Self::default()
+            .with_machine_name(machine_name_from_environment())
+            .with_user_words(users)
+    }
+
+    fn add_literals(&mut self, words: impl IntoIterator<Item = String>, placeholder: &'static str) {
+        for word in words {
+            let word = word.trim().to_string();
+            // A word inside a placeholder would break the idempotence of the redaction.
+            let in_placeholder = [REDACTED_USER, REDACTED_VALUE, REDACTED_MACHINE]
+                .iter()
+                .any(|p| p.to_ascii_lowercase().contains(&word.to_ascii_lowercase()));
+            if word.chars().count() < MIN_LITERAL_WORD_CHARS
+                || in_placeholder
+                || self
+                    .literals
+                    .iter()
+                    .any(|(w, _)| w.eq_ignore_ascii_case(&word))
+            {
+                continue;
+            }
+            self.literals.push((word, placeholder));
+        }
+        self.literals
+            .sort_by_key(|(w, _)| std::cmp::Reverse(w.len()));
+    }
+
+    /// User names (proxy accounts, the operating system user) replaced by `[user]` wherever they
+    /// appear in a text.
+    pub fn with_user_words(mut self, words: impl IntoIterator<Item = String>) -> Self {
+        self.add_literals(words, REDACTED_USER);
+        self
+    }
+
+    /// Secret values (proxy passwords) replaced by `[redacted]` wherever they appear in a text.
+    pub fn with_secret_words(mut self, words: impl IntoIterator<Item = String>) -> Self {
+        self.add_literals(words, REDACTED_VALUE);
+        self
+    }
+
+    /// Seeds the user names and passwords of the proxies of `profile`.
+    pub fn with_profile_credentials(self, profile: &ProfileConfig) -> Self {
+        let mut users = Vec::new();
+        let mut secrets = Vec::new();
+        for auth in profile.proxies.iter().filter_map(|p| p.auth.as_ref()) {
+            users.push(auth.username.clone());
+            secrets.push(auth.password_str().to_string());
+        }
+        self.with_user_words(users).with_secret_words(secrets)
     }
 
     pub fn with_machine_name(mut self, machine_name: Option<String>) -> Self {
@@ -250,10 +363,15 @@ impl Redactor {
     /// Redacts one text (a log line, a message, a whole file).
     pub fn redact_text(&self, input: &str) -> String {
         let p = patterns();
-        // Web addresses first, so a query string is gone before the key=value pass.
+        // Known literal words first: a password never survives inside another pattern.
+        let mut seeded = input.to_string();
+        for (word, placeholder) in &self.literals {
+            seeded = replace_literal_ignore_case(&seeded, word, placeholder);
+        }
+        // Web addresses next, so a query string is gone before the key=value pass.
         let text = p
             .url
-            .replace_all(input, |caps: &Captures| redact_url_in_text(&caps[0]));
+            .replace_all(&seeded, |caps: &Captures| redact_url_in_text(&caps[0]));
         let text = p
             .authorization_header
             .replace_all(&text, format!("${{1}}${{2}}{REDACTED_VALUE}"));
@@ -274,12 +392,22 @@ impl Redactor {
                 format!("{}{}{REDACTED_VALUE}", &caps[1], &caps[2])
             }
         });
+        let text = p.user_pair.replace_all(&text, |caps: &Captures| {
+            if &caps[3] == REDACTED_USER {
+                caps[0].to_string()
+            } else {
+                format!("{}{}{REDACTED_USER}", &caps[1], &caps[2])
+            }
+        });
         let text = p
             .windows_user_path
             .replace_all(&text, format!("${{1}}{REDACTED_USER}"));
         let text = p
             .unix_user_path
             .replace_all(&text, format!("${{1}}{REDACTED_USER}"));
+        let text = p
+            .root_home_path
+            .replace_all(&text, format!("${{1}}/{REDACTED_USER}/"));
         let mut text = text.into_owned();
         if let Some(machine) = &self.machine_name {
             text = replace_word_ignore_case(&text, machine, REDACTED_MACHINE);
@@ -291,7 +419,7 @@ impl Redactor {
     }
 
     fn mask_domains_in_text(&self, text: &str) -> String {
-        let mut out = text.to_string();
+        let mut out = mask_site_rule_id(text);
         for known in &self.known_domains {
             out = replace_word_ignore_case(&out, known, &mask_domain(known));
         }
@@ -317,6 +445,26 @@ fn is_masked_code(candidate: &str) -> bool {
     first.len() == MASKED_HASH_HEX_DIGITS
         && first.bytes().all(|b| b.is_ascii_hexdigit())
         && labels.count() == 1
+}
+
+/// Replaces every occurrence of `word` (ASCII case-insensitive), inside other words too.
+fn replace_literal_ignore_case(text: &str, word: &str, replacement: &str) -> String {
+    if word.is_empty() {
+        return text.to_string();
+    }
+    let lower_text = text.to_ascii_lowercase();
+    let lower_word = word.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(found) = lower_text[cursor..].find(&lower_word) {
+        let start = cursor + found;
+        let end = start + lower_word.len();
+        out.push_str(&text[cursor..start]);
+        out.push_str(replacement);
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
 }
 
 /// Replaces whole-word occurrences of `word` (ASCII case-insensitive) with `replacement`.
@@ -391,6 +539,18 @@ pub fn redact_profile(profile: &ProfileConfig, redactor: &Redactor) -> ProfileCo
             .iter()
             .map(|p| mask_domain_pattern(p))
             .collect();
+        for rule in &mut redacted.rules {
+            rule.id = mask_site_rule_id(&rule.id);
+        }
+        for proxy in &mut redacted.proxies {
+            proxy.sni = proxy.sni.as_deref().map(|name| {
+                if name.contains('.') && name.parse::<std::net::IpAddr>().is_err() {
+                    mask_domain(name)
+                } else {
+                    name.to_string()
+                }
+            });
+        }
     }
     // Names the user typed may hold anything: run them through the text redaction.
     redacted.name = redactor.redact_text(&redacted.name);
@@ -476,6 +636,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn seeded_user_names_and_passwords_are_replaced_everywhere() {
+        let r = redactor()
+            .with_user_words(vec!["alice".to_string(), "CORP".to_string()])
+            .with_secret_words(vec!["Tr0ub4dor&3".to_string()]);
+        let cases = [
+            ("user=alice logged in", "alice"),
+            ("username: \"alice\"", "alice"),
+            (r"CORP\alice opened a session", "alice"),
+            ("mail alice@example.org sent", "alice"),
+            (
+                "proxy said wrong password Tr0ub4dor&3 for it",
+                "Tr0ub4dor&3",
+            ),
+            ("ALICE and Alice", "alice"),
+            ("path /var/home/alice/.config and /home/alice/x", "alice"),
+        ];
+        for (input, secret) in cases {
+            let out = r.redact_text(input);
+            assert!(
+                !out.to_lowercase().contains(&secret.to_lowercase()),
+                "{secret:?} survived in {out:?}"
+            );
+            assert_eq!(r.redact_text(&out), out, "not idempotent: {out:?}");
+        }
+        // A short or placeholder-like word is never seeded: it would corrupt every text.
+        let r = redactor().with_user_words(vec![
+            "ab".to_string(),
+            "user".to_string(),
+            "red".to_string(),
+        ]);
+        assert_eq!(r.redact_text("a user is red"), "a user is red");
+    }
+
+    #[test]
+    fn user_pairs_and_root_and_var_home_paths_are_redacted() {
+        let r = redactor();
+        let out = r.redact_text("user=bobby login: carol username=\"dave\"");
+        for name in ["bobby", "carol", "dave"] {
+            assert!(!out.contains(name), "{name} survived in {out:?}");
+        }
+        assert_eq!(r.redact_text(&out), out);
+        for (input, name) in [
+            ("read /root/.config/routeward", "root"),
+            ("read /var/home/erin/.config", "erin"),
+        ] {
+            let out = r.redact_text(input);
+            assert!(!out.contains(&format!("/{name}/")), "{out}");
+            assert!(out.contains(REDACTED_USER), "{out}");
+        }
+        // Harmless text that merely mentions the word stays.
+        assert_eq!(r.redact_text("a user clicked Save"), "a user clicked Save");
+    }
+
+    #[test]
+    fn site_names_inside_rule_ids_are_masked_consistently() {
+        let r = redactor().with_masked_domains(Vec::new());
+        let ids = [
+            "rule-site-secret-example-com",
+            "rule-unblock-site-secret-example-com",
+            "rule-unblock-site-secret-example-com-proxy",
+            "rule-unblock-site-secret-example-com-tmp",
+            "rule-unblock-site-secret-example-com-proxy-tmp",
+            "rule-app-chrome-exe--secret-example-com",
+        ];
+        for id in ids {
+            let masked = mask_site_rule_id(id);
+            assert!(!masked.contains("secret"), "{id} -> {masked}");
+            assert_eq!(mask_site_rule_id(&masked), masked, "idempotent {id}");
+            assert_eq!(
+                r.redact_text(&format!("matched {id} now")),
+                format!("matched {masked} now")
+            );
+        }
+        // The proxy and temporary markers survive, and equal slugs give equal codes.
+        assert!(mask_site_rule_id(ids[4]).ends_with("-proxy-tmp"));
+        assert_eq!(
+            mask_site_rule_id(ids[1]).trim_start_matches("rule-unblock-site-"),
+            mask_site_rule_id("rule-unblock-site-secret-example-com-tmp")
+                .trim_start_matches("rule-unblock-site-")
+                .trim_end_matches("-tmp")
+        );
+        // Ids that do not carry a site name are untouched.
+        assert_eq!(
+            mask_site_rule_id("rule-app-chrome-exe"),
+            "rule-app-chrome-exe"
+        );
+        assert_eq!(mask_site_rule_id("rule-pack-ads"), "rule-pack-ads");
+        // Without masking requested, the text is left alone.
+        assert_eq!(
+            redactor().redact_text("rule-site-secret-example-com"),
+            "rule-site-secret-example-com"
+        );
+    }
+
+    #[test]
+    fn redaction_codes_are_stable_and_domains_is_conditional() {
+        assert_eq!(
+            redaction_codes(false),
+            vec![
+                "passwords",
+                "authHeaders",
+                "tokens",
+                "urlSecrets",
+                "userPaths",
+                "usernames",
+                "machineName",
+                "exitIp"
+            ]
+        );
+        assert_eq!(redaction_codes(true).last(), Some(&REDACTION_CODE_DOMAINS));
+        assert_eq!(REDACTION_CODE_DOMAINS, "domains");
     }
 
     #[test]

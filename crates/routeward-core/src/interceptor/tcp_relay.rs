@@ -16,11 +16,9 @@
 
 #[cfg(not(windows))]
 use super::nftables::NftablesInterceptor;
-#[cfg(not(windows))]
-use super::policy::block_reason_for_decision;
 use super::policy::{
-    block_reason_for_rule, port_policy_override, unknown_process_block_reason, upstream_proxy_id,
-    UNKNOWN_PROCESS_RULE_ID,
+    block_reason_for_decision, block_reason_for_rule, port_policy_override,
+    unknown_process_block_reason, upstream_proxy_id, UNKNOWN_PROCESS_RULE_ID,
 };
 use super::{
     RouteWardController, COMPONENT_DNS, COMPONENT_ENGINE, COMPONENT_TRANSPARENT, ROUTE_BLOCK_LABEL,
@@ -182,7 +180,7 @@ impl RouteWardController {
             process_name: proc_id.name.clone(),
             process_path: Some(proc_id.executable_path.clone()),
             target_host: target_host.clone(),
-            target_ip: target_ip_str,
+            target_ip: target_ip_str.clone(),
             target_port,
             protocol: TransportProtocol::Tcp,
         });
@@ -230,6 +228,7 @@ impl RouteWardController {
                         proc_id.pid,
                     )
                     .target(target_host, target_port)
+                    .with_ip(target_ip_str.clone())
                     .with_domain(eval.effective_domain)
                     .with_rule_id(eval.matched_rule_id),
             );
@@ -280,6 +279,7 @@ impl RouteWardController {
                     )
                     .process(proc_id.name, proc_id.executable_path, proc_id.pid)
                     .target(target_host, target_port)
+                    .with_ip(target_ip_str.clone())
                     .with_domain(eval.effective_domain)
                     .with_rule_id(eval.matched_rule_id)
                     .with_proxy(upstream_proxy_id(&eval.action))
@@ -563,9 +563,10 @@ impl RouteWardController {
                     resolved_domain,
                     session.matched_rule_name
                 );
-                let reason = session_rule_id
-                    .as_deref()
-                    .map_or(BlockReason::RuleBlock, block_reason_for_rule);
+                let reason = block_reason_for_decision(
+                    session_rule_id.as_deref(),
+                    &session.matched_rule_name,
+                );
                 let mut record = BlockedRecord::new(
                     reason,
                     TransportProtocol::Tcp,

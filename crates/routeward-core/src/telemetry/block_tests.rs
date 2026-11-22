@@ -57,10 +57,7 @@ fn every_reason_serializes_to_its_contract_name() {
             BlockReason::KillSwitchProxyMisconfigured,
             "killSwitchProxyMisconfigured",
         ),
-        (
-            BlockReason::KillSwitchUdpUnsupported,
-            "killSwitchUdpUnsupported",
-        ),
+        (BlockReason::UdpProxyUnsupported, "udpProxyUnsupported"),
         (
             BlockReason::KillSwitchDirectUdpFailed,
             "killSwitchDirectUdpFailed",
@@ -122,7 +119,7 @@ fn upstream_errors_map_to_their_kill_switch_reason() {
                 key: ERR_KEY_UDP_NOT_SUPPORTED,
                 proxy_id: "p".into(),
             },
-            BlockReason::KillSwitchUdpUnsupported,
+            BlockReason::UdpProxyUnsupported,
         ),
         (
             RouteWardError::ProxyNotFound {
@@ -186,9 +183,37 @@ fn upstream_errors_map_to_their_kill_switch_reason() {
 #[test]
 fn kill_switch_proxy_reasons_are_flagged() {
     assert!(BlockReason::KillSwitchProxyRefused.is_kill_switch_proxy());
-    assert!(BlockReason::KillSwitchUdpUnsupported.is_kill_switch_proxy());
+    assert!(!BlockReason::UdpProxyUnsupported.is_kill_switch_proxy());
     assert!(!BlockReason::KillSwitchDirectUdpFailed.is_kill_switch_proxy());
     assert!(!BlockReason::RuleBlock.is_kill_switch_proxy());
+}
+
+#[test]
+fn udp_proxy_failure_never_gets_a_kill_switch_reason_when_the_kill_switch_is_off() {
+    let errors = [
+        RouteWardError::UdpAssociateUnsupported {
+            key: ERR_KEY_UDP_NOT_SUPPORTED,
+            proxy_id: "p".into(),
+        },
+        RouteWardError::ConnectionTimeout {
+            key: ERR_KEY_CONNECTION_TIMEOUT,
+        },
+        RouteWardError::Io(Error::from(ErrorKind::ConnectionRefused)),
+    ];
+    for err in &errors {
+        let off = BlockReason::from_udp_proxy_error(err, false);
+        assert_eq!(off, BlockReason::UdpProxyUnsupported, "{err}");
+        assert!(!off.is_kill_switch_proxy());
+    }
+    // A capability gap stays a capability gap with the kill switch on; an outage becomes one.
+    assert_eq!(
+        BlockReason::from_udp_proxy_error(&errors[0], true),
+        BlockReason::UdpProxyUnsupported
+    );
+    assert_eq!(
+        BlockReason::from_udp_proxy_error(&errors[1], true),
+        BlockReason::KillSwitchProxyTimeout
+    );
 }
 
 #[test]

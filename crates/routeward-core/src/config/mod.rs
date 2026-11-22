@@ -95,6 +95,13 @@ pub struct IpcConstants {
     pub max_line_bytes: usize,
     pub idle_timeout_ms: u64,
     pub reconnect_interval_ms: u64,
+    /// How often the daemon sweeps expired temporary rules, whatever the engine state.
+    #[serde(default = "default_rule_expiry_sweep_interval_ms")]
+    pub rule_expiry_sweep_interval_ms: u64,
+}
+
+fn default_rule_expiry_sweep_interval_ms() -> u64 {
+    1000
 }
 
 impl IpcConstants {

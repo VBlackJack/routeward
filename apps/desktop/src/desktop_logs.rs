@@ -18,7 +18,7 @@
 
 use routeward_core::diagnostics::bundle::{BundleLimits, CollectOptions, SECTION_LOGS};
 use routeward_core::diagnostics::logs::{list_log_dates, read_file_tail};
-use routeward_core::diagnostics::redact::Redactor;
+use routeward_core::diagnostics::redact::{redaction_codes, Redactor};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -31,6 +31,8 @@ const TEXT_KEY: &str = "text";
 /// Keys of the manifest and of its section list.
 const MANIFEST_KEY: &str = "manifest";
 const SECTIONS_KEY: &str = "sections";
+const REDACTIONS_KEY: &str = "redactions";
+const MASK_DOMAINS_KEY: &str = "maskDomains";
 const NAME_KEY: &str = "name";
 const BYTES_KEY: &str = "bytes";
 /// How many times the desktop log budget is halved before the desktop logs are given up.
@@ -96,6 +98,33 @@ fn desktop_files(source: &DesktopLogSource, redactor: &Redactor, budget: usize) 
     files
 }
 
+/// Adds the redaction codes the desktop part applied to the manifest and keeps `maskDomains`
+/// true as soon as any part of the bundle masks site names.
+fn update_redactions(bundle: &mut Value, masks_domains: bool) {
+    let Some(manifest) = bundle.get_mut(MANIFEST_KEY).and_then(Value::as_object_mut) else {
+        return;
+    };
+    let mut codes: Vec<Value> = manifest
+        .get(REDACTIONS_KEY)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for code in redaction_codes(masks_domains) {
+        if !codes.iter().any(|c| c.as_str() == Some(code)) {
+            codes.push(json!(code));
+        }
+    }
+    manifest.insert(REDACTIONS_KEY.to_string(), Value::Array(codes));
+    let already = manifest
+        .get(MASK_DOMAINS_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    manifest.insert(
+        MASK_DOMAINS_KEY.to_string(),
+        json!(already || masks_domains),
+    );
+}
+
 /// Rewrites the size of the logs section in the manifest (adding the entry when the daemon left
 /// the section out).
 fn update_manifest(bundle: &mut Value) {
@@ -155,6 +184,7 @@ pub fn add_desktop_logs(bundle: &mut Value, source: &DesktopLogSource) {
             None => *logs = json!({ FILES_KEY: files }),
         }
         update_manifest(&mut candidate);
+        update_redactions(&mut candidate, redactor.masks_domains());
         if json_bytes(&candidate) <= source.limits.bundle_max_bytes {
             *bundle = candidate;
             return;

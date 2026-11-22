@@ -19,7 +19,7 @@ mod ctl_reports;
 use clap::{Parser, Subcommand};
 use routeward_core::config::security::load_or_init_secure_daemon_profile;
 use routeward_core::config::{
-    ProfileConfig, ProxyNode, RoutingRule, SystemConstants, TransportProtocol,
+    ProfileConfig, ProxyNode, RoutingRule, SystemConstants, TelemetryConstants, TransportProtocol,
 };
 use routeward_core::diagnostics::logs::LogQuerySource;
 use routeward_core::error::{
@@ -533,8 +533,8 @@ enum CtlCommands {
     /// printed as JSON; with an option the entries are filtered by the daemon and printed as lines
     Logs {
         /// Lowest level to show: debug, info, warn or error
-        #[arg(long, value_parser = ctl_reports::parse_level)]
-        level: Option<LogLevel>,
+        #[arg(long)]
+        level: Option<String>,
         /// Only this component (repeatable)
         #[arg(long)]
         component: Vec<String>,
@@ -545,8 +545,8 @@ enum CtlCommands {
         #[arg(long)]
         pid: Option<u32>,
         /// Only lines newer than this age, for example 15m, 2h or 1d
-        #[arg(long, value_name = "AGE", value_parser = ctl_reports::parse_since)]
-        since: Option<Duration>,
+        #[arg(long, value_name = "AGE")]
+        since: Option<String>,
         /// Read the daemon log file of this day (yyyyMMdd) instead of the live buffer
         #[arg(long, value_name = "YYYYMMDD")]
         file: Option<String>,
@@ -805,7 +805,10 @@ fn print_ctl_result(
     Ok(())
 }
 
-fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, IpcCommand)> {
+fn ctl_action_into_ipc(
+    action: CtlCommands,
+    i18n: &I18nRegistry,
+) -> Result<(&'static str, IpcCommand), Box<dyn std::error::Error>> {
     let label = ctl_action_label(&action);
     let ipc_cmd = match action {
         CtlCommands::Status => IpcCommand::GetDiagnostics,
@@ -835,17 +838,25 @@ fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, Ip
             if unfiltered {
                 IpcCommand::ListLogs
             } else {
+                let min_level = level
+                    .as_deref()
+                    .map(|raw| ctl_reports::parse_level(i18n, raw))
+                    .transpose()?;
+                let age = since
+                    .as_deref()
+                    .map(|raw| ctl_reports::parse_since(i18n, raw))
+                    .transpose()?;
                 IpcCommand::QueryLogs {
                     source: match file {
                         Some(date) => LogQuerySource::DaemonFile { date },
                         None => LogQuerySource::Memory,
                     },
-                    min_level: level,
+                    min_level,
                     components: component,
                     text: grep,
                     pid,
                     connection_id: None,
-                    since: since.map(|age| epoch_ms_now().saturating_sub(age.as_millis() as i64)),
+                    since: age.map(|age| epoch_ms_now().saturating_sub(age.as_millis() as i64)),
                     until: None,
                     limit: limit.unwrap_or(ctl_reports::DEFAULT_LOG_LIMIT),
                     cursor: None,
@@ -904,10 +915,11 @@ fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, Ip
 async fn execute_ctl_action(
     client: &IpcClient,
     user_logger: &FileLogger,
+    i18n: &I18nRegistry,
     action: CtlCommands,
 ) -> Result<routeward_core::ipc::protocol::IpcResponse, Box<dyn std::error::Error>> {
     let expected_label = ctl_action_label(&action);
-    let (cmd_label, ipc_cmd) = match ctl_action_into_ipc(action) {
+    let (cmd_label, ipc_cmd) = match ctl_action_into_ipc(action, i18n) {
         Ok(pair) => pair,
         Err(err) => {
             user_logger.log(
@@ -915,7 +927,7 @@ async fn execute_ctl_action(
                 COMPONENT_CLI_CTL,
                 &format!("Executed ctl command '{expected_label}': outcome=invalid_input ({err})"),
             );
-            return Err(err.into());
+            return Err(err);
         }
     };
 
@@ -1242,14 +1254,20 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// The per-user CLI log, pruned like every other log (`logRetentionDays`).
+fn open_user_logger(log_dir: std::path::PathBuf, telemetry: &TelemetryConstants) -> FileLogger {
+    let logger = FileLogger::new(log_dir, &telemetry.log_app_name, true);
+    logger.set_retention_days(telemetry.log_retention_days);
+    logger
+}
+
 async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let constants = SystemConstants::load_embedded()?;
 
     if let Commands::Ctl { action } = args.command {
-        let user_logger = FileLogger::new(
+        let user_logger = open_user_logger(
             constants.telemetry.resolve_user_log_dir(),
-            &constants.telemetry.log_app_name,
-            true,
+            &constants.telemetry,
         );
         let client = IpcClient::new(constants.ipc);
         let i18n = I18nRegistry::new(&args.locale);
@@ -1264,7 +1282,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                 return Err(ctl_reports::export_exists_message(&i18n, output).into());
             }
         }
-        let response = execute_ctl_action(&client, &user_logger, action).await?;
+        let response = execute_ctl_action(&client, &user_logger, &i18n, action).await?;
         if !response.ok {
             println!("{}", serde_json::to_string_pretty(&response)?);
             let err_msg = response
@@ -1277,7 +1295,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         let Some(result) = response.result else {
-            return Err("Daemon returned an empty result".into());
+            return Err(ctl_reports::empty_result_message(&i18n).into());
         };
         return print_ctl_result(render, result, &i18n);
     }
@@ -1483,6 +1501,29 @@ mod tests {
     use routeward_core::ipc::protocol::DaemonFullState;
 
     #[test]
+    fn the_user_cli_log_prunes_files_past_the_retention() {
+        let dir = std::env::temp_dir().join(format!(
+            "routeward_cli_retention_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let constants = SystemConstants::load_embedded().expect("constants");
+        let old = dir.join(routeward_core::logger::log_file_name(
+            &constants.telemetry.log_app_name,
+            "20200101",
+        ));
+        std::fs::write(&old, "old").expect("old log");
+        let logger = open_user_logger(dir.clone(), &constants.telemetry);
+        logger.log(routeward_core::telemetry::LogLevel::Info, "Test", "today");
+        assert!(!old.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn cleanup_accepts_fail_closed_on_crash_flag() {
         let args =
             CliArgs::try_parse_from(["routeward", "cleanup", "--force", "--fail-closed-on-crash"])
@@ -1623,7 +1664,7 @@ mod tests {
         let Commands::Ctl { action } = args.command else {
             panic!("expected ctl");
         };
-        let (label, cmd) = ctl_action_into_ipc(action).expect("maps");
+        let (label, cmd) = ctl_action_into_ipc(action, &I18nRegistry::new("en")).expect("maps");
         assert_eq!(label, "pause");
         assert!(matches!(
             cmd,
@@ -1643,7 +1684,7 @@ mod tests {
         let Commands::Ctl { action } = parsed.command else {
             panic!("expected ctl");
         };
-        ctl_action_into_ipc(action).expect("maps")
+        ctl_action_into_ipc(action, &I18nRegistry::new("en")).expect("maps")
     }
 
     #[test]
@@ -1708,8 +1749,23 @@ mod tests {
             }
             other => panic!("expected query_logs, got {other:?}"),
         }
-        assert!(CliArgs::try_parse_from(["routeward", "ctl", "logs", "--level", "loud"]).is_err());
-        assert!(CliArgs::try_parse_from(["routeward", "ctl", "logs", "--since", "soon"]).is_err());
+        // Bad values are refused with the localized message once the locale is known.
+        let i18n = I18nRegistry::new("en");
+        for (flag, value, key) in [
+            ("--level", "loud", "cli.logs.invalid_level"),
+            ("--since", "soon", "cli.logs.invalid_since"),
+        ] {
+            let parsed =
+                CliArgs::try_parse_from(["routeward", "ctl", "logs", flag, value]).expect("parses");
+            let Commands::Ctl { action } = parsed.command else {
+                panic!("expected ctl");
+            };
+            let err = ctl_action_into_ipc(action, &i18n).expect_err("refused");
+            assert_eq!(
+                err.to_string(),
+                ctl_reports::interpolate(&i18n.t(key), &[("value", value.to_string())])
+            );
+        }
     }
 
     #[test]
@@ -2013,6 +2069,7 @@ mod tests {
         let upsert_resp = execute_ctl_action(
             &client,
             &user_logger,
+            &I18nRegistry::new("en"),
             CtlCommands::UpsertRule {
                 json: Some(temp_rule_json),
                 json_file: None,
@@ -2022,9 +2079,14 @@ mod tests {
         .expect("execute ctl upsert-rule");
         assert!(upsert_resp.ok);
 
-        let state_after_add = execute_ctl_action(&client, &user_logger, CtlCommands::State)
-            .await
-            .expect("execute ctl state");
+        let state_after_add = execute_ctl_action(
+            &client,
+            &user_logger,
+            &I18nRegistry::new("en"),
+            CtlCommands::State,
+        )
+        .await
+        .expect("execute ctl state");
         let parsed_after_add: DaemonFullState =
             serde_json::from_value(state_after_add.result.expect("state result"))
                 .expect("decode DaemonFullState");
@@ -2038,6 +2100,7 @@ mod tests {
         let remove_resp = execute_ctl_action(
             &client,
             &user_logger,
+            &I18nRegistry::new("en"),
             CtlCommands::RemoveRule {
                 id: "rule-temp-block-test".to_string(),
             },
@@ -2046,9 +2109,14 @@ mod tests {
         .expect("execute ctl remove-rule");
         assert!(remove_resp.ok);
 
-        let state_after_remove = execute_ctl_action(&client, &user_logger, CtlCommands::State)
-            .await
-            .expect("execute ctl state after remove");
+        let state_after_remove = execute_ctl_action(
+            &client,
+            &user_logger,
+            &I18nRegistry::new("en"),
+            CtlCommands::State,
+        )
+        .await
+        .expect("execute ctl state after remove");
         let parsed_after_remove: DaemonFullState =
             serde_json::from_value(state_after_remove.result.expect("state result"))
                 .expect("decode DaemonFullState");
@@ -2129,6 +2197,7 @@ mod tests {
         let resp_valid = execute_ctl_action(
             &client,
             &user_logger,
+            &I18nRegistry::new("en"),
             CtlCommands::UpsertRule {
                 json: None,
                 json_file: Some(valid_file_path.clone()),
@@ -2152,6 +2221,7 @@ mod tests {
         let resp_bom = execute_ctl_action(
             &client,
             &user_logger,
+            &I18nRegistry::new("en"),
             CtlCommands::UpsertRule {
                 json: None,
                 json_file: Some(bom_file_path.clone()),
@@ -2161,9 +2231,14 @@ mod tests {
         .expect("upsert-rule via UTF-8 BOM --json-file");
         assert!(resp_bom.ok);
 
-        let state_resp = execute_ctl_action(&client, &user_logger, CtlCommands::State)
-            .await
-            .expect("query state");
+        let state_resp = execute_ctl_action(
+            &client,
+            &user_logger,
+            &I18nRegistry::new("en"),
+            CtlCommands::State,
+        )
+        .await
+        .expect("query state");
         let parsed_state: DaemonFullState =
             serde_json::from_value(state_resp.result.expect("state result")).expect("decode state");
         let stored_rule = parsed_state
