@@ -45,7 +45,7 @@
       "disconnected_desc": "RouteWard ne parvient pas à joindre son service de fond. Démarrez-le avec le bouton, ou redémarrez RouteWard. Il essaie de se reconnecter tout seul.",
       "simple_disconnected_title": "Protection arrêtée",
       "simple_disconnected_desc": "Démarrez la protection en un clic pour appliquer vos règles par application.",
-      "simple_disconnected_non_windows": "Le service de fond n'est pas encore démarré. Lancez RouteWard en administrateur (root) pour activer la protection.",
+      "simple_disconnected_non_windows": "Le service RouteWard n'est pas prêt. Dans un terminal, lancez : sudo systemctl enable --now routeward. Puis lancez : sudo usermod -aG routeward $USER, et fermez puis rouvrez votre session.",
       "reconnecting_badge": "Reconnexion",
       "retry_button": "Réessayer",
       "start_button": "Démarrer la protection",
@@ -1098,7 +1098,8 @@
     },
     "desktop": {
       "ui_init": "RouteWard n'a pas pu ouvrir sa fenêtre. Installez ou réparez Microsoft Edge WebView2 Runtime, vérifiez que votre dossier utilisateur n'est pas en lecture seule, puis relancez RouteWard.",
-      "ui_init_linux": "RouteWard n'a pas pu ouvrir sa fenêtre. Mettez votre système à jour, puis relancez RouteWard. Le détail est dans le journal : {{path}}"
+      "ui_init_linux": "RouteWard n'a pas pu ouvrir sa fenêtre. Mettez votre système à jour, puis relancez RouteWard. Le détail est dans le journal : {{path}}",
+      "ui_init_linux_no_log": "RouteWard n'a pas pu ouvrir sa fenêtre. Mettez votre système à jour, puis relancez RouteWard."
     }
   },
   "themeforge": {

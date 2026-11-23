@@ -189,12 +189,12 @@ describe('App navigation and accessible modals', () => {
   it.each([
     ['linux_group_required', 409, /usermod -aG routeward/],
     ['linux_service_not_running', 503, /systemctl enable --now routeward/],
-    ['unsupported_os', 501, /systemctl enable --now routeward/]
-  ])('shows the Linux instructions when the daemon start fails with %s', async (errorKey, status, expected) => {
+    ['unsupported_os', 501, /RouteWard could not start\. Try again\.|RouteWard n'a pas pu démarrer\. Réessayez\./]
+  ])('shows the matching text on Linux when the daemon start fails with %s', async (errorKey, status, expected) => {
     vi.spyOn(routewardClient, 'getDiagnostics').mockReturnValue({
       daemonConnected: false,
       running: false,
-      osName: 'WINDOWS',
+      osName: 'LINUX',
       interceptionMode: 'hybrid',
       elevatedPrivileges: false,
       relayTcpEndpoint: '127.0.0.1:10808',
@@ -218,6 +218,41 @@ describe('App navigation and accessible modals', () => {
     await waitFor(() => {
       expect(screen.getByText(expected)).toBeInTheDocument();
     });
+  });
+
+  it('offers the start action and both Linux steps when the service is unreachable on Linux', async () => {
+    window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.LOCALE, 'en');
+    await i18n.changeLanguage('en');
+    vi.spyOn(routewardClient, 'getDiagnostics').mockReturnValue({
+      daemonConnected: false,
+      running: false,
+      osName: 'LINUX',
+      interceptionMode: 'hybrid',
+      elevatedPrivileges: false,
+      relayTcpEndpoint: '127.0.0.1:10808',
+      relayHttpEndpoint: '127.0.0.1:10809',
+      dnsEndpoint: '127.0.0.1:5353',
+      fakeIpCidr: '198.18.0.0/15',
+      activeLocale: 'en',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
+    });
+    const startDaemonSpy = vi
+      .spyOn(routewardClient, 'startDaemon')
+      .mockRejectedValue(
+        new HttpResponseError(409, 'group required', 'linux_group_required')
+      );
+
+    renderApp();
+
+    expect(
+      screen.getAllByText(/sudo systemctl enable --now routeward/).length
+    ).toBeGreaterThan(0);
+    expect(screen.getAllByText(/sudo usermod -aG routeward \$USER/).length).toBeGreaterThan(0);
+    fireEvent.click(
+      screen.getAllByRole('button', { name: /start protection/i })[0]
+    );
+    await waitFor(() => expect(startDaemonSpy).toHaveBeenCalledTimes(1));
   });
 
   it('shows a persistent translated error toast, not a success toast, when adding a proxy fails', async () => {

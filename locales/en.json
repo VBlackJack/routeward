@@ -45,7 +45,7 @@
       "disconnected_desc": "RouteWard cannot reach its background service. Start it with the button, or restart RouteWard. It keeps trying to reconnect by itself.",
       "simple_disconnected_title": "Protection stopped",
       "simple_disconnected_desc": "Start protection in one click to apply your app rules.",
-      "simple_disconnected_non_windows": "The background service is not running yet. Start RouteWard as administrator (root) to turn on protection.",
+      "simple_disconnected_non_windows": "The RouteWard service is not ready. In a terminal, run: sudo systemctl enable --now routeward. Then run: sudo usermod -aG routeward $USER, and log out and back in.",
       "reconnecting_badge": "Reconnecting",
       "retry_button": "Try again",
       "start_button": "Start protection",
@@ -1098,7 +1098,8 @@
     },
     "desktop": {
       "ui_init": "RouteWard could not open its window. Install or repair Microsoft Edge WebView2 Runtime, make sure your user folder is not read-only, then start RouteWard again.",
-      "ui_init_linux": "RouteWard could not open its window. Update your system, then start RouteWard again. Details are in the log: {{path}}"
+      "ui_init_linux": "RouteWard could not open its window. Update your system, then start RouteWard again. Details are in the log: {{path}}",
+      "ui_init_linux_no_log": "RouteWard could not open its window. Update your system, then start RouteWard again."
     }
   },
   "themeforge": {

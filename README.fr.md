@@ -44,7 +44,7 @@ Si une application ou un site cesse de fonctionner, ouvrez **Activité**, puis *
 3. Démarrez le service : `sudo systemctl enable --now routeward`
 4. Lancez RouteWard depuis le menu des applications.
 
-La fenêtre a besoin de `libwebkit2gtk-4.1` (installé comme paquet recommandé). Sans lui, la fenêtre ne peut pas s'ouvrir.
+La fenêtre a besoin de `libwebkit2gtk-4.1` et GTK 3, dont le paquet dépend : `apt` les installe avec RouteWard.
 
 ## Documentation
 

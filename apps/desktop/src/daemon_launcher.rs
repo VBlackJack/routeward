@@ -432,15 +432,20 @@ pub fn build_daemon_launch_plan(
     }
 }
 
-/// Turns what a probe of the service socket found into the error a failed start reports on Linux.
-pub fn linux_start_failure_for_probe(probe: DaemonIpcProbe) -> DaemonLaunchError {
+/// Turns what a probe of the service socket found into the outcome of a start request on Linux:
+/// the access errors the user must act on, or (socket answers) a launch with no process to watch,
+/// so the caller polls and reconnects instead of reporting a failure.
+pub fn linux_start_outcome_for_probe(
+    probe: DaemonIpcProbe,
+) -> Result<LaunchOutcome, DaemonLaunchError> {
     match probe {
-        DaemonIpcProbe::AccessDenied => DaemonLaunchError::LinuxGroupRequired,
-        DaemonIpcProbe::NotRunning => DaemonLaunchError::LinuxServiceNotRunning,
-        // The socket answers now: the failed start was a race, so there is nothing specific to say.
-        DaemonIpcProbe::Running => DaemonLaunchError::LaunchFailed(
-            "The RouteWard service answered after the start request failed".to_string(),
-        ),
+        DaemonIpcProbe::AccessDenied => Err(DaemonLaunchError::LinuxGroupRequired),
+        DaemonIpcProbe::NotRunning => Err(DaemonLaunchError::LinuxServiceNotRunning),
+        DaemonIpcProbe::Running => Ok(LaunchOutcome {
+            handle: None,
+            mode: LaunchMode::ServiceStarted,
+            fallback_reason_key: None,
+        }),
     }
 }
 
@@ -462,7 +467,7 @@ pub async fn start_privileged_daemon_with_release(
             })
             .await
             .map_err(|err| DaemonLaunchError::LaunchFailed(err.to_string()))?;
-            Err(linux_start_failure_for_probe(probe))
+            linux_start_outcome_for_probe(probe)
         }
         #[cfg(not(target_os = "linux"))]
         Err(DaemonLaunchError::UnsupportedOs)
@@ -830,19 +835,25 @@ mod tests {
     }
 
     #[test]
-    fn linux_probe_results_map_to_distinct_start_errors() {
-        let group = linux_start_failure_for_probe(DaemonIpcProbe::AccessDenied);
+    fn linux_probe_results_map_to_distinct_start_results() {
+        let Err(group) = linux_start_outcome_for_probe(DaemonIpcProbe::AccessDenied) else {
+            panic!("access denied must be an error");
+        };
         assert_eq!(group, DaemonLaunchError::LinuxGroupRequired);
         assert_eq!(group.error_key(), "linux_group_required");
         assert_eq!(group.status_code(), 409);
-        let down = linux_start_failure_for_probe(DaemonIpcProbe::NotRunning);
+        let Err(down) = linux_start_outcome_for_probe(DaemonIpcProbe::NotRunning) else {
+            panic!("a stopped service must be an error");
+        };
         assert_eq!(down, DaemonLaunchError::LinuxServiceNotRunning);
         assert_eq!(down.error_key(), "linux_service_not_running");
         assert_eq!(down.status_code(), 503);
-        assert_eq!(
-            linux_start_failure_for_probe(DaemonIpcProbe::Running).error_key(),
-            "start_failed"
-        );
+        // The socket answers: not a failure, the caller polls and reconnects.
+        let running = linux_start_outcome_for_probe(DaemonIpcProbe::Running)
+            .expect("a running service is a successful outcome");
+        assert!(running.handle.is_none());
+        assert_eq!(running.mode, LaunchMode::ServiceStarted);
+        assert!(running.fallback_reason_key.is_none());
     }
 
     #[test]

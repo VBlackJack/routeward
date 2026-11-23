@@ -49,8 +49,11 @@ const EMBEDDED_ICON_256_RGBA: &[u8] = include_bytes!("../../../assets/branding/r
 
 const WINDOW_TITLE: &str = "RouteWard";
 const ERR_KEY_DESKTOP_UI_INIT: &str = "errors.desktop.ui_init";
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(test)))]
 const ERR_KEY_DESKTOP_UI_INIT_LINUX: &str = "errors.desktop.ui_init_linux";
+/// Linux window-error text without the log folder, for when the folder cannot be determined.
+#[cfg(all(target_os = "linux", not(test)))]
+const ERR_KEY_DESKTOP_UI_INIT_LINUX_NO_LOG: &str = "errors.desktop.ui_init_linux_no_log";
 /// Placeholder of the log folder in the Linux window-error text.
 #[cfg(any(target_os = "linux", test))]
 const UI_INIT_PATH_PLACEHOLDER: &str = "{{path}}";
@@ -433,11 +436,14 @@ fn clamp_initial_window_size(monitor_logical: Option<(f64, f64)>) -> (f64, f64) 
     )
 }
 
-/// Primary monitor size in logical pixels, when the platform reports one.
+/// Primary monitor size in logical pixels, when the platform reports one. Some compositors (for
+/// example GNOME on Wayland) report no primary monitor: the first available one stands in.
 fn primary_monitor_logical_size<T>(
     event_loop: &tao::event_loop::EventLoop<T>,
 ) -> Option<(f64, f64)> {
-    let monitor = event_loop.primary_monitor()?;
+    let monitor = event_loop
+        .primary_monitor()
+        .or_else(|| event_loop.available_monitors().next())?;
     let logical = monitor.size().to_logical::<f64>(monitor.scale_factor());
     Some((logical.width, logical.height))
 }
@@ -448,29 +454,52 @@ fn format_ui_init_linux_message(template: &str, log_dir: &str) -> String {
     template.replace(UI_INIT_PATH_PLACEHOLDER, log_dir)
 }
 
-/// Shows the Linux window-error text in a GTK dialog and on stderr. The dialog is shown only from
-/// the thread that initialised GTK; elsewhere the stderr line and the log are all there is.
+/// Picks the Linux window-error text: the one naming the log folder when it is known, otherwise
+/// the one without the folder, so the message never ends on an empty path.
+#[cfg(any(target_os = "linux", test))]
+fn ui_init_linux_message(with_path: &str, without_path: &str, log_dir: Option<&str>) -> String {
+    match log_dir.filter(|dir| !dir.is_empty()) {
+        Some(dir) => format_ui_init_linux_message(with_path, dir),
+        None => without_path.to_string(),
+    }
+}
+
+/// Shows the Linux window-error text in a modal GTK dialog. Main (GTK) thread only.
 #[cfg(all(target_os = "linux", not(test)))]
-fn report_fatal_ui_error_linux(bridge: &DesktopCommandBridge, detail: &str) {
+fn show_linux_error_dialog(message: &str) {
     use gtk::prelude::{DialogExt, WidgetExt};
 
+    let dialog = gtk::MessageDialog::builder()
+        .message_type(gtk::MessageType::Error)
+        .buttons(gtk::ButtonsType::Ok)
+        .modal(true)
+        .title(WINDOW_TITLE)
+        .text(message)
+        .build();
+    dialog.run();
+    dialog.hide();
+}
+
+/// Reports the Linux window error on stderr and in a GTK dialog. GTK may only be used from the
+/// thread that initialised it: from any other thread the dialog is posted to the GTK main loop.
+#[cfg(all(target_os = "linux", not(test)))]
+fn report_fatal_ui_error_linux(bridge: &DesktopCommandBridge, detail: &str) {
     let log_dir = routeward_core::config::SystemConstants::load_embedded()
+        .ok()
         .map(|constants| constants.telemetry.resolve_user_log_dir())
-        .map(|dir| dir.display().to_string())
-        .unwrap_or_default();
-    let message =
-        format_ui_init_linux_message(&bridge.translate(ERR_KEY_DESKTOP_UI_INIT_LINUX), &log_dir);
+        .map(|dir| dir.display().to_string());
+    let message = ui_init_linux_message(
+        &bridge.translate(ERR_KEY_DESKTOP_UI_INIT_LINUX),
+        &bridge.translate(ERR_KEY_DESKTOP_UI_INIT_LINUX_NO_LOG),
+        log_dir.as_deref(),
+    );
     eprintln!("{WINDOW_TITLE}: {message} ({detail})");
     if gtk::is_initialized_main_thread() {
-        let dialog = gtk::MessageDialog::builder()
-            .message_type(gtk::MessageType::Error)
-            .buttons(gtk::ButtonsType::Ok)
-            .modal(true)
-            .title(WINDOW_TITLE)
-            .text(message.as_str())
-            .build();
-        dialog.run();
-        dialog.hide();
+        show_linux_error_dialog(&message);
+    } else {
+        // Always asynchronous: `idle_add_once` queues on the default main context, which the
+        // event loop iterates on the GTK thread.
+        gtk::glib::idle_add_once(move || show_linux_error_dialog(&message));
     }
 }
 
@@ -923,6 +952,22 @@ mod tests {
     fn linux_window_error_text_carries_the_log_folder() {
         let text = format_ui_init_linux_message("Details: {{path}}", "/home/u/.local/log");
         assert_eq!(text, "Details: /home/u/.local/log");
+    }
+
+    #[test]
+    fn linux_window_error_text_drops_the_path_clause_without_a_log_folder() {
+        const WITH_PATH: &str = "Details: {{path}}";
+        const WITHOUT_PATH: &str = "No details.";
+        assert_eq!(
+            ui_init_linux_message(WITH_PATH, WITHOUT_PATH, Some("/var/log/x")),
+            "Details: /var/log/x"
+        );
+        for unknown in [None, Some("")] {
+            assert_eq!(
+                ui_init_linux_message(WITH_PATH, WITHOUT_PATH, unknown),
+                WITHOUT_PATH
+            );
+        }
     }
 
     #[test]

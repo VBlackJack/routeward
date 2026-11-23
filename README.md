@@ -44,7 +44,7 @@ If an app or a website stops working, open **Activity**, then **Blocked**: Route
 3. Start the service: `sudo systemctl enable --now routeward`
 4. Start RouteWard from the applications menu.
 
-The window needs `libwebkit2gtk-4.1` (installed as a recommended package). Without it, the window cannot open.
+The window needs `libwebkit2gtk-4.1` and GTK 3, which the package depends on, so `apt` installs them with RouteWard.
 
 ## Documentation
 
