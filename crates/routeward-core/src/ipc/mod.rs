@@ -293,162 +293,75 @@ fn keyed_error_response(id: String, err: &RouteWardError) -> IpcResponse {
     IpcResponse::error_with_key(Some(id), Some(err.i18n_key().to_string()), err.to_string())
 }
 
-async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> IpcResponse {
-    let id = req.id;
-    match req.command {
-        IpcCommand::GetState => {
-            let state = DaemonFullState {
-                diagnostics: controller.diagnostics(),
-                profile: controller.profile.read().redacted_for_ipc(),
-                telemetry: controller.telemetry.snapshot(),
-                connections: controller.telemetry.list_connections(),
-                logs: controller.telemetry.list_logs(),
-                fake_ips: controller.dns.list_entries(),
-            };
-            IpcResponse::success(id, &state)
-        }
-        IpcCommand::GetDiagnostics => IpcResponse::success(id, &controller.diagnostics()),
-        IpcCommand::GetTelemetry => IpcResponse::success(id, &controller.telemetry.snapshot()),
-        IpcCommand::ToggleEngine { start } => {
-            if start {
-                if let Err(err) = controller.start_protection() {
-                    return keyed_error_response(id, &err);
-                }
-            } else {
-                controller.stop_engine();
-            }
-            controller.record_protection_choice(start);
-            IpcResponse::success(id, &controller.diagnostics())
-        }
-        IpcCommand::PauseEngine { duration_secs } => {
-            match controller.pause_protection(duration_secs) {
-                Ok(_) => IpcResponse::success(id, &controller.diagnostics()),
-                Err(err) => keyed_error_response(id, &err),
-            }
-        }
-        IpcCommand::SetInterceptionMode { mode } => {
-            controller.set_interception_mode(mode);
-            if let Err(err) = controller.save_profile_default() {
-                return keyed_error_response(id, &err);
-            }
-            IpcResponse::success(id, &controller.diagnostics())
-        }
-        IpcCommand::SetTheme { theme, accent } => {
-            controller.set_theme_config(theme, accent);
-            if let Err(err) = controller.save_profile_default() {
-                return keyed_error_response(id, &err);
-            }
-            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
-        }
-        IpcCommand::GetProfile => {
-            let prof = controller.profile.read().redacted_for_ipc();
-            IpcResponse::success(id, &prof)
-        }
-        IpcCommand::ReplaceProfile { profile } => {
-            if let Err(err) = controller.replace_profile(profile) {
-                return keyed_error_response(id, &err);
-            }
-            if let Err(err) = controller.save_profile_default() {
-                return keyed_error_response(id, &err);
-            }
-            let prof = controller.profile.read().redacted_for_ipc();
-            IpcResponse::success(id, &prof)
-        }
-        IpcCommand::UpsertRule { rule } => {
-            controller.upsert_rule(rule);
-            if let Err(err) = controller.save_profile_default() {
-                return keyed_error_response(id, &err);
-            }
-            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
-        }
-        IpcCommand::RemoveRule { rule_id } => {
-            controller.remove_rule(&rule_id);
-            if let Err(err) = controller.save_profile_default() {
-                return keyed_error_response(id, &err);
-            }
-            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
-        }
-        IpcCommand::UpsertProxy { node } => {
-            controller.upsert_proxy(node);
-            if let Err(err) = controller.save_profile_default() {
-                return keyed_error_response(id, &err);
-            }
-            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
-        }
-        IpcCommand::RemoveProxy { proxy_id } => {
-            controller.remove_proxy(&proxy_id);
-            if let Err(err) = controller.save_profile_default() {
-                return keyed_error_response(id, &err);
-            }
-            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
-        }
-        IpcCommand::SetPrimaryProxy { proxy_id } => {
-            if !controller.set_primary_proxy(&proxy_id) {
-                return IpcResponse::error_with_key(
-                    Some(id),
-                    Some(crate::error::ERR_KEY_PROXY_NOT_FOUND.to_string()),
-                    "Proxy not found",
-                );
-            }
-            if let Err(err) = controller.save_profile_default() {
-                return keyed_error_response(id, &err);
-            }
-            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
-        }
-        IpcCommand::UpsertChain { chain } => {
-            controller.upsert_chain(chain);
-            if let Err(err) = controller.save_profile_default() {
-                return keyed_error_response(id, &err);
-            }
-            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
-        }
-        IpcCommand::RemoveChain { chain_id } => {
-            controller.remove_chain(&chain_id);
-            if let Err(err) = controller.save_profile_default() {
-                return keyed_error_response(id, &err);
-            }
-            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
-        }
-        IpcCommand::EvaluateRule { request } => {
-            let res = controller.evaluate_rule(&request);
-            IpcResponse::success(id, &res)
-        }
-        IpcCommand::SimulateConnection { request } => {
-            let tracked = controller.simulate_connection(request);
-            IpcResponse::success(id, &tracked)
-        }
-        IpcCommand::ScanOsSockets => {
-            let sockets = controller.scan_and_ingest_os_sockets(DEFAULT_OS_SCAN_LIMIT);
-            IpcResponse::success(id, &sockets)
-        }
-        IpcCommand::TestProxy { proxy_id } => match controller.test_proxy(&proxy_id).await {
-            Ok(report) => IpcResponse::success(id, &report),
-            Err(err) => keyed_error_response(id, &err),
+/// Persists the default profile off the Tokio async worker pool and maps errors to a keyed IPC
+/// response.
+async fn save_profile_default_async(
+    controller: &RouteWardController,
+    id: &str,
+) -> Result<(), IpcResponse> {
+    let ctrl = controller.clone();
+    match run_blocking(move || ctrl.save_profile_default()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(keyed_error_response(id.to_string(), &err)),
+        Err(detail) => Err(IpcResponse::error(Some(id.to_string()), detail)),
+    }
+}
+
+/// Persists the default profile off the async worker pool and returns `{ "ok": true }` on success.
+async fn save_profile_ok_response(controller: &RouteWardController, id: String) -> IpcResponse {
+    match save_profile_default_async(controller, &id).await {
+        Ok(()) => IpcResponse::success(id, &serde_json::json!({ "ok": true })),
+        Err(resp) => resp,
+    }
+}
+
+async fn dispatch_named_profile_command(
+    controller: &RouteWardController,
+    id: String,
+    cmd: IpcCommand,
+) -> IpcResponse {
+    let ctrl = controller.clone();
+    match cmd {
+        IpcCommand::ListProfiles => match run_blocking(move || ctrl.list_named_profiles()).await {
+            Ok(Ok(list)) => IpcResponse::success(id, &list),
+            Ok(Err(err)) => keyed_error_response(id, &err),
+            Err(detail) => IpcResponse::error(Some(id), detail),
         },
-        IpcCommand::TestAllProxies => {
-            let reports = controller.test_all_proxies().await;
-            IpcResponse::success(id, &reports)
+        IpcCommand::SaveNamedProfile { profile_id, name } => {
+            match run_blocking(move || {
+                ctrl.save_named_profile(profile_id.as_deref(), name.as_deref())
+            })
+            .await
+            {
+                Ok(Ok(list)) => IpcResponse::success(id, &list),
+                Ok(Err(err)) => keyed_error_response(id, &err),
+                Err(detail) => IpcResponse::error(Some(id), detail),
+            }
         }
-        IpcCommand::ListConnections => {
-            let conns = controller.telemetry.list_connections();
-            IpcResponse::success(id, &conns)
+        IpcCommand::SwitchProfile { profile_id } => {
+            match run_blocking(move || ctrl.switch_named_profile(&profile_id)).await {
+                Ok(Ok(prof)) => IpcResponse::success(id, &prof),
+                Ok(Err(err)) => keyed_error_response(id, &err),
+                Err(detail) => IpcResponse::error(Some(id), detail),
+            }
         }
-        IpcCommand::TerminateConnection { connection_id } => {
-            let terminated = controller.terminate_connection(&connection_id);
-            IpcResponse::success(id, &serde_json::json!({ "terminated": terminated }))
+        IpcCommand::DeleteProfile { profile_id } => {
+            match run_blocking(move || ctrl.delete_named_profile(&profile_id)).await {
+                Ok(Ok(list)) => IpcResponse::success(id, &list),
+                Ok(Err(err)) => keyed_error_response(id, &err),
+                Err(detail) => IpcResponse::error(Some(id), detail),
+            }
         }
-        IpcCommand::ClearClosedConnections => {
-            controller.telemetry.clear_closed_connections();
-            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
-        }
-        IpcCommand::ListLogs => {
-            let logs = controller.telemetry.list_logs();
-            IpcResponse::success(id, &logs)
-        }
-        IpcCommand::ClearLogs => {
-            controller.telemetry.clear_logs();
-            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
-        }
+        _ => unreachable!("only named-profile commands are routed here"),
+    }
+}
+
+async fn dispatch_diagnostics_command(
+    controller: &RouteWardController,
+    id: String,
+    cmd: IpcCommand,
+) -> IpcResponse {
+    match cmd {
         IpcCommand::ListBlocked { since, limit } => {
             IpcResponse::success(id, &diagnostics::list_blocked(controller, since, limit))
         }
@@ -523,6 +436,153 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
             );
             IpcResponse::success(id, &outcome)
         }
+        _ => unreachable!("only diagnostics commands are routed here"),
+    }
+}
+
+async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> IpcResponse {
+    let id = req.id;
+    match req.command {
+        IpcCommand::GetState => {
+            let state = DaemonFullState {
+                diagnostics: controller.diagnostics(),
+                profile: controller.profile.read().redacted_for_ipc(),
+                telemetry: controller.telemetry.snapshot(),
+                connections: controller.telemetry.list_connections(),
+                logs: controller.telemetry.list_logs(),
+                fake_ips: controller.dns.list_entries(),
+            };
+            IpcResponse::success(id, &state)
+        }
+        IpcCommand::GetDiagnostics => IpcResponse::success(id, &controller.diagnostics()),
+        IpcCommand::GetTelemetry => IpcResponse::success(id, &controller.telemetry.snapshot()),
+        IpcCommand::ToggleEngine { start } => {
+            if start {
+                if let Err(err) = controller.start_protection() {
+                    return keyed_error_response(id, &err);
+                }
+            } else {
+                controller.stop_engine();
+            }
+            controller.record_protection_choice(start);
+            IpcResponse::success(id, &controller.diagnostics())
+        }
+        IpcCommand::PauseEngine { duration_secs } => {
+            match controller.pause_protection(duration_secs) {
+                Ok(_) => IpcResponse::success(id, &controller.diagnostics()),
+                Err(err) => keyed_error_response(id, &err),
+            }
+        }
+        IpcCommand::SetInterceptionMode { mode } => {
+            controller.set_interception_mode(mode);
+            if let Err(resp) = save_profile_default_async(controller, &id).await {
+                return resp;
+            }
+            IpcResponse::success(id, &controller.diagnostics())
+        }
+        IpcCommand::SetTheme { theme, accent } => {
+            controller.set_theme_config(theme, accent);
+            save_profile_ok_response(controller, id).await
+        }
+        IpcCommand::GetProfile => {
+            let prof = controller.profile.read().redacted_for_ipc();
+            IpcResponse::success(id, &prof)
+        }
+        IpcCommand::ReplaceProfile { profile } => {
+            if let Err(err) = controller.replace_profile(profile) {
+                return keyed_error_response(id, &err);
+            }
+            if let Err(resp) = save_profile_default_async(controller, &id).await {
+                return resp;
+            }
+            let prof = controller.profile.read().redacted_for_ipc();
+            IpcResponse::success(id, &prof)
+        }
+        IpcCommand::UpsertRule { rule } => {
+            controller.upsert_rule(rule);
+            save_profile_ok_response(controller, id).await
+        }
+        IpcCommand::RemoveRule { rule_id } => {
+            controller.remove_rule(&rule_id);
+            save_profile_ok_response(controller, id).await
+        }
+        IpcCommand::UpsertProxy { node } => {
+            controller.upsert_proxy(node);
+            save_profile_ok_response(controller, id).await
+        }
+        IpcCommand::RemoveProxy { proxy_id } => {
+            controller.remove_proxy(&proxy_id);
+            save_profile_ok_response(controller, id).await
+        }
+        IpcCommand::SetPrimaryProxy { proxy_id } => {
+            if !controller.set_primary_proxy(&proxy_id) {
+                return IpcResponse::error_with_key(
+                    Some(id),
+                    Some(crate::error::ERR_KEY_PROXY_NOT_FOUND.to_string()),
+                    "Proxy not found",
+                );
+            }
+            save_profile_ok_response(controller, id).await
+        }
+        IpcCommand::UpsertChain { chain } => {
+            controller.upsert_chain(chain);
+            save_profile_ok_response(controller, id).await
+        }
+        IpcCommand::RemoveChain { chain_id } => {
+            controller.remove_chain(&chain_id);
+            save_profile_ok_response(controller, id).await
+        }
+        IpcCommand::EvaluateRule { request } => {
+            let res = controller.evaluate_rule(&request);
+            IpcResponse::success(id, &res)
+        }
+        IpcCommand::SimulateConnection { request } => {
+            let tracked = controller.simulate_connection(request);
+            IpcResponse::success(id, &tracked)
+        }
+        IpcCommand::ScanOsSockets => {
+            let ctrl = controller.clone();
+            match run_blocking(move || ctrl.scan_and_ingest_os_sockets(DEFAULT_OS_SCAN_LIMIT)).await
+            {
+                Ok(sockets) => IpcResponse::success(id, &sockets),
+                Err(detail) => IpcResponse::error(Some(id), detail),
+            }
+        }
+        IpcCommand::TestProxy { proxy_id } => match controller.test_proxy(&proxy_id).await {
+            Ok(report) => IpcResponse::success(id, &report),
+            Err(err) => keyed_error_response(id, &err),
+        },
+        IpcCommand::TestAllProxies => {
+            let reports = controller.test_all_proxies().await;
+            IpcResponse::success(id, &reports)
+        }
+        IpcCommand::ListConnections => {
+            let conns = controller.telemetry.list_connections();
+            IpcResponse::success(id, &conns)
+        }
+        IpcCommand::TerminateConnection { connection_id } => {
+            let terminated = controller.terminate_connection(&connection_id);
+            IpcResponse::success(id, &serde_json::json!({ "terminated": terminated }))
+        }
+        IpcCommand::ClearClosedConnections => {
+            controller.telemetry.clear_closed_connections();
+            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
+        }
+        IpcCommand::ListLogs => {
+            let logs = controller.telemetry.list_logs();
+            IpcResponse::success(id, &logs)
+        }
+        IpcCommand::ClearLogs => {
+            controller.telemetry.clear_logs();
+            IpcResponse::success(id, &serde_json::json!({ "ok": true }))
+        }
+        cmd @ (IpcCommand::ListBlocked { .. }
+        | IpcCommand::QueryLogs { .. }
+        | IpcCommand::Analyze
+        | IpcCommand::CollectDiagnostics { .. }
+        | IpcCommand::PreviewRuleChange { .. }) => {
+            dispatch_diagnostics_command(controller, id, cmd).await
+        }
         IpcCommand::ListFakeIps => {
             let entries = controller.dns.list_entries();
             IpcResponse::success(id, &entries)
@@ -563,8 +623,8 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
                     for rule in &imported.rules {
                         controller.upsert_rule(rule.clone());
                     }
-                    if let Err(err) = controller.save_profile_default() {
-                        return keyed_error_response(id, &err);
+                    if let Err(resp) = save_profile_default_async(controller, &id).await {
+                        return resp;
                     }
                     imported.proxies = imported
                         .proxies
@@ -576,27 +636,11 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
                 Err(err) => keyed_error_response(id, &err),
             }
         }
-        IpcCommand::ListProfiles => match controller.list_named_profiles() {
-            Ok(list) => IpcResponse::success(id, &list),
-            Err(err) => keyed_error_response(id, &err),
-        },
-        IpcCommand::SaveNamedProfile { profile_id, name } => {
-            match controller.save_named_profile(profile_id.as_deref(), name.as_deref()) {
-                Ok(list) => IpcResponse::success(id, &list),
-                Err(err) => keyed_error_response(id, &err),
-            }
-        }
-        IpcCommand::SwitchProfile { profile_id } => {
-            match controller.switch_named_profile(&profile_id) {
-                Ok(prof) => IpcResponse::success(id, &prof),
-                Err(err) => keyed_error_response(id, &err),
-            }
-        }
-        IpcCommand::DeleteProfile { profile_id } => {
-            match controller.delete_named_profile(&profile_id) {
-                Ok(list) => IpcResponse::success(id, &list),
-                Err(err) => keyed_error_response(id, &err),
-            }
+        cmd @ (IpcCommand::ListProfiles
+        | IpcCommand::SaveNamedProfile { .. }
+        | IpcCommand::SwitchProfile { .. }
+        | IpcCommand::DeleteProfile { .. }) => {
+            dispatch_named_profile_command(controller, id, cmd).await
         }
         IpcCommand::Subscribe => {
             IpcResponse::success(id, &serde_json::json!({ "subscribed": true }))

@@ -346,6 +346,8 @@ where
     }
 }
 
+const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+
 pub async fn handle_api_route(
     method: &str,
     path: &str,
@@ -353,7 +355,28 @@ pub async fn handle_api_route(
     bridge: &DesktopCommandBridge,
     on_window_cmd: Option<&(dyn Fn(DesktopWindowCommand) + Send + Sync)>,
 ) -> Option<(u16, String, Vec<u8>)> {
-    let json_ct = "application/json; charset=utf-8".to_string();
+    if let Some(resp) = handle_activity_and_diagnostics_routes(method, path, body_str, bridge).await
+    {
+        return Some(resp);
+    }
+    if let Some(resp) =
+        handle_engine_and_ui_routes(method, path, body_str, bridge, on_window_cmd).await
+    {
+        return Some(resp);
+    }
+    if let Some(resp) = handle_rules_proxies_dns_routes(method, path, body_str, bridge).await {
+        return Some(resp);
+    }
+    handle_system_profiles_window_routes(method, path, body_str, bridge, on_window_cmd).await
+}
+
+async fn handle_activity_and_diagnostics_routes(
+    method: &str,
+    path: &str,
+    body_str: &str,
+    bridge: &DesktopCommandBridge,
+) -> Option<(u16, String, Vec<u8>)> {
+    let json_ct = JSON_CONTENT_TYPE.to_string();
 
     if path.starts_with("/api/state") {
         let state = bridge.refresh_state().await;
@@ -481,6 +504,18 @@ pub async fn handle_api_route(
         let json = serde_json::to_vec(&logs).unwrap_or_default();
         return Some((200, json_ct, json));
     }
+
+    None
+}
+
+async fn handle_engine_and_ui_routes(
+    method: &str,
+    path: &str,
+    body_str: &str,
+    bridge: &DesktopCommandBridge,
+    on_window_cmd: Option<&(dyn Fn(DesktopWindowCommand) + Send + Sync)>,
+) -> Option<(u16, String, Vec<u8>)> {
+    let json_ct = JSON_CONTENT_TYPE.to_string();
 
     if path.starts_with("/api/engine/toggle") {
         if let Some(rejection) = require_post(method, &json_ct) {
@@ -675,6 +710,17 @@ pub async fn handle_api_route(
             }
         }
     }
+
+    None
+}
+
+async fn handle_rules_proxies_dns_routes(
+    method: &str,
+    path: &str,
+    body_str: &str,
+    bridge: &DesktopCommandBridge,
+) -> Option<(u16, String, Vec<u8>)> {
+    let json_ct = JSON_CONTENT_TYPE.to_string();
 
     if path.starts_with("/api/rules/upsert") {
         if let Some(rejection) = require_post(method, &json_ct) {
@@ -910,6 +956,18 @@ pub async fn handle_api_route(
         let json = serde_json::to_vec(&sockets).unwrap_or_default();
         return Some((200, json_ct, json));
     }
+
+    None
+}
+
+async fn handle_system_profiles_window_routes(
+    method: &str,
+    path: &str,
+    body_str: &str,
+    bridge: &DesktopCommandBridge,
+    on_window_cmd: Option<&(dyn Fn(DesktopWindowCommand) + Send + Sync)>,
+) -> Option<(u16, String, Vec<u8>)> {
+    let json_ct = JSON_CONTENT_TYPE.to_string();
 
     if path == "/api/system/flush-os-dns" || path.starts_with("/api/system/flush-os-dns?") {
         if let Some(rejection) = require_post(method, &json_ct) {
@@ -1274,6 +1332,30 @@ pub async fn serve_loopback_http_connection<FStatic>(
         }
     };
 
+    // SSE streams are long-lived and use their own dedicated concurrency cap so they never
+    // starve short-lived `/api/*` requests sharing the `admission` semaphore.
+    if path.starts_with("/api/events") {
+        const LOOPBACK_MAX_SSE_STREAMS: usize = 16;
+        static SSE_SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+        let sse_slots =
+            SSE_SLOTS.get_or_init(|| tokio::sync::Semaphore::new(LOOPBACK_MAX_SSE_STREAMS));
+        let Ok(_sse_permit) = sse_slots.try_acquire() else {
+            let body = b"{\"error\":\"busy\"}";
+            let resp = format!(
+                "{}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+                http_status_line(503),
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+            let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
+            return;
+        };
+        stream_sse_events(stream, bound_port, bridge).await;
+        return;
+    }
+
     // The serving permit is taken only once the request is validated, so connections that never
     // finish or never authenticate cannot use up the slots reserved for real requests.
     let _admitted = match admission {
@@ -1295,11 +1377,6 @@ pub async fn serve_loopback_http_connection<FStatic>(
         },
         None => None,
     };
-
-    if path.starts_with("/api/events") {
-        stream_sse_events(stream, bound_port, bridge).await;
-        return;
-    }
 
     let body_str = extract_json_body(&req);
     let allowed_origin = format!("http://127.0.0.1:{bound_port}");

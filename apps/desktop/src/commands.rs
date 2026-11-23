@@ -1443,23 +1443,10 @@ impl DesktopCommandBridge {
         &self,
         mode: InterceptionMode,
     ) -> Result<SystemDiagnostics, IpcCallError> {
-        match self
+        let result = self
             .call_daemon_detailed::<SystemDiagnostics>(IpcCommand::SetInterceptionMode { mode })
-            .await
-        {
-            Ok(mut diag) => {
-                diag.daemon_connected = true;
-                diag.active_locale = self.i18n.get_locale();
-                self.state.write().diagnostics = diag.clone();
-                self.emit_resync();
-                self.notify_tray();
-                Ok(diag)
-            }
-            Err(err) => {
-                self.notify_tray();
-                Err(err)
-            }
-        }
+            .await;
+        self.apply_engine_result(result)
     }
 
     pub async fn start_privileged_daemon(&self) -> Result<DaemonFullState, DaemonLaunchError> {
@@ -1647,23 +1634,38 @@ impl DesktopCommandBridge {
             } else {
                 Vec::new()
             };
-            crate::desktop_logs::add_desktop_logs(
-                &mut bundle,
-                &crate::desktop_logs::DesktopLogSource {
-                    log_dir: &self.log_dir,
-                    app_name: &telemetry.log_app_name,
-                    options,
-                    limits: BundleLimits {
-                        max_log_days: telemetry.diagnostics_max_log_days,
-                        logs_max_bytes: telemetry.diagnostics_logs_max_bytes,
-                        bundle_max_bytes: telemetry.diagnostics_bundle_max_bytes,
-                        hard_max_bytes: self.constants.ipc.max_line_bytes,
+            let log_dir = self.log_dir.clone();
+            let app_name = telemetry.log_app_name.clone();
+            let limits = BundleLimits {
+                max_log_days: telemetry.diagnostics_max_log_days,
+                logs_max_bytes: telemetry.diagnostics_logs_max_bytes,
+                bundle_max_bytes: telemetry.diagnostics_bundle_max_bytes,
+                hard_max_bytes: self.constants.ipc.max_line_bytes,
+            };
+            let redactor =
+                Redactor::from_environment().with_profile_credentials(&self.state.read().profile);
+            if let Ok(merged) = tokio::task::spawn_blocking(move || {
+                crate::desktop_logs::add_desktop_logs(
+                    &mut bundle,
+                    &crate::desktop_logs::DesktopLogSource {
+                        log_dir: &log_dir,
+                        app_name: &app_name,
+                        options,
+                        limits,
+                        known_domains,
+                        redactor,
                     },
-                    known_domains,
-                    redactor: Redactor::from_environment()
-                        .with_profile_credentials(&self.state.read().profile),
-                },
-            );
+                );
+                bundle
+            })
+            .await
+            {
+                return Ok(merged);
+            }
+            return Err(IpcCallError::Remote {
+                message: "diagnostic bundle assembly failed".to_string(),
+                error_key: None,
+            });
         }
         Ok(bundle)
     }
