@@ -41,17 +41,9 @@ pub use security::{
 };
 pub use sse::stream_sse_events;
 
-/// Locale used when neither `ROUTEWARD_LOCALE` nor the operating system gives a French one.
-const DEFAULT_DESKTOP_LOCALE: &str = "en";
-const FRENCH_DESKTOP_LOCALE: &str = "fr";
-const FRENCH_LOCALE_PREFIX: &str = "fr";
-const ENV_ROUTEWARD_LOCALE: &str = "ROUTEWARD_LOCALE";
-#[cfg(not(target_os = "windows"))]
-const ENV_OS_LANG: &str = "LANG";
-/// Length of the buffer `GetUserDefaultLocaleName` fills (`LOCALE_NAME_MAX_LENGTH`).
-#[cfg(target_os = "windows")]
-const OS_LOCALE_NAME_MAX_LEN: usize = 85;
+pub use routeward_core::i18n::{locale_from_os_name, os_default_locale};
 
+const ENV_ROUTEWARD_LOCALE: &str = "ROUTEWARD_LOCALE";
 /// Duration of the tray "Pause 15 min" action, handed to the daemon (it keeps the deadline).
 pub const TRAY_PAUSE_SECS: u64 = 15 * 60;
 
@@ -79,44 +71,6 @@ pub struct TrayBalloon {
     pub title: String,
     pub body: String,
     pub level: TrayBalloonLevel,
-}
-
-/// Maps an operating-system locale name (`fr-FR`, `en-US`, `fr_CA.UTF-8`) to a desktop locale:
-/// any French variant gives French, everything else English.
-pub fn locale_from_os_name(name: &str) -> &'static str {
-    if name
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with(FRENCH_LOCALE_PREFIX)
-    {
-        FRENCH_DESKTOP_LOCALE
-    } else {
-        DEFAULT_DESKTOP_LOCALE
-    }
-}
-
-/// The locale of the operating system user, as a desktop locale.
-pub fn os_default_locale() -> &'static str {
-    #[cfg(target_os = "windows")]
-    {
-        use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
-        let mut buffer = [0u16; OS_LOCALE_NAME_MAX_LEN];
-        // SAFETY: the buffer is valid for `OS_LOCALE_NAME_MAX_LEN` UTF-16 units, which is the
-        // size passed; the function writes a NUL-terminated name and returns its length.
-        let written =
-            unsafe { GetUserDefaultLocaleName(buffer.as_mut_ptr(), OS_LOCALE_NAME_MAX_LEN as i32) };
-        if written <= 0 {
-            return DEFAULT_DESKTOP_LOCALE;
-        }
-        let len = buffer.iter().position(|&unit| unit == 0).unwrap_or(0);
-        locale_from_os_name(&String::from_utf16_lossy(&buffer[..len]))
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var(ENV_OS_LANG)
-            .map(|lang| locale_from_os_name(&lang))
-            .unwrap_or(DEFAULT_DESKTOP_LOCALE)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

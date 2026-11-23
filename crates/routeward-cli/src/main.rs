@@ -26,7 +26,7 @@ use routeward_core::error::{
     RouteWardError, RouteWardResult, ERR_KEY_CLEANUP_DAEMON_ACTIVE, ERR_KEY_CONFIG_JSON,
     ERR_KEY_CONFIG_LOAD, ERR_KEY_DAEMON_NOT_ELEVATED,
 };
-use routeward_core::i18n::I18nRegistry;
+use routeward_core::i18n::{os_default_locale, I18nRegistry};
 use routeward_core::interceptor::RouteWardController;
 use routeward_core::ipc::protocol::IpcCommand;
 use routeward_core::ipc::transport::is_daemon_ipc_active;
@@ -50,9 +50,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-const DEFAULT_CLI_LOCALE: &str = "fr";
 const DEFAULT_EVAL_PORT: u16 = 443;
 const COMPONENT_CLI_CTL: &str = "CliCtl";
+
+/// Explicit locale (flag or `ROUTEWARD_LOCALE`) wins; otherwise the operating system language.
+fn resolve_locale(explicit: Option<&str>, os_default: impl FnOnce() -> &'static str) -> String {
+    explicit
+        .map(str::to_string)
+        .unwrap_or_else(|| os_default().to_string())
+}
 
 #[derive(Parser)]
 #[command(name = "routeward", version, about)]
@@ -60,8 +66,8 @@ struct CliArgs {
     #[arg(short, long, env = "ROUTEWARD_CONFIG_PATH")]
     profile: Option<PathBuf>,
 
-    #[arg(short, long, global = true, env = "ROUTEWARD_LOCALE", default_value = DEFAULT_CLI_LOCALE)]
-    locale: String,
+    #[arg(short, long, global = true, env = "ROUTEWARD_LOCALE")]
+    locale: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -1225,12 +1231,19 @@ fn init_logging(command: &Commands) {
     }
 }
 
+impl CliArgs {
+    fn resolved_locale(&self) -> String {
+        resolve_locale(self.locale.as_deref(), os_default_locale)
+    }
+}
+
 fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
     init_logging(&args.command);
 
+    let locale = args.resolved_locale();
     if let Commands::Service { action } = args.command {
-        return handle_service_command(action, &args.locale);
+        return handle_service_command(action, &locale);
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1262,6 +1275,7 @@ fn open_user_logger(log_dir: std::path::PathBuf, telemetry: &TelemetryConstants)
 }
 
 async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let locale = args.resolved_locale();
     let constants = SystemConstants::load_embedded()?;
 
     if let Commands::Ctl { action } = args.command {
@@ -1270,7 +1284,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             &constants.telemetry,
         );
         let client = IpcClient::new(constants.ipc);
-        let i18n = I18nRegistry::new(&args.locale);
+        let i18n = I18nRegistry::new(&locale);
         let render = CtlRender::for_action(&action);
         if let CtlRender::Export {
             output,
@@ -1305,11 +1319,11 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         allow_sid,
     } = args.command
     {
-        return run_daemon_host(constants, &args.locale, duration_secs, &allow_sid, None).await;
+        return run_daemon_host(constants, &locale, duration_secs, &allow_sid, None).await;
     }
 
     if let Commands::Recover { pause_at_end } = args.command {
-        return run_recover(constants, &args.locale, pause_at_end).await;
+        return run_recover(constants, &locale, pause_at_end).await;
     }
 
     if let Commands::MigrateUpgradeState { user_sid } = &args.command {
@@ -1318,7 +1332,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if matches!(args.command, Commands::PurgeData) {
-        let i18n = I18nRegistry::new(&args.locale);
+        let i18n = I18nRegistry::new(&locale);
         if let Err(err) = run_purge_data(&constants, &i18n) {
             eprintln!("{}", describe_admin_command_error(&i18n, &err));
             return Err(err.into());
@@ -1334,7 +1348,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             ..
         }
     ) {
-        let i18n = I18nRegistry::new(&args.locale);
+        let i18n = I18nRegistry::new(&locale);
         if let Err(err) = run_cleanup_all_users(&constants, &i18n) {
             eprintln!("{}", describe_admin_command_error(&i18n, &err));
             return Err(err.into());
@@ -1344,7 +1358,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if matches!(args.command, Commands::Cleanup { user: true, .. }) {
-        let i18n = I18nRegistry::new(&args.locale);
+        let i18n = I18nRegistry::new(&locale);
         if let Err(err) = run_cleanup_user(&constants) {
             eprintln!("{}", i18n.t(err.i18n_key()));
             return Err(err.into());
@@ -1356,7 +1370,7 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(args.command, Commands::Run { .. })
         && !RouteWardController::detect_admin_or_system()
     {
-        let i18n = I18nRegistry::new(&args.locale);
+        let i18n = I18nRegistry::new(&locale);
         let msg = i18n.t(routeward_core::error::ERR_KEY_INTERCEPTOR_NOT_ROOT);
         eprintln!("{msg}");
         return Err(RouteWardError::DaemonError {
@@ -1373,9 +1387,9 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let controller = match args.command {
         Commands::Run { .. } | Commands::Cleanup { .. } => {
-            RouteWardController::new(constants, profile, &args.locale)
+            RouteWardController::new(constants, profile, &locale)
         }
-        _ => RouteWardController::new_user_cli(constants, profile, &args.locale),
+        _ => RouteWardController::new_user_cli(constants, profile, &locale),
     };
 
     match args.command {
@@ -1496,6 +1510,24 @@ async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn locale_resolution_prefers_the_explicit_value_over_the_os() {
+        assert_eq!(super::resolve_locale(Some("en"), || "fr"), "en");
+        assert_eq!(super::resolve_locale(None, || "fr"), "fr");
+    }
+
+    #[test]
+    fn locale_flag_and_env_are_optional_and_the_flag_wins() {
+        let flag = CliArgs::try_parse_from(["routeward", "--locale", "fr", "ctl", "status"])
+            .expect("parse --locale");
+        assert_eq!(flag.locale.as_deref(), Some("fr"));
+        let absent =
+            CliArgs::try_parse_from(["routeward", "ctl", "status"]).expect("parse no locale");
+        if std::env::var_os("ROUTEWARD_LOCALE").is_none() {
+            assert_eq!(absent.locale, None);
+        }
+    }
+
     use super::*;
     use routeward_core::error::ERR_KEY_CLEANUP_DAEMON_ACTIVE;
     use routeward_core::ipc::protocol::DaemonFullState;
@@ -2426,7 +2458,7 @@ mod tests {
             "S-1-5-21-1-2-3-1002",
         ])
         .expect("parse daemon --locale --allow-sid");
-        assert_eq!(daemon.locale, "en");
+        assert_eq!(daemon.locale.as_deref(), Some("en"));
         match daemon.command {
             Commands::Daemon {
                 duration_secs,
