@@ -5,6 +5,24 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+## [v2026.1123.00] - 2026-11-23
+
+### Added
+- Linux: the .deb installs a menu launcher (`routeward-desktop.desktop`) and RouteWard icons (16 to 512 px and scalable); CI and release validate the launcher and check the package content.
+- Linux: when the desktop app cannot reach the service, it tells apart "your account is not in the `routeward` group" from "the service is not running" and shows the command to run; the Start action is available on Linux too.
+- README (EN/FR): an "Install on Linux" section.
+
+### Changed
+- The command line follows the system language (`--locale`, then `ROUTEWARD_LOCALE`, then the OS: LC_ALL, LC_MESSAGES, LANG, LANGUAGE on Linux) instead of always French; the desktop app shares the same detection.
+- Linux .deb: `libwebkit2gtk-4.1-0` and `libgtk-3-0` are now dependencies (the desktop app links them).
+- The first window size is capped to the screen on every OS.
+
+### Fixed
+- Linux desktop app: it exited at once under Wayland (`UnsupportedWindowHandle`) and showed an empty window under X11; the web view is now built on the window's GTK container.
+- Linux desktop app: a window that cannot open now shows an error dialog with a Linux-specific message instead of a WebView2 hint in the log only.
+
+### Security
+- `cookie` updated to 0.18.3 (RUSTSEC-2026-0594).
 ## [v2026.1122.01] - 2026-11-22
 
 ### Added
