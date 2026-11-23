@@ -164,7 +164,8 @@
         "completed_direct_no_proxy": "Configuration enregistrée. Pas encore de proxy : votre adresse IP reste visible et seules vos règles par application s'appliquent."
       },
       "dns": {
-        "flushed": "Mémoire DNS vidée"
+        "flushed": "Mémoire DNS vidée",
+        "os_flushed": "Cache DNS de Windows vidé"
       },
       "profile": {
         "imported": "Profil importé",
@@ -533,7 +534,8 @@
         "block_process": "Bloquer cet Exécutable",
         "block_domain": "Bloquer ce Domaine Cible",
         "terminate_socket": "Fermer la Connexion Active",
-        "close": "Fermer l'Inspecteur"
+        "close": "Fermer l'Inspecteur",
+        "see_logs": "Voir les journaux de cette connexion"
       }
     },
     "quick": {
@@ -690,6 +692,11 @@
     }
   },
   "rules": {
+    "temporary": {
+      "badge": "Temporaire - encore {{time}}",
+      "minutes": "{{count}} min",
+      "hours_minutes": "{{hours}} h {{minutes}} min"
+    },
     "simple": {
       "title": "Mes Applications & Sites",
       "subtitle": "Choisissez quelles applications ou sites passent par votre proxy, en direct, ou restent bloqués.",
@@ -937,6 +944,28 @@
       "component": "Sous-Système",
       "message": "Description de l'événement",
       "empty": "Aucun événement enregistré."
+    },
+    "query": {
+      "search_label": "Rechercher",
+      "search_placeholder": "Chercher dans les messages...",
+      "component_label": "Partie de RouteWard",
+      "component_all": "Toutes les parties",
+      "range_label": "Période",
+      "range_all": "Tout",
+      "range_15min": "15 dernières minutes",
+      "range_1h": "Dernière heure",
+      "range_24h": "Dernières 24 heures",
+      "source_label": "Source",
+      "source_memory": "En direct (depuis le démarrage)",
+      "source_file": "Fichier du {{date}}",
+      "search_button": "Rechercher",
+      "jump_active": "Seule cette connexion est affichée, dans une fenêtre de {{seconds}} secondes autour d'elle.",
+      "jump_clear": "Afficher tous les journaux",
+      "error": "Impossible de lire les journaux.",
+      "truncated": "Il y a plus de lignes que celles affichées. Affinez la recherche pour les voir.",
+      "loading": "Chargement...",
+      "load_more": "Charger la suite",
+      "context_pid": "(application numéro {{pid}})"
     }
   },
   "cli": {
@@ -988,6 +1017,29 @@
       "next_step": "Ouvrez RouteWard pour réactiver la protection.",
       "failed": "RouteWard n'a pas pu rétablir vos réglages Internet. Suivez les étapes \"Je n'ai plus Internet\" du guide de dépannage de RouteWard, ou ouvrez les Paramètres Windows, allez dans Réseau et Internet, puis Proxy, et désactivez le proxy.",
       "press_enter": "Appuyez sur Entrée pour fermer cette fenêtre."
+    },
+    "diagnose": {
+      "header": "Bilan RouteWard",
+      "no_findings": "Rien d'inquiétant n'a été trouvé."
+    },
+    "blocked": {
+      "header": "Connexions bloquées",
+      "empty": "Rien n'a été bloqué.",
+      "counters": "Écartés sans application connue : {{syn}} tentatives de connexion, {{udp}} paquets UDP."
+    },
+    "ctl": {
+      "empty_result": "Rien à afficher."
+    },
+    "logs": {
+      "invalid_level": "Niveau de journal inconnu : {{value}}.",
+      "invalid_since": "Valeur de temps illisible : {{value}}.",
+      "more_available": "D'autres lignes sont disponibles. Continuez avec le curseur {{cursor}}.",
+      "empty": "Aucune ligne de journal ne correspond."
+    },
+    "export": {
+      "written": "Fichier de diagnostic écrit dans {{path}}",
+      "exists": "Le fichier {{path}} existe déjà. Utilisez --force pour le remplacer.",
+      "sections": "Parties incluses : {{sections}}"
     }
   },
   "errors": {
@@ -1273,7 +1325,8 @@
       "hide_title": "Masquer les diagnostics",
       "subtab_overview": "Vue d'ensemble",
       "subtab_dns": "Cache DNS Fake-IP",
-      "subtab_logs": "Journaux d'événements"
+      "subtab_logs": "Journaux d'événements",
+      "subtab_checkup": "Bilan"
     }
   },
   "format": {
@@ -1361,6 +1414,354 @@
       "start_failed": "RouteWard n'a pas pu démarrer la protection. Ouvrez RouteWard pour plus de détails.",
       "toggle_failed": "RouteWard n'a pas pu modifier la protection. Ouvrez RouteWard pour plus de détails.",
       "pause_failed": "RouteWard n'a pas pu mettre la protection en pause. Ouvrez RouteWard pour plus de détails."
+    }
+  },
+  "activity": {
+    "subtabs": {
+      "label": "Sections de l'activité",
+      "connections": "Connexions",
+      "blocked": "Bloqué"
+    }
+  },
+  "blocked": {
+    "focus": {
+      "notice": "Affichage limité à ce que le bilan a signalé.",
+      "clear": "Tout afficher"
+    },
+    "title": "Connexions bloquées",
+    "subtitle": "Tout ce que RouteWard a arrêté, regroupé par application et par site, avec la raison en mots simples.",
+    "checkup": "Lancer un bilan",
+    "refresh": "Actualiser",
+    "error": "Impossible de charger la liste des connexions bloquées.",
+    "empty": "Rien n'a été bloqué depuis le démarrage de RouteWard.",
+    "row": {
+      "count_one": "{{count}} fois",
+      "count_other": "{{count}} fois",
+      "rule": "Règle : {{name}}",
+      "proxy": "Proxy : {{name}}",
+      "last_seen": "Dernière fois : {{time}}",
+      "unblock": "Débloquer",
+      "see_logs": "Voir les journaux"
+    },
+    "counters": {
+      "line": "Également arrêtés sans savoir quelle application les envoyait : {{syn}} tentatives de connexion et {{udp}} paquets UDP.",
+      "limit": "Limite : une partie du trafic est arrêtée par le système ou par le pare-feu Linux avant que RouteWard sache quelle application l'a envoyé. Ce trafic est seulement compté ici, jamais listé."
+    },
+    "home": {
+      "text_one": "{{count}} connexion a été bloquée.",
+      "text_other": "{{count}} connexions ont été bloquées.",
+      "cta": "Voir ce qui a été bloqué"
+    },
+    "reasons": {
+      "ruleBlock": {
+        "title": "Bloqué par l'une de vos règles",
+        "body": "Une règle de protection demande à RouteWard d'arrêter cette connexion."
+      },
+      "defaultPolicyBlock": {
+        "title": "Bloqué car rien ne l'autorise",
+        "body": "Aucune règle ne couvre cette application, et votre réglage par défaut bloque ce qui n'est pas autorisé. Ajoutez une exception pour la laisser passer."
+      },
+      "killSwitchProxyUnreachable": {
+        "title": "Coupe-circuit : le proxy est injoignable",
+        "body": "Cette application doit passer par votre proxy, mais RouteWard n'arrive pas à l'atteindre. Pour protéger votre vraie adresse, la connexion a été arrêtée plutôt que de sortir sans protection."
+      },
+      "killSwitchProxyRefused": {
+        "title": "Coupe-circuit : le proxy a refusé la connexion",
+        "body": "L'ordinateur proxy a répondu mais n'a pas accepté cette connexion. Vérifiez que le proxy fonctionne et que son adresse et son port sont corrects."
+      },
+      "killSwitchProxyTimeout": {
+        "title": "Coupe-circuit : le proxy a mis trop de temps à répondre",
+        "body": "Le proxy n'a pas répondu à temps, la connexion a donc été arrêtée plutôt que de sortir sans protection. Le proxy est peut-être arrêté ou très lent."
+      },
+      "killSwitchProxyAuthRejected": {
+        "title": "Coupe-circuit : le proxy a refusé votre identifiant",
+        "body": "L'identifiant ou le mot de passe enregistré pour le proxy n'est pas accepté. Ouvrez les réglages du proxy et vérifiez-les."
+      },
+      "killSwitchProxyHandshake": {
+        "title": "Coupe-circuit : le proxy a répondu de façon inattendue",
+        "body": "RouteWard a joint le proxy mais l'échange a échoué. Le type de proxy (SOCKS5, HTTP...) est peut-être incorrect dans ses réglages."
+      },
+      "killSwitchProxyMisconfigured": {
+        "title": "Coupe-circuit : les réglages du proxy sont incomplets",
+        "body": "Cette application devrait utiliser un proxy qui n'existe pas ou qui est désactivé. Ouvrez la liste des proxys et choisissez-en un qui est activé."
+      },
+      "udpProxyUnsupported": {
+        "title": "Votre proxy ne peut pas transporter ce type de trafic",
+        "body": "Les appels, les jeux et certains flux vidéo utilisent l'UDP, un type de trafic que ce proxy ne sait pas transporter. La connexion a été arrêtée pour qu'elle ne parte pas sans passer par le proxy. Ce n'est pas une panne du proxy."
+      },
+      "killSwitchDirectUdpFailed": {
+        "title": "Coupe-circuit sur du trafic direct",
+        "body": "Ce trafic aurait quitté votre ordinateur sans passer par le proxy alors que le coupe-circuit est activé : il a donc été arrêté."
+      },
+      "fragmentedUdpBlocked": {
+        "title": "Des données découpées en morceaux ont été arrêtées",
+        "body": "Ces données sont arrivées découpées en plusieurs morceaux, que RouteWard ne peut pas envoyer sans risque par un proxy. Laisser l'application se connecter directement, ou utiliser un proxy qui prend en charge l'UDP, évite le problème."
+      },
+      "unknownProcessPolicy": {
+        "title": "RouteWard n'a pas pu identifier ce programme",
+        "body": "Le programme à l'origine de cette connexion n'a pas pu être identifié, votre réglage pour les programmes inconnus a donc été appliqué. Dans la plupart des cas, il n'y a rien à corriger."
+      },
+      "unknownProcessKillSwitch": {
+        "title": "Programme inconnu arrêté par le coupe-circuit",
+        "body": "RouteWard n'a pas pu identifier le programme à l'origine de cette connexion, et le coupe-circuit arrête ce qu'il ne peut pas identifier. Dans la plupart des cas, il n'y a rien à corriger."
+      },
+      "fakeIpEgressGuard": {
+        "title": "Une application a utilisé une adresse de substitution qui n'existe plus",
+        "body": "RouteWard distribue des adresses de substitution temporaires pour suivre les noms de sites. Une application en a gardé une après son expiration, le trafic a donc été arrêté. Videz le cache DNS, puis redémarrez l'application."
+      },
+      "quicBlocked": {
+        "title": "Protocole web rapide (QUIC) désactivé volontairement",
+        "body": "Les navigateurs essaient QUIC en premier. RouteWard le bloque pour que le navigateur revienne à la connexion sécurisée normale, qui peut passer par votre proxy. C'est normal et le site se charge quand même."
+      },
+      "encryptedDnsBlocked": {
+        "title": "La recherche de noms privée de l'application a été bloquée",
+        "body": "Certaines applications cherchent les noms de sites par leur propre canal privé, ce qui contournerait votre protection. RouteWard l'arrête pour que l'application utilise la recherche normale. C'est attendu."
+      },
+      "localNameGuard": {
+        "title": "Un nom de réseau privé n'a pas été envoyé sur Internet",
+        "body": "Un nom qui n'existe que sur votre réseau domestique ou professionnel allait être recherché sur l'Internet public. Il a été arrêté pour ne pas révéler votre réseau."
+      },
+      "dnsServerBlockedByRule": {
+        "title": "Une règle a bloqué une recherche de nom de site",
+        "body": "Une règle a empêché cette application d'interroger un serveur DNS (l'annuaire d'Internet) pour obtenir l'adresse d'un site."
+      },
+      "unknown": {
+        "title": "Bloqué, raison non précisée",
+        "body": "RouteWard a bloqué cette connexion mais cette version ne sait pas dire pourquoi. Ouvrez les journaux pour en savoir plus."
+      }
+    }
+  },
+  "unblock": {
+    "duration": {
+      "legend": "Pour combien de temps ?",
+      "minutes15": "15 minutes",
+      "hour1": "1 heure",
+      "always": "Toujours"
+    },
+    "option": {
+      "change_rule_direct": {
+        "title": "Le laisser se connecter directement",
+        "desc": "Modifie votre règle existante pour que cette application ou ce site sorte sans le proxy. Le site verra votre vraie adresse."
+      },
+      "change_rule_proxy": {
+        "title": "L'envoyer par le proxy",
+        "desc": "Modifie votre règle existante pour qu'elle utilise votre proxy au lieu de bloquer."
+      },
+      "exception_app_direct": {
+        "title": "Laisser passer cette application (en direct)",
+        "desc": "Ajoute une règle pour cette application seulement. Elle se connectera sans le proxy : les sites verront votre vraie adresse."
+      },
+      "exception_app_proxy": {
+        "title": "Laisser passer cette application par le proxy",
+        "desc": "Ajoute une règle pour cette application seulement, afin qu'elle se connecte par votre proxy."
+      },
+      "exception_site_direct": {
+        "title": "Laisser passer ce site (en direct)",
+        "desc": "Ajoute une règle pour ce site seulement, quelle que soit l'application. Il se connectera sans le proxy."
+      },
+      "exception_site_proxy": {
+        "title": "Laisser passer ce site par le proxy",
+        "desc": "Ajoute une règle pour ce site seulement, afin qu'il se connecte par votre proxy."
+      },
+      "exception_app_site_direct": {
+        "title": "Laisser cette application joindre ce site seulement",
+        "desc": "Ajoute une règle étroite : cette application seulement, ce site seulement, en connexion directe."
+      },
+      "disable_rule": {
+        "title": "Désactiver la règle : {{rule}}",
+        "desc": "Cette règle couvre aussi d'autres applications et sites. Ils ne seront plus protégés par elle."
+      },
+      "cannot_outrank": {
+        "title": "Cette règle ne peut pas être contournée",
+        "desc": "Elle a la priorité maximale : aucune exception ne peut passer devant. Désactivez la règle ou modifiez-la dans la liste des règles."
+      },
+      "app_direct_unprotected": {
+        "title": "Laisser cette application sortir en direct (sans protection)",
+        "desc": "Attention : l'application se connecte sans le proxy, votre vraie adresse est donc exposée. Le coupe-circuit reste actif pour tout le reste."
+      },
+      "test_proxy": {
+        "title": "Tester le proxy",
+        "desc": "Vérifie si RouteWard peut l'atteindre en ce moment."
+      },
+      "open_proxy": {
+        "title": "Ouvrir les réglages du proxy",
+        "desc": "Vérifiez ou modifiez l'adresse, le port et l'identifiant, ou ajoutez un proxy de secours."
+      },
+      "pause": {
+        "title": "Mettre la protection en pause {{minutes}} minutes",
+        "desc": "Tout se connecte directement pendant un moment, les sites voient donc votre vraie adresse. La protection reprend ensuite toute seule."
+      },
+      "flush_dns": {
+        "title": "Vider le cache DNS de Windows",
+        "desc": "Windows oublie les anciennes adresses mémorisées : l'application en redemande et obtient des adresses à jour."
+      },
+      "restart_app": {
+        "title": "Puis redémarrer l'application",
+        "desc": "Fermez complètement l'application et rouvrez-la pour qu'elle demande de nouvelles adresses."
+      }
+    },
+    "rules": {
+      "app_proxy": "{{name}} - connexion par le proxy",
+      "site_proxy": "{{name}} - connexion par le proxy",
+      "app_site_direct": "{{app}} vers {{site}} - connexion directe"
+    },
+    "diff": {
+      "added": "Ajouter la règle : {{name}}",
+      "changed": "Modifier la règle : {{name}}",
+      "disabled": "Désactiver la règle : {{name}}",
+      "removed": "Supprimer la règle : {{name}}",
+      "expires": "Cette règle s'arrête toute seule à {{time}}.",
+      "outranks": "Attention : cette exception passe aussi devant vos règles de proxy pour le reste du trafic de la même application ou du même site : {{names}}."
+    },
+    "confirm": {
+      "title": "Débloquer {{name}} ?",
+      "intro": "Ces changements vont être appliqués :",
+      "outcome_direct": "Résultat : la connexion sortira directement, sans le proxy.",
+      "outcome_proxy": "Résultat : la connexion passera par votre proxy.",
+      "outcome_block": "Résultat : la connexion serait toujours bloquée.",
+      "outcome_unknown": "RouteWard n'a pas pu prévoir le résultat avant d'appliquer.",
+      "override_warning": "Un réglage de sécurité la bloquerait encore : {{reason}}. Ce changement seul ne suffira pas.",
+      "still_blocked_warning": "Ce changement ne débloque pas la connexion à lui seul. Une autre règle ou un autre réglage la bloque encore."
+    },
+    "toast": {
+      "done": "{{name}} est débloqué"
+    }
+  },
+  "analyzer": {
+    "pause_confirm": {
+      "title": "Mettre la protection en pause {{minutes}} minutes ?",
+      "intro": "La protection va s'arrêter un moment :",
+      "change": "Tout se connecte directement pendant {{minutes}} minutes, puis la protection reprend toute seule.",
+      "warning": "Pendant la pause, les sites voient votre vraie adresse et rien n'est bloqué."
+    },
+    "title": "Bilan",
+    "subtitle": "RouteWard examine ce qui a été bloqué et vos réglages, puis vous dit quoi faire.",
+    "run": "Lancer le bilan",
+    "running": "Analyse en cours...",
+    "export": "Exporter un fichier de diagnostic",
+    "error": "Le bilan n'a pas pu s'exécuter.",
+    "none": "Rien d'inquiétant n'a été trouvé.",
+    "evidence_one": "Vu {{count}} fois",
+    "evidence_other": "Vu {{count}} fois",
+    "last_seen": "dernière fois à {{time}}",
+    "action": {
+      "open_proxy": "Ouvrir le proxy",
+      "test_proxy": "Tester le proxy",
+      "unblock": "Voir ce qui est bloqué",
+      "edit_rule": "Ouvrir les règles",
+      "pause": "Mettre la protection en pause",
+      "open_setting": "Ouvrir les réglages"
+    },
+    "unknown": {
+      "title": "Quelque chose à examiner",
+      "body": "Le bilan a trouvé un problème que cette version ne sait pas décrire.",
+      "fix": "Mettez RouteWard à jour, ou ouvrez les journaux pour les détails."
+    },
+    "findings": {
+      "proxyUnreachable": {
+        "title": "Le proxy {{proxy}} est injoignable",
+        "body": "Les applications qui devraient l'utiliser sont arrêtées par le coupe-circuit ({{count}} connexions bloquées).",
+        "fix": "Testez le proxy. S'il échoue, vérifiez son adresse et qu'il fonctionne, ou passez sur un proxy de secours."
+      },
+      "proxyAuthRejected": {
+        "title": "Le proxy {{proxy}} refuse votre identifiant",
+        "body": "L'identifiant ou le mot de passe enregistré ne correspond pas à ce que le proxy attend.",
+        "fix": "Ouvrez le proxy et saisissez de nouveau l'identifiant."
+      },
+      "defaultPolicyBlocking": {
+        "title": "{{app}} est bloqué car aucune règle ne l'autorise",
+        "body": "Votre réglage par défaut bloque tout ce qu'aucune règle ne couvre, et {{app}} n'est pas couvert.",
+        "fix": "Débloquez-le depuis l'onglet Bloqué, ou changez l'action par défaut."
+      },
+      "appBlockedBySimpleRule": {
+        "title": "{{app}} est bloqué par une règle que vous avez définie",
+        "body": "Vous, ou un assistant de configuration, avez réglé {{app}} sur Bloqué.",
+        "fix": "Réglez l'application sur Direct ou Via le proxy dans la page Applications, ou débloquez-la depuis l'onglet Bloqué."
+      },
+      "appBlockedByPack": {
+        "title": "{{app}} est bloqué par un pack de protection",
+        "body": "Une protection toute faite ({{rule}}) bloque du trafic que cette application utilise.",
+        "fix": "Ajoutez une exception pour cette application, ou désactivez cette protection."
+      },
+      "appBlockedByRule": {
+        "title": "{{app}} est bloqué par l'une de vos règles",
+        "body": "La règle {{rule}} bloque du trafic que cette application utilise.",
+        "fix": "Modifiez cette règle ou ajoutez une exception pour cette application."
+      },
+      "ruleShadowed": {
+        "title": "La règle {{rule}} ne s'applique jamais",
+        "body": "Une autre règle avec un numéro plus bas décide en premier, celle-ci n'est donc jamais atteinte.",
+        "fix": "Ouvrez les règles et réordonnez ou supprimez l'une d'elles."
+      },
+      "quicOrDohBlockedInfo": {
+        "title": "Le protocole web rapide et la recherche de noms privée sont bloqués volontairement",
+        "body": "{{count}} tentatives ont été arrêtées. Les navigateurs reviennent à la connexion sécurisée normale, les sites se chargent donc quand même.",
+        "fix": "Rien à faire, sauf si une application en a vraiment besoin. Dans ce cas, désactivez l'option dans les Réglages."
+      },
+      "unattributedDropsHigh": {
+        "title": "Beaucoup de connexions ont été arrêtées sans savoir quelle application",
+        "body": "{{count}} tentatives ont été arrêtées par le coupe-circuit avant que RouteWard puisse identifier l'application : la liste Bloqué ne peut donc pas les montrer.",
+        "fix": "Vérifiez que le proxy fonctionne. Ces arrêts cessent en général dès qu'il fonctionne."
+      },
+      "fakeIpGuardHits": {
+        "title": "Une application a gardé une adresse de substitution expirée",
+        "body": "RouteWard a arrêté {{count}} connexions vers des adresses qu'il avait distribuées auparavant.",
+        "fix": "Utilisez Débloquer sur l'élément bloqué pour vider le cache DNS de Windows, puis redémarrez l'application."
+      },
+      "protectionPausedOrStopped": {
+        "title": "La protection est en pause ou arrêtée",
+        "body": "Rien n'est dirigé ni bloqué pour le moment : vos applications se connectent comme sans RouteWard.",
+        "fix": "Réactivez la protection depuis la page d'accueil."
+      },
+      "logFolderLarge": {
+        "title": "Le dossier des journaux devient volumineux",
+        "body": "Les anciens journaux sont supprimés automatiquement, mais le dossier est plus gros que prévu.",
+        "fix": "Exportez ce dont vous avez besoin, puis effacez les journaux depuis les Réglages."
+      }
+    }
+  },
+  "diagnostics": {
+    "export": {
+      "title": "Exporter un fichier de diagnostic",
+      "intro": "Crée un fichier unique à envoyer à la personne qui vous aide. Il est fabriqué ici et enregistré sur votre ordinateur. Rien n'est envoyé nulle part.",
+      "options": "Ce qu'il faut inclure",
+      "log_days": "Jours de journaux",
+      "days_one": "{{count}} jour",
+      "days_other": "{{count}} jours",
+      "include_connections": "Connexions récentes",
+      "include_profile": "Mes réglages (les mots de passe ne sont jamais inclus)",
+      "mask_sites": "Masquer les noms de sites (chacun est remplacé par un code court)",
+      "sites_warning": "Ce fichier liste les sites contactés par vos applications. Cochez la case ci-dessus pour les masquer avant de le partager.",
+      "error": "Le fichier n'a pas pu être préparé.",
+      "manifest_title": "Ce que contient le fichier",
+      "col_section": "Partie",
+      "col_size": "Taille",
+      "total": "Total",
+      "redaction": {
+        "passwords": "mots de passe",
+        "authHeaders": "en-têtes d'identification",
+        "tokens": "jetons d'accès",
+        "urlSecrets": "secrets dans les adresses web",
+        "userPaths": "noms de dossiers d'utilisateur",
+        "usernames": "noms d'utilisateur",
+        "machineName": "nom de l'ordinateur",
+        "exitIp": "adresse de sortie du proxy",
+        "domains": "noms de sites web"
+      },
+      "redactions": "Retiré ou masqué : {{list}}.",
+      "never_sent": "Vérifiez la liste, puis téléchargez. RouteWard n'envoie le fichier nulle part.",
+      "close": "Fermer",
+      "download": "Télécharger le fichier",
+      "prepare": "Préparer le fichier",
+      "preparing": "Préparation...",
+      "done": "Diagnostic enregistré sous {{name}}",
+      "section": {
+        "system": "Système",
+        "profile": "Réglages",
+        "connections": "Connexions",
+        "blocked": "Liste des blocages",
+        "logs": "Journaux"
+      }
     }
   }
 }

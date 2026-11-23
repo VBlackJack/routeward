@@ -54,6 +54,7 @@ import {
   TelemetrySnapshot
 } from '../types/routeward';
 import { DashboardUseCaseId } from './DashboardView';
+import { BlockedShortcut } from './BlockedShortcut';
 
 interface SimpleDashboardViewProps {
   telemetry: TelemetrySnapshot;
@@ -81,6 +82,8 @@ interface SimpleDashboardViewProps {
   onUpdateSecurityPolicy: (partial: Partial<SecurityPolicyConfig>) => void;
   onOpenWizard: () => void;
   onOpenTroubleshoot?: () => void;
+  /** Opens the Blocked tab of Activity; the shortcut shows only when something was blocked. */
+  onOpenBlocked?: () => void;
   onNavigateRules: () => void;
   onSwitchToExpert: () => void;
 }
@@ -106,6 +109,7 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
   onUpdateSecurityPolicy,
   onOpenWizard,
   onOpenTroubleshoot,
+  onOpenBlocked,
   onNavigateRules,
   onSwitchToExpert
 }) => {
@@ -248,6 +252,8 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
   return (
     <div className="space-y-6">
       {/* Focused Hero Protection Banner (1 primary CTA + optional temporary pause) */}
+      <BlockedShortcut blockedCount={telemetry.blockedCount} onOpen={onOpenBlocked} />
+
       <div
         className={`tf-card space-y-4 border-l-4 p-5 ${toneBorder}`}
       >

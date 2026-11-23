@@ -16,6 +16,7 @@
 
 pub mod checker;
 pub mod config;
+pub mod diagnostics;
 pub mod dns;
 pub mod error;
 pub mod i18n;

@@ -18,7 +18,11 @@ pub mod protocol;
 pub mod transport;
 
 use crate::config::IpcConstants;
+use crate::diagnostics::bundle::CollectOptions;
+use crate::diagnostics::logs::{QueryLogsRequest, QueryLogsResponse};
+use crate::diagnostics::{self, AnalyzeResponse, BlockedResponse, PreviewRuleChangeRequest};
 use crate::error::{RouteWardError, RouteWardResult, ERR_KEY_DAEMON_IPC_ERROR};
+use crate::interceptor::policy::PredictedOutcome;
 use crate::interceptor::RouteWardController;
 use crate::ipc::protocol::{
     parse_ipc_request, read_bounded_line, recv_next_stream_event, DaemonFullState, IpcCommand,
@@ -28,6 +32,7 @@ use crate::ipc::transport::{connect_ipc_stream, IpcServer, IpcStream, PeerIdenti
 use crate::pac::FoxyProxyImporter;
 use crate::telemetry::LogLevel;
 use serde::de::DeserializeOwned;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -89,6 +94,24 @@ impl DaemonIpcService {
         mut shutdown: watch::Receiver<bool>,
     ) -> RouteWardResult<()> {
         let mut client_tasks = tokio::task::JoinSet::new();
+        // Expired temporary rules are swept and persisted by the daemon, whatever the engine
+        // state. The task is aborted with the accept loop.
+        let sweep_interval = Duration::from_millis(
+            self.controller
+                .constants
+                .ipc
+                .rule_expiry_sweep_interval_ms
+                .max(1),
+        );
+        let expiry_task = tokio::spawn(run_rule_expiry_persistence(
+            self.controller.clone(),
+            sweep_interval,
+            shutdown.clone(),
+            |ctrl: &RouteWardController| {
+                let _ = ctrl.persist_after_rule_expiry();
+            },
+        ));
+        let _expiry_guard = AbortOnDrop(expiry_task);
         loop {
             while client_tasks.try_join_next().is_some() {}
             tokio::select! {
@@ -115,6 +138,45 @@ impl DaemonIpcService {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Aborts the wrapped task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Sweeps expired rules every `interval` (the first sweep runs at once, which covers a profile
+/// loaded with expired rules) and calls `persist` each time rules were removed, by this timer or
+/// by the engine ticker. Returns on shutdown.
+async fn run_rule_expiry_persistence<F>(
+    controller: RouteWardController,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    persist: F,
+) where
+    F: Fn(&RouteWardController),
+{
+    let mut notices = controller.subscribe_rule_expiry();
+    let mut timer = tokio::time::interval(interval);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = wait_for_shutdown_signal(&mut shutdown) => return,
+            _ = timer.tick() => {
+                controller.sweep_expired_rules(chrono::Utc::now());
+            }
+            notice = notices.recv() => match notice {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    persist(&controller);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     }
@@ -387,6 +449,80 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
             controller.telemetry.clear_logs();
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
         }
+        IpcCommand::ListBlocked { since, limit } => {
+            IpcResponse::success(id, &diagnostics::list_blocked(controller, since, limit))
+        }
+        IpcCommand::QueryLogs {
+            source,
+            min_level,
+            components,
+            text,
+            pid,
+            connection_id,
+            since,
+            until,
+            limit,
+            cursor,
+        } => {
+            let query = QueryLogsRequest {
+                source,
+                min_level,
+                components,
+                text,
+                pid,
+                connection_id,
+                since,
+                until,
+                limit,
+                cursor,
+            };
+            let ctrl = controller.clone();
+            match run_blocking(move || diagnostics::query_logs(&ctrl, &query)).await {
+                Ok(Ok(res)) => IpcResponse::success(id, &res),
+                Ok(Err(err)) => IpcResponse::error(Some(id), err.to_string()),
+                Err(detail) => IpcResponse::error(Some(id), detail),
+            }
+        }
+        IpcCommand::Analyze => {
+            let ctrl = controller.clone();
+            match run_blocking(move || diagnostics::analyze(&ctrl)).await {
+                Ok(res) => IpcResponse::success(id, &res),
+                Err(detail) => IpcResponse::error(Some(id), detail),
+            }
+        }
+        IpcCommand::CollectDiagnostics {
+            log_days,
+            include_connections,
+            include_profile,
+            mask_domains,
+        } => {
+            let options = CollectOptions {
+                log_days,
+                include_connections,
+                include_profile,
+                mask_domains,
+            };
+            let ctrl = controller.clone();
+            match run_blocking(move || diagnostics::collect_diagnostics(&ctrl, options)).await {
+                Ok(bundle) => IpcResponse::success(id, &bundle),
+                Err(detail) => IpcResponse::error(Some(id), detail),
+            }
+        }
+        IpcCommand::PreviewRuleChange {
+            upserts,
+            remove_ids,
+            request,
+        } => {
+            let outcome = diagnostics::preview_rule_change(
+                controller,
+                &PreviewRuleChangeRequest {
+                    upserts,
+                    remove_ids,
+                    request,
+                },
+            );
+            IpcResponse::success(id, &outcome)
+        }
         IpcCommand::ListFakeIps => {
             let entries = controller.dns.list_entries();
             IpcResponse::success(id, &entries)
@@ -398,6 +534,13 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
         IpcCommand::FlushFakeIps => {
             controller.dns.flush();
             IpcResponse::success(id, &serde_json::json!({ "ok": true }))
+        }
+        IpcCommand::FlushOsDnsCache => {
+            let ctrl = controller.clone();
+            match run_blocking(move || ctrl.flush_os_dns_cache("ipc")).await {
+                Ok(flushed) => IpcResponse::success(id, &serde_json::json!({ "ok": flushed })),
+                Err(detail) => IpcResponse::error(Some(id), detail),
+            }
         }
         IpcCommand::ImportFoxyProxyJson {
             json,
@@ -459,6 +602,15 @@ async fn dispatch_command(controller: &RouteWardController, req: IpcRequest) -> 
             IpcResponse::success(id, &serde_json::json!({ "subscribed": true }))
         }
     }
+}
+
+/// Runs file-reading work off the async workers.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|err| format!("task_failed: {err}"))
 }
 
 async fn write_json_line<W, T>(writer: &mut W, payload: &T) -> std::io::Result<()>
@@ -579,6 +731,68 @@ impl IpcClient {
     ) -> Result<crate::interceptor::SystemDiagnostics, IpcCallError> {
         self.call_typed_detailed(IpcCommand::PauseEngine { duration_secs })
             .await
+    }
+
+    /// Aggregated blocked connections (`since` is epoch milliseconds).
+    pub async fn list_blocked(
+        &self,
+        since: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<BlockedResponse, IpcCallError> {
+        self.call_typed_detailed(IpcCommand::ListBlocked { since, limit })
+            .await
+    }
+
+    /// Queries the daemon's logs (memory ring or one of its daily files).
+    pub async fn query_logs(
+        &self,
+        query: QueryLogsRequest,
+    ) -> Result<QueryLogsResponse, IpcCallError> {
+        self.call_typed_detailed(IpcCommand::QueryLogs {
+            source: query.source,
+            min_level: query.min_level,
+            components: query.components,
+            text: query.text,
+            pid: query.pid,
+            connection_id: query.connection_id,
+            since: query.since,
+            until: query.until,
+            limit: query.limit,
+            cursor: query.cursor,
+        })
+        .await
+    }
+
+    /// Runs the check-up on the daemon.
+    pub async fn analyze(&self) -> Result<AnalyzeResponse, IpcCallError> {
+        self.call_typed_detailed(IpcCommand::Analyze).await
+    }
+
+    /// Asks the daemon for the redacted diagnostic bundle.
+    pub async fn collect_diagnostics(
+        &self,
+        options: CollectOptions,
+    ) -> Result<serde_json::Value, IpcCallError> {
+        self.call_typed_detailed(IpcCommand::CollectDiagnostics {
+            log_days: options.log_days,
+            include_connections: options.include_connections,
+            include_profile: options.include_profile,
+            mask_domains: options.mask_domains,
+        })
+        .await
+    }
+
+    /// Predicts a connection's outcome under a rule change, without applying it.
+    pub async fn preview_rule_change(
+        &self,
+        preview: PreviewRuleChangeRequest,
+    ) -> Result<PredictedOutcome, IpcCallError> {
+        self.call_typed_detailed(IpcCommand::PreviewRuleChange {
+            upserts: preview.upserts,
+            remove_ids: preview.remove_ids,
+            request: preview.request,
+        })
+        .await
     }
 
     pub async fn call_typed<T: DeserializeOwned>(&self, command: IpcCommand) -> RouteWardResult<T> {
@@ -849,6 +1063,84 @@ mod tests {
         RouteWardController::new(constants, profile, "en")
     }
 
+    fn expired_rule(id: &str) -> crate::config::RoutingRule {
+        crate::config::RoutingRule {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            priority: 5,
+            process_patterns: vec![],
+            domain_patterns: vec![],
+            ip_cidrs: vec![],
+            port_ranges: vec![],
+            protocol: crate::config::TransportProtocol::Any,
+            action: crate::config::RuleAction::Direct,
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::seconds(5)),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_daemon_sweeps_and_persists_expired_rules_with_the_engine_stopped() {
+        let controller = test_controller();
+        assert!(!controller.is_running());
+        controller.upsert_rule(expired_rule("tmp-1"));
+        let saves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = saves.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_rule_expiry_persistence(
+            controller.clone(),
+            Duration::from_millis(10),
+            stop_rx,
+            move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        ));
+        for _ in 0..200 {
+            if saves.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(controller
+            .profile
+            .read()
+            .rules
+            .iter()
+            .all(|r| r.id != "tmp-1"));
+        // A later tick with nothing to remove never saves again.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 1);
+        stop_tx.send(true).expect("stop");
+        task.await.expect("task ends on shutdown");
+    }
+
+    #[test]
+    fn only_the_daemon_controller_persists_after_a_rule_expiry() {
+        // A plain engine (`routeward run --profile X`, user CLI, tests) never writes a profile.
+        let controller = test_controller();
+        controller.upsert_rule(expired_rule("tmp-2"));
+        assert_eq!(
+            controller.sweep_expired_rules(chrono::Utc::now()),
+            vec!["tmp-2".to_string()]
+        );
+        assert!(controller.persist_after_rule_expiry().is_none());
+    }
+
+    #[test]
+    fn replacing_a_profile_drops_the_rules_that_already_expired() {
+        let controller = test_controller();
+        let mut incoming = controller.profile.read().redacted_for_ipc();
+        incoming.rules.push(expired_rule("tmp-3"));
+        controller.replace_profile(incoming).expect("valid profile");
+        assert!(controller
+            .profile
+            .read()
+            .rules
+            .iter()
+            .all(|r| r.id != "tmp-3"));
+    }
+
     fn proxy_with_auth(id: &str, auth: ProxyCredentials) -> ProxyNode {
         ProxyNode {
             id: id.to_string(),
@@ -922,6 +1214,180 @@ mod tests {
         controller.replace_profile(replacement).expect("replace");
         assert!(!stored_has_password(&controller, "p-replaced"));
         assert!(stored_has_password(&controller, "p-real"));
+    }
+
+    fn diagnostics_controller() -> (RouteWardController, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("routeward_ipc_diag_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+        profile.enable_logging = true;
+        profile.rules = Vec::new();
+        profile.default_action = crate::config::RuleAction::Direct;
+        let controller =
+            RouteWardController::new_with_log_dir(constants, profile, "en", dir.clone());
+        (controller, dir)
+    }
+
+    async fn dispatch_json(
+        controller: &RouteWardController,
+        command: serde_json::Value,
+    ) -> IpcResponse {
+        let line = serde_json::json!({ "id": "req", "command": command }).to_string();
+        let req = parse_ipc_request(&line).expect("valid request");
+        dispatch_command(controller, req).await
+    }
+
+    #[test]
+    fn diagnostics_commands_parse_from_the_documented_json() {
+        let samples = [
+            r#"{"id":"1","command":{"type":"list_blocked"}}"#,
+            r#"{"id":"1","command":{"type":"flush_os_dns_cache"}}"#,
+            r#"{"id":"1","command":{"type":"list_blocked","since":1,"limit":5}}"#,
+            r#"{"id":"1","command":{"type":"query_logs","source":"memory","limit":10}}"#,
+            r#"{"id":"1","command":{"type":"query_logs","source":{"daemonFile":{"date":"20261122"}},"minLevel":"WARN","components":["a"],"text":"x","pid":3,"connectionId":"abc","since":1,"until":2,"limit":10,"cursor":"5"}}"#,
+            r#"{"id":"1","command":{"type":"analyze"}}"#,
+            r#"{"id":"1","command":{"type":"collect_diagnostics","logDays":3,"includeConnections":true,"includeProfile":false,"maskDomains":true}}"#,
+            r#"{"id":"1","command":{"type":"preview_rule_change","upserts":[],"removeIds":["a"],"request":{"processName":"a.exe","targetHost":"h","targetPort":1,"protocol":"tcp"}}}"#,
+        ];
+        for sample in samples {
+            parse_ipc_request(sample).unwrap_or_else(|e| panic!("{sample}: {e:?}"));
+        }
+        // Strict like every other command: unknown fields are refused.
+        let unknown = r#"{"id":"1","command":{"type":"list_blocked","extra":1}}"#;
+        assert!(parse_ipc_request(unknown).is_err());
+        let missing_limit = r#"{"id":"1","command":{"type":"query_logs","source":"memory"}}"#;
+        assert!(parse_ipc_request(missing_limit).is_err());
+    }
+
+    #[tokio::test]
+    async fn blocked_logs_analyze_collect_and_preview_round_trip_through_dispatch() {
+        use crate::config::TransportProtocol;
+        use crate::telemetry::{BlockReason, BlockedRecord, TrackedConnection};
+        let (controller, dir) = diagnostics_controller();
+        controller.telemetry.record_connection(
+            TrackedConnection::blocked(
+                BlockedRecord::new(
+                    BlockReason::DefaultPolicyBlock,
+                    TransportProtocol::Tcp,
+                    "Default",
+                )
+                .process("slack.exe", "C:\\slack.exe", 9)
+                .target("slack.com", 443),
+            ),
+            false,
+        );
+        controller
+            .telemetry
+            .push_log(LogLevel::Warn, "Round", "trip line");
+        controller.telemetry.flush_file_logger();
+
+        let blocked =
+            dispatch_json(&controller, serde_json::json!({ "type": "list_blocked" })).await;
+        assert!(blocked.ok);
+        let blocked: crate::diagnostics::BlockedResponse =
+            serde_json::from_value(blocked.result.expect("result")).expect("decode");
+        assert_eq!(blocked.entries.len(), 1);
+        assert_eq!(blocked.entries[0].process_name, "slack.exe");
+
+        let memory = dispatch_json(
+            &controller,
+            serde_json::json!({ "type": "query_logs", "source": "memory", "components": ["Round"], "limit": 5 }),
+        )
+        .await;
+        assert!(memory.ok);
+        let memory: QueryLogsResponse =
+            serde_json::from_value(memory.result.expect("result")).expect("decode");
+        assert_eq!(memory.entries.len(), 1);
+        assert_eq!(memory.available_dates.len(), 1);
+
+        let file = dispatch_json(
+            &controller,
+            serde_json::json!({
+                "type": "query_logs",
+                "source": { "daemonFile": { "date": memory.available_dates[0] } },
+                "text": "trip",
+                "limit": 5
+            }),
+        )
+        .await;
+        assert!(file.ok);
+        let file: QueryLogsResponse =
+            serde_json::from_value(file.result.expect("result")).expect("decode");
+        assert_eq!(file.entries[0].message, "trip line");
+
+        // A date that is not eight digits is refused, whatever it tries to reach.
+        let traversal = dispatch_json(
+            &controller,
+            serde_json::json!({
+                "type": "query_logs",
+                "source": { "daemonFile": { "date": "..\\..\\secret" } },
+                "limit": 5
+            }),
+        )
+        .await;
+        assert!(!traversal.ok);
+        assert!(traversal
+            .error
+            .unwrap_or_default()
+            .contains("invalid_log_date"));
+
+        let analysis = dispatch_json(&controller, serde_json::json!({ "type": "analyze" })).await;
+        assert!(analysis.ok);
+        let analysis: crate::diagnostics::AnalyzeResponse =
+            serde_json::from_value(analysis.result.expect("result")).expect("decode");
+        assert!(analysis
+            .findings
+            .iter()
+            .any(|f| f.code == crate::diagnostics::analyzer::FindingCode::DefaultPolicyBlocking));
+
+        let bundle = dispatch_json(
+            &controller,
+            serde_json::json!({
+                "type": "collect_diagnostics",
+                "logDays": 1,
+                "includeConnections": true,
+                "includeProfile": true,
+                "maskDomains": false
+            }),
+        )
+        .await;
+        assert!(bundle.ok);
+        let bundle = bundle.result.expect("result");
+        let names: Vec<&str> = bundle["manifest"]["sections"]
+            .as_array()
+            .expect("sections")
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["system", "profile", "connections", "blocked", "logs"]
+        );
+
+        let preview = dispatch_json(
+            &controller,
+            serde_json::json!({
+                "type": "preview_rule_change",
+                "upserts": [{
+                    "id": "rule-unblock-app-slack", "name": "x", "enabled": true, "priority": 6,
+                    "processPatterns": ["slack.exe"], "domainPatterns": [], "ipCidrs": [],
+                    "portRanges": [], "protocol": "any", "action": { "type": "block" }
+                }],
+                "removeIds": [],
+                "request": { "processName": "slack.exe", "targetHost": "slack.com", "targetPort": 443, "protocol": "tcp" }
+            }),
+        )
+        .await;
+        assert!(preview.ok);
+        let preview = preview.result.expect("result");
+        assert_eq!(
+            preview["evaluation"]["matchedRuleId"],
+            "rule-unblock-app-slack"
+        );
+        assert_eq!(preview["evaluation"]["action"]["type"], "block");
+        assert!(preview.get("policyOverride").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

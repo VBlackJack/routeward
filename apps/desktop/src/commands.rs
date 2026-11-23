@@ -23,11 +23,16 @@ use routeward_core::config::{
     InterceptionMode, ProfileConfig, ProfileSummary, ProxyChain, ProxyNode, RoutingRule,
     SystemConstants, ThemeForgeCatalog,
 };
+use routeward_core::diagnostics::bundle::{BundleLimits, CollectOptions};
+use routeward_core::diagnostics::logs::{QueryLogsRequest, QueryLogsResponse};
+use routeward_core::diagnostics::redact::Redactor;
+use routeward_core::diagnostics::{AnalyzeResponse, BlockedResponse, PreviewRuleChangeRequest};
 use routeward_core::dns::FakeIpEntry;
 use routeward_core::error::{
     RouteWardError, RouteWardResult, ERR_KEY_DAEMON_DISCONNECTED, ERR_KEY_SYSTEM_PATH_EMPTY,
 };
 use routeward_core::i18n::I18nRegistry;
+use routeward_core::interceptor::policy::PredictedOutcome;
 use routeward_core::interceptor::SystemDiagnostics;
 use routeward_core::ipc::protocol::{
     read_bounded_line, DaemonFullState, IpcCommand, IpcRequest, IpcResponse, IpcStreamEvent,
@@ -93,10 +98,17 @@ pub struct DaemonStartReport {
 }
 
 /// True when a connection update shows the proxy failed to carry the traffic: the connection
-/// was blocked and carries the detail of an upstream failure. A block decided by a rule has no
-/// such detail, so it never raises the outage alert.
+/// was blocked for a kill-switch proxy reason and is not a simulation. A block decided by a rule
+/// never raises the outage alert. A record without a reason (older daemon) falls back to the
+/// former heuristic: blocked with the detail of an upstream failure.
 pub fn is_proxy_outage(conn: &TrackedConnection) -> bool {
-    conn.status == ConnectionStatus::Blocked && conn.error_detail.is_some()
+    if conn.status != ConnectionStatus::Blocked || conn.simulated {
+        return false;
+    }
+    match conn.block_reason {
+        Some(reason) => reason.is_kill_switch_proxy(),
+        None => conn.error_detail.is_some(),
+    }
 }
 
 /// A failed system operation (registry tools, process spawn): the localized message plus the
@@ -190,6 +202,8 @@ pub struct DesktopCommandBridge {
     i18n: I18nRegistry,
     ipc_client: IpcClient,
     file_logger: FileLogger,
+    /// The desktop's own log directory (added to the diagnostic bundle).
+    log_dir: std::path::PathBuf,
     state: Arc<RwLock<DaemonFullState>>,
     profiles: Arc<RwLock<Vec<ProfileSummary>>>,
     daemon_connected: Arc<AtomicBool>,
@@ -228,6 +242,7 @@ impl DesktopCommandBridge {
             &constants.telemetry.log_app_name,
             default_profile.enable_logging,
         );
+        file_logger.set_retention_days(constants.telemetry.log_retention_days);
         let net = &constants.network;
         let (event_tx, _) = tokio::sync::broadcast::channel(BRIDGE_EVENT_CHANNEL_CAPACITY);
         // Next to the other per-user state (the WebView data lives in a sub-directory of it).
@@ -274,6 +289,7 @@ impl DesktopCommandBridge {
             i18n,
             ipc_client,
             file_logger,
+            log_dir: log_dir.clone(),
             state: Arc::new(RwLock::new(initial_state)),
             profiles: Arc::new(RwLock::new(initial_profiles)),
             daemon_connected: Arc::new(AtomicBool::new(false)),
@@ -1541,6 +1557,115 @@ impl DesktopCommandBridge {
             .call_daemon::<serde_json::Value>(IpcCommand::FlushFakeIps)
             .await;
         self.state.write().fake_ips.clear();
+    }
+
+    /// Flushes the operating system DNS resolver cache through the daemon (not the Fake-IP
+    /// table). Returns whether the daemon reported success.
+    pub async fn flush_os_dns_cache(&self) -> Result<bool, IpcCallError> {
+        let reply: serde_json::Value = self
+            .call_daemon_detailed(IpcCommand::FlushOsDnsCache)
+            .await?;
+        Ok(reply
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    /// Aggregated blocked connections from the daemon (`since` in epoch milliseconds).
+    pub async fn list_blocked(
+        &self,
+        since: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<BlockedResponse, IpcCallError> {
+        self.call_daemon_detailed(IpcCommand::ListBlocked { since, limit })
+            .await
+    }
+
+    /// One page of the daemon's logs (memory ring or a daily file).
+    pub async fn query_logs(
+        &self,
+        query: QueryLogsRequest,
+    ) -> Result<QueryLogsResponse, IpcCallError> {
+        self.call_daemon_detailed(IpcCommand::QueryLogs {
+            source: query.source,
+            min_level: query.min_level,
+            components: query.components,
+            text: query.text,
+            pid: query.pid,
+            connection_id: query.connection_id,
+            since: query.since,
+            until: query.until,
+            limit: query.limit,
+            cursor: query.cursor,
+        })
+        .await
+    }
+
+    /// The daemon's check-up findings.
+    pub async fn analyze_diagnostics(&self) -> Result<AnalyzeResponse, IpcCallError> {
+        self.call_daemon_detailed(IpcCommand::Analyze).await
+    }
+
+    /// What a connection would do after a rule change, without applying it.
+    pub async fn preview_rule_change(
+        &self,
+        preview: PreviewRuleChangeRequest,
+    ) -> Result<PredictedOutcome, IpcCallError> {
+        self.call_daemon_detailed(IpcCommand::PreviewRuleChange {
+            upserts: preview.upserts,
+            remove_ids: preview.remove_ids,
+            request: preview.request,
+        })
+        .await
+    }
+
+    /// The daemon's redacted diagnostic bundle, plus the desktop's own redacted log files.
+    pub async fn collect_diagnostics(
+        &self,
+        options: CollectOptions,
+    ) -> Result<serde_json::Value, IpcCallError> {
+        let mut bundle: serde_json::Value = self
+            .call_daemon_detailed(IpcCommand::CollectDiagnostics {
+                log_days: options.log_days,
+                include_connections: options.include_connections,
+                include_profile: options.include_profile,
+                mask_domains: options.mask_domains,
+            })
+            .await?;
+        let telemetry = &self.constants.telemetry;
+        // Same directory as the daemon (a daemon run as the same user): already in the bundle.
+        if telemetry.resolve_daemon_log_dir() != self.log_dir {
+            let known_domains = if options.mask_domains {
+                let state = self.state.read();
+                state
+                    .connections
+                    .iter()
+                    .flat_map(|c| {
+                        std::iter::once(c.target_host.clone()).chain(c.resolved_domain.clone())
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            crate::desktop_logs::add_desktop_logs(
+                &mut bundle,
+                &crate::desktop_logs::DesktopLogSource {
+                    log_dir: &self.log_dir,
+                    app_name: &telemetry.log_app_name,
+                    options,
+                    limits: BundleLimits {
+                        max_log_days: telemetry.diagnostics_max_log_days,
+                        logs_max_bytes: telemetry.diagnostics_logs_max_bytes,
+                        bundle_max_bytes: telemetry.diagnostics_bundle_max_bytes,
+                        hard_max_bytes: self.constants.ipc.max_line_bytes,
+                    },
+                    known_domains,
+                    redactor: Redactor::from_environment()
+                        .with_profile_credentials(&self.state.read().profile),
+                },
+            );
+        }
+        Ok(bundle)
     }
 
     pub fn list_logs(&self) -> Vec<LogEntry> {

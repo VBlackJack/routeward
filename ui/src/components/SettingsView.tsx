@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   BookOpen,
@@ -35,6 +35,7 @@ import {
   Shield,
   ShieldAlert,
   ShieldCheck,
+  Stethoscope,
   Upload,
   Wand2,
   Wifi
@@ -47,11 +48,14 @@ import {
   InterceptionMode,
   LogEntry,
   ProfileSummary,
+  QueryLogsRequest,
+  QueryLogsResponse,
   SecurityPolicyConfig,
   SystemDiagnostics
 } from '../types/routeward';
 import { DnsView } from './DnsView';
 import { HelpTooltip } from './HelpTooltip';
+import { LogsJump } from '../services/logQuery';
 import { LogsView } from './LogsView';
 import { ExperienceMode } from './QuickSetupWizardModal';
 import { ConfirmDeleteButton } from './ConfirmDeleteButton';
@@ -81,6 +85,14 @@ interface SettingsViewProps {
   onAllocateDns: (domain: string) => void;
   onFlushDns: () => void;
   onClearLogs: () => void;
+  /** Reads logs from the daemon (memory or files by date); keep the function identity stable. */
+  onQueryLogs?: (req: QueryLogsRequest) => Promise<QueryLogsResponse>;
+  /** Opens the logs filtered on one connection; a new object each time it is asked. */
+  logsJump?: LogsJump | null;
+  /** Opens a diagnostics tab from outside (for example "See logs"); a new object each time. */
+  diagnosticsRequest?: { tab: 'logs' | 'checkup' } | null;
+  /** Content of the check-up tab (the analyzer panel built by the app). */
+  checkupPanel?: React.ReactNode;
   pacEnabled?: boolean;
   pacUrl?: string;
   autostartEnabled?: boolean;
@@ -97,7 +109,7 @@ interface SettingsViewProps {
   onSetNetworkProfileRule?: (networkName: string, profileId: string | null) => void;
 }
 
-type DiagnosticSubtab = 'overview' | 'dns' | 'logs';
+type DiagnosticSubtab = 'overview' | 'dns' | 'logs' | 'checkup';
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   diagnostics,
@@ -123,6 +135,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onAllocateDns,
   onFlushDns,
   onClearLogs,
+  onQueryLogs,
+  logsJump = null,
+  diagnosticsRequest = null,
+  checkupPanel,
   pacEnabled = false,
   pacUrl = buildDefaultPacUrl(),
   autostartEnabled = false,
@@ -148,6 +164,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [resettingDefaults, setResettingDefaults] = useState(false);
   const [newProfileName, setNewProfileName] = useState('');
   const [selectedAutoProfileId, setSelectedAutoProfileId] = useState('');
+
+  useEffect(() => {
+    if (!diagnosticsRequest) {
+      return;
+    }
+    setDiagSubtab(diagnosticsRequest.tab);
+    setShowSimpleDiagnostics(true);
+  }, [diagnosticsRequest]);
 
   const allShieldsActive =
     securityPolicy.killSwitchEnabled &&
@@ -1013,6 +1037,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   {t('settings.diagnostics.subtab_logs')} ({logs.length})
                 </span>
               </button>
+              <button
+                type="button"
+                aria-pressed={diagSubtab === 'checkup'}
+                onClick={() => setDiagSubtab('checkup')}
+                className={`flex items-center gap-1.5 rounded-tf-md px-3 py-1.5 text-xs font-semibold transition ${
+                  diagSubtab === 'checkup'
+                    ? 'bg-tf-accent text-tf-bg'
+                    : 'tf-surface-alt text-tf-secondary hover:text-tf-primary'
+                }`}
+              >
+                <Stethoscope className="h-3.5 w-3.5" />
+                <span>{t('settings.diagnostics.subtab_checkup')}</span>
+              </button>
             </div>
 
             {diagSubtab === 'overview' && (
@@ -1062,8 +1099,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             )}
 
             {diagSubtab === 'logs' && (
-              <LogsView logs={logs} onClear={onClearLogs} />
+              <LogsView
+                logs={logs}
+                onClear={onClearLogs}
+                onQuery={onQueryLogs}
+                jump={logsJump}
+              />
             )}
+
+            {diagSubtab === 'checkup' && checkupPanel}
           </>
         )}
       </div>

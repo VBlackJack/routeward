@@ -17,7 +17,7 @@
 use super::dns_handler::{RelayCaches, MAX_UDP_DATAGRAM_BYTES};
 use super::{
     RouteWardController, SystemDiagnostics, WarnRateLimiter, COMPONENT_DNS, COMPONENT_ENGINE,
-    COMPONENT_PROXY, COMPONENT_RULE, COMPONENT_TRANSPARENT, COMPONENT_WINDIVERT, ROUTE_BLOCK_LABEL,
+    COMPONENT_PROXY, COMPONENT_RULE, COMPONENT_TRANSPARENT, COMPONENT_WINDIVERT,
 };
 use crate::checker::{ProxyChecker, ProxyHealthReport};
 use crate::config::security::{
@@ -43,6 +43,10 @@ use crate::interceptor::nat::{
 use crate::interceptor::nftables::NftablesInterceptor;
 #[cfg(target_os = "linux")]
 use crate::interceptor::nftables::TproxyRoutingSpec;
+use crate::interceptor::policy::{
+    block_reason_for_rule, predict_from_evaluation, unknown_process_decision, PolicyPorts,
+    FAKE_IP_UNMAPPED_RULE_ID,
+};
 #[cfg(windows)]
 use crate::interceptor::windivert::WinDivertInterceptor;
 use crate::process::{ProcessAttribution, ProcessIdentity, ProcessResolver};
@@ -51,7 +55,10 @@ use crate::proxy::udp::UdpAssociationManager;
 use crate::proxy::uri::ProxyUriCodec;
 use crate::proxy::ProxyConnector;
 use crate::rules::{ConnectionRequest, RuleEngine, RuleEvaluationResult};
-use crate::telemetry::{ConnectionStatus, LogLevel, TelemetryHub, TrackedConnection};
+use crate::telemetry::{
+    BlockReason, BlockedRecord, ConnectionStatus, LogContext, LogLevel, TelemetryHub,
+    TrackedConnection, UnattributedDropCounters,
+};
 use chrono::Utc;
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -63,6 +70,13 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+/// Capacity of the channel announcing removed expired rules.
+const RULE_EXPIRY_CHANNEL_CAPACITY: usize = 16;
+/// Process name shown on records produced by the Fake-IP egress guard.
+const FAKE_IP_GUARD_PROCESS_NAME: &str = "fake-ip-guard";
+/// Rule name shown on records produced by the Fake-IP egress guard.
+const FAKE_IP_GUARD_RULE_NAME: &str = "SecurityPolicy:FakeIpEgressGuard";
 
 /// Upper bound of the wait, in `stop_engine`, for the listener tasks to drop their sockets.
 const ENGINE_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -238,12 +252,16 @@ impl RouteWardController {
             engine_lifecycle: Arc::new(parking_lot::Mutex::new(())),
             engine_runtime: Arc::new(parking_lot::Mutex::new(None)),
             protection: Arc::new(super::protection::ProtectionRuntime::new(None)),
+            proxy_health: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            rule_expiry_tx: tokio::sync::broadcast::channel(RULE_EXPIRY_CHANNEL_CAPACITY).0,
         };
 
         controller.telemetry.push_log(
             LogLevel::Info,
             COMPONENT_ENGINE,
-            controller.i18n.t("cli.engine.startup.loaded_profile"),
+            controller
+                .i18n
+                .t_english("cli.engine.startup.loaded_profile"),
         );
 
         controller
@@ -331,7 +349,7 @@ impl RouteWardController {
             COMPONENT_ENGINE,
             format!(
                 "{}: {relay_addr}",
-                self.i18n.t("cli.engine.startup.listening_socks")
+                self.i18n.t_english("cli.engine.startup.listening_socks")
             ),
         );
         self.telemetry.push_log(
@@ -339,7 +357,8 @@ impl RouteWardController {
             COMPONENT_TRANSPARENT,
             format!(
                 "{}: {transparent_addr}",
-                self.i18n.t("cli.engine.startup.listening_transparent")
+                self.i18n
+                    .t_english("cli.engine.startup.listening_transparent")
             ),
         );
         self.telemetry.push_log(
@@ -385,7 +404,7 @@ impl RouteWardController {
         self.telemetry.push_log(
             LogLevel::Info,
             COMPONENT_ENGINE,
-            self.i18n.t("cli.engine.startup.banner"),
+            self.i18n.t_english("cli.engine.startup.banner"),
         );
 
         // Bind first, spawn after: a listener that cannot be bound would otherwise leave the
@@ -415,6 +434,9 @@ impl RouteWardController {
                 Duration::from_millis(ticker_ctrl.constants.telemetry.sampling_interval_ms);
             while ticker_ctrl.is_running() {
                 ticker_ctrl.telemetry.tick_bandwidth_sample();
+                // Memory only: persisting the profile is the daemon's job (see ipc), so a
+                // `run --profile X` engine never writes the daemon profile file.
+                ticker_ctrl.sweep_expired_rules(Utc::now());
                 if or_shutdown(&mut ticker_signal, tokio::time::sleep(interval))
                     .await
                     .is_none()
@@ -505,7 +527,8 @@ impl RouteWardController {
                         COMPONENT_TRANSPARENT,
                         format!(
                             "{}: [{}]:{}",
-                            self.i18n.t("cli.engine.startup.listening_transparent"),
+                            self.i18n
+                                .t_english("cli.engine.startup.listening_transparent"),
                             v6_ip,
                             port
                         ),
@@ -1102,7 +1125,8 @@ impl RouteWardController {
             COMPONENT_ENGINE,
             format!(
                 "{}: {backend_name}",
-                self.i18n.t("cli.engine.startup.interception_active")
+                self.i18n
+                    .t_english("cli.engine.startup.interception_active")
             ),
         );
         Ok(backend_name)
@@ -1123,7 +1147,7 @@ impl RouteWardController {
         self.telemetry.push_log(
             LogLevel::Info,
             COMPONENT_ENGINE,
-            self.i18n.t("app.header.engine.stopped"),
+            self.i18n.t_english("app.header.engine.stopped"),
         );
         self.telemetry.flush_file_logger();
     }
@@ -1173,7 +1197,8 @@ impl RouteWardController {
 
     /// Flushes the OS client DNS resolver cache (`dnsapi.dll!DnsFlushResolverCache` / `ipconfig /flushdns`
     /// on Windows; `resolvectl flush-caches` on Linux if `systemd-resolved` is active).
-    pub fn flush_os_dns_cache(&self, stage: &str) {
+    /// Returns whether the flush succeeded.
+    pub fn flush_os_dns_cache(&self, stage: &str) -> bool {
         match crate::dns::flush_os_dns_cache() {
             Ok(method) => {
                 self.telemetry.push_log(
@@ -1181,9 +1206,10 @@ impl RouteWardController {
                     COMPONENT_DNS,
                     format!(
                         "{} ({stage} via {method})",
-                        self.i18n.t("cli.engine.startup.dns_cache_flushed")
+                        self.i18n.t_english("cli.engine.startup.dns_cache_flushed")
                     ),
                 );
+                true
             }
             Err(detail) => {
                 self.telemetry.push_log(
@@ -1191,6 +1217,7 @@ impl RouteWardController {
                     COMPONENT_DNS,
                     format!("Skipped OS DNS cache flush on {stage}: {detail}"),
                 );
+                false
             }
         }
     }
@@ -1234,29 +1261,22 @@ impl RouteWardController {
                     ),
                 );
                 self.telemetry.record_connection(
-                    TrackedConnection {
-                        id: Uuid::new_v4().to_string(),
-                        pid: 0,
-                        process_name: "fake-ip-guard".to_string(),
-                        process_path: context.to_string(),
-                        target_host: v4.to_string(),
-                        resolved_domain: mapped_domain,
-                        target_port,
-                        protocol,
-                        matched_rule: "SecurityPolicy:FakeIpEgressGuard".to_string(),
-                        route_label: ROUTE_BLOCK_LABEL.to_string(),
-                        latency_ms: 0,
-                        rx_bytes: 0,
-                        tx_bytes: 0,
-                        status: ConnectionStatus::Blocked,
-                        started_at: Utc::now(),
-                        error_detail: None,
-                    },
+                    TrackedConnection::blocked(
+                        BlockedRecord::new(
+                            BlockReason::FakeIpEgressGuard,
+                            protocol,
+                            FAKE_IP_GUARD_RULE_NAME,
+                        )
+                        .process(FAKE_IP_GUARD_PROCESS_NAME, context, 0)
+                        .target(v4.to_string(), target_port)
+                        .with_ip(Some(v4.to_string()))
+                        .with_domain(mapped_domain),
+                    ),
                     false,
                 );
                 return Err(RouteWardError::BlockedByPolicy {
                     key: ERR_KEY_RULE_BLOCKED,
-                    rule_name: "SecurityPolicy:FakeIpEgressGuard".to_string(),
+                    rule_name: FAKE_IP_GUARD_RULE_NAME.to_string(),
                 });
             }
         }
@@ -1301,24 +1321,18 @@ impl RouteWardController {
             ),
         );
         self.telemetry.record_connection(
-            TrackedConnection {
-                id: Uuid::new_v4().to_string(),
-                pid: 0,
-                process_name: "fake-ip-guard".to_string(),
-                process_path: component.to_string(),
-                target_host: dst_ip.to_string(),
-                resolved_domain: mapped_domain,
-                target_port: dst_port,
-                protocol,
-                matched_rule: "SecurityPolicy:FakeIpEgressGuard".to_string(),
-                route_label: ROUTE_BLOCK_LABEL.to_string(),
-                latency_ms: 0,
-                rx_bytes: 0,
-                tx_bytes: packet.len() as u64,
-                status: ConnectionStatus::Blocked,
-                started_at: Utc::now(),
-                error_detail: None,
-            },
+            TrackedConnection::blocked(
+                BlockedRecord::new(
+                    BlockReason::FakeIpEgressGuard,
+                    protocol,
+                    FAKE_IP_GUARD_RULE_NAME,
+                )
+                .process(FAKE_IP_GUARD_PROCESS_NAME, component, 0)
+                .target(dst_ip.to_string(), dst_port)
+                .with_ip(Some(dst_ip.to_string()))
+                .with_domain(mapped_domain)
+                .with_tx_bytes(packet.len() as u64),
+            ),
             false,
         );
         true
@@ -1409,6 +1423,113 @@ impl RouteWardController {
         }
     }
 
+    /// Ports the security policy reacts to, from the controller's constants.
+    pub fn policy_ports(&self) -> PolicyPorts {
+        PolicyPorts::from_constants(&self.constants)
+    }
+
+    /// Latest known proxy health reports (filled by [`Self::test_proxy`]).
+    pub fn proxy_health_snapshot(&self) -> Vec<ProxyHealthReport> {
+        self.proxy_health.read().values().cloned().collect()
+    }
+
+    /// Counters of SYN / UDP packets dropped under the kill switch without a connection row.
+    pub fn unattributed_drop_counters(&self) -> UnattributedDropCounters {
+        UnattributedDropCounters {
+            dropped_unattributed_syn: self.nat_table.dropped_unattributed_syn_count(),
+            dropped_unattributed_udp: self.nat_table.dropped_unattributed_udp_count(),
+        }
+    }
+
+    /// Logs `message` at WARN with the blocked connection as context, then records it.
+    pub(super) fn log_and_record_blocked(
+        &self,
+        component: &str,
+        message: String,
+        conn: TrackedConnection,
+    ) {
+        self.telemetry.push_log_ctx(
+            LogLevel::Warn,
+            component,
+            message,
+            Some(LogContext::for_connection(&conn)),
+        );
+        self.telemetry.record_connection(conn, false);
+    }
+
+    /// Id of the first rule named `name`, for the paths that only carry the rule name.
+    #[cfg(not(windows))]
+    pub(super) fn rule_id_by_name(&self, name: &str) -> Option<String> {
+        self.profile
+            .read()
+            .rules
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.id.clone())
+    }
+
+    /// Removes the rules whose `expiresAt` has passed at `now` from the active profile and returns
+    /// their ids. Logs one INFO line, wakes the DNS server refresh and notifies
+    /// [`Self::subscribe_rule_expiry`] subscribers. It never persists: the daemon does, on the
+    /// notice. The check runs under a read lock, the write lock is taken only when a rule expired.
+    pub fn sweep_expired_rules(&self, now: chrono::DateTime<Utc>) -> Vec<String> {
+        let any_expired = self
+            .profile
+            .read()
+            .rules
+            .iter()
+            .any(|r| RuleEngine::is_expired(r, now));
+        if !any_expired {
+            return Vec::new();
+        }
+        let removed = {
+            let mut prof = self.profile.write();
+            let ids = RuleEngine::expired_rule_ids(&prof.rules, now);
+            if !ids.is_empty() {
+                prof.rules.retain(|r| !ids.contains(&r.id));
+            }
+            ids
+        };
+        if removed.is_empty() {
+            return removed;
+        }
+        self.telemetry.push_log(
+            LogLevel::Info,
+            COMPONENT_RULE,
+            format!(
+                "Removed {} expired temporary rule(s): {}",
+                removed.len(),
+                removed.join(", ")
+            ),
+        );
+        self.schedule_dns_server_refresh();
+        let _ = self.rule_expiry_tx.send(removed.clone());
+        removed
+    }
+
+    /// Saves the profile after rules expired, for the daemon only (the controller that owns a
+    /// protection state path). Any other controller (`routeward run --profile X`, user CLI,
+    /// tests) returns `None` and writes nothing.
+    pub fn persist_after_rule_expiry(&self) -> Option<RouteWardResult<()>> {
+        if !self.persists_protection_state() {
+            return None;
+        }
+        let result = self.save_profile_default();
+        if let Err(err) = &result {
+            self.telemetry.push_log(
+                LogLevel::Warn,
+                COMPONENT_RULE,
+                format!("Could not save the profile after removing expired rules: {err}"),
+            );
+        }
+        Some(result)
+    }
+
+    /// Subscribes to the ids of the rules removed by the expiry sweeper.
+    pub fn subscribe_rule_expiry(&self) -> tokio::sync::broadcast::Receiver<Vec<String>> {
+        self.rule_expiry_tx.subscribe()
+    }
+
     pub fn evaluate_rule(&self, req: &ConnectionRequest) -> RuleEvaluationResult {
         let prof = self.profile.read();
         let parsed_v4 = req
@@ -1428,7 +1549,7 @@ impl RouteWardController {
                         ),
                     );
                     return RuleEvaluationResult {
-                        matched_rule_id: "fake-ip-unmapped".to_string(),
+                        matched_rule_id: FAKE_IP_UNMAPPED_RULE_ID.to_string(),
                         matched_rule_name: "FakeIP:UnmappedOrExpired".to_string(),
                         action: RuleAction::Block,
                         effective_domain: None,
@@ -1574,6 +1695,7 @@ impl RouteWardController {
             )
         };
 
+        let decision = unknown_process_decision(&self.profile.read().security_policy);
         if kill_switch_enabled && configured_action == RuleAction::Direct {
             self.telemetry.push_log(
                 LogLevel::Warn,
@@ -1583,10 +1705,7 @@ impl RouteWardController {
                     client_port, target_host, target_port, reason
                 ),
             );
-            (
-                RuleAction::Block,
-                "SecurityPolicy:unknownProcessAction(KillSwitchOverride)".to_string(),
-            )
+            (decision.action, decision.rule_name.to_string())
         } else {
             self.telemetry.push_log(
                 LogLevel::Warn,
@@ -1596,10 +1715,7 @@ impl RouteWardController {
                     client_port, target_host, target_port, reason, configured_action, kill_switch_enabled
                 ),
             );
-            (
-                configured_action,
-                "SecurityPolicy:unknownProcessAction".to_string(),
-            )
+            (decision.action, decision.rule_name.to_string())
         }
     }
 
@@ -1773,18 +1889,25 @@ impl RouteWardController {
         }
     }
 
+    /// Predicts the outcome of `req` with the same policy functions the relays use (rules, QUIC,
+    /// DoT / DoQ, unknown process, kill switch against the cached proxy health).
+    fn predict_request(&self, req: &ConnectionRequest) -> super::policy::PredictedOutcome {
+        let eval = self.evaluate_rule(req);
+        let health = self.proxy_health_snapshot();
+        let prof = self.profile.read();
+        predict_from_evaluation(&prof, req, eval, &health, self.policy_ports())
+    }
+
     pub fn simulate_connection(&self, req: ConnectionRequest) -> TrackedConnection {
-        let eval = self.evaluate_rule(&req);
+        let outcome = self.predict_request(&req);
+        let eval = outcome.evaluation.clone();
         let route_label = self.format_action_label(&eval.action);
         let is_proxied = matches!(
             eval.action,
             RuleAction::Proxy { .. } | RuleAction::Chain { .. }
         );
-        let status = if eval.action == RuleAction::Block {
-            ConnectionStatus::Blocked
-        } else {
-            ConnectionStatus::Active
-        };
+        let block_reason = outcome.block_reason();
+        let blocked = block_reason.is_some();
 
         let resolved_domain = eval.effective_domain.clone().or_else(|| {
             if req.target_host.parse::<IpAddr>().is_err() {
@@ -1795,31 +1918,53 @@ impl RouteWardController {
             }
         });
 
-        let tracked = TrackedConnection {
-            id: Uuid::new_v4().to_string(),
-            pid: 0,
-            process_name: ProcessResolver::extract_basename(&req.process_name),
-            process_path: req.process_path.unwrap_or_else(|| req.process_name.clone()),
-            target_host: req.target_host.clone(),
-            resolved_domain,
-            target_port: req.target_port,
-            protocol: req.protocol,
-            matched_rule: eval.matched_rule_name.clone(),
-            route_label: route_label.clone(),
-            latency_ms: 0,
-            rx_bytes: 0,
-            tx_bytes: 0,
-            status,
-            started_at: Utc::now(),
-            error_detail: None,
+        let process_name = ProcessResolver::extract_basename(&req.process_name);
+        let process_path = req
+            .process_path
+            .clone()
+            .unwrap_or_else(|| req.process_name.clone());
+        let tracked = if let Some(reason) = block_reason {
+            TrackedConnection::blocked(
+                BlockedRecord::new(reason, req.protocol, eval.matched_rule_name.clone())
+                    .process(process_name, process_path, 0)
+                    .target(req.target_host.clone(), req.target_port)
+                    .with_domain(resolved_domain)
+                    .with_ip(req.target_ip.clone())
+                    .with_rule_id(eval.matched_rule_id.clone())
+                    .simulated(),
+            )
+        } else {
+            TrackedConnection {
+                id: Uuid::new_v4().to_string(),
+                pid: 0,
+                process_name,
+                process_path,
+                target_host: req.target_host.clone(),
+                resolved_domain,
+                target_port: req.target_port,
+                protocol: req.protocol,
+                matched_rule: eval.matched_rule_name.clone(),
+                route_label: route_label.clone(),
+                latency_ms: 0,
+                rx_bytes: 0,
+                tx_bytes: 0,
+                status: ConnectionStatus::Active,
+                started_at: Utc::now(),
+                error_detail: None,
+                block_reason: None,
+                matched_rule_id: Some(eval.matched_rule_id.clone()),
+                proxy_id: None,
+                target_ip: req.target_ip.clone(),
+                simulated: true,
+            }
         };
 
-        let log_level = if status == ConnectionStatus::Blocked {
+        let log_level = if blocked {
             LogLevel::Warn
         } else {
             LogLevel::Info
         };
-        self.telemetry.push_log(
+        self.telemetry.push_log_ctx(
             log_level,
             COMPONENT_RULE,
             format!(
@@ -1827,9 +1972,10 @@ impl RouteWardController {
                 tracked.process_name,
                 tracked.target_host,
                 tracked.target_port,
-                route_label,
+                tracked.route_label,
                 tracked.matched_rule
             ),
+            Some(LogContext::for_connection(&tracked)),
         );
 
         self.telemetry
@@ -1900,29 +2046,47 @@ impl RouteWardController {
                 eval.action,
                 RuleAction::Proxy { .. } | RuleAction::Chain { .. }
             );
-            let status = if eval.action == RuleAction::Block {
-                ConnectionStatus::Blocked
-            } else {
-                ConnectionStatus::Active
-            };
 
-            let tracked = TrackedConnection {
-                id: conn_id,
-                pid: sock.pid,
-                process_name: sock.process_name,
-                process_path: sock.process_path,
-                target_host: sock.remote_ip,
-                resolved_domain: eval.effective_domain,
-                target_port: sock.remote_port,
-                protocol: TransportProtocol::Tcp,
-                matched_rule: eval.matched_rule_name,
-                route_label,
-                latency_ms: 0,
-                rx_bytes: 0,
-                tx_bytes: 0,
-                status,
-                started_at: Utc::now(),
-                error_detail: None,
+            let tracked = if eval.action == RuleAction::Block {
+                let mut blocked = TrackedConnection::blocked(
+                    BlockedRecord::new(
+                        block_reason_for_rule(&eval.matched_rule_id),
+                        TransportProtocol::Tcp,
+                        eval.matched_rule_name,
+                    )
+                    .process(sock.process_name, sock.process_path, sock.pid)
+                    .target(sock.remote_ip.clone(), sock.remote_port)
+                    .with_ip(Some(sock.remote_ip))
+                    .with_domain(eval.effective_domain)
+                    .with_rule_id(eval.matched_rule_id)
+                    .simulated(),
+                );
+                blocked.id = conn_id;
+                blocked
+            } else {
+                TrackedConnection {
+                    id: conn_id,
+                    pid: sock.pid,
+                    process_name: sock.process_name,
+                    process_path: sock.process_path,
+                    target_host: sock.remote_ip.clone(),
+                    resolved_domain: eval.effective_domain,
+                    target_port: sock.remote_port,
+                    protocol: TransportProtocol::Tcp,
+                    matched_rule: eval.matched_rule_name,
+                    route_label,
+                    latency_ms: 0,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    status: ConnectionStatus::Active,
+                    started_at: Utc::now(),
+                    error_detail: None,
+                    block_reason: None,
+                    matched_rule_id: Some(eval.matched_rule_id),
+                    proxy_id: None,
+                    target_ip: Some(sock.remote_ip),
+                    simulated: true,
+                }
             };
 
             self.telemetry
@@ -1946,6 +2110,9 @@ impl RouteWardController {
         };
 
         let report = ProxyChecker::test_proxy(&node, &self.constants).await;
+        self.proxy_health
+            .write()
+            .insert(proxy_id.to_string(), report.clone());
 
         {
             let mut prof = self.profile.write();
@@ -1958,14 +2125,14 @@ impl RouteWardController {
         let msg = if report.reachable {
             format!(
                 "{}: {} ({} ms)",
-                self.i18n.t("cli.engine.check.result_online"),
+                self.i18n.t_english("cli.engine.check.result_online"),
                 node.name,
                 report.latency_ms.unwrap_or(0)
             )
         } else {
             format!(
                 "{}: {}",
-                self.i18n.t("cli.engine.check.result_offline"),
+                self.i18n.t_english("cli.engine.check.result_offline"),
                 node.name
             )
         };
@@ -2228,6 +2395,8 @@ impl RouteWardController {
                 });
             }
         }
+        // A loaded profile may carry rules that already expired: drop them now.
+        self.sweep_expired_rules(Utc::now());
         Ok(())
     }
 
@@ -2250,7 +2419,7 @@ impl RouteWardController {
             COMPONENT_ENGINE,
             format!(
                 "{} (securityPolicyChanged={security_changed}, dnsConfigChanged={dns_changed})",
-                self.i18n.t("cli.engine.startup.reloaded_live")
+                self.i18n.t_english("cli.engine.startup.reloaded_live")
             ),
         );
     }
@@ -2685,6 +2854,7 @@ mod tests {
             port_ranges: Vec::<PortRange>::new(),
             protocol: TransportProtocol::Any,
             action: RuleAction::Direct,
+            expires_at: None,
         }
     }
 

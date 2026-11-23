@@ -192,7 +192,7 @@ impl Interceptor for NftablesInterceptor {
             self.active.store(false, Ordering::SeqCst);
             return Err(RouteWardError::InterceptorError {
                 key: ERR_KEY_INTERCEPTOR_NOT_ROOT,
-                detail: controller.i18n.t(ERR_KEY_INTERCEPTOR_NOT_ROOT),
+                detail: controller.i18n.t_english(ERR_KEY_INTERCEPTOR_NOT_ROOT),
             });
         }
 
@@ -231,7 +231,7 @@ impl Interceptor for NftablesInterceptor {
                     key: ERR_KEY_INTERCEPTOR_NFT_MISSING,
                     detail: format!(
                         "{}: {}",
-                        controller.i18n.t(ERR_KEY_INTERCEPTOR_NFT_MISSING),
+                        controller.i18n.t_english(ERR_KEY_INTERCEPTOR_NFT_MISSING),
                         nft_bin
                     ),
                 });

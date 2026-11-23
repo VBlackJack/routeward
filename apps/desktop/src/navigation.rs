@@ -24,7 +24,6 @@ const ALLOWED_SCHEME: &str = "http";
 const AUTHORITY_TERMINATORS: [char; 3] = ['/', '?', '#'];
 const USERINFO_MARKER: char = '@';
 const BACKSLASH: char = '\\';
-const LOG_SCHEME_MAX_CHARS: usize = 16;
 /// Prefix of object URLs created by `URL.createObjectURL` (used by exports).
 const BLOB_PREFIX: &str = "blob:";
 
@@ -85,25 +84,9 @@ pub fn should_allow_multiple_downloads(
     is_multiple_downloads_kind && is_navigation_allowed(requesting_uri, allowed_authority)
 }
 
-fn truncated_scheme(scheme: &str) -> String {
-    scheme.chars().take(LOG_SCHEME_MAX_CHARS).collect()
-}
-
-/// Reduces a URL to a form safe for logs: scheme and host only, never
-/// userinfo, path, query or fragment (which may carry the token).
-pub fn redact_url_for_log(target: &str) -> String {
-    match target.split_once(SCHEME_SEPARATOR) {
-        Some((scheme, rest)) => {
-            let end = rest.find(AUTHORITY_TERMINATORS).unwrap_or(rest.len());
-            let host = rest[..end].rsplit(USERINFO_MARKER).next().unwrap_or("");
-            format!("{}{SCHEME_SEPARATOR}{host}", truncated_scheme(scheme))
-        }
-        None => {
-            let scheme = target.split(':').next().unwrap_or("");
-            format!("{}:", truncated_scheme(scheme))
-        }
-    }
-}
+/// Reduces a URL to a form safe for logs: scheme and host only, never userinfo, path, query or
+/// fragment (which may carry the token). Shared with the diagnostic bundle redaction.
+pub use routeward_core::diagnostics::redact::redact_url_for_log;
 
 #[cfg(test)]
 mod tests {

@@ -19,6 +19,9 @@ use crate::security::{extract_json_body, validate_loopback_http_request_with_met
 use crate::sse::stream_sse_events;
 use crate::{parse_hex_colorref, resolve_palette_window_appearance, DesktopWindowCommand};
 use routeward_core::config::{InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule};
+use routeward_core::diagnostics::bundle::CollectOptions;
+use routeward_core::diagnostics::logs::QueryLogsRequest;
+use routeward_core::diagnostics::PreviewRuleChangeRequest;
 use routeward_core::error::{
     ERR_KEY_CHAIN_EMPTY, ERR_KEY_CLEANUP_DAEMON_ACTIVE, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_SAVE,
     ERR_KEY_DAEMON_ALREADY_RUNNING, ERR_KEY_DAEMON_INSECURE_PROFILE, ERR_KEY_DAEMON_INVALID_PAUSE,
@@ -294,6 +297,55 @@ fn require_post(method: &str, json_ct: &str) -> Option<(u16, String, Vec<u8>)> {
     None
 }
 
+/// Parses the optional `since` and `limit` of `GET /api/blocked`.
+fn parse_blocked_query(path: &str) -> Result<(Option<i64>, Option<usize>), String> {
+    let mut since = None;
+    let mut limit = None;
+    let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "since" => {
+                since = Some(value.parse::<i64>().map_err(|e| format!("since: {e}"))?);
+            }
+            "limit" => {
+                limit = Some(value.parse::<usize>().map_err(|e| format!("limit: {e}"))?);
+            }
+            _ => {}
+        }
+    }
+    Ok((since, limit))
+}
+
+/// A POST route that parses a JSON body, forwards it to the daemon and relays the answer:
+/// 405 for another method, 400 for a bad body, the mapped daemon error otherwise.
+async fn post_json_route<Req, Res, Fut>(
+    method: &str,
+    body_str: &str,
+    json_ct: String,
+    call: impl FnOnce(Req) -> Fut,
+) -> (u16, String, Vec<u8>)
+where
+    Req: serde::de::DeserializeOwned,
+    Res: serde::Serialize,
+    Fut: std::future::Future<Output = Result<Res, IpcCallError>>,
+{
+    if let Some(rejection) = require_post(method, &json_ct) {
+        return rejection;
+    }
+    match serde_json::from_str::<Req>(body_str) {
+        Ok(req) => match call(req).await {
+            Ok(res) => ok_json_response(&res, json_ct),
+            Err(err) => ipc_error_response(&err, json_ct),
+        },
+        Err(err) => {
+            let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
+                .unwrap_or_default();
+            (400, json_ct, json)
+        }
+    }
+}
+
 pub async fn handle_api_route(
     method: &str,
     path: &str,
@@ -307,6 +359,67 @@ pub async fn handle_api_route(
         let state = bridge.refresh_state().await;
         let json = serde_json::to_vec(&state).unwrap_or_default();
         return Some((200, json_ct, json));
+    }
+
+    if path == "/api/blocked" || path.starts_with("/api/blocked?") {
+        let (since, limit) = match parse_blocked_query(path) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                let json = serde_json::to_vec(&serde_json::json!({ "error": message }))
+                    .unwrap_or_default();
+                return Some((400, json_ct, json));
+            }
+        };
+        return Some(match bridge.list_blocked(since, limit).await {
+            Ok(res) => ok_json_response(&res, json_ct),
+            Err(err) => ipc_error_response(&err, json_ct),
+        });
+    }
+
+    if path.starts_with("/api/logs/query") {
+        return Some(
+            post_json_route(
+                method,
+                body_str,
+                json_ct,
+                |req: QueryLogsRequest| async move { bridge.query_logs(req).await },
+            )
+            .await,
+        );
+    }
+
+    if path.starts_with("/api/diagnostics/analyze") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        return Some(match bridge.analyze_diagnostics().await {
+            Ok(res) => ok_json_response(&res, json_ct),
+            Err(err) => ipc_error_response(&err, json_ct),
+        });
+    }
+
+    if path.starts_with("/api/diagnostics/collect") {
+        return Some(
+            post_json_route(
+                method,
+                body_str,
+                json_ct,
+                |req: CollectOptions| async move { bridge.collect_diagnostics(req).await },
+            )
+            .await,
+        );
+    }
+
+    if path.starts_with("/api/rules/preview") {
+        return Some(
+            post_json_route(
+                method,
+                body_str,
+                json_ct,
+                |req: PreviewRuleChangeRequest| async move { bridge.preview_rule_change(req).await },
+            )
+            .await,
+        );
     }
 
     if path.starts_with("/api/diagnostics") {
@@ -796,6 +909,16 @@ pub async fn handle_api_route(
         let sockets = bridge.scan_os_sockets().await;
         let json = serde_json::to_vec(&sockets).unwrap_or_default();
         return Some((200, json_ct, json));
+    }
+
+    if path == "/api/system/flush-os-dns" || path.starts_with("/api/system/flush-os-dns?") {
+        if let Some(rejection) = require_post(method, &json_ct) {
+            return Some(rejection);
+        }
+        return Some(match bridge.flush_os_dns_cache().await {
+            Ok(ok) => ok_json_response(&serde_json::json!({ "ok": ok }), json_ct),
+            Err(err) => ipc_error_response(&err, json_ct),
+        });
     }
 
     if path.starts_with("/api/system/pac") {

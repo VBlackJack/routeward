@@ -54,15 +54,15 @@ use crate::config::{RoutingRule, RuleAction, TransportProtocol};
 use crate::interceptor::COMPONENT_ENGINE;
 use crate::process::ProcessIdentity;
 use crate::rules::{ConnectionRequest, RuleEngine, DEFAULT_FALLBACK_RULE_ID};
-use crate::telemetry::{ConnectionStatus, LogLevel, TelemetryHub, TrackedConnection};
-use chrono::Utc;
+use crate::telemetry::{BlockReason, BlockedRecord, LogLevel, TelemetryHub, TrackedConnection};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use uuid::Uuid;
 
+/// Port of the DNS queries a blocked DNS server process is recorded with.
+const DNS_QUERY_PORT: u16 = 53;
 /// Longest accepted `dnsServerProcesses` entry, in characters.
 const MAX_ENTRY_CHARS: usize = 260;
 /// Largest accepted `dnsServerProcesses` list.
@@ -503,6 +503,17 @@ pub fn dns_server_block_rule(
     dst: IpAddr,
     proto: DnsProto,
 ) -> Option<String> {
+    dns_server_block_match(rules, default_action, identity, dst, proto).map(|(_, name)| name)
+}
+
+/// Like [`dns_server_block_rule`] with the id of the Block rule first: `(rule id, rule name)`.
+pub fn dns_server_block_match(
+    rules: &[RoutingRule],
+    default_action: &RuleAction,
+    identity: &ProcessIdentity,
+    dst: IpAddr,
+    proto: DnsProto,
+) -> Option<(String, String)> {
     let request = ConnectionRequest {
         process_name: identity.name.clone(),
         process_path: Some(identity.executable_path.clone()),
@@ -519,7 +530,7 @@ pub fn dns_server_block_rule(
     if rule.process_patterns.is_empty() {
         return None;
     }
-    Some(eval.matched_rule_name)
+    Some((eval.matched_rule_id, eval.matched_rule_name))
 }
 
 /// `true` when `dns_server_block_rule` finds an explicit Block rule for the process.
@@ -539,26 +550,24 @@ pub fn blocked_dns_connection_record(
     dst: IpAddr,
     proto: DnsProto,
     rule_name: String,
-    route_label: &str,
+    rule_id: Option<String>,
 ) -> TrackedConnection {
-    TrackedConnection {
-        id: Uuid::new_v4().to_string(),
-        pid: identity.pid,
-        process_name: identity.name.clone(),
-        process_path: identity.executable_path.clone(),
-        target_host: dst.to_string(),
-        resolved_domain: None,
-        target_port: 53,
-        protocol: proto.transport(),
-        matched_rule: rule_name,
-        route_label: route_label.to_string(),
-        latency_ms: 0,
-        rx_bytes: 0,
-        tx_bytes: 0,
-        status: ConnectionStatus::Blocked,
-        started_at: Utc::now(),
-        error_detail: None,
+    let mut record = BlockedRecord::new(
+        BlockReason::DnsServerBlockedByRule,
+        proto.transport(),
+        rule_name,
+    )
+    .process(
+        identity.name.clone(),
+        identity.executable_path.clone(),
+        identity.pid,
+    )
+    .target(dst.to_string(), DNS_QUERY_PORT)
+    .with_ip(Some(dst.to_string()));
+    if let Some(id) = rule_id {
+        record = record.with_rule_id(id);
     }
+    TrackedConnection::blocked(record)
 }
 
 /// One process of the Linux `/proc` scan.
@@ -1136,6 +1145,7 @@ fn windows_ports_of(pids: &HashMap<u32, String>, state: &mut TrackerState) {
 mod tests {
     use super::*;
     use crate::config::{PortRange, SystemConstants};
+    use crate::telemetry::ConnectionStatus;
     use std::cell::Cell;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -1187,6 +1197,7 @@ mod tests {
             port_ranges: Vec::<PortRange>::new(),
             protocol: TransportProtocol::Any,
             action,
+            expires_at: None,
         }
     }
 
@@ -1503,7 +1514,7 @@ mod tests {
             RESOLVER,
             DnsProto::Udp,
             "rule r1".into(),
-            "BLOCKED",
+            Some("r1".into()),
         );
         assert_eq!(record.status, ConnectionStatus::Blocked);
         assert_eq!(record.target_port, 53);

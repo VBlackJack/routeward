@@ -15,6 +15,8 @@ A **proxy** is a middleman server on the Internet: your apps talk to it, and it 
 
 Protection starts by itself at every boot and is remembered after a restart. Closing the window keeps RouteWard in the system tray. If you ever lose your Internet connection, use the Start menu shortcut **RouteWard - Restore Internet** or follow [Troubleshooting, section 0](docs/troubleshooting.md#0-i-have-no-internet-anymore).
 
+If an app or a website stops working, open **Activity**, then **Blocked**: RouteWard lists what it stopped, explains why in plain words, and lets you unblock it with an undo (see [Troubleshooting, section 16](docs/troubleshooting.md#16-what-is-blocked-why-and-how-to-unblock-it)).
+
 ## License and Author
 
 - **Author:** Julien Bombled

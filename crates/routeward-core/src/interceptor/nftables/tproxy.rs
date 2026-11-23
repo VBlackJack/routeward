@@ -307,7 +307,7 @@ impl NftablesInterceptor {
         if let Some(conflict) = Self::detect_ip_rule_conflict(&rule_stdout, spec) {
             let detail = format!(
                 "{}: {conflict}",
-                i18n.t(ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT)
+                i18n.t_english(ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT)
             );
             telemetry.push_log(LogLevel::Error, COMPONENT_NFTABLES, detail.clone());
             return Err(RouteWardError::InterceptorError {
@@ -341,7 +341,7 @@ impl NftablesInterceptor {
             {
                 let detail = format!(
                     "{}: {conflict}",
-                    i18n.t(ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT)
+                    i18n.t_english(ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT)
                 );
                 telemetry.push_log(LogLevel::Error, COMPONENT_NFTABLES, detail.clone());
                 return Err(RouteWardError::InterceptorError {

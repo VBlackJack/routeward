@@ -21,11 +21,15 @@ use super::fragments::{
 use super::icmp_limit::{IcmpFlowKey, IcmpRateLimiter};
 use super::*;
 use crate::interceptor::dns_server_exempt::{
-    blocked_dns_connection_record, dns_server_block_rule, DnsProto,
+    blocked_dns_connection_record, dns_server_block_match, DnsProto,
+};
+use crate::interceptor::policy::{
+    block_reason_for_decision, ENCRYPTED_DNS_POLICY_RULE_ID, ENCRYPTED_DNS_POLICY_RULE_NAME,
+    QUIC_POLICY_RULE_ID, QUIC_POLICY_RULE_NAME, QUIC_PROCESS_NAME, UNKNOWN_PROCESS_RULE_ID,
 };
 use crate::interceptor::ROUTE_DIRECT_LABEL;
 use crate::process::ProcessIdentity;
-use crate::telemetry::udp_flow_key;
+use crate::telemetry::{udp_flow_key, BlockReason, BlockedRecord};
 
 /// One outbound datagram routed DIRECT, as recorded in telemetry.
 struct DirectUdpDatagram<'a> {
@@ -112,9 +116,9 @@ impl WinDivertInterceptor {
         };
         let block_rule = {
             let prof = ctrl.profile.read();
-            dns_server_block_rule(&prof.rules, &prof.default_action, &identity, dst, proto)
+            dns_server_block_match(&prof.rules, &prof.default_action, &identity, dst, proto)
         };
-        if let Some(rule_name) = block_rule {
+        if let Some((rule_id, rule_name)) = block_rule {
             ctrl.push_rate_limited_warn(
                 DNS_SERVER_BLOCK_LOG_KEY,
                 COMPONENT_WINDIVERT,
@@ -124,7 +128,7 @@ impl WinDivertInterceptor {
                 ),
             );
             ctrl.telemetry.record_connection(
-                blocked_dns_connection_record(&identity, dst, proto, rule_name, "BLOCKED"),
+                blocked_dns_connection_record(&identity, dst, proto, rule_name, Some(rule_id)),
                 false,
             );
             return Some(DnsServerFlowAction::Drop);
@@ -229,6 +233,11 @@ impl WinDivertInterceptor {
                 status: ConnectionStatus::Active,
                 started_at: Utc::now(),
                 error_detail: None,
+                block_reason: None,
+                matched_rule_id: None,
+                proxy_id: None,
+                target_ip: None,
+                simulated: false,
             },
             false,
             0,
@@ -556,7 +565,7 @@ impl WinDivertInterceptor {
                 );
                 let resolved_dom = ctrl.dns.resolve_fake_ip(&meta.dst_ip);
                 crate::rules::RuleEvaluationResult {
-                    matched_rule_id: "security-policy-unknown-process".to_string(),
+                    matched_rule_id: UNKNOWN_PROCESS_RULE_ID.to_string(),
                     matched_rule_name: rule_name,
                     action: unknown_action,
                     effective_domain: resolved_dom.clone(),
@@ -581,7 +590,8 @@ impl WinDivertInterceptor {
                     .block_encrypted_dns_bypass
             {
                 eval.action = RuleAction::Block;
-                eval.matched_rule_name = "SecurityPolicy:blockEncryptedDnsBypass".to_string();
+                eval.matched_rule_name = ENCRYPTED_DNS_POLICY_RULE_NAME.to_string();
+                eval.matched_rule_id = ENCRYPTED_DNS_POLICY_RULE_ID.to_string();
             }
 
             match &eval.action {
@@ -646,24 +656,21 @@ impl WinDivertInterceptor {
                         ),
                     );
                     ctrl.telemetry.record_connection(
-                        TrackedConnection {
-                            id: Uuid::new_v4().to_string(),
-                            pid: proc_id.pid,
-                            process_name: proc_id.name,
-                            process_path: proc_id.executable_path,
-                            target_host: dst_ip_str,
-                            resolved_domain: eval.effective_domain,
-                            target_port: meta.dst_port,
-                            protocol: TransportProtocol::Tcp,
-                            matched_rule: eval.matched_rule_name,
-                            route_label: "BLOCKED".to_string(),
-                            latency_ms: 0,
-                            rx_bytes: 0,
-                            tx_bytes: 0,
-                            status: ConnectionStatus::Blocked,
-                            started_at: Utc::now(),
-                            error_detail: None,
-                        },
+                        TrackedConnection::blocked(
+                            BlockedRecord::new(
+                                block_reason_for_decision(
+                                    Some(&eval.matched_rule_id),
+                                    &eval.matched_rule_name,
+                                ),
+                                TransportProtocol::Tcp,
+                                eval.matched_rule_name,
+                            )
+                            .process(proc_id.name, proc_id.executable_path, proc_id.pid)
+                            .target(dst_ip_str.clone(), meta.dst_port)
+                            .with_ip(Some(dst_ip_str))
+                            .with_domain(eval.effective_domain)
+                            .with_rule_id(eval.matched_rule_id),
+                        ),
                         false,
                     );
                     // The SYN is never forwarded; the application is refused at once instead.
@@ -788,7 +795,7 @@ impl WinDivertInterceptor {
             );
             let resolved_dom = ctrl.dns.resolve_fake_ip(&meta.dst_ip);
             crate::rules::RuleEvaluationResult {
-                matched_rule_id: "security-policy-unknown-process".to_string(),
+                matched_rule_id: UNKNOWN_PROCESS_RULE_ID.to_string(),
                 matched_rule_name: rule_name,
                 action: unknown_action,
                 effective_domain: resolved_dom.clone(),
@@ -1020,7 +1027,7 @@ impl WinDivertInterceptor {
                     "process image unavailable",
                 );
                 crate::rules::RuleEvaluationResult {
-                    matched_rule_id: "security-policy-unknown-process".to_string(),
+                    matched_rule_id: UNKNOWN_PROCESS_RULE_ID.to_string(),
                     matched_rule_name: rule_name,
                     action: unknown_action,
                     effective_domain: None,
@@ -1096,24 +1103,21 @@ impl WinDivertInterceptor {
                         ),
                     );
                     ctrl.telemetry.record_connection(
-                        TrackedConnection {
-                            id: Uuid::new_v4().to_string(),
-                            pid: proc_id.pid,
-                            process_name: proc_id.name,
-                            process_path: proc_id.executable_path,
-                            target_host: dst_ip_str,
-                            resolved_domain: eval.effective_domain,
-                            target_port: meta.dst_port,
-                            protocol: TransportProtocol::Tcp,
-                            matched_rule: eval.matched_rule_name,
-                            route_label: "BLOCKED".to_string(),
-                            latency_ms: 0,
-                            rx_bytes: 0,
-                            tx_bytes: 0,
-                            status: ConnectionStatus::Blocked,
-                            started_at: Utc::now(),
-                            error_detail: None,
-                        },
+                        TrackedConnection::blocked(
+                            BlockedRecord::new(
+                                block_reason_for_decision(
+                                    Some(&eval.matched_rule_id),
+                                    &eval.matched_rule_name,
+                                ),
+                                TransportProtocol::Tcp,
+                                eval.matched_rule_name,
+                            )
+                            .process(proc_id.name, proc_id.executable_path, proc_id.pid)
+                            .target(dst_ip_str.clone(), meta.dst_port)
+                            .with_ip(Some(dst_ip_str))
+                            .with_domain(eval.effective_domain)
+                            .with_rule_id(eval.matched_rule_id),
+                        ),
                         false,
                     );
                     Self::reject_blocked_syn(ctrl, api, net_handle, packet, addr);
@@ -1203,7 +1207,7 @@ impl WinDivertInterceptor {
                 "process image unavailable",
             );
             crate::rules::RuleEvaluationResult {
-                matched_rule_id: "security-policy-unknown-process".to_string(),
+                matched_rule_id: UNKNOWN_PROCESS_RULE_ID.to_string(),
                 matched_rule_name: rule_name,
                 action: unknown_action,
                 effective_domain: None,
@@ -1444,29 +1448,21 @@ impl WinDivertInterceptor {
                 "Rejected QUIC (UDP port {quic_port}) with {icmp_proto} Port Unreachable {src_ip}:{src_port} -> {dst_ip}:{dst_port} [blockQuicUdp443=true]"
             ),
         );
-        ctrl_net.telemetry.record_connection(
-            TrackedConnection {
-                id: Uuid::new_v4().to_string(),
-                pid: 0,
-                process_name: "quic-udp-443".to_string(),
-                process_path: "quic-udp-443".to_string(),
-                target_host: dst_ip.to_string(),
-                resolved_domain: match dst_ip {
-                    IpAddr::V4(v4) => ctrl_net.dns.resolve_fake_ip(&v4),
-                    IpAddr::V6(_) => None,
-                },
-                target_port: dst_port,
-                protocol: TransportProtocol::Udp,
-                matched_rule: "SecurityPolicy:blockQuicUdp443".to_string(),
-                route_label: "BLOCKED".to_string(),
-                latency_ms: 0,
-                rx_bytes: 0,
-                tx_bytes: 0,
-                status: ConnectionStatus::Blocked,
-                started_at: Utc::now(),
-                error_detail: None,
-            },
-            false,
+        ctrl_net.record_blocked_udp(
+            SocketAddr::new(src_ip, src_port),
+            BlockedRecord::new(
+                BlockReason::QuicBlocked,
+                TransportProtocol::Udp,
+                QUIC_POLICY_RULE_NAME,
+            )
+            .process(QUIC_PROCESS_NAME, QUIC_PROCESS_NAME, 0)
+            .target(dst_ip.to_string(), dst_port)
+            .with_ip(Some(dst_ip.to_string()))
+            .with_domain(match dst_ip {
+                IpAddr::V4(v4) => ctrl_net.dns.resolve_fake_ip(&v4),
+                IpAddr::V6(_) => None,
+            })
+            .with_rule_id(QUIC_POLICY_RULE_ID),
         );
     }
 
@@ -1494,27 +1490,22 @@ impl WinDivertInterceptor {
                 "Blocked encrypted DNS bypass ({proto_label} port {dst_port}) {src_ip}:{src_port} -> {dst_ip}:{dst_port}"
             ),
         );
-        ctrl_net.telemetry.record_connection(
-            TrackedConnection {
-                id: Uuid::new_v4().to_string(),
-                pid,
-                process_name: process_name.to_string(),
-                process_path: process_path.to_string(),
-                target_host: dst_ip.to_string(),
-                resolved_domain: None,
-                target_port: dst_port,
-                protocol,
-                matched_rule: "SecurityPolicy:blockEncryptedDnsBypass".to_string(),
-                route_label: "BLOCKED".to_string(),
-                latency_ms: 0,
-                rx_bytes: 0,
-                tx_bytes: 0,
-                status: ConnectionStatus::Blocked,
-                started_at: Utc::now(),
-                error_detail: None,
-            },
-            false,
-        );
+        let record = BlockedRecord::new(
+            BlockReason::EncryptedDnsBlocked,
+            protocol,
+            ENCRYPTED_DNS_POLICY_RULE_NAME,
+        )
+        .process(process_name, process_path, pid)
+        .target(dst_ip.to_string(), dst_port)
+        .with_ip(Some(dst_ip.to_string()))
+        .with_rule_id(ENCRYPTED_DNS_POLICY_RULE_ID);
+        if protocol == TransportProtocol::Udp {
+            ctrl_net.record_blocked_udp(SocketAddr::new(src_ip, src_port), record);
+        } else {
+            ctrl_net
+                .telemetry
+                .record_connection(TrackedConnection::blocked(record), false);
+        }
     }
 
     /// Starts the helper that recognises a DNS server process the periodic rescan has not seen
@@ -2091,26 +2082,24 @@ impl WinDivertInterceptor {
                                             udp_meta.dst_port
                                         ),
                                     );
-                                    ctrl_net.telemetry.record_connection(
-                                        TrackedConnection {
-                                            id: Uuid::new_v4().to_string(),
-                                            pid: 0,
-                                            process_name: proto_label.to_lowercase(),
-                                            process_path: proto_label.to_lowercase(),
-                                            target_host: udp_meta.dst_ip.to_string(),
-                                            resolved_domain: Some(qname),
-                                            target_port: udp_meta.dst_port,
-                                            protocol: TransportProtocol::Udp,
-                                            matched_rule: format!("LocalNameGuard:{proto_label}"),
-                                            route_label: "BLOCKED".to_string(),
-                                            latency_ms: 0,
-                                            rx_bytes: 0,
-                                            tx_bytes: 0,
-                                            status: ConnectionStatus::Blocked,
-                                            started_at: Utc::now(),
-                                            error_detail: None,
-                                        },
-                                        false,
+                                    ctrl_net.record_blocked_udp(
+                                        SocketAddr::new(
+                                            IpAddr::V4(udp_meta.src_ip),
+                                            udp_meta.src_port,
+                                        ),
+                                        BlockedRecord::new(
+                                            BlockReason::LocalNameGuard,
+                                            TransportProtocol::Udp,
+                                            format!("LocalNameGuard:{proto_label}"),
+                                        )
+                                        .process(
+                                            proto_label.to_lowercase(),
+                                            proto_label.to_lowercase(),
+                                            0,
+                                        )
+                                        .target(udp_meta.dst_ip.to_string(), udp_meta.dst_port)
+                                        .with_ip(Some(udp_meta.dst_ip.to_string()))
+                                        .with_domain(Some(qname)),
                                     );
                                     continue;
                                 }
@@ -2131,26 +2120,16 @@ impl WinDivertInterceptor {
                                         netbios_ns_port, udp_meta.dst_ip, udp_meta.dst_port
                                     ),
                                 );
-                                ctrl_net.telemetry.record_connection(
-                                    TrackedConnection {
-                                        id: Uuid::new_v4().to_string(),
-                                        pid: 0,
-                                        process_name: "netbios-ns".to_string(),
-                                        process_path: "netbios-ns".to_string(),
-                                        target_host: udp_meta.dst_ip.to_string(),
-                                        resolved_domain: None,
-                                        target_port: udp_meta.dst_port,
-                                        protocol: TransportProtocol::Udp,
-                                        matched_rule: "LocalNameGuard:NetBIOS".to_string(),
-                                        route_label: "BLOCKED".to_string(),
-                                        latency_ms: 0,
-                                        rx_bytes: 0,
-                                        tx_bytes: 0,
-                                        status: ConnectionStatus::Blocked,
-                                        started_at: Utc::now(),
-                                        error_detail: None,
-                                    },
-                                    false,
+                                ctrl_net.record_blocked_udp(
+                                    SocketAddr::new(IpAddr::V4(udp_meta.src_ip), udp_meta.src_port),
+                                    BlockedRecord::new(
+                                        BlockReason::LocalNameGuard,
+                                        TransportProtocol::Udp,
+                                        "LocalNameGuard:NetBIOS",
+                                    )
+                                    .process("netbios-ns", "netbios-ns", 0)
+                                    .target(udp_meta.dst_ip.to_string(), udp_meta.dst_port)
+                                    .with_ip(Some(udp_meta.dst_ip.to_string())),
                                 );
                                 continue;
                             }

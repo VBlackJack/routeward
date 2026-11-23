@@ -31,6 +31,13 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
+mod block;
+
+use block::BlockedSummaryStore;
+pub use block::{
+    BlockReason, BlockedRecord, BlockedSummary, UnattributedDropCounters, ROUTE_BLOCK_LABEL,
+};
+
 const MIN_BROADCAST_CAPACITY: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +77,21 @@ pub struct TrackedConnection {
     pub started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
+    /// Why the connection was blocked (blocked records only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<BlockReason>,
+    /// Id of the rule that matched (`matchedRule` is its display name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_rule_id: Option<String>,
+    /// Upstream proxy that failed (kill-switch blocks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<String>,
+    /// Destination IP when it differs from `targetHost` (for example a domain was requested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ip: Option<String>,
+    /// True for hypothetical records (simulation, OS socket scan).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub simulated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +110,39 @@ pub struct LogEntry {
     pub level: LogLevel,
     pub component: String,
     pub message: String,
+    /// Structured pointers to the connection the line is about, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<LogContext>,
+}
+
+/// Connection a log line refers to; every field is optional.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+impl LogContext {
+    /// Context of a tracked connection: its pid, id, target host and port.
+    pub fn for_connection(conn: &TrackedConnection) -> Self {
+        Self {
+            pid: Some(conn.pid),
+            connection_id: Some(conn.id.clone()),
+            host: Some(
+                conn.resolved_domain
+                    .clone()
+                    .unwrap_or_else(|| conn.target_host.clone()),
+            ),
+            port: Some(conn.target_port),
+        }
+    }
 }
 
 impl LogEntry {
@@ -98,6 +153,7 @@ impl LogEntry {
             level,
             component: component.into(),
             message: message.into(),
+            context: None,
         }
     }
 }
@@ -227,6 +283,9 @@ pub fn udp_flow_key(client: SocketAddr, target: SocketAddr, route_label: &str) -
 pub struct TelemetryHub {
     connections: Arc<DashMap<String, ConnectionSlot>>,
     udp_flows: Arc<DashMap<String, UdpFlow>>,
+    /// Blocked UDP flows seen recently: one record per flow while datagrams keep arriving.
+    blocked_udp_flows: Arc<DashMap<String, Instant>>,
+    blocked_summary: Arc<Mutex<BlockedSummaryStore>>,
     /// Non-active connections ordered oldest first: the only records eligible for eviction.
     evictable: Arc<Mutex<EvictionIndex>>,
     udp_flow_idle_timeout: Duration,
@@ -272,6 +331,7 @@ impl TelemetryHub {
             enable_logging,
             constants.log_flush_interval_ms,
         );
+        file_logger.set_retention_days(constants.log_retention_days);
         let broadcast_cap = constants
             .event_broadcast_capacity
             .max(MIN_BROADCAST_CAPACITY);
@@ -280,6 +340,10 @@ impl TelemetryHub {
         Self {
             connections: Arc::new(DashMap::new()),
             udp_flows: Arc::new(DashMap::new()),
+            blocked_udp_flows: Arc::new(DashMap::new()),
+            blocked_summary: Arc::new(Mutex::new(BlockedSummaryStore::new(
+                constants.max_blocked_summary_entries,
+            ))),
             evictable: Arc::new(Mutex::new(BTreeSet::new())),
             udp_flow_idle_timeout: Duration::from_millis(constants.udp_flow_idle_timeout_ms),
             update_interval: Duration::from_millis(constants.telemetry_update_interval_ms),
@@ -310,6 +374,11 @@ impl TelemetryHub {
         self.event_tx.subscribe()
     }
 
+    /// Directory of the daily log files this hub writes to.
+    pub fn log_dir(&self) -> &std::path::Path {
+        self.file_logger.log_dir()
+    }
+
     pub fn set_file_logging_enabled(&self, enabled: bool) {
         self.file_logger.set_enabled(enabled);
     }
@@ -321,7 +390,11 @@ impl TelemetryHub {
     pub fn record_connection(&self, conn: TrackedConnection, is_proxied: bool) {
         match conn.status {
             ConnectionStatus::Blocked => {
-                self.blocked_count.fetch_add(1, Ordering::Relaxed);
+                // A simulated record is hypothetical: it is never counted.
+                if !conn.simulated {
+                    self.blocked_count.fetch_add(1, Ordering::Relaxed);
+                }
+                self.blocked_summary.lock().record(&conn);
             }
             _ => {
                 if is_proxied {
@@ -347,6 +420,60 @@ impl TelemetryHub {
         }
         self.evict_excess_connections();
         let _ = self.event_tx.send(TelemetryEvent::ConnectionUpdated(conn));
+    }
+
+    /// Records a blocked UDP datagram. The first datagram of `flow_key` creates one `Blocked`
+    /// record; later datagrams within `udpFlowIdleTimeoutMs` only refresh the flow and bump the
+    /// blocked summary count, so a chatty flow does not flood the connection list. Returns
+    /// `true` when a new record was created.
+    pub fn record_blocked_udp(&self, flow_key: &str, conn: TrackedConnection) -> bool {
+        let now = Instant::now();
+        if let Some(mut seen) = self.blocked_udp_flows.get_mut(flow_key) {
+            if seen.elapsed() < self.udp_flow_idle_timeout {
+                *seen = now;
+                drop(seen);
+                // The datagram has no stored row: the summary keeps pointing at the first one.
+                self.blocked_summary.lock().record_repeat(&conn);
+                return false;
+            }
+            *seen = now;
+        } else {
+            if self.blocked_udp_flows.len() >= self.max_connections {
+                self.sweep_idle_udp_flows();
+            }
+            if self.blocked_udp_flows.len() < self.max_connections {
+                self.blocked_udp_flows.insert(flow_key.to_string(), now);
+            }
+        }
+        self.record_connection(conn, false);
+        true
+    }
+
+    /// Aggregated blocked connections, newest `lastSeen` first. Simulated records are excluded.
+    pub fn blocked_summary(&self) -> Vec<BlockedSummary> {
+        self.blocked_summary.lock().sorted()
+    }
+
+    /// Forgets every aggregated blocked entry (the connection records are not touched).
+    pub fn clear_blocked_summary(&self) {
+        self.blocked_summary.lock().clear();
+    }
+
+    /// Like [`Self::blocked_summary`] restricted to entries seen at or after `since`, truncated
+    /// to `limit` entries.
+    pub fn blocked_summary_filtered(
+        &self,
+        since: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+    ) -> Vec<BlockedSummary> {
+        let mut list = self.blocked_summary();
+        if let Some(since) = since {
+            list.retain(|s| s.last_seen >= since);
+        }
+        if let Some(limit) = limit {
+            list.truncate(limit);
+        }
+        list
     }
 
     /// Evicts the oldest non-active records (closed, blocked, idle UDP flows) while over capacity.
@@ -506,6 +633,9 @@ impl TelemetryHub {
             self.udp_flows.remove(flow_key);
             self.mark_connection_closed(conn_id);
         }
+        let idle_timeout = self.udp_flow_idle_timeout;
+        self.blocked_udp_flows
+            .retain(|_, seen| seen.elapsed() < idle_timeout);
         idle.len()
     }
 
@@ -692,18 +822,31 @@ impl TelemetryHub {
     }
 
     pub fn push_log(&self, level: LogLevel, component: &str, message: impl Into<String>) {
+        self.push_log_ctx(level, component, message, None);
+    }
+
+    /// Same as [`Self::push_log`] with the connection the line is about attached to the entry.
+    pub fn push_log_ctx(
+        &self,
+        level: LogLevel,
+        component: &str,
+        message: impl Into<String>,
+        context: Option<LogContext>,
+    ) {
         let msg = message.into();
         if level == LogLevel::Debug {
             tracing::debug!(component = component, "{}", msg);
             return;
         }
-        self.file_logger.log(level, component, &msg);
+        self.file_logger
+            .log_with_context(level, component, &msg, context.as_ref());
         let entry = LogEntry {
             id: Uuid::new_v4().to_string(),
             timestamp: Utc::now(),
             level,
             component: component.to_string(),
             message: msg,
+            context,
         };
         {
             let mut logs = self.logs.write();
@@ -760,6 +903,11 @@ mod tests {
             status: ConnectionStatus::Active,
             started_at: Utc::now(),
             error_detail: None,
+            block_reason: None,
+            matched_rule_id: None,
+            proxy_id: None,
+            target_ip: None,
+            simulated: false,
         };
         hub.record_connection(tracked, true);
 
@@ -876,6 +1024,10 @@ mod tests {
             event_broadcast_capacity: 16,
             udp_flow_idle_timeout_ms: 30000,
             telemetry_update_interval_ms: 250,
+            max_blocked_summary_entries: 500,
+            ..crate::config::SystemConstants::load_embedded()
+                .expect("SystemConstants")
+                .telemetry
         };
         let hub = TelemetryHub::new_with_logging(&constants, false);
         let base_time = Utc::now();
@@ -897,6 +1049,11 @@ mod tests {
             status,
             started_at: base_time + chrono::Duration::seconds(offset_secs),
             error_detail: None,
+            block_reason: None,
+            matched_rule_id: None,
+            proxy_id: None,
+            target_ip: None,
+            simulated: false,
         };
 
         hub.record_connection(make_conn("active-old", 1, ConnectionStatus::Active), false);
@@ -930,6 +1087,11 @@ mod tests {
             status: ConnectionStatus::Active,
             started_at: Utc::now(),
             error_detail: None,
+            block_reason: None,
+            matched_rule_id: None,
+            proxy_id: None,
+            target_ip: None,
+            simulated: false,
         }
     }
 
@@ -1113,3 +1275,7 @@ mod tests {
         assert!(saw_update, "tick must flush the pending counter update");
     }
 }
+
+#[cfg(test)]
+#[path = "hub_blocked_tests.rs"]
+mod hub_blocked_tests;

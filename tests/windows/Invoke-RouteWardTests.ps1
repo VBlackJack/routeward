@@ -101,6 +101,9 @@ param(
     [string]$ProfileFileName = "active_profile.json",
 
     [Parameter(Mandatory = $false)]
+    [string]$ProtectionStateFileName = "protection_state.json",
+
+    [Parameter(Mandatory = $false)]
     [string]$LogsFolderName = "logs",
 
     [Parameter(Mandatory = $false)]
@@ -556,6 +559,7 @@ $programDataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Com
 $localAppDataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
 $programDataAppDir = Join-Path $programDataRoot $AppDataFolderName
 $activeProfilePath = Join-Path $programDataAppDir $ProfileFileName
+$protectionStatePath = Join-Path $programDataAppDir $ProtectionStateFileName
 $daemonLogsDir = Join-Path $programDataAppDir $LogsFolderName
 $userLogsDir = Join-Path (Join-Path $localAppDataRoot $AppDataFolderName) $LogsFolderName
 $logWildcard = "${LogFilePrefix}_*.log"
@@ -2558,6 +2562,11 @@ try {
         Stop-AllTrackedUdpTestServers
     Stop-AllTrackedDaemons -ExePath $routeWardExePath -FullPipePath $PipeName -ForceKillOnly
         Ensure-SyntheticFirewallRulePresent -RuleName $FirewallRuleName -ProgramPath $routeWardExePath -Port $TransparentRelayPort
+
+        # The daemon re-applies the remembered protection choice at start; (g) left it on through its
+        # force-kill, so the restart below would re-create the firewall rule and mask the orphan cleanup.
+        # Forget it here to start a genuinely idle daemon.
+        Remove-Item -LiteralPath $protectionStatePath -Force -ErrorAction SilentlyContinue
 
         $daemonLogBeforeLines = 0
         $existingDaemonLogs = @(Get-ChildItem -Path $daemonLogsDir -Filter $logWildcard -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
