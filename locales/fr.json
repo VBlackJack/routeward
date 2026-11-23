@@ -735,7 +735,7 @@
       "pack_lan_desc": "Garde toujours un accès direct à votre box Internet, imprimante Wi-Fi et appareils locaux.",
       "pack_ads_title": "Pubs & Pisteurs",
       "pack_ads_desc": "Bloque les régies publicitaires et domaines de suivi courants.",
-      "pack_telemetry_title": "Télémétrie Windows & Apps",
+      "pack_telemetry_title": "Télémétrie système et applis",
       "pack_telemetry_desc": "Bloque les rapports de diagnostic et collecteurs en arrière-plan.",
       "pack_social_title": "Mode Focus (Réseaux sociaux)",
       "pack_social_desc": "Bloque temporairement TikTok, Instagram, X, Facebook et Reddit.",
@@ -1137,7 +1137,7 @@
       "step_indicator": "Étape",
       "step1_title": "1. Quel est votre objectif principal ?",
       "step1_privacy_title": "Confidentialité et navigation privée",
-      "step1_privacy_desc": "Faire passer navigateurs et messageries par votre proxy (pour masquer votre adresse IP) et bloquer la télémétrie de Windows.",
+      "step1_privacy_desc": "Faire passer navigateurs et messageries par votre proxy (pour masquer votre adresse IP) et bloquer la télémétrie en arrière-plan de votre système et de vos applis.",
       "step1_work_title": "Télétravail et outils de développement",
       "step1_work_desc": "Passer mes outils (Git, VS Code, Terminal, Navigateur) par un proxy d'entreprise ou SSH.",
       "step1_gaming_title": "Jeux en ligne et performances",
@@ -1181,7 +1181,7 @@
       "no_proxy_ip_visible": "Sans proxy, votre adresse IP reste visible.",
       "browsers_via_proxy": "Vos navigateurs web passeront par votre proxy.",
       "work_tools_via_proxy": "Vos outils de développement passeront par votre proxy.",
-      "block_telemetry": "La télémétrie de Windows (rapports envoyés à Microsoft en arrière-plan) sera bloquée.",
+      "block_telemetry": "La télémétrie en arrière-plan de votre système et de vos applis (rapports d'utilisation envoyés en arrière-plan) sera bloquée.",
       "local_network_direct": "Votre réseau local (maison ou bureau) reste en connexion directe."
     },
     "done": {
@@ -1225,7 +1225,7 @@
       },
       "rules": {
         "term": "Règles pour chaque application",
-        "simple": "Vos instructions : par exemple \"Firefox passe par le Proxy\", \"Steam se connecte en Direct\" et \"La télémétrie Windows est Bloquée\".",
+        "simple": "Vos instructions : par exemple \"Firefox passe par le Proxy\", \"Steam se connecte en Direct\" et \"La télémétrie est Bloquée\".",
         "expert": "Moteur d'évaluation déterministe par priorité croissante supportant les globs d'exécutables, masques de domaines, sous-réseaux CIDR IPv4/IPv6 et plages de ports."
       },
       "system_proxy": {
