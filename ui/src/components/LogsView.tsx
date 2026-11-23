@@ -323,7 +323,10 @@ export const LogsView: React.FC<LogsViewProps> = ({
                 </td>
               </tr>
             ) : (
-              shown.map((entry, index) => (
+              (source === SOURCE_MEMORY
+                ? shown.slice(0, UI_CONFIG.MAX_RENDERED_TABLE_ROWS)
+                : shown
+              ).map((entry, index) => (
                 <tr
                   key={`${entry.id}-${index}`}
                   className="transition hover:bg-tf-surface-alt/40"

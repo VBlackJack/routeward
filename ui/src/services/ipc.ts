@@ -432,19 +432,26 @@ export class RouteWardClientService {
   }
 
   /**
-   * Network-level failures flip the client to the disconnected state. The error is then
-   * rethrown so a mutation never reports success to the caller: an HTTP error answer means the
-   * bridge is reachable, and an unreachable bridge means the change was not applied either.
-   * Read helpers that return a harmless fallback pass `rethrowNetworkError = false`.
+   * Marks the client disconnected on network-level failures and always throws so callers cannot
+   * fall through to stale state after a failed mutation.
    */
-  private handleRequestFailure(err: unknown, rethrowNetworkError = true): void {
+  private failRequest(err: unknown): never {
     if (err instanceof HttpResponseError) {
       throw err;
     }
     this.markDisconnectedState();
-    if (rethrowNetworkError) {
+    throw err;
+  }
+
+  /**
+   * Same as `failRequest`, except network-level failures do not rethrow so read helpers can return
+   * a harmless fallback while HTTP errors still surface.
+   */
+  private failRequestOrFallback(err: unknown): void {
+    if (err instanceof HttpResponseError) {
       throw err;
     }
+    this.markDisconnectedState();
   }
 
   private async requestJson<T>(
@@ -690,12 +697,8 @@ export class RouteWardClientService {
       await this.fetchState();
       return this.diagnostics;
     } catch (err) {
-      this.handleRequestFailure(err);
-      if (err instanceof HttpResponseError) {
-        throw err;
-      }
+      this.failRequest(err);
     }
-    return this.diagnostics;
   }
 
   /**
@@ -713,12 +716,8 @@ export class RouteWardClientService {
       await this.fetchState();
       return this.diagnostics;
     } catch (err) {
-      this.handleRequestFailure(err);
-      if (err instanceof HttpResponseError) {
-        throw err;
-      }
+      this.failRequest(err);
     }
-    return this.diagnostics;
   }
 
   public async setInterceptionMode(
@@ -733,10 +732,10 @@ export class RouteWardClientService {
       this.diagnostics = diag;
       this.profile = { ...this.profile, interceptionMode: mode };
       this.notifyListeners();
+      return this.diagnostics;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
-    return this.diagnostics;
   }
 
   public async updateSecurityPolicy(
@@ -770,10 +769,10 @@ export class RouteWardClientService {
       );
       this.profile = saved;
       this.notifyListeners();
+      return this.profile;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
-    return this.profile;
   }
 
   public async importProfileJson(jsonText: string): Promise<ProfileConfig> {
@@ -800,8 +799,7 @@ export class RouteWardClientService {
       this.notifyListeners();
       return this.profile;
     } catch (err) {
-      this.handleRequestFailure(err);
-      throw err;
+      this.failRequest(err);
     }
   }
 
@@ -834,7 +832,7 @@ export class RouteWardClientService {
       terminated = res?.terminated === true;
       await this.fetchState();
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
     if (!terminated) {
       // The daemon answered but there was nothing to terminate (already closed or unknown id).
@@ -854,10 +852,10 @@ export class RouteWardClientService {
         {}
       );
       await this.fetchState();
+      return this.connections;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
-    return this.connections;
   }
 
   public async evaluateRule(
@@ -870,7 +868,7 @@ export class RouteWardClientService {
         req
       );
     } catch (err) {
-      this.handleRequestFailure(err, false);
+      this.failRequestOrFallback(err);
       return null;
     }
   }
@@ -886,8 +884,7 @@ export class RouteWardClientService {
       await this.fetchState();
       return report;
     } catch (err) {
-      this.handleRequestFailure(err);
-      return null;
+      this.failRequest(err);
     }
   }
 
@@ -902,8 +899,7 @@ export class RouteWardClientService {
       await this.fetchState();
       return reports;
     } catch (err) {
-      this.handleRequestFailure(err);
-      return [];
+      this.failRequest(err);
     }
   }
 
@@ -917,10 +913,10 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
+      return this.profile;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
-    return this.profile;
   }
 
   public async removeProxy(proxyId: string): Promise<ProfileConfig> {
@@ -932,10 +928,10 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
+      return this.profile;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
-    return this.profile;
   }
 
   public async setPrimaryProxy(proxyId: string): Promise<ProfileConfig> {
@@ -947,10 +943,10 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
+      return this.profile;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
-    return this.profile;
   }
 
   public async importProxyUris(rawText: string): Promise<number> {
@@ -1010,7 +1006,7 @@ export class RouteWardClientService {
       await this.fetchState();
       return osConns;
     } catch (err) {
-      this.handleRequestFailure(err, false);
+      this.failRequestOrFallback(err);
       return this.connections;
     }
   }
@@ -1025,8 +1021,7 @@ export class RouteWardClientService {
       await this.fetchState();
       return Boolean(confirmed);
     } catch (err) {
-      this.handleRequestFailure(err);
-      throw err;
+      this.failRequest(err);
     }
   }
 
@@ -1042,8 +1037,7 @@ export class RouteWardClientService {
       );
       await this.fetchState();
     } catch (err) {
-      this.handleRequestFailure(err);
-      throw err;
+      this.failRequest(err);
     }
   }
 
@@ -1064,10 +1058,10 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
+      return this.profile;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
-    return this.profile;
   }
 
   public async removeChain(chainId: string): Promise<ProfileConfig> {
@@ -1079,10 +1073,10 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
+      return this.profile;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
-    return this.profile;
   }
 
   public async upsertRule(rule: RoutingRule): Promise<ProfileConfig> {
@@ -1094,10 +1088,10 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
+      return this.profile;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
-    return this.profile;
   }
 
   public async toggleRuleEnabled(ruleId: string): Promise<ProfileConfig> {
@@ -1151,10 +1145,10 @@ export class RouteWardClientService {
       );
       this.profile = updated;
       this.notifyListeners();
+      return this.profile;
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
-    return this.profile;
   }
 
   public async allocateFakeIp(domain: string): Promise<string | null> {
@@ -1169,8 +1163,7 @@ export class RouteWardClientService {
       await this.fetchState();
       return res.allocated;
     } catch (err) {
-      this.handleRequestFailure(err);
-      return null;
+      this.failRequest(err);
     }
   }
 
@@ -1183,7 +1176,7 @@ export class RouteWardClientService {
       );
       await this.fetchState();
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
   }
 
@@ -1196,7 +1189,7 @@ export class RouteWardClientService {
         {}
       );
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
   }
 
@@ -1209,7 +1202,7 @@ export class RouteWardClientService {
       );
       await this.fetchState();
     } catch (err) {
-      this.handleRequestFailure(err);
+      this.failRequest(err);
     }
   }
 
@@ -1233,7 +1226,7 @@ export class RouteWardClientService {
         'GET'
       );
     } catch (err) {
-      this.handleRequestFailure(err, false);
+      this.failRequestOrFallback(err);
       return null;
     }
   }
@@ -1281,7 +1274,7 @@ export class RouteWardClientService {
         req
       );
     } catch (err) {
-      this.handleRequestFailure(err, false);
+      this.failRequestOrFallback(err);
       return null;
     }
   }

@@ -102,6 +102,8 @@ export const UI_CONFIG = {
   REQUEST_TIMEOUT_MS: 30000,
   /** Timeout for slow bridge operations (health checks, socket scan, daemon launch). */
   LONG_REQUEST_TIMEOUT_MS: 120000,
+  /** Maximum rows rendered at once in live Connections and Logs tables before windowing. */
+  MAX_RENDERED_TABLE_ROWS: 250,
   /** Auto-dismiss delay for non-error toasts; error toasts stay until dismissed. */
   TOAST_DURATION_MS: 3200,
   /** Extended auto-dismiss delay for toasts that carry an Undo action. */

@@ -172,6 +172,17 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
     [connections, selectedConnId]
   );
 
+  const failingByProcess = useMemo(() => {
+    const map = new Map<string, TrackedConnection>();
+    for (const group of groupedApps) {
+      const failing = findConnectionToExplain(connections, group.processName);
+      if (failing) {
+        map.set(group.processName, failing);
+      }
+    }
+    return map;
+  }, [connections, groupedApps]);
+
   const filtered = useMemo(() => {
     const q = filterText.trim().toLowerCase();
     return connections.filter((c) => {
@@ -398,13 +409,11 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                     <div className="text-xs text-tf-secondary">
                       {group.domains.join(', ')}
                     </div>
-                    {(() => {
-                      const failing = findConnectionToExplain(
-                        connections,
-                        group.processName
-                      );
-                      return failing ? <ActivityWhy connection={failing} /> : null;
-                    })()}
+                    {failingByProcess.has(group.processName) ? (
+                      <ActivityWhy
+                        connection={failingByProcess.get(group.processName)!}
+                      />
+                    ) : null}
                   </div>
 
                 <div className="flex flex-wrap items-center gap-2">
@@ -478,6 +487,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
 
   return (
     <div className="space-y-4">
+      <h2 className="sr-only">{t('app.nav.activity.tab')}</h2>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="relative min-w-[260px] flex-1">
           <Search className="absolute left-3 top-2.5 h-4 w-4 text-tf-secondary" />
@@ -495,6 +505,8 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
           {(['all', 'active', 'blocked', 'closed'] as const).map((st) => (
             <button
               key={st}
+              type="button"
+              aria-pressed={statusFilter === st}
               onClick={() => setStatusFilter(st)}
               className={`rounded-tf-md px-2.5 py-1.5 text-xs font-semibold transition ${
                 statusFilter === st
@@ -588,7 +600,9 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                     </td>
                   </tr>
                 ) : (
-                  filtered.map((conn) => {
+                  filtered
+                    .slice(0, UI_CONFIG.MAX_RENDERED_TABLE_ROWS)
+                    .map((conn) => {
                     const isSelected = conn.id === selectedConnId;
                     return (
                       <tr

@@ -974,7 +974,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       {/* Add Proxy Modal */}
       {showAddProxy && (
         <ModalContainer
-          onClose={() => setShowAddProxy(false)}
+          onClose={() => {
+            setPassword('');
+            setShowAddProxy(false);
+          }}
           labelledBy={proxyTitleId}
           backdropClassName="bg-black/70 p-4"
         >

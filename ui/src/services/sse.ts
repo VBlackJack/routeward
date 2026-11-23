@@ -125,8 +125,16 @@ export async function runRealtimeSseLoop(
     if (abortSignal?.aborted) {
       break;
     }
-    await new Promise((resolve) =>
-      window.setTimeout(resolve, options.reconnectDelayMs)
-    );
+    await new Promise<void>((resolve) => {
+      const timer = window.setTimeout(() => {
+        abortSignal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, options.reconnectDelayMs);
+      const onAbort = () => {
+        window.clearTimeout(timer);
+        resolve();
+      };
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+    });
   }
 }

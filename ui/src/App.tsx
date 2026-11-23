@@ -299,12 +299,22 @@ export const App: React.FC = () => {
   );
 
   const syncFromClient = useCallback(() => {
-    setProfile(routewardClient.getProfile());
-    setDiagnostics(routewardClient.getDiagnostics());
-    setTelemetry(routewardClient.getTelemetry());
-    setConnections(routewardClient.listConnections());
-    setFakeIps(routewardClient.listFakeIps());
-    setLogs(routewardClient.listLogs());
+    const nextProfile = routewardClient.getProfile();
+    const nextDiagnostics = routewardClient.getDiagnostics();
+    const nextTelemetry = routewardClient.getTelemetry();
+    const nextConnections = routewardClient.listConnections();
+    const nextFakeIps = routewardClient.listFakeIps();
+    const nextLogs = routewardClient.listLogs();
+    setProfile((prev) => (prev === nextProfile ? prev : nextProfile));
+    setDiagnostics((prev) =>
+      prev === nextDiagnostics ? prev : nextDiagnostics
+    );
+    setTelemetry((prev) => (prev === nextTelemetry ? prev : nextTelemetry));
+    setConnections((prev) =>
+      prev === nextConnections ? prev : nextConnections
+    );
+    setFakeIps((prev) => (prev === nextFakeIps ? prev : nextFakeIps));
+    setLogs((prev) => (prev === nextLogs ? prev : nextLogs));
   }, []);
 
   useEffect(() => {
