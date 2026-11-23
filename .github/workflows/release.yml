@@ -117,11 +117,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            desktop-file-utils \
             dpkg-dev \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             pkg-config
+
+      - name: Validate the desktop entry
+        run: desktop-file-validate packaging/linux/routeward-desktop.desktop
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -139,6 +143,20 @@ jobs:
 
       - name: Build Debian package
         run: bash packaging/linux/build-deb.sh --target-dir target/release --out-dir dist
+
+      - name: Check the launcher entry and icons are in the package
+        run: |
+          set -euo pipefail
+          deb_listing="$(dpkg-deb -c dist/routeward_*.deb)"
+          for expected in \
+            ./usr/share/applications/routeward-desktop.desktop \
+            ./usr/share/icons/hicolor/256x256/apps/routeward.png \
+            ./usr/share/icons/hicolor/scalable/apps/routeward.svg; do
+            if ! printf '%s\n' "$deb_listing" | grep -qF -- " $expected"; then
+              echo "Missing from the .deb: $expected" >&2
+              exit 1
+            fi
+          done
 
       - name: Upload Debian package as workflow artifact (manual runs only)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}

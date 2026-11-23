@@ -37,6 +37,15 @@ Si une application ou un site cesse de fonctionner, ouvrez **Activité**, puis *
 - **Interface Bureau ThemeForge (`apps/desktop` et `ui/`)** : Fenêtre native `tao` + `wry` intégrant les 16 palettes Oklab canoniques de ThemeForge + `HighContrast` et 9 teintes d'accent, structurée en 5 onglets par cas d'usage (`Accueil`, `Mes Apps & Sites`, `Mon Proxy`, `Activité`, `Réglages`) avec modes **Simple** et **Avancé (Expert)**, assistant guidé en 3 étapes (lien, saisie manuelle ou détection auto + test direct + activation immédiate), bilan **Vérifier ma protection** (comparaison IP avant/après), dépannage guidé **Une app ne marche plus ?** avec motifs vulgarisés, pause temporaire (`15 min`/`1 h`) avec reprise automatique, normalisation automatique des URL de sites, testeur humain **Par où passe un site ?**, détection des règles masquées avec bouton **Faire passer en premier**, packs de protection et compatibilité réseau local en 1 clic, bouton **Annuler** dans les notifications, collage presse-papiers en 1 clic et import par glisser-déposer (`.json`/`.txt`), bascule automatique sur proxy de secours, bouton **Passer en principal**, détection des proxies existants, bascule automatique de profil par Wi-Fi, réinitialisation douce avec sauvegarde automatique, confirmations de suppression en 2 étapes, modale d'import JSON FoxyProxy, noms d'apps conviviaux + diagnostic `errorDetail` + export CSV/JSON dans Activité, gestionnaire de profils nommés et System Tray Windows dynamique (icône colorée selon l'état, démarrage du service en 1 clic, **Pause 15 min** et notifications Windows natives en cas de coupure proxy).
 - **Périmètre Actuel** : RouteWard assure l'interception transparente double pile IPv4 et IPv6 TCP, UDP (`TPROXY` / `WinDivert`) et DNS port `53` avec Fake-IP, l'inspection TLS SNI + HTTP `Host:`, SOCKS4/SOCKS5/HTTP/HTTPS (+ Windows SSPI), PAC local + import FoxyProxy (`msedge.exe`), le rejet QUIC (`UDP 443`), le blocage configurable DoT (`853`) + protection canari DoH Mozilla, l'empaquetage `.msi` Windows / service Windows / Linux `systemd`, le System Tray Windows avec démarrage UAC en 1 clic et une architecture modulaire Rust bureau + interface React/Vitest à 5 onglets.
 
+## Installation sous Linux
+
+1. Installez le paquet : `sudo apt install ./routeward_*.deb`
+2. Autorisez votre compte à joindre le service : `sudo usermod -aG routeward $USER`, puis fermez la session et rouvrez-la.
+3. Démarrez le service : `sudo systemctl enable --now routeward`
+4. Lancez RouteWard depuis le menu des applications.
+
+La fenêtre a besoin de `libwebkit2gtk-4.1` (installé comme paquet recommandé). Sans lui, la fenêtre ne peut pas s'ouvrir.
+
 ## Documentation
 
 - [Architecture](docs/fr/architecture.md) ([English](docs/architecture.md))
