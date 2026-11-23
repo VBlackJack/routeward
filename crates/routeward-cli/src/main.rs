@@ -26,7 +26,7 @@ use routeward_core::error::{
     RouteWardError, RouteWardResult, ERR_KEY_CLEANUP_DAEMON_ACTIVE, ERR_KEY_CONFIG_JSON,
     ERR_KEY_CONFIG_LOAD, ERR_KEY_DAEMON_NOT_ELEVATED,
 };
-use routeward_core::i18n::{os_default_locale, I18nRegistry};
+use routeward_core::i18n::{locale_from_os_name, os_default_locale, I18nRegistry};
 use routeward_core::interceptor::RouteWardController;
 use routeward_core::ipc::protocol::IpcCommand;
 use routeward_core::ipc::transport::is_daemon_ipc_active;
@@ -56,7 +56,9 @@ const COMPONENT_CLI_CTL: &str = "CliCtl";
 /// Explicit locale (flag or `ROUTEWARD_LOCALE`) wins; otherwise the operating system language.
 fn resolve_locale(explicit: Option<&str>, os_default: impl FnOnce() -> &'static str) -> String {
     explicit
-        .map(str::to_string)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| locale_from_os_name(value).to_string())
         .unwrap_or_else(|| os_default().to_string())
 }
 
@@ -1517,15 +1519,23 @@ mod tests {
     }
 
     #[test]
-    fn locale_flag_and_env_are_optional_and_the_flag_wins() {
+    fn locale_resolution_normalises_os_style_and_blank_values() {
+        assert_eq!(super::resolve_locale(Some("fr_FR.UTF-8"), || "en"), "fr");
+        assert_eq!(super::resolve_locale(Some(" fr-CA "), || "en"), "fr");
+        assert_eq!(super::resolve_locale(Some("de"), || "fr"), "en");
+        assert_eq!(super::resolve_locale(Some(""), || "fr"), "fr");
+        assert_eq!(super::resolve_locale(Some("   "), || "fr"), "fr");
+    }
+
+    #[test]
+    fn locale_flag_is_parsed_from_the_command_line() {
         let flag = CliArgs::try_parse_from(["routeward", "--locale", "fr", "ctl", "status"])
             .expect("parse --locale");
         assert_eq!(flag.locale.as_deref(), Some("fr"));
-        let absent =
-            CliArgs::try_parse_from(["routeward", "ctl", "status"]).expect("parse no locale");
-        if std::env::var_os("ROUTEWARD_LOCALE").is_none() {
-            assert_eq!(absent.locale, None);
-        }
+        // The flag is parsed ahead of its env fallback, so it also wins when the variable is set.
+        let flag_over_env =
+            CliArgs::try_parse_from(["routeward", "-l", "en", "ctl", "status"]).expect("parse -l");
+        assert_eq!(flag_over_env.locale.as_deref(), Some("en"));
     }
 
     use super::*;

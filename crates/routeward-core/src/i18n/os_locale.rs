@@ -19,6 +19,9 @@
 const ENGLISH_LOCALE: &str = "en";
 const FRENCH_LOCALE: &str = "fr";
 const FRENCH_LOCALE_PREFIX: &str = "fr";
+const ENGLISH_LOCALE_PREFIX: &str = "en";
+/// Characters that end the language part of a POSIX locale (`fr_FR.UTF-8@euro`).
+const POSIX_MODIFIER_SEPARATORS: [char; 2] = ['.', '@'];
 /// POSIX locale names that mean "no localisation": messages stay in English.
 const POSIX_NEUTRAL_LOCALES: [&str; 2] = ["c", "posix"];
 /// Separator between the entries of the GNU `LANGUAGE` priority list.
@@ -48,6 +51,18 @@ pub fn locale_from_os_name(name: &str) -> &'static str {
     }
 }
 
+/// Maps an OS locale name to a supported locale, or `None` when it is not one of them.
+fn supported_locale_from_os_name(name: &str) -> Option<&'static str> {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.starts_with(FRENCH_LOCALE_PREFIX) {
+        Some(FRENCH_LOCALE)
+    } else if lower.starts_with(ENGLISH_LOCALE_PREFIX) {
+        Some(ENGLISH_LOCALE)
+    } else {
+        None
+    }
+}
+
 /// Resolves the POSIX locale from the four environment variables, as plain values so the logic
 /// is testable without touching the process environment. Order: `LC_ALL`, `LC_MESSAGES`, `LANG`
 /// (empty values are skipped). `C` and `POSIX` mean English. Otherwise the first entry of
@@ -66,17 +81,25 @@ pub fn locale_from_posix_env(
     let Some(effective) = effective else {
         return ENGLISH_LOCALE;
     };
+    // Compare the language part only: `C.UTF-8` and `POSIX@x` are neutral too.
+    let base = effective
+        .split(POSIX_MODIFIER_SEPARATORS)
+        .next()
+        .unwrap_or(effective);
     let neutral = POSIX_NEUTRAL_LOCALES
         .iter()
-        .any(|name| effective.eq_ignore_ascii_case(name));
+        .any(|name| base.eq_ignore_ascii_case(name));
     if neutral {
         return ENGLISH_LOCALE;
     }
-    let first_language = language
-        .and_then(|list| list.split(LANGUAGE_LIST_SEPARATOR).next())
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty());
-    locale_from_os_name(first_language.unwrap_or(effective))
+    // First `LANGUAGE` entry that maps to a supported locale (`de:fr` gives French).
+    let from_language = language.and_then(|list| {
+        list.split(LANGUAGE_LIST_SEPARATOR)
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .find_map(supported_locale_from_os_name)
+    });
+    from_language.unwrap_or_else(|| locale_from_os_name(effective))
 }
 
 /// The locale of the operating system user, as a supported locale (`"en"` or `"fr"`).
@@ -158,5 +181,32 @@ mod tests {
             "en"
         );
         assert_eq!(locale_from_posix_env(None, None, en, Some("")), "en");
+    }
+
+    #[test]
+    fn posix_c_utf8_is_neutral_and_ignores_language() {
+        let fr = Some("fr");
+        assert_eq!(locale_from_posix_env(None, None, Some("C.UTF-8"), fr), "en");
+        assert_eq!(locale_from_posix_env(Some("POSIX@x"), None, None, fr), "en");
+        // A locale that merely starts with `c` is not neutral.
+        assert_eq!(
+            locale_from_posix_env(None, None, Some("ca_ES.UTF-8"), fr),
+            "fr"
+        );
+    }
+
+    #[test]
+    fn posix_language_picks_the_first_supported_entry() {
+        let en = Some("en_US.UTF-8");
+        assert_eq!(locale_from_posix_env(None, None, en, Some("de:fr")), "fr");
+        assert_eq!(
+            locale_from_posix_env(None, None, en, Some("de:en:fr")),
+            "en"
+        );
+        assert_eq!(locale_from_posix_env(None, None, en, Some(":de:fr")), "fr");
+        assert_eq!(
+            locale_from_posix_env(None, None, Some("fr_FR.UTF-8"), Some("de:es")),
+            "fr"
+        );
     }
 }
