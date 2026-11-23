@@ -37,7 +37,7 @@ const TEXT_EXTENSIONS: &[&str] = &[
 ];
 
 /// Extensionless packaging scripts that are scanned as text (maintainer scripts of the .deb).
-const TEXT_FILE_NAMES: &[&str] = &["Dockerfile", "postinst", "prerm", ".env.example"];
+const TEXT_FILE_NAMES: &[&str] = &["Dockerfile", "postinst", "prerm", "postrm", ".env.example"];
 
 const SOURCE_HEADER_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "css", "ps1", "sh", "py", "js", "bat", "wxs", "toml", "yml", "html",
@@ -324,6 +324,14 @@ fn repo_typography_encoding_and_mojibake_guard() {
                         reason,
                         ch
                     ));
+                } else if ch.is_control() && ch != '\t' {
+                    violations.push(format!(
+                        "{}:{}:{}: unexpected control character U+{:04X}",
+                        rel_str,
+                        line_no,
+                        col_idx + 1,
+                        ch as u32
+                    ));
                 }
             }
             for marker in mojibake_markers {
@@ -585,8 +593,9 @@ fn release_tag_for_workspace_version(cargo_toml: &str) -> String {
     let version = version.expect("workspace.package.version in Cargo.toml");
     let parts: Vec<&str> = version.split('.').collect();
     assert_eq!(parts.len(), 3, "unexpected workspace version {}", version);
+    let month_day: u32 = parts[1].parse().expect("numeric month-day");
     let day: u32 = parts[2].parse().expect("numeric day counter");
-    format!("v{}.{}.{:02}", parts[0], parts[1], day)
+    format!("v{}.{:04}.{:02}", parts[0], month_day, day)
 }
 
 #[test]
@@ -657,6 +666,8 @@ fn release_tag_mapping_pads_the_day_counter() {
     assert_eq!(release_tag_for_workspace_version(manifest), "v2026.1115.03");
     let manifest = "[workspace.package]\nversion = \"2026.1201.12\"\n";
     assert_eq!(release_tag_for_workspace_version(manifest), "v2026.1201.12");
+    let manifest = "[workspace.package]\nversion = \"2027.105.0\"\n";
+    assert_eq!(release_tag_for_workspace_version(manifest), "v2027.0105.00");
 }
 
 /// Returns the opening tags named `tag` (for example `<Custom `) of an XML text, each as one

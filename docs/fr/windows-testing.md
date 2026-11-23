@@ -36,7 +36,7 @@ Tous les chemins, ports, URL de test, noms de règles et délais sont paramétra
 
 ## Ordre d'Exécution des Scénarios et Relance du Tunnel SOCKS5
 
-Chaque scénario conserve une **lettre stable** (`(a)` à `(z)`) dans tous les rapports, associée à un **ordre d'exécution explicite** (`[Order 01/26]` à `[Order 25/26]`).
+Chaque scénario conserve une **lettre stable** (`(a)` à `(z)`) dans tous les rapports, associée à un **ordre d'exécution explicite** (`[Order 01/26]` à `[Order 26/26]`).
 
 Comme le scénario `(j)` arrête le processus SOCKS5 local en écoute sur `-Socks5Port` pour tester le Kill-Switch (et qu'un tunnel `ssh -D` interactif demandant un mot de passe ne peut pas être relancé automatiquement sans intervention), le scénario `(j)` s'exécute toujours **en DERNIER (`Order 26/26`)**, après tous les autres scénarios :
 

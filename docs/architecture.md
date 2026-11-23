@@ -167,7 +167,7 @@ RouteWard is structured as a Rust workspace with three crates (`routeward-core`,
   - Split `crates/routeward-core/src/interceptor` into focused submodules (`controller.rs`, `tcp_relay.rs`, `udp_relay.rs`, `dns_handler.rs`, `nat.rs`, `nftables/{mod.rs, ruleset.rs, tproxy.rs, watchdog.rs, tests.rs}`, `windivert/{mod.rs, ffi.rs, filters.rs, worker.rs, tests.rs}`, `tests.rs`).
   - Split `apps/desktop/src` loopback API/bridge into `security.rs`, `sse.rs`, `routes.rs`, `commands.rs`, `daemon_launcher.rs`, `tray.rs`, `lib.rs`, and `tests.rs`, plus headless `--smoke-ipc` verification on `routeward-desktop`.
   - Split `ui/src/services` into `uri.ts` (with `[ipv6]:port` URI formatting/parsing), `sse.ts`, and `ipc.ts` alongside Vitest UI view and navigation tests (`ui/src/components/Views.test.tsx`, `ui/src/App.test.tsx`).
-  - Verified end-to-end across dual-stack OS integration suites (`tests/linux/run-scenarios.sh` and `25` scenarios in `tests/windows/Invoke-RouteWardTests.ps1`, backed by `crates/routeward-core/examples/socks5_udp_test_server.rs` with `--map-target` and `--udp-echo-bind`).
+  - Verified end-to-end across dual-stack OS integration suites (`tests/linux/run-scenarios.sh` and `26` scenarios in `tests/windows/Invoke-RouteWardTests.ps1`, backed by `crates/routeward-core/examples/socks5_udp_test_server.rs` with `--map-target` and `--udp-echo-bind`).
 
 ### Desktop UX, System Tray, and Privileged 1-Click Start
 - **5 Use-Case Tabs & Simple/Advanced Modes (`ui/src/`)**:
