@@ -1137,7 +1137,7 @@
       "step_indicator": "Step",
       "step1_title": "1. What is your main goal?",
       "step1_privacy_title": "Privacy & Anonymous Browsing",
-      "step1_privacy_desc": "Send browsers and chat apps through your proxy (to hide your IP address) and block Windows telemetry.",
+      "step1_privacy_desc": "Send browsers and chat apps through your proxy (to hide your IP address) and block background telemetry from your system and apps.",
       "step1_work_title": "Remote Work & Developer Tools",
       "step1_work_desc": "Route developer tools (Git, VS Code, Terminal, Browsers) through a corporate or SSH proxy.",
       "step1_gaming_title": "Low-Latency Gaming & Split Tunneling",
@@ -1181,7 +1181,7 @@
       "no_proxy_ip_visible": "Without a proxy, your IP address stays visible.",
       "browsers_via_proxy": "Your web browsers will go through your proxy.",
       "work_tools_via_proxy": "Your developer tools will go through your proxy.",
-      "block_telemetry": "Windows telemetry (background reports to Microsoft) will be blocked.",
+      "block_telemetry": "Background telemetry from your system and apps (usage reports sent in the background) will be blocked.",
       "local_network_direct": "Your home or office network stays on a direct connection."
     },
     "done": {
@@ -1225,7 +1225,7 @@
       },
       "rules": {
         "term": "Rules for each app",
-        "simple": "Your custom traffic laws: e.g., 'Firefox goes through Proxy', 'Steam connects Directly', and 'Windows Telemetry is Blocked'.",
+        "simple": "Your custom traffic laws: e.g., 'Firefox goes through Proxy', 'Steam connects Directly', and 'Telemetry is Blocked'.",
         "expert": "Deterministic ascending-priority evaluator matching process globs, domain wildcards, IPv4/IPv6 CIDR subnets, and port ranges."
       },
       "system_proxy": {
