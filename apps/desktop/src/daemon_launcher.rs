@@ -388,11 +388,40 @@ pub fn spawn_daemon_args(allow_sid: Option<&str>, locale: &str) -> Vec<String> {
         "--locale".to_string(),
         safe_locale.to_string(),
     ];
-    if let Some(sid) = allow_sid.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(sid) = allow_sid.map(str::trim).filter(|s| is_plausible_sid(s)) {
         args.push("--allow-sid".to_string());
         args.push(sid.to_string());
     }
     args
+}
+
+/// Quotes one argument according to Win32 `CommandLineToArgvW` rules.
+#[cfg(any(windows, test))]
+fn quote_windows_cmdline_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| matches!(c, ' ' | '\t' | '"')) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
 }
 
 /// Chooses how to bring the daemon up.
@@ -428,7 +457,7 @@ pub fn build_daemon_launch_plan(
                 sid.to_string(),
             ],
         }),
-        None => Ok(build_spawn_daemon_plan(allow_sid, locale)),
+        None => Ok(build_spawn_daemon_plan(None, locale)),
     }
 }
 
@@ -529,10 +558,8 @@ mod windows_impl {
 
     /// Runs the CLI elevated through the UAC prompt.
     ///
-    /// The arguments are only quoted when they contain a space, with no escaping. That is safe
-    /// because every variable argument is checked before it gets here: the user SID passes the
-    /// strict SID check and the locale comes from a whitelist, so neither can hold a quote or
-    /// another special character. Keep it that way: never pass free text through this function.
+    /// Variable arguments are validated before reaching this function (SID and whitelisted locale)
+    /// and additionally escaped using Win32 `CommandLineToArgvW` quoting rules as defense-in-depth.
     fn run_elevated_cli(
         cli_exe: &Path,
         args: &[String],
@@ -540,13 +567,7 @@ mod windows_impl {
         let exe_str = cli_exe.to_string_lossy();
         let params_str = args
             .iter()
-            .map(|a| {
-                if a.contains(' ') {
-                    format!("\"{a}\"")
-                } else {
-                    a.clone()
-                }
-            })
+            .map(|a| super::quote_windows_cmdline_arg(a))
             .collect::<Vec<_>>()
             .join(" ");
 
@@ -768,15 +789,25 @@ mod tests {
             }
         );
 
-        // Without a usable SID the service pipe would stay out of the user's reach: spawn a daemon.
+        // Without a usable SID the service pipe would stay out of the user's reach: spawn a daemon
+        // without forwarding any unvalidated --allow-sid value.
         for unusable in [None, Some(""), Some("not-a-sid"), Some("S-1-5-21 --evil")] {
             let plan = build_daemon_launch_plan(false, "not_installed", unusable, "fr")
                 .expect("an uninstalled service without a usable SID spawns a daemon");
-            assert!(
-                matches!(plan, DaemonLaunchPlan::SpawnDaemon { .. }),
-                "{unusable:?} must not reach the elevated service install command"
-            );
+            match plan {
+                DaemonLaunchPlan::SpawnDaemon { args } => {
+                    assert!(
+                        !args.iter().any(|a| a == "--allow-sid"),
+                        "{unusable:?} must not forward --allow-sid to the fallback daemon: {args:?}"
+                    );
+                }
+                other => panic!(
+                    "{unusable:?} must not reach the elevated service install command: {other:?}"
+                ),
+            }
         }
+        assert_eq!(quote_windows_cmdline_arg("plain"), "plain");
+        assert_eq!(quote_windows_cmdline_arg(r#"a "b" c\"#), r#""a \"b\" c\\""#);
     }
 
     #[test]

@@ -861,7 +861,7 @@ pub fn verify_windows_dacl_security(path: &Path) -> RouteWardResult<()> {
 }
 
 #[cfg(windows)]
-unsafe fn sid_to_string(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+pub(crate) unsafe fn sid_to_string(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;

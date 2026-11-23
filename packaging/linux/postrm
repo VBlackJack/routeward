@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -e
+set -eu
 
 # Debian maintainer script run after the package files are removed. Only "purge" deletes data.
 # The system group "routeward" is intentionally kept: a group that may still own files is never

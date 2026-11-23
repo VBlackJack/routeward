@@ -726,34 +726,42 @@ impl ProcessResolver {
         None
     }
 
-    /// Views an IP Helper `MIB_*TABLE_OWNER_PID` buffer as its row slice.
+    /// Copies rows from an IP Helper `MIB_*TABLE_OWNER_PID` byte buffer using unaligned reads.
     ///
     /// All of these tables are a `u32` entry count followed by the row array, so one generic
     /// accessor serves TCP/UDP over IPv4/IPv6. The declared count is clamped to the buffer.
+    /// Using `read_unaligned` avoids alignment UB on `Vec<u8>` allocations.
     ///
     /// # Safety
-    /// `buffer` must hold a table of rows of type `R` filled in by the matching IP Helper call.
+    /// `buffer` must hold a table of valid `R` rows filled in by the matching IP Helper call.
     #[cfg(windows)]
-    pub(crate) unsafe fn iphelper_rows<R>(buffer: &[u8]) -> &[R] {
+    pub(crate) unsafe fn iphelper_rows<R: Copy>(buffer: &[u8]) -> Vec<R> {
         let header = std::mem::size_of::<u32>().next_multiple_of(std::mem::align_of::<R>());
-        if buffer.len() < header {
-            return &[];
+        let row_size = std::mem::size_of::<R>();
+        if buffer.len() < header || row_size == 0 {
+            return Vec::new();
         }
-        let declared = unsafe { *(buffer.as_ptr() as *const u32) } as usize;
-        let capacity = (buffer.len() - header) / std::mem::size_of::<R>().max(1);
+        let declared = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const u32) } as usize;
+        let capacity = (buffer.len() - header) / row_size;
         let count = declared.min(capacity);
-        unsafe { std::slice::from_raw_parts(buffer.as_ptr().add(header) as *const R, count) }
+        let base = unsafe { buffer.as_ptr().add(header) };
+        let mut rows = Vec::with_capacity(count);
+        for idx in 0..count {
+            let row = unsafe { std::ptr::read_unaligned(base.add(idx * row_size) as *const R) };
+            rows.push(row);
+        }
+        rows
     }
 
     /// Finds the owning PID of `local_port` in one IP Helper table (one family/protocol).
     /// `row_port_pid` extracts the raw network-order port field and the owning PID from a row.
     #[cfg(windows)]
-    fn find_pid_in_table<R>(
+    fn find_pid_in_table<R: Copy>(
         buffer: &[u8],
         local_port: u16,
         row_port_pid: impl Fn(&R) -> (u32, u32),
     ) -> Option<u32> {
-        let rows: &[R] = unsafe { Self::iphelper_rows::<R>(buffer) };
+        let rows: Vec<R> = unsafe { Self::iphelper_rows::<R>(buffer) };
         rows.iter().find_map(|row| {
             let (raw_port, pid) = row_port_pid(row);
             (u16::from_be((raw_port & 0xFFFF) as u16) == local_port).then_some(pid)
@@ -837,7 +845,7 @@ impl ProcessResolver {
                 0,
             )
         }) {
-            let rows: &[MIB_TCPROW_OWNER_PID] = unsafe { Self::iphelper_rows(&buffer) };
+            let rows: Vec<MIB_TCPROW_OWNER_PID> = unsafe { Self::iphelper_rows(&buffer) };
 
             for row in rows {
                 if row.dwState != MIB_TCP_STATE_ESTAB as u32 {
@@ -872,7 +880,7 @@ impl ProcessResolver {
                     0,
                 )
             }) {
-                let rows: &[MIB_TCP6ROW_OWNER_PID] = unsafe { Self::iphelper_rows(&buffer) };
+                let rows: Vec<MIB_TCP6ROW_OWNER_PID> = unsafe { Self::iphelper_rows(&buffer) };
 
                 for row in rows {
                     if row.dwState != MIB_TCP_STATE_ESTAB as u32 {
@@ -1431,7 +1439,7 @@ mod tests {
     fn iphelper_rows_clamps_declared_count_to_buffer() {
         let mut buffer = vec![0u8; 4 + 8];
         buffer[..4].copy_from_slice(&1000u32.to_ne_bytes());
-        let rows: &[[u32; 2]] = unsafe { ProcessResolver::iphelper_rows(&buffer) };
+        let rows: Vec<[u32; 2]> = unsafe { ProcessResolver::iphelper_rows(&buffer) };
         assert_eq!(rows.len(), 1);
     }
 

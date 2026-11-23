@@ -236,9 +236,7 @@ mod win32_impl {
         LocalFree, ERROR_CALL_NOT_IMPLEMENTED, ERROR_INSUFFICIENT_BUFFER,
         ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SUCCESS, NO_ERROR,
     };
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    };
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
         OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
@@ -514,20 +512,7 @@ mod win32_impl {
     }
 
     unsafe fn sid_to_string(sid: PSID) -> Option<String> {
-        if sid.is_null() {
-            return None;
-        }
-        let mut wide_ptr: *mut u16 = null_mut();
-        if ConvertSidToStringSidW(sid, &mut wide_ptr) == 0 || wide_ptr.is_null() {
-            return None;
-        }
-        let mut len = 0usize;
-        while *wide_ptr.add(len) != 0 {
-            len += 1;
-        }
-        let out = String::from_utf16_lossy(std::slice::from_raw_parts(wide_ptr, len));
-        let _ = LocalFree(wide_ptr as *mut c_void);
-        Some(out)
+        crate::config::security::sid_to_string(sid)
     }
 
     /// Security facts about one path that matter for the service binary check.

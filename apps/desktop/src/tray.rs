@@ -202,9 +202,17 @@ const TRAY_KEY_MENU_QUIT: &str = "tray.menu.quit";
 /// Local time of day (`HH:MM`) of a Unix timestamp in milliseconds; UTC when the time zone
 /// conversion is unavailable.
 pub fn format_local_time_of_day(epoch_ms: u64) -> String {
-    let ticks = (epoch_ms / MILLIS_PER_SEC + FILETIME_UNIX_EPOCH_OFFSET_SECS)
-        * FILETIME_TICKS_PER_SEC
-        + (epoch_ms % MILLIS_PER_SEC) * FILETIME_TICKS_PER_MS;
+    let Some(ticks) = (epoch_ms / MILLIS_PER_SEC)
+        .checked_add(FILETIME_UNIX_EPOCH_OFFSET_SECS)
+        .and_then(|secs| secs.checked_mul(FILETIME_TICKS_PER_SEC))
+        .and_then(|base| {
+            (epoch_ms % MILLIS_PER_SEC)
+                .checked_mul(FILETIME_TICKS_PER_MS)
+                .and_then(|rem| base.checked_add(rem))
+        })
+    else {
+        return String::new();
+    };
     let file_time = FILETIME {
         dwLowDateTime: ticks as u32,
         dwHighDateTime: (ticks >> 32) as u32,
@@ -312,12 +320,17 @@ impl TrayWindowState {
         let snap = self.snapshot.lock().clone();
         let labels = build_tray_labels(&snap);
         let visual_state = visual_state_from_snapshot(&snap);
-        let mut nid = self.nid.borrow_mut();
-        encode_utf16_tip_truncated(&labels.tooltip, &mut nid.szTip);
-        nid.hIcon = self.icons.for_state(visual_state);
-        nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+        // Copy NOTIFYICONDATAW by value and drop the RefCell borrow before calling
+        // Shell_NotifyIconW: synchronous Shell IPC can re-entrantly dispatch into WNDPROC.
+        let nid_copy = {
+            let mut nid = self.nid.borrow_mut();
+            encode_utf16_tip_truncated(&labels.tooltip, &mut nid.szTip);
+            nid.hIcon = self.icons.for_state(visual_state);
+            nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+            *nid
+        };
         unsafe {
-            Shell_NotifyIconW(NIM_MODIFY, &*nid);
+            Shell_NotifyIconW(NIM_MODIFY, &nid_copy);
         }
     }
 
@@ -325,16 +338,19 @@ impl TrayWindowState {
         let Some(balloon) = self.pending_alert.lock().take() else {
             return;
         };
-        let mut nid = self.nid.borrow_mut();
-        encode_utf16_fixed(&balloon.title, &mut nid.szInfoTitle);
-        encode_utf16_fixed(&balloon.body, &mut nid.szInfo);
-        nid.dwInfoFlags = match balloon.level {
-            TrayBalloonLevel::Info => NIIF_INFO,
-            TrayBalloonLevel::Warning => NIIF_WARNING,
+        let nid_copy = {
+            let mut nid = self.nid.borrow_mut();
+            encode_utf16_fixed(&balloon.title, &mut nid.szInfoTitle);
+            encode_utf16_fixed(&balloon.body, &mut nid.szInfo);
+            nid.dwInfoFlags = match balloon.level {
+                TrayBalloonLevel::Info => NIIF_INFO,
+                TrayBalloonLevel::Warning => NIIF_WARNING,
+            };
+            nid.uFlags = NIF_INFO;
+            *nid
         };
-        nid.uFlags = NIF_INFO;
         unsafe {
-            Shell_NotifyIconW(NIM_MODIFY, &*nid);
+            Shell_NotifyIconW(NIM_MODIFY, &nid_copy);
         }
     }
 
@@ -342,24 +358,33 @@ impl TrayWindowState {
         let snap = self.snapshot.lock().clone();
         let labels = build_tray_labels(&snap);
         let visual_state = visual_state_from_snapshot(&snap);
-        let mut nid = self.nid.borrow_mut();
-        encode_utf16_tip_truncated(&labels.tooltip, &mut nid.szTip);
-        nid.hIcon = self.icons.for_state(visual_state);
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+        let nid_add = {
+            let mut nid = self.nid.borrow_mut();
+            encode_utf16_tip_truncated(&labels.tooltip, &mut nid.szTip);
+            nid.hIcon = self.icons.for_state(visual_state);
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+            *nid
+        };
         unsafe {
-            if Shell_NotifyIconW(NIM_ADD, &*nid) == 0 {
+            if Shell_NotifyIconW(NIM_ADD, &nid_add) == 0 {
                 return false;
             }
+        }
+        let nid_version = {
+            let mut nid = self.nid.borrow_mut();
             nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-            Shell_NotifyIconW(NIM_SETVERSION, &*nid);
+            *nid
+        };
+        unsafe {
+            Shell_NotifyIconW(NIM_SETVERSION, &nid_version);
         }
         true
     }
 
     fn remove_icon(&self) {
-        let nid = self.nid.borrow();
+        let nid_copy = *self.nid.borrow();
         unsafe {
-            Shell_NotifyIconW(NIM_DELETE, &*nid);
+            Shell_NotifyIconW(NIM_DELETE, &nid_copy);
         }
     }
 
