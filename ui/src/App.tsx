@@ -389,6 +389,9 @@ export const App: React.FC = () => {
         }
         const errorToastMap: Record<string, string> = {
           access_denied: 'app.toast.daemon.access_denied',
+          linux_group_required: 'app.toast.daemon.linux_group_required',
+          linux_service_not_running: 'app.toast.daemon.linux_service_not_running',
+          unsupported_os: 'app.toast.daemon.linux_service_not_running',
           insecure_profile: 'app.toast.daemon.insecure_profile',
           ipc_error: 'app.toast.daemon.ipc_error',
           not_elevated: 'app.toast.daemon.not_elevated',

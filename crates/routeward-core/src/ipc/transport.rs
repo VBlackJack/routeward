@@ -413,18 +413,70 @@ pub async fn connect_ipc_stream(ipc_config: &IpcConstants) -> RouteWardResult<Ip
     }
 }
 
+/// What a probe of the daemon IPC endpoint found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonIpcProbe {
+    /// The endpoint answers: a daemon is listening and this user can reach it.
+    Running,
+    /// Nothing listens on the endpoint.
+    NotRunning,
+    /// Something is there (or the path cannot be inspected) but this user is not allowed in, for
+    /// example a 0750 `root:routeward` socket directory for an account outside that group.
+    AccessDenied,
+}
+
+/// Pure classification of a Unix socket probe from the error kinds it produced.
+///
+/// `metadata` is the result of inspecting the socket path (`Err` carries the error kind) and
+/// `connect` is evaluated only when the path exists. A `PermissionDenied` at either step means the
+/// user cannot reach a daemon that may well be running; any other failure means it is not running.
+pub fn classify_unix_socket_probe(
+    metadata: Result<(), std::io::ErrorKind>,
+    connect: impl FnOnce() -> Result<(), std::io::ErrorKind>,
+) -> DaemonIpcProbe {
+    match metadata {
+        Err(std::io::ErrorKind::PermissionDenied) => return DaemonIpcProbe::AccessDenied,
+        Err(_) => return DaemonIpcProbe::NotRunning,
+        Ok(()) => {}
+    }
+    match connect() {
+        Ok(()) => DaemonIpcProbe::Running,
+        Err(std::io::ErrorKind::PermissionDenied) => DaemonIpcProbe::AccessDenied,
+        Err(_) => DaemonIpcProbe::NotRunning,
+    }
+}
+
+/// Probes the configured daemon IPC endpoint and tells "running", "not running" and "not allowed".
+pub fn probe_daemon_ipc(ipc_config: &IpcConstants) -> DaemonIpcProbe {
+    #[cfg(unix)]
+    {
+        let socket_path = std::path::Path::new(&ipc_config.unix_socket_path);
+        classify_unix_socket_probe(
+            std::fs::metadata(socket_path)
+                .map(|_| ())
+                .map_err(|err| err.kind()),
+            || {
+                std::os::unix::net::UnixStream::connect(socket_path)
+                    .map(|_stream| ())
+                    .map_err(|err| err.kind())
+            },
+        )
+    }
+    #[cfg(windows)]
+    {
+        if is_daemon_ipc_active(ipc_config) {
+            DaemonIpcProbe::Running
+        } else {
+            DaemonIpcProbe::NotRunning
+        }
+    }
+}
+
 /// Checks whether a `routeward daemon` instance is currently listening on the configured OS IPC endpoint.
 pub fn is_daemon_ipc_active(ipc_config: &IpcConstants) -> bool {
     #[cfg(unix)]
     {
-        let socket_path = std::path::Path::new(&ipc_config.unix_socket_path);
-        if !socket_path.exists() {
-            return false;
-        }
-        match std::os::unix::net::UnixStream::connect(socket_path) {
-            Ok(_stream) => true,
-            Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
-        }
+        probe_daemon_ipc(ipc_config) != DaemonIpcProbe::NotRunning
     }
     #[cfg(windows)]
     {
@@ -1122,6 +1174,31 @@ fn create_windows_named_pipe_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_probe_tells_running_missing_and_not_allowed_apart() {
+        use std::io::ErrorKind;
+        assert_eq!(
+            classify_unix_socket_probe(Ok(()), || Ok(())),
+            DaemonIpcProbe::Running
+        );
+        assert_eq!(
+            classify_unix_socket_probe(Err(ErrorKind::NotFound), || panic!("no connect")),
+            DaemonIpcProbe::NotRunning
+        );
+        assert_eq!(
+            classify_unix_socket_probe(Err(ErrorKind::PermissionDenied), || panic!("no connect")),
+            DaemonIpcProbe::AccessDenied
+        );
+        assert_eq!(
+            classify_unix_socket_probe(Ok(()), || Err(ErrorKind::PermissionDenied)),
+            DaemonIpcProbe::AccessDenied
+        );
+        assert_eq!(
+            classify_unix_socket_probe(Ok(()), || Err(ErrorKind::ConnectionRefused)),
+            DaemonIpcProbe::NotRunning
+        );
+    }
 
     #[test]
     fn rejects_broad_principals_and_sddl_injection_in_allow_sid() {

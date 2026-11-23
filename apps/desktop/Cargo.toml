@@ -39,6 +39,9 @@ tracing-subscriber.workspace = true
 tao = "0.30"
 wry = "0.47"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.33"
 windows = "0.58"

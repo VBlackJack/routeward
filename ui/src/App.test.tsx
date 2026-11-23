@@ -186,6 +186,40 @@ describe('App navigation and accessible modals', () => {
     });
   });
 
+  it.each([
+    ['linux_group_required', 409, /usermod -aG routeward/],
+    ['linux_service_not_running', 503, /systemctl enable --now routeward/],
+    ['unsupported_os', 501, /systemctl enable --now routeward/]
+  ])('shows the Linux instructions when the daemon start fails with %s', async (errorKey, status, expected) => {
+    vi.spyOn(routewardClient, 'getDiagnostics').mockReturnValue({
+      daemonConnected: false,
+      running: false,
+      osName: 'WINDOWS',
+      interceptionMode: 'hybrid',
+      elevatedPrivileges: false,
+      relayTcpEndpoint: '127.0.0.1:10808',
+      relayHttpEndpoint: '127.0.0.1:10809',
+      dnsEndpoint: '127.0.0.1:5353',
+      fakeIpCidr: '198.18.0.0/15',
+      activeLocale: 'fr',
+      pausedUntilEpochMs: null,
+      autoStartErrorKey: null
+    });
+    vi.spyOn(routewardClient, 'startDaemon').mockRejectedValue(
+      new HttpResponseError(status, 'daemon start failed', errorKey)
+    );
+
+    renderApp();
+
+    fireEvent.click(
+      screen.getByRole('button', { name: /démarrer la protection|start protection/i })
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(expected)).toBeInTheDocument();
+    });
+  });
+
   it('shows a persistent translated error toast, not a success toast, when adding a proxy fails', async () => {
     window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.LOCALE, 'en');
     await i18n.changeLanguage('en');

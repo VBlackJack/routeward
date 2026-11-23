@@ -197,7 +197,9 @@
         "started": "RouteWard fonctionne maintenant en arrière-plan",
         "uac_cancelled": "Vous avez annulé la demande d'administrateur : rien n'a été démarré",
         "start_failed": "RouteWard n'a pas pu démarrer. Réessayez.",
-        "access_denied": "RouteWard fonctionne, mais votre session Windows n'a pas le droit de l'utiliser. Redémarrez RouteWard.",
+        "access_denied": "RouteWard fonctionne, mais ce compte n'a pas le droit de l'utiliser. Redémarrez RouteWard.",
+        "linux_group_required": "Votre compte ne peut pas encore joindre le service RouteWard. Dans un terminal, lancez : sudo usermod -aG routeward $USER, puis fermez votre session et rouvrez-la.",
+        "linux_service_not_running": "Le service RouteWard n'est pas démarré. Dans un terminal, lancez : sudo systemctl enable --now routeward",
         "insecure_profile": "RouteWard n'a pas démarré car son dossier de données peut être modifié par d'autres utilisateurs. Réinstallez RouteWard pour le réparer.",
         "ipc_error": "RouteWard a démarré mais n'a pas pu se connecter à sa protection. Redémarrez RouteWard.",
         "not_elevated": "Windows n'a pas donné les droits d'administrateur à RouteWard. Réessayez et acceptez la demande.",
@@ -1095,7 +1097,8 @@
       "purge_unsupported": "La suppression du dossier de données de RouteWard de cette façon n'est disponible que sous Windows."
     },
     "desktop": {
-      "ui_init": "RouteWard n'a pas pu ouvrir sa fenêtre. Installez ou réparez Microsoft Edge WebView2 Runtime, vérifiez que votre dossier utilisateur n'est pas en lecture seule, puis relancez RouteWard."
+      "ui_init": "RouteWard n'a pas pu ouvrir sa fenêtre. Installez ou réparez Microsoft Edge WebView2 Runtime, vérifiez que votre dossier utilisateur n'est pas en lecture seule, puis relancez RouteWard.",
+      "ui_init_linux": "RouteWard n'a pas pu ouvrir sa fenêtre. Mettez votre système à jour, puis relancez RouteWard. Le détail est dans le journal : {{path}}"
     }
   },
   "themeforge": {

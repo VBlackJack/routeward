@@ -2295,6 +2295,7 @@ name = "routeward-desktop"
 version = "2026.1122.1"
 dependencies = [
  "embed-resource",
+ "gtk",
  "parking_lot",
  "routeward-core",
  "serde",
