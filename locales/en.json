@@ -45,7 +45,7 @@
       "disconnected_desc": "RouteWard cannot reach its background service. Start it with the button, or restart RouteWard. It keeps trying to reconnect by itself.",
       "simple_disconnected_title": "Protection stopped",
       "simple_disconnected_desc": "Start protection in one click to apply your app rules.",
-      "simple_disconnected_non_windows": "The background service is not running yet. Start RouteWard as administrator (root) to turn on protection.",
+      "simple_disconnected_non_windows": "The RouteWard service is not ready. In a terminal, run: sudo systemctl enable --now routeward. Then run: sudo usermod -aG routeward $USER, and log out and back in.",
       "reconnecting_badge": "Reconnecting",
       "retry_button": "Try again",
       "start_button": "Start protection",
@@ -197,7 +197,9 @@
         "started": "RouteWard is now running in the background",
         "uac_cancelled": "You cancelled the administrator prompt, so nothing was started",
         "start_failed": "RouteWard could not start. Try again.",
-        "access_denied": "RouteWard is running, but your Windows session is not allowed to use it. Restart RouteWard.",
+        "access_denied": "RouteWard is running, but this account is not allowed to use it. Restart RouteWard.",
+        "linux_group_required": "Your account cannot reach the RouteWard service yet. In a terminal, run: sudo usermod -aG routeward $USER, then log out and back in.",
+        "linux_service_not_running": "The RouteWard service is not running. In a terminal, run: sudo systemctl enable --now routeward",
         "insecure_profile": "RouteWard did not start because its data folder can be changed by other users. Reinstall RouteWard to repair it.",
         "ipc_error": "RouteWard started but could not connect to its protection. Restart RouteWard.",
         "not_elevated": "Windows did not give RouteWard administrator rights. Try again and accept the prompt.",
@@ -1095,7 +1097,9 @@
       "purge_unsupported": "Deleting the RouteWard data folder this way is only available on Windows."
     },
     "desktop": {
-      "ui_init": "RouteWard could not open its window. Install or repair Microsoft Edge WebView2 Runtime, make sure your user folder is not read-only, then start RouteWard again."
+      "ui_init": "RouteWard could not open its window. Install or repair Microsoft Edge WebView2 Runtime, make sure your user folder is not read-only, then start RouteWard again.",
+      "ui_init_linux": "RouteWard could not open its window. Update your system, then start RouteWard again. Details are in the log: {{path}}",
+      "ui_init_linux_no_log": "RouteWard could not open its window. Update your system, then start RouteWard again."
     }
   },
   "themeforge": {

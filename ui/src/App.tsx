@@ -107,6 +107,11 @@ import { useUnblockFlow } from './components/useUnblockFlow';
 import { LogsJump } from './services/logQuery';
 import { useBlockedSummary } from './services/useBlockedSummary';
 
+/** The desktop starts (Windows) or checks (Linux: group and service) the daemon for these systems. */
+const DAEMON_START_OS_NAMES: readonly string[] = ['WINDOWS', 'LINUX'];
+const canStartDaemonFromUi = (osName: string): boolean =>
+  DAEMON_START_OS_NAMES.includes(osName);
+
 interface PendingConfirm {
   title: string;
   intro: string;
@@ -389,6 +394,9 @@ export const App: React.FC = () => {
         }
         const errorToastMap: Record<string, string> = {
           access_denied: 'app.toast.daemon.access_denied',
+          linux_group_required: 'app.toast.daemon.linux_group_required',
+          linux_service_not_running: 'app.toast.daemon.linux_service_not_running',
+          unsupported_os: 'app.toast.daemon.start_failed',
           insecure_profile: 'app.toast.daemon.insecure_profile',
           ipc_error: 'app.toast.daemon.ipc_error',
           not_elevated: 'app.toast.daemon.not_elevated',
@@ -1608,7 +1616,7 @@ export const App: React.FC = () => {
               <span className="rounded bg-tf-red/20 px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-tf-red">
                 {t('app.daemon_banner.reconnecting_badge')}
               </span>
-              {diagnostics.osName === 'WINDOWS' && (
+              {canStartDaemonFromUi(diagnostics.osName) && (
                 <button
                   type="button"
                   disabled={startingDaemon}
@@ -2098,7 +2106,7 @@ export const App: React.FC = () => {
             onEnableProtection={() => {
               if (diagnostics.daemonConnected) {
                 void handleToggleEngine(true);
-              } else if (diagnostics.osName === 'WINDOWS') {
+              } else if (canStartDaemonFromUi(diagnostics.osName)) {
                 void handleStartAndEnableProtection();
               }
             }}

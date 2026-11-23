@@ -98,6 +98,19 @@ install -m 0755 "$SCRIPT_DIR/postrm" "$STAGE_DIR/DEBIAN/postrm"
 install -m 0755 "$TARGET_DIR/routeward" "$STAGE_DIR/usr/bin/routeward"
 if [ -f "$TARGET_DIR/routeward-desktop" ]; then
     install -m 0755 "$TARGET_DIR/routeward-desktop" "$STAGE_DIR/usr/bin/routeward-desktop"
+
+    # Launcher entry and icons: the desktop cache refresh is done by dpkg triggers.
+    install -d -m 0755 "$STAGE_DIR/usr/share/applications"
+    install -m 0644 "$SCRIPT_DIR/routeward-desktop.desktop" \
+        "$STAGE_DIR/usr/share/applications/routeward-desktop.desktop"
+    for icon_size in 16 24 32 48 64 128 256 512; do
+        icon_dir="$STAGE_DIR/usr/share/icons/hicolor/${icon_size}x${icon_size}/apps"
+        install -d -m 0755 "$icon_dir"
+        install -m 0644 "$ROOT_DIR/assets/branding/routeward-${icon_size}.png" "$icon_dir/routeward.png"
+    done
+    install -d -m 0755 "$STAGE_DIR/usr/share/icons/hicolor/scalable/apps"
+    install -m 0644 "$ROOT_DIR/assets/branding/routeward-icon.svg" \
+        "$STAGE_DIR/usr/share/icons/hicolor/scalable/apps/routeward.svg"
 fi
 
 install -m 0644 "$SCRIPT_DIR/routeward.service" "$STAGE_DIR/lib/systemd/system/routeward.service"

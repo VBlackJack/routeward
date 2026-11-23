@@ -33,7 +33,7 @@ const SKIPPED_DIRS: &[&str] = &[
 
 const TEXT_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "css", "html", "md", "json", "toml", "yml", "yaml", "ps1",
-    "sh", "py", "bat", "wxs", "svg", "rc", "template", "service",
+    "sh", "py", "bat", "wxs", "svg", "rc", "template", "service", "desktop",
 ];
 
 /// Extensionless packaging scripts that are scanned as text (maintainer scripts of the .deb).

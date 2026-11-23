@@ -49,10 +49,22 @@ const EMBEDDED_ICON_256_RGBA: &[u8] = include_bytes!("../../../assets/branding/r
 
 const WINDOW_TITLE: &str = "RouteWard";
 const ERR_KEY_DESKTOP_UI_INIT: &str = "errors.desktop.ui_init";
+#[cfg(all(target_os = "linux", not(test)))]
+const ERR_KEY_DESKTOP_UI_INIT_LINUX: &str = "errors.desktop.ui_init_linux";
+/// Linux window-error text without the log folder, for when the folder cannot be determined.
+#[cfg(all(target_os = "linux", not(test)))]
+const ERR_KEY_DESKTOP_UI_INIT_LINUX_NO_LOG: &str = "errors.desktop.ui_init_linux_no_log";
+/// Placeholder of the log folder in the Linux window-error text.
+#[cfg(any(target_os = "linux", test))]
+const UI_INIT_PATH_PLACEHOLDER: &str = "{{path}}";
 const WINDOW_DEFAULT_WIDTH: f64 = 1400.0;
 const WINDOW_DEFAULT_HEIGHT: f64 = 900.0;
 const WINDOW_MIN_WIDTH: f64 = 980.0;
 const WINDOW_MIN_HEIGHT: f64 = 660.0;
+/// Share of the primary monitor width the initial window may take, so it fits on small screens.
+const WINDOW_MAX_WIDTH_SHARE: f64 = 0.90;
+/// Share of the primary monitor height the initial window may take (room for panels and title bar).
+const WINDOW_MAX_HEIGHT_SHARE: f64 = 0.85;
 const LOOPBACK_EPHEMERAL_ADDR: &str = "127.0.0.1:0";
 /// Connections the loopback UI server holds while they are still sending their request. Each is
 /// cut off by the request deadline; anything beyond this is closed before it is read.
@@ -404,9 +416,98 @@ fn allow_multiple_downloads(
     }
 }
 
+/// Caps the default window size to the primary monitor (logical pixels), never below the minimum
+/// window size. A monitor size that is not usable leaves the default size untouched.
+fn clamp_initial_window_size(monitor_logical: Option<(f64, f64)>) -> (f64, f64) {
+    let Some((monitor_width, monitor_height)) = monitor_logical else {
+        return (WINDOW_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT);
+    };
+    if !(monitor_width.is_finite() && monitor_height.is_finite())
+        || monitor_width <= 0.0
+        || monitor_height <= 0.0
+    {
+        return (WINDOW_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT);
+    }
+    let max_width = (monitor_width * WINDOW_MAX_WIDTH_SHARE).max(WINDOW_MIN_WIDTH);
+    let max_height = (monitor_height * WINDOW_MAX_HEIGHT_SHARE).max(WINDOW_MIN_HEIGHT);
+    (
+        WINDOW_DEFAULT_WIDTH.min(max_width),
+        WINDOW_DEFAULT_HEIGHT.min(max_height),
+    )
+}
+
+/// Primary monitor size in logical pixels, when the platform reports one. Some compositors (for
+/// example GNOME on Wayland) report no primary monitor: the first available one stands in.
+fn primary_monitor_logical_size<T>(
+    event_loop: &tao::event_loop::EventLoop<T>,
+) -> Option<(f64, f64)> {
+    let monitor = event_loop
+        .primary_monitor()
+        .or_else(|| event_loop.available_monitors().next())?;
+    let logical = monitor.size().to_logical::<f64>(monitor.scale_factor());
+    Some((logical.width, logical.height))
+}
+
+/// Fills the log folder into the Linux window-error text.
+#[cfg(any(target_os = "linux", test))]
+fn format_ui_init_linux_message(template: &str, log_dir: &str) -> String {
+    template.replace(UI_INIT_PATH_PLACEHOLDER, log_dir)
+}
+
+/// Picks the Linux window-error text: the one naming the log folder when it is known, otherwise
+/// the one without the folder, so the message never ends on an empty path.
+#[cfg(any(target_os = "linux", test))]
+fn ui_init_linux_message(with_path: &str, without_path: &str, log_dir: Option<&str>) -> String {
+    match log_dir.filter(|dir| !dir.is_empty()) {
+        Some(dir) => format_ui_init_linux_message(with_path, dir),
+        None => without_path.to_string(),
+    }
+}
+
+/// Shows the Linux window-error text in a modal GTK dialog. Main (GTK) thread only.
+#[cfg(all(target_os = "linux", not(test)))]
+fn show_linux_error_dialog(message: &str) {
+    use gtk::prelude::{DialogExt, WidgetExt};
+
+    let dialog = gtk::MessageDialog::builder()
+        .message_type(gtk::MessageType::Error)
+        .buttons(gtk::ButtonsType::Ok)
+        .modal(true)
+        .title(WINDOW_TITLE)
+        .text(message)
+        .build();
+    dialog.run();
+    dialog.hide();
+}
+
+/// Reports the Linux window error on stderr and in a GTK dialog. GTK may only be used from the
+/// thread that initialised it: from any other thread the dialog is posted to the GTK main loop.
+#[cfg(all(target_os = "linux", not(test)))]
+fn report_fatal_ui_error_linux(bridge: &DesktopCommandBridge, detail: &str) {
+    let log_dir = routeward_core::config::SystemConstants::load_embedded()
+        .ok()
+        .map(|constants| constants.telemetry.resolve_user_log_dir())
+        .map(|dir| dir.display().to_string());
+    let message = ui_init_linux_message(
+        &bridge.translate(ERR_KEY_DESKTOP_UI_INIT_LINUX),
+        &bridge.translate(ERR_KEY_DESKTOP_UI_INIT_LINUX_NO_LOG),
+        log_dir.as_deref(),
+    );
+    eprintln!("{WINDOW_TITLE}: {message} ({detail})");
+    if gtk::is_initialized_main_thread() {
+        show_linux_error_dialog(&message);
+    } else {
+        // Always asynchronous: `idle_add_once` queues on the default main context, which the
+        // event loop iterates on the GTK thread.
+        gtk::glib::idle_add_once(move || show_linux_error_dialog(&message));
+    }
+}
+
 fn report_fatal_ui_error(bridge: &DesktopCommandBridge, detail: &str) {
     let summary = bridge.translate(ERR_KEY_DESKTOP_UI_INIT);
     bridge.log_error(format!("{summary}: {detail}"));
+    #[cfg(all(target_os = "linux", not(test)))]
+    report_fatal_ui_error_linux(bridge, detail);
     #[cfg(all(target_os = "windows", not(test)))]
     {
         use std::ffi::OsStr;
@@ -583,13 +684,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Theme::Dark
     };
 
+    let (initial_width, initial_height) =
+        clamp_initial_window_size(primary_monitor_logical_size(&event_loop));
     let window_builder = WindowBuilder::new()
         .with_title(WINDOW_TITLE)
         .with_window_icon(load_window_icon_32())
-        .with_inner_size(LogicalSize::new(
-            WINDOW_DEFAULT_WIDTH,
-            WINDOW_DEFAULT_HEIGHT,
-        ))
+        .with_inner_size(LogicalSize::new(initial_width, initial_height))
         .with_min_inner_size(LogicalSize::new(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT))
         .with_theme(Some(initial_tao_theme))
         // Started by the sign-in autostart: stay in the tray (the window opens from there). Without
@@ -640,7 +740,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     let allowed_authority_for_permissions = allowed_authority.clone();
     let mut web_context = WebContext::new(Some(webview_data_dir));
-    let webview = match WebViewBuilder::with_web_context(&mut web_context)
+    let webview_builder = WebViewBuilder::with_web_context(&mut web_context)
         .with_initialization_script(&init_script)
         .with_navigation_handler(move |target| {
             let allowed = navigation::is_navigation_allowed(&target, &allowed_authority);
@@ -661,9 +761,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         // DevTools only in debug builds, so the CSP can be inspected without exposing them to users.
         .with_devtools(cfg!(debug_assertions))
-        .with_url(&ui_url)
-        .build(&window)
-    {
+        .with_url(&ui_url);
+
+    // On Linux the webview must live in the window's GTK box: `build(&window)` needs X11 and fails
+    // on Wayland. Only the final call differs between platforms.
+    #[cfg(target_os = "linux")]
+    let webview_result = {
+        use tao::platform::unix::WindowExtUnix;
+        use wry::WebViewBuilderExtUnix;
+        match window.default_vbox() {
+            Some(vbox) => webview_builder.build_gtk(vbox),
+            None => {
+                report_fatal_ui_error(&bridge, "Window has no GTK container for the WebView");
+                return Err("Window has no GTK container for the WebView".into());
+            }
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let webview_result = webview_builder.build(&window);
+
+    let webview = match webview_result {
         Ok(wv) => wv,
         Err(err) => {
             report_fatal_ui_error(&bridge, &format!("WebView build error: {err}"));
@@ -798,6 +915,59 @@ mod tests {
         assert!(std::str::from_utf8(EMBEDDED_ICON_SVG)
             .expect("UTF-8 icon SVG")
             .contains("<svg"));
+    }
+
+    #[test]
+    fn window_size_is_capped_to_the_monitor_and_never_below_the_minimum() {
+        // Large monitor: the default size is kept.
+        assert_eq!(
+            clamp_initial_window_size(Some((3840.0, 2160.0))),
+            (WINDOW_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT)
+        );
+        // Small monitor: capped at the width and height shares.
+        let (width, height) = clamp_initial_window_size(Some((1280.0, 800.0)));
+        assert_eq!(width, 1280.0 * WINDOW_MAX_WIDTH_SHARE);
+        assert_eq!(height, 800.0 * WINDOW_MAX_HEIGHT_SHARE);
+        // Tiny monitor: never below the minimum window size.
+        assert_eq!(
+            clamp_initial_window_size(Some((800.0, 600.0))),
+            (WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        );
+        // Unknown or unusable monitor: the default size.
+        for unusable in [
+            None,
+            Some((0.0, 0.0)),
+            Some((f64::NAN, 900.0)),
+            Some((-1.0, 900.0)),
+            Some((f64::INFINITY, 900.0)),
+        ] {
+            assert_eq!(
+                clamp_initial_window_size(unusable),
+                (WINDOW_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT)
+            );
+        }
+    }
+
+    #[test]
+    fn linux_window_error_text_carries_the_log_folder() {
+        let text = format_ui_init_linux_message("Details: {{path}}", "/home/u/.local/log");
+        assert_eq!(text, "Details: /home/u/.local/log");
+    }
+
+    #[test]
+    fn linux_window_error_text_drops_the_path_clause_without_a_log_folder() {
+        const WITH_PATH: &str = "Details: {{path}}";
+        const WITHOUT_PATH: &str = "No details.";
+        assert_eq!(
+            ui_init_linux_message(WITH_PATH, WITHOUT_PATH, Some("/var/log/x")),
+            "Details: /var/log/x"
+        );
+        for unknown in [None, Some("")] {
+            assert_eq!(
+                ui_init_linux_message(WITH_PATH, WITHOUT_PATH, unknown),
+                WITHOUT_PATH
+            );
+        }
     }
 
     #[test]

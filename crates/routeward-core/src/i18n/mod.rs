@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+mod os_locale;
+
+pub use os_locale::{locale_from_os_name, locale_from_posix_env, os_default_locale};
+
 use parking_lot::RwLock;
 use serde_json::Value;
 use std::sync::Arc;

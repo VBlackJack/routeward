@@ -56,6 +56,11 @@ import {
 import { DashboardUseCaseId } from './DashboardView';
 import { BlockedShortcut } from './BlockedShortcut';
 
+/** The desktop starts (Windows) or checks (Linux: group and service) the daemon for these systems. */
+const DAEMON_START_OS_NAMES: readonly string[] = ['WINDOWS', 'LINUX'];
+const canStartDaemonFromUi = (osName: string): boolean =>
+  DAEMON_START_OS_NAMES.includes(osName);
+
 interface SimpleDashboardViewProps {
   telemetry: TelemetrySnapshot;
   diagnostics: SystemDiagnostics;
@@ -302,7 +307,7 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
 
           <div className="flex flex-wrap items-center gap-2">
             {!diagnostics.daemonConnected &&
-              diagnostics.osName === 'WINDOWS' &&
+              canStartDaemonFromUi(diagnostics.osName) &&
               onStartAndEnableProtection && (
                 <button
                   type="button"
@@ -547,7 +552,7 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
                 label: t('dashboard.simple.checklist_step_service'),
                 onClick:
                   !stepServiceReady &&
-                  diagnostics.osName === 'WINDOWS' &&
+                  canStartDaemonFromUi(diagnostics.osName) &&
                   onStartAndEnableProtection
                     ? () => {
                         void onStartAndEnableProtection();
@@ -560,7 +565,7 @@ export const SimpleDashboardView: React.FC<SimpleDashboardViewProps> = ({
                 onClick: !stepProtectionReady
                   ? diagnostics.daemonConnected && onToggleEngine
                     ? onToggleEngine
-                    : diagnostics.osName === 'WINDOWS' &&
+                    : canStartDaemonFromUi(diagnostics.osName) &&
                         onStartAndEnableProtection
                       ? () => {
                           void onStartAndEnableProtection();

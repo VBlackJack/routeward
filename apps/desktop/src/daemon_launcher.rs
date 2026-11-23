@@ -18,6 +18,7 @@ use routeward_core::error::{
     DAEMON_EXIT_CONFIG_ERROR, DAEMON_EXIT_INSECURE_PROFILE, DAEMON_EXIT_IPC_ERROR,
     DAEMON_EXIT_NOT_ELEVATED,
 };
+use routeward_core::ipc::transport::DaemonIpcProbe;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +80,10 @@ pub struct LaunchOutcome {
 pub enum DaemonLaunchError {
     AlreadyInFlight,
     UnsupportedOs,
+    /// Linux: the service socket exists but this account is not in the `routeward` group.
+    LinuxGroupRequired,
+    /// Linux: nothing listens on the service socket; the service has to be enabled and started.
+    LinuxServiceNotRunning,
     MissingCliBinary,
     AlreadyRunningAccessDenied,
     UacCancelled,
@@ -106,7 +111,10 @@ impl DaemonLaunchError {
             Self::UacCancelled => 400,
             Self::NotElevated(_) => 403,
             Self::MissingCliBinary => 404,
-            Self::AlreadyInFlight | Self::AlreadyRunningAccessDenied => 409,
+            Self::AlreadyInFlight | Self::AlreadyRunningAccessDenied | Self::LinuxGroupRequired => {
+                409
+            }
+            Self::LinuxServiceNotRunning => 503,
             Self::InsecureProfile(_) | Self::ConfigInvalid(_) => 422,
             Self::UnsupportedOs => 501,
             Self::IpcBindFailed(_) | Self::DaemonExitedEarly(_) | Self::LaunchFailed(_) => 500,
@@ -117,6 +125,8 @@ impl DaemonLaunchError {
         match self {
             Self::AlreadyInFlight => "already_in_flight",
             Self::UnsupportedOs => "unsupported_os",
+            Self::LinuxGroupRequired => "linux_group_required",
+            Self::LinuxServiceNotRunning => "linux_service_not_running",
             Self::MissingCliBinary => "cli_missing",
             Self::AlreadyRunningAccessDenied => "access_denied",
             Self::UacCancelled => "uac_cancelled",
@@ -143,6 +153,13 @@ impl DaemonLaunchError {
             Self::AlreadyInFlight => "A daemon start operation is already in progress".to_string(),
             Self::UnsupportedOs => {
                 "Automatic privileged service start is only supported on Windows".to_string()
+            }
+            Self::LinuxGroupRequired => {
+                "The RouteWard service socket is not reachable: this account is not in the routeward group"
+                    .to_string()
+            }
+            Self::LinuxServiceNotRunning => {
+                "The RouteWard service is not running on its socket".to_string()
             }
             Self::MissingCliBinary => {
                 "Sibling routeward CLI executable was not found next to desktop binary".to_string()
@@ -415,6 +432,23 @@ pub fn build_daemon_launch_plan(
     }
 }
 
+/// Turns what a probe of the service socket found into the outcome of a start request on Linux:
+/// the access errors the user must act on, or (socket answers) a launch with no process to watch,
+/// so the caller polls and reconnects instead of reporting a failure.
+pub fn linux_start_outcome_for_probe(
+    probe: DaemonIpcProbe,
+) -> Result<LaunchOutcome, DaemonLaunchError> {
+    match probe {
+        DaemonIpcProbe::AccessDenied => Err(DaemonLaunchError::LinuxGroupRequired),
+        DaemonIpcProbe::NotRunning => Err(DaemonLaunchError::LinuxServiceNotRunning),
+        DaemonIpcProbe::Running => Ok(LaunchOutcome {
+            handle: None,
+            mode: LaunchMode::ServiceStarted,
+            fallback_reason_key: None,
+        }),
+    }
+}
+
 pub async fn start_privileged_daemon_with_release(
     _release: &InFlightRelease,
     locale: &str,
@@ -422,6 +456,20 @@ pub async fn start_privileged_daemon_with_release(
     #[cfg(not(windows))]
     {
         let _ = locale;
+        #[cfg(target_os = "linux")]
+        {
+            // The service is managed with systemd by the administrator; the desktop only tells the
+            // user which of the two documented steps is missing.
+            let constants = routeward_core::config::SystemConstants::load_embedded()
+                .map_err(|err| DaemonLaunchError::LaunchFailed(err.to_string()))?;
+            let probe = tokio::task::spawn_blocking(move || {
+                routeward_core::ipc::transport::probe_daemon_ipc(&constants.ipc)
+            })
+            .await
+            .map_err(|err| DaemonLaunchError::LaunchFailed(err.to_string()))?;
+            linux_start_outcome_for_probe(probe)
+        }
+        #[cfg(not(target_os = "linux"))]
         Err(DaemonLaunchError::UnsupportedOs)
     }
 
@@ -784,6 +832,28 @@ mod tests {
         assert!(!is_plausible_sid("S-2-5-21"));
         assert!(!is_plausible_sid("S-1-5-21-1 --other"));
         assert!(!is_plausible_sid(""));
+    }
+
+    #[test]
+    fn linux_probe_results_map_to_distinct_start_results() {
+        let Err(group) = linux_start_outcome_for_probe(DaemonIpcProbe::AccessDenied) else {
+            panic!("access denied must be an error");
+        };
+        assert_eq!(group, DaemonLaunchError::LinuxGroupRequired);
+        assert_eq!(group.error_key(), "linux_group_required");
+        assert_eq!(group.status_code(), 409);
+        let Err(down) = linux_start_outcome_for_probe(DaemonIpcProbe::NotRunning) else {
+            panic!("a stopped service must be an error");
+        };
+        assert_eq!(down, DaemonLaunchError::LinuxServiceNotRunning);
+        assert_eq!(down.error_key(), "linux_service_not_running");
+        assert_eq!(down.status_code(), 503);
+        // The socket answers: not a failure, the caller polls and reconnects.
+        let running = linux_start_outcome_for_probe(DaemonIpcProbe::Running)
+            .expect("a running service is a successful outcome");
+        assert!(running.handle.is_none());
+        assert_eq!(running.mode, LaunchMode::ServiceStarted);
+        assert!(running.fallback_reason_key.is_none());
     }
 
     #[test]

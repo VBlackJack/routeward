@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=RouteWard
+Name[fr]=RouteWard
+Comment=Choose which apps and sites go through your proxy
+Comment[fr]=Choisissez quelles applications et quels sites passent par votre proxy
+Exec=routeward-desktop
+TryExec=routeward-desktop
+Icon=routeward
+Terminal=false
+Categories=Network;
+StartupWMClass=routeward-desktop
+Keywords=proxy;vpn;routing;network;privacy;
+Keywords[fr]=proxy;vpn;routage;reseau;confidentialite;

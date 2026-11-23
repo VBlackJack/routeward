@@ -3,8 +3,7 @@ Version: @VERSION@
 Section: net
 Priority: optional
 Architecture: @ARCH@
-Depends: nftables, iproute2
-Recommends: libwebkit2gtk-4.1-0, libgtk-3-0
+Depends: nftables, iproute2, libwebkit2gtk-4.1-0, libgtk-3-0
 Maintainer: Julien Bombled <222413562+VBlackJack@users.noreply.github.com>
 Homepage: https://github.com/VBlackJack/routeward
 Description: RouteWard transparent proxy routing daemon and desktop UI

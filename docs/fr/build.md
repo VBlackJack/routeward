@@ -154,6 +154,8 @@ sudo apt install ./dist/routeward_*.deb
 sudo systemctl enable --now routeward
 ```
 
+Le paquet installe aussi une entrée du menu des applications (`routeward-desktop.desktop`) et l'icône `routeward` dans le thème `hicolor` (16 à 512 px et un SVG vectoriel). Les jobs de release et de CI valident l'entrée avec `desktop-file-validate`, et le job de release échoue si l'entrée ou les icônes manquent dans le `.deb`.
+
 Les binaires sont liés à la glibc de la machine qui les compile. Le `.deb` publié est compilé sous Ubuntu 22.04 (glibc 2.35) : il fonctionne sous Debian 12, Ubuntu 22.04 et les versions plus récentes. Le job de release échoue si un binaire demande un symbole glibc plus récent (`packaging/linux/check-glibc-floor.sh --max 2.35`). Un paquet compilé sur une distribution plus récente ne fonctionne qu'avec cette glibc ou une plus récente.
 
 ### Emplacement des Journaux (Daemon vs Bureau / CLI)

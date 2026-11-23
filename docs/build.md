@@ -154,6 +154,8 @@ sudo apt install ./dist/routeward_*.deb
 sudo systemctl enable --now routeward
 ```
 
+The package also installs an applications-menu entry (`routeward-desktop.desktop`) and the `routeward` icon in the `hicolor` theme (16 to 512 px plus a scalable SVG). The release and CI jobs validate the entry with `desktop-file-validate`, and the release job fails if the entry or the icons are missing from the `.deb`.
+
 The binaries link against the glibc of the machine that builds them. The published `.deb` is built on Ubuntu 22.04 (glibc 2.35), so it runs on Debian 12, Ubuntu 22.04 and newer; the release job fails if a binary needs a newer glibc symbol (`packaging/linux/check-glibc-floor.sh --max 2.35`). A package built on a newer distribution only runs on that glibc or a newer one.
 
 ### Log File Locations (Daemon vs Desktop / CLI)

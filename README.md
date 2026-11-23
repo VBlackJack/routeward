@@ -37,6 +37,15 @@ If an app or a website stops working, open **Activity**, then **Blocked**: Route
 - **ThemeForge Desktop UI (`apps/desktop` & `ui/`)**: Standalone `tao` + `wry` desktop window styled with the 16 canonical ThemeForge Oklab palettes + `HighContrast` and 9 accent tints, organized into 5 use-case tabs (`Home`, `My Apps & Sites`, `My Proxy`, `Activity`, `Settings`) with **Simple** and **Advanced (Expert)** modes, a guided 3-step setup wizard (link, manual host/port, or auto-detection + live connection check + auto-enable), 1-click **Verify My Protection** (Before/After IP check), **"App not working?"** guided troubleshooter with humanized reasons, temporary pause (`15m`/`1h`) with auto-resume, automatic URL-to-domain normalization, plain-language **"Where does a website go?"** tester, shadowed-rule detection with 1-click **Move First**, 1-click protection and Local LAN compatibility packs, **Undo** toasts, 1-click clipboard proxy paste and drag-and-drop `.json`/`.txt` import, automatic backup proxy failover, **Make Primary** proxy switching, existing proxy auto-detection, Wi-Fi auto profile switching, soft reset to defaults with automatic backup, 2-step delete confirmations, FoxyProxy JSON import modal, Activity friendly app names + `errorDetail` diagnostics + CSV/JSON export, named profile switcher, and a dynamic Windows System Tray (colored status icon, 1-click **Start Service**, **Pause 15 min**, and native Windows outage alerts).
 - **Current Scope**: RouteWard provides dual-stack IPv4 and IPv6 transparent TCP, UDP (`TPROXY` / `WinDivert`), and port `53` DNS interception with Fake-IP, TLS SNI + HTTP `Host:` inspection, SOCKS4/SOCKS5/HTTP/HTTPS (+ Windows SSPI), local PAC + FoxyProxy import (`msedge.exe`), QUIC (`UDP 443`) rejection, configurable DoT (`853`) blocking + Mozilla DoH canary protection, Windows `.msi` / Service / Linux `systemd` packaging, Windows System Tray & UAC 1-click service start, and modular Rust desktop + React/Vitest 5-tab UI components.
 
+## Install on Linux
+
+1. Install the package: `sudo apt install ./routeward_*.deb`
+2. Let your account reach the service: `sudo usermod -aG routeward $USER`, then log out and back in.
+3. Start the service: `sudo systemctl enable --now routeward`
+4. Start RouteWard from the applications menu.
+
+The window needs `libwebkit2gtk-4.1` and GTK 3, which the package depends on, so `apt` installs them with RouteWard.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) ([Français](docs/fr/architecture.md))
