@@ -5,6 +5,9 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+### Fixed
+- Setup assistant, rule packs and help: the telemetry texts no longer say "Windows" on every system; they describe background telemetry from the system and apps (EN/FR).
+
 ## [v2026.1123.00] - 2026-11-23
 
 ### Added
