@@ -251,6 +251,7 @@ mod tests {
                 action: RuleAction::Proxy {
                     target_id: "proxy-1".to_string(),
                 },
+                expires_at: None,
             },
             RoutingRule {
                 id: "rule-plain-direct".to_string(),
@@ -263,6 +264,7 @@ mod tests {
                 port_ranges: vec![],
                 protocol: TransportProtocol::Udp,
                 action: RuleAction::Direct,
+                expires_at: None,
             },
         ];
         RouteWardController::new(constants, profile, "en")

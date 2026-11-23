@@ -15,7 +15,8 @@
  */
 
 import { TrackedConnection } from '../types/routeward';
-import { getHumanErrorKey, localizeEngineRuleName, Translate } from './friendly';
+import { describeBlockReason } from './blockReason';
+import { localizeEngineRuleName, Translate } from './friendly';
 
 export interface ConnectionExplanation {
   /** Name of the rule that decided, in plain words; null when the engine did not report one. */
@@ -37,7 +38,7 @@ export function explainConnection(
   const rawRule = conn.matchedRule?.trim() ?? '';
   return {
     ruleName: rawRule ? localizeEngineRuleName(rawRule, t) : null,
-    reasonKey: getHumanErrorKey(conn.errorDetail)
+    reasonKey: describeBlockReason(conn.blockReason, conn.errorDetail).bodyKey
   };
 }
 

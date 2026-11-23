@@ -398,6 +398,7 @@ describe('RouteWardClientService', () => {
       () => client.terminateConnection('conn-1'),
       () => client.clearClosedConnections(),
       () => client.flushFakeIps(),
+      () => client.flushOsDnsCache(),
       () => client.clearLogs(),
       () => client.allocateFakeIp('example.com'),
       () => client.testProxy('p1'),

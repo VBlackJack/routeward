@@ -51,6 +51,12 @@ const HEADER_SCAN_LINES: usize = 20;
 const DYNAMIC_LOCALE_KEY_PREFIXES: &[&str] = &[
     // App.tsx: `app.nav.${id}.tab`
     "app.nav.",
+    // BlockedView.tsx, activityWhy.ts: `blocked.reasons.${reason}.title|body` (see blockReason.ts)
+    "blocked.reasons.",
+    // AnalyzerPanel.tsx: `analyzer.findings.${code}.title|body|fix` (codes come from the daemon)
+    "analyzer.findings.",
+    // DiagnosticExportModal.tsx: `diagnostics.export.redaction.${code}` (codes come from the daemon)
+    "diagnostics.export.redaction.",
     // ConnectionsView.tsx: `connections.table.status.${conn.status}`
     "connections.table.status.",
     // ConnectionsView.tsx: `connections.toolbar.status_filter.${st}`
@@ -886,4 +892,68 @@ fn xml_tag_scanner_ignores_quoted_angle_brackets() {
     assert_eq!(tags.len(), 2);
     assert_eq!(xml_attr(tags[0], "Two"), Some("c"));
     assert_eq!(xml_attr(tags[1], "One"), Some("d"));
+}
+
+/// Directory whose sources may build `Blocked` records by hand (the one constructor lives there).
+const BLOCKED_LITERAL_ALLOWED_DIR: &str = "crates/routeward-core/src/telemetry/";
+
+/// Line numbers (1-based) where a `Blocked` status is written as a struct field, outside the
+/// `#[cfg(test)]` tail of the file.
+fn blocked_status_literal_lines(source: &str) -> Vec<usize> {
+    let mut lines = Vec::new();
+    for (idx, line) in source.lines().enumerate() {
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            break;
+        }
+        let compact: String = line.split_whitespace().collect();
+        if compact.contains("status:ConnectionStatus::Blocked") {
+            lines.push(idx + 1);
+        }
+    }
+    lines
+}
+
+#[test]
+fn blocked_status_literal_scanner_ignores_comparisons_and_test_modules() {
+    let sample = "let a = c.status == ConnectionStatus::Blocked;\n\
+                  let b = X { status: ConnectionStatus::Blocked };\n\
+                  #[cfg(test)]\n\
+                  mod tests { let c = X { status: ConnectionStatus::Blocked }; }\n";
+    assert_eq!(blocked_status_literal_lines(sample), vec![2]);
+}
+
+#[test]
+fn blocked_connections_are_only_built_through_the_telemetry_constructor() {
+    let root = repo_root();
+    let files = collect_repo_files(&root);
+    let mut scanned_interceptor = false;
+    let mut offenders = Vec::new();
+    for rel in files {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if !rel_str.ends_with(".rs")
+            || !(rel_str.starts_with("crates/") || rel_str.starts_with("apps/"))
+            || rel_str.contains("/tests/")
+            || rel_str.ends_with("/tests.rs")
+            || rel_str.starts_with(BLOCKED_LITERAL_ALLOWED_DIR)
+        {
+            continue;
+        }
+        if rel_str == "crates/routeward-core/src/interceptor/udp_relay.rs" {
+            scanned_interceptor = true;
+        }
+        let source = fs::read_to_string(root.join(&rel))
+            .unwrap_or_else(|e| panic!("read {}: {}", rel_str, e));
+        for line in blocked_status_literal_lines(&source) {
+            offenders.push(format!("{rel_str}:{line}"));
+        }
+    }
+    assert!(
+        scanned_interceptor,
+        "the guard must reach the interceptor sources"
+    );
+    assert!(
+        offenders.is_empty(),
+        "build blocked connections with TrackedConnection::blocked(BlockedRecord) so a reason is \
+         always recorded; hand-written literals found at: {offenders:?}"
+    );
 }

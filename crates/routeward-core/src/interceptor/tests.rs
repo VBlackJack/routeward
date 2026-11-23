@@ -1255,6 +1255,7 @@ async fn transparent_relay_extracts_tls_sni_on_port_443_and_routes_literal_ip_vi
         action: RuleAction::Proxy {
             target_id: "proxy-sni".to_string(),
         },
+        expires_at: None,
     }];
 
     let controller = Arc::new(RouteWardController::new(constants, profile, "en"));
@@ -1496,6 +1497,7 @@ async fn forward_udp_datagram_evaluates_rules_per_datagram_and_enforces_fragment
             action: RuleAction::Proxy {
                 target_id: "socks-udp-1".to_string(),
             },
+            expires_at: None,
         },
         RoutingRule {
             id: "rule-udp-direct".to_string(),
@@ -1511,6 +1513,7 @@ async fn forward_udp_datagram_evaluates_rules_per_datagram_and_enforces_fragment
             }],
             protocol: TransportProtocol::Udp,
             action: RuleAction::Direct,
+            expires_at: None,
         },
     ];
     profile.default_action = RuleAction::Block;
@@ -2009,6 +2012,7 @@ async fn ipv6_dual_stack_transparent_tcp_and_udp_interception() {
         port_ranges: vec![],
         protocol: TransportProtocol::Udp,
         action: RuleAction::Direct,
+        expires_at: None,
     }];
     let controller = RouteWardController::new(constants, profile, "en");
 

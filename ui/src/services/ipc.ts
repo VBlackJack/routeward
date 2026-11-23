@@ -21,23 +21,31 @@ import {
   UI_CONFIG
 } from '../config/constants';
 import {
+  AnalyzeResponse,
   AutostartStatus,
+  BlockedResponse,
+  CollectDiagnosticsRequest,
   ConnectionRequest,
   CurrentNetworkInfo,
   DaemonFullState,
   DetectedProxyCandidate,
+  DiagnosticBundle,
   FakeIpEntry,
   FoxyProxyImportResult,
   InterceptionMode,
   IpcStreamEvent,
   LogEntry,
   PacStatus,
+  PreviewRuleChangeRequest,
+  PreviewRuleChangeResponse,
   ProcessTrafficSummary,
   ProfileConfig,
   ProfileSummary,
   ProxyChain,
   ProxyHealthReport,
   ProxyNode,
+  QueryLogsRequest,
+  QueryLogsResponse,
   RoutingRule,
   RuleEvaluationResult,
   SecurityPolicyConfig,
@@ -1179,6 +1187,19 @@ export class RouteWardClientService {
     }
   }
 
+  /** Clears the operating system's own DNS resolver cache (not the Fake-IP table). */
+  public async flushOsDnsCache(): Promise<void> {
+    try {
+      await this.requestJson<{ ok: boolean }>(
+        UI_CONFIG.API_ENDPOINTS.SYSTEM_FLUSH_OS_DNS,
+        'POST',
+        {}
+      );
+    } catch (err) {
+      this.handleRequestFailure(err);
+    }
+  }
+
   public async clearLogs(): Promise<void> {
     try {
       await this.requestJson<{ ok: boolean }>(
@@ -1189,6 +1210,79 @@ export class RouteWardClientService {
       await this.fetchState();
     } catch (err) {
       this.handleRequestFailure(err);
+    }
+  }
+
+  /** Aggregated blocked connections plus the unattributed drop counters; null when the bridge is unreachable. */
+  public async getBlocked(
+    options: { since?: number; limit?: number } = {}
+  ): Promise<BlockedResponse | null> {
+    const params = new URLSearchParams();
+    if (options.since !== undefined) {
+      params.set('since', String(options.since));
+    }
+    if (options.limit !== undefined) {
+      params.set('limit', String(options.limit));
+    }
+    const query = params.toString();
+    try {
+      return await this.requestJson<BlockedResponse>(
+        query
+          ? `${UI_CONFIG.API_ENDPOINTS.BLOCKED}?${query}`
+          : UI_CONFIG.API_ENDPOINTS.BLOCKED,
+        'GET'
+      );
+    } catch (err) {
+      this.handleRequestFailure(err, false);
+      return null;
+    }
+  }
+
+  /** Reads one page of logs from the live memory ring or from a daemon log file. */
+  public async queryLogs(req: QueryLogsRequest): Promise<QueryLogsResponse> {
+    return this.requestJson<QueryLogsResponse>(
+      UI_CONFIG.API_ENDPOINTS.LOGS_QUERY,
+      'POST',
+      req,
+      UI_CONFIG.LONG_REQUEST_TIMEOUT_MS
+    );
+  }
+
+  /** Runs the analyzer: plain-language findings about what blocks or breaks connections. */
+  public async analyzeDiagnostics(): Promise<AnalyzeResponse> {
+    return this.requestJson<AnalyzeResponse>(
+      UI_CONFIG.API_ENDPOINTS.DIAGNOSTICS_ANALYZE,
+      'POST',
+      {},
+      UI_CONFIG.LONG_REQUEST_TIMEOUT_MS
+    );
+  }
+
+  /** Builds the redacted diagnostic bundle; the caller downloads it, nothing is written by the daemon. */
+  public async collectDiagnostics(
+    req: CollectDiagnosticsRequest
+  ): Promise<DiagnosticBundle> {
+    return this.requestJson<DiagnosticBundle>(
+      UI_CONFIG.API_ENDPOINTS.DIAGNOSTICS_COLLECT,
+      'POST',
+      req,
+      UI_CONFIG.LONG_REQUEST_TIMEOUT_MS
+    );
+  }
+
+  /** Predicts how a connection would be handled after a rule change, without applying it. */
+  public async previewRuleChange(
+    req: PreviewRuleChangeRequest
+  ): Promise<PreviewRuleChangeResponse | null> {
+    try {
+      return await this.requestJson<PreviewRuleChangeResponse>(
+        UI_CONFIG.API_ENDPOINTS.RULES_PREVIEW,
+        'POST',
+        req
+      );
+    } catch (err) {
+      this.handleRequestFailure(err, false);
+      return null;
     }
   }
 

@@ -76,6 +76,12 @@ impl I18nRegistry {
         key_path.to_string()
     }
 
+    /// Translates `key_path` in English whatever the active locale is. Used for daemon log lines,
+    /// which are always written in English so a diagnostic file reads the same everywhere.
+    pub fn t_english(&self, key_path: &str) -> String {
+        Self::lookup_path(&self.en_tree, key_path).unwrap_or_else(|| key_path.to_string())
+    }
+
     fn lookup_path(root: &Value, key_path: &str) -> Option<String> {
         let mut cursor = root;
         for segment in key_path.split(KEY_PATH_SEPARATOR) {
@@ -95,5 +101,15 @@ mod tests {
         assert_eq!(i18n.t("app.header.engine.running"), "Intercepteur Actif");
         i18n.set_locale("en");
         assert_eq!(i18n.t("app.header.engine.running"), "Interceptor Active");
+    }
+
+    #[test]
+    fn english_lookup_ignores_the_active_locale() {
+        let i18n = I18nRegistry::new("fr");
+        assert_eq!(
+            i18n.t_english("app.header.engine.running"),
+            "Interceptor Active"
+        );
+        assert_eq!(i18n.t_english("no.such.key"), "no.such.key");
     }
 }

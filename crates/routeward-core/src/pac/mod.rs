@@ -106,8 +106,12 @@ impl PacGenerator {
         js.push_str("    return cachedIp;\n");
         js.push_str("  }\n");
 
-        let mut sorted_rules: Vec<&RoutingRule> =
-            profile.rules.iter().filter(|r| r.enabled).collect();
+        let now = chrono::Utc::now();
+        let mut sorted_rules: Vec<&RoutingRule> = profile
+            .rules
+            .iter()
+            .filter(|r| r.enabled && !RuleEngine::is_expired(r, now))
+            .collect();
         sorted_rules.sort_by_key(|r| r.priority);
 
         for rule in sorted_rules {
@@ -552,6 +556,7 @@ impl FoxyProxyImporter {
                     port_ranges: Vec::new(),
                     protocol: TransportProtocol::Tcp,
                     action,
+                    expires_at: None,
                 });
             }
         }
@@ -736,6 +741,7 @@ mod tests {
                 action: RuleAction::Proxy {
                     target_id: "edge-proxy".to_string(),
                 },
+                expires_at: None,
             },
             RoutingRule {
                 id: "cli-only-rule".to_string(),
@@ -750,10 +756,24 @@ mod tests {
                 action: RuleAction::Proxy {
                     target_id: "edge-proxy".to_string(),
                 },
+                expires_at: None,
             },
         ];
         profile.default_action = RuleAction::Direct;
         profile
+    }
+
+    #[test]
+    fn pac_generator_skips_expired_rules() {
+        let constants = SystemConstants::load_embedded().unwrap();
+        let mut profile = sample_profile();
+        profile.rules[0].expires_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        let pac = PacGenerator::generate(&profile, &constants, true);
+        assert!(!pac.contains("rwMatchDomainSuffix(h, \"corp.example\")"));
+
+        profile.rules[0].expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
+        let pac = PacGenerator::generate(&profile, &constants, true);
+        assert!(pac.contains("rwMatchDomainSuffix(h, \"corp.example\")"));
     }
 
     #[test]

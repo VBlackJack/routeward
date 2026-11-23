@@ -15,6 +15,8 @@ Un **proxy** est un serveur intermédiaire sur Internet : vos applications lui p
 
 La protection démarre toute seule à chaque démarrage et est mémorisée après un redémarrage. Fermer la fenêtre garde RouteWard dans la zone de notification. Si vous perdez un jour votre connexion Internet, utilisez le raccourci du menu Démarrer **RouteWard - Restore Internet** ou suivez le [Dépannage, section 0](docs/fr/troubleshooting.md#0-je-nai-plus-internet).
 
+Si une application ou un site cesse de fonctionner, ouvrez **Activité**, puis **Bloqué** : RouteWard liste ce qu'il a arrêté, explique pourquoi en mots simples, et vous laisse le débloquer avec un bouton Annuler (voir le [Dépannage, section 16](docs/fr/troubleshooting.md#16-ce-qui-est-bloque-pourquoi-et-comment-le-debloquer)).
+
 ## Licence et Auteur
 
 - **Auteur :** Julien Bombled

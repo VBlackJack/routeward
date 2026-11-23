@@ -15,6 +15,7 @@
  */
 
 use crate::config::{InterceptionMode, ProfileConfig, ProxyChain, ProxyNode, RoutingRule};
+use crate::diagnostics::logs::LogQuerySource;
 use crate::dns::FakeIpEntry;
 use crate::interceptor::SystemDiagnostics;
 use crate::rules::ConnectionRequest;
@@ -106,11 +107,63 @@ pub enum IpcCommand {
     ClearClosedConnections,
     ListLogs,
     ClearLogs,
+    /// Aggregated blocked connections plus the counters of packets dropped without an owner.
+    ListBlocked {
+        /// Epoch milliseconds: only entries seen at or after it.
+        #[serde(default)]
+        since: Option<i64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Queries the memory log ring or one daily file of the daemon's own log directory.
+    QueryLogs {
+        source: LogQuerySource,
+        #[serde(default, rename = "minLevel")]
+        min_level: Option<LogLevel>,
+        #[serde(default)]
+        components: Vec<String>,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        pid: Option<u32>,
+        #[serde(default, rename = "connectionId")]
+        connection_id: Option<String>,
+        #[serde(default)]
+        since: Option<i64>,
+        #[serde(default)]
+        until: Option<i64>,
+        limit: usize,
+        #[serde(default)]
+        cursor: Option<String>,
+    },
+    /// Runs the check-up and returns its findings.
+    Analyze,
+    /// Builds the redacted diagnostic bundle.
+    CollectDiagnostics {
+        #[serde(rename = "logDays")]
+        log_days: u32,
+        #[serde(rename = "includeConnections")]
+        include_connections: bool,
+        #[serde(rename = "includeProfile")]
+        include_profile: bool,
+        #[serde(rename = "maskDomains")]
+        mask_domains: bool,
+    },
+    /// Predicts the outcome of a connection under a rule change applied to a copy of the profile.
+    PreviewRuleChange {
+        #[serde(default)]
+        upserts: Vec<RoutingRule>,
+        #[serde(default, rename = "removeIds")]
+        remove_ids: Vec<String>,
+        request: ConnectionRequest,
+    },
     ListFakeIps,
     AllocateFakeIp {
         domain: String,
     },
     FlushFakeIps,
+    /// Flushes the operating system DNS resolver cache (not the Fake-IP table).
+    FlushOsDnsCache,
     ImportFoxyProxyJson {
         json: String,
         #[serde(default, rename = "processPatterns")]

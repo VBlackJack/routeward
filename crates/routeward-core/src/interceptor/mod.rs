@@ -15,11 +15,14 @@
  */
 
 pub mod backend;
+#[cfg(test)]
+mod block_reason_tests;
 mod controller;
 mod dns_handler;
 pub mod dns_server_exempt;
 pub mod nat;
 pub mod nftables;
+pub mod policy;
 mod protection;
 mod tcp_relay;
 #[cfg(test)]
@@ -53,7 +56,7 @@ pub(super) const COMPONENT_RULE: &str = "RuleEngine";
 pub(super) const COMPONENT_PROXY: &str = "ProxyConnector";
 pub(super) const COMPONENT_DNS: &str = "FakeIpDNS";
 pub(super) const ROUTE_DIRECT_LABEL: &str = "DIRECT";
-pub(super) const ROUTE_BLOCK_LABEL: &str = "BLOCKED";
+pub(super) use crate::telemetry::ROUTE_BLOCK_LABEL;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -196,6 +199,11 @@ pub struct RouteWardController {
     pub(super) engine_runtime: Arc<parking_lot::Mutex<Option<controller::EngineRuntime>>>,
     /// Persisted desired protection state and pause timer (only the daemon persists).
     pub(super) protection: Arc<protection::ProtectionRuntime>,
+    /// Latest proxy health reports by proxy id, filled when a proxy is tested.
+    pub(super) proxy_health:
+        Arc<RwLock<std::collections::HashMap<String, crate::checker::ProxyHealthReport>>>,
+    /// Ids of the expired rules removed by the sweeper.
+    pub(super) rule_expiry_tx: tokio::sync::broadcast::Sender<Vec<String>>,
 }
 
 #[cfg(test)]

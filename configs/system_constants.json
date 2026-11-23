@@ -157,7 +157,17 @@
     "logFlushIntervalMs": 500,
     "eventBroadcastCapacity": 256,
     "udpFlowIdleTimeoutMs": 30000,
-    "telemetryUpdateIntervalMs": 250
+    "telemetryUpdateIntervalMs": 250,
+    "maxBlockedSummaryEntries": 500,
+    "logRetentionDays": 14,
+    "logQueryMaxReadBytes": 2097152,
+    "logQueryMaxEntries": 1000,
+    "diagnosticsMaxLogDays": 14,
+    "diagnosticsDefaultLogDays": 3,
+    "diagnosticsLogsMaxBytes": 3145728,
+    "diagnosticsBundleMaxBytes": 6291456,
+    "analyzerUnattributedDropsThreshold": 20,
+    "analyzerLogFolderLargeBytes": 268435456
   },
   "ipc": {
     "unixSocketPath": "/run/routeward/routeward.sock",
@@ -169,7 +179,8 @@
     "linuxProfilePath": "/etc/routeward/active_profile.json",
     "maxLineBytes": 8388608,
     "idleTimeoutMs": 30000,
-    "reconnectIntervalMs": 2000
+    "reconnectIntervalMs": 2000,
+    "ruleExpirySweepIntervalMs": 1000
   },
   "protocols": {
     "socks5Version": 5,

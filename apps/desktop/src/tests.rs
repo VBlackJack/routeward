@@ -1563,3 +1563,367 @@ fn exit_stops_the_engine_when_it_runs_or_is_paused() {
     assert!(exit_must_stop_engine(true, Some(1_700_000_000_000)));
     assert!(!exit_must_stop_engine(false, None));
 }
+
+#[test]
+fn proxy_outage_follows_the_block_reason_and_ignores_simulations() {
+    use crate::commands::is_proxy_outage;
+    use routeward_core::telemetry::TrackedConnection;
+
+    let connection = |reason: Option<&str>, simulated: bool, detail: Option<&str>| {
+        let mut value = serde_json::json!({
+            "id": "c1",
+            "pid": 1,
+            "processName": "app.exe",
+            "processPath": "",
+            "targetHost": "example.com",
+            "resolvedDomain": null,
+            "targetPort": 443,
+            "protocol": "tcp",
+            "matchedRule": "rule",
+            "routeLabel": "BLOCK",
+            "latencyMs": 0,
+            "rxBytes": 0,
+            "txBytes": 0,
+            "status": "blocked",
+            "startedAt": "2026-11-22T10:00:00Z",
+        });
+        let map = value.as_object_mut().expect("object");
+        if let Some(reason) = reason {
+            map.insert("blockReason".to_string(), reason.into());
+        }
+        if simulated {
+            map.insert("simulated".to_string(), true.into());
+        }
+        if let Some(detail) = detail {
+            map.insert("errorDetail".to_string(), detail.into());
+        }
+        serde_json::from_value::<TrackedConnection>(value).expect("tracked connection")
+    };
+
+    for reason in [
+        "killSwitchProxyUnreachable",
+        "killSwitchProxyRefused",
+        "killSwitchProxyTimeout",
+        "killSwitchProxyAuthRejected",
+    ] {
+        assert!(is_proxy_outage(&connection(Some(reason), false, None)));
+    }
+    // A reason that is not a proxy failure never alerts, even with a detail.
+    for reason in [
+        "ruleBlock",
+        "quicBlocked",
+        "defaultPolicyBlock",
+        "udpProxyUnsupported",
+    ] {
+        assert!(!is_proxy_outage(&connection(
+            Some(reason),
+            false,
+            Some("x")
+        )));
+    }
+    // A simulated record never alerts.
+    assert!(!is_proxy_outage(&connection(
+        Some("killSwitchProxyTimeout"),
+        true,
+        None
+    )));
+    // No reason: the former heuristic.
+    assert!(is_proxy_outage(&connection(None, false, Some("refused"))));
+    assert!(!is_proxy_outage(&connection(None, false, None)));
+}
+
+#[test]
+fn desktop_logs_older_than_the_retention_are_pruned_when_a_day_file_opens() {
+    let dir = std::env::temp_dir().join(format!(
+        "routeward_desktop_retention_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let constants = SystemConstants::load_embedded().expect("constants");
+    let old = dir.join(routeward_core::logger::log_file_name(
+        &constants.telemetry.log_app_name,
+        "20200101",
+    ));
+    std::fs::write(&old, "old").expect("old log");
+    let profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    assert!(profile.enable_logging);
+    let bridge = DesktopCommandBridge::new_with_log_dir(constants, profile, "en", dir.clone());
+    bridge.log_info("opens today's file");
+    assert!(!old.exists(), "a log past the retention must be removed");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn blocked_logs_query_and_diagnostics_routes_are_not_shadowed_by_their_prefixes() {
+    let constants = constants_with_private_ipc_endpoint("blocked-routes");
+    let mut profile = ProfileConfig::load_embedded_default().expect("Default profile");
+    profile.enable_logging = false;
+    let bridge = DesktopCommandBridge::new(constants, profile, "en");
+
+    // POST-only routes refuse GET with 405 (the shared prefixes answer 200 to a GET).
+    for path in [
+        "/api/logs/query",
+        "/api/diagnostics/analyze",
+        "/api/diagnostics/collect",
+        "/api/rules/preview",
+        "/api/system/flush-os-dns",
+    ] {
+        let res = handle_api_route("GET", path, "{}", &bridge, None)
+            .await
+            .expect("route response");
+        assert_eq!(res.0, 405, "{path} must be POST-only");
+    }
+
+    // Bad bodies are refused before the daemon is asked.
+    for path in [
+        "/api/logs/query",
+        "/api/diagnostics/collect",
+        "/api/rules/preview",
+    ] {
+        let res = handle_api_route("POST", path, "{invalid", &bridge, None)
+            .await
+            .expect("route response");
+        assert_eq!(res.0, 400, "{path} must refuse a bad body");
+    }
+    let bad_query = handle_api_route("GET", "/api/blocked?limit=abc", "", &bridge, None)
+        .await
+        .expect("route response");
+    assert_eq!(bad_query.0, 400);
+
+    // Valid requests reach the daemon bridge: without a daemon they answer 503 with an error
+    // key, never the 200 array of /api/logs or the diagnostics object.
+    let query_body = r#"{"source":"memory","limit":10}"#;
+    let collect_body =
+        r#"{"logDays":1,"includeConnections":false,"includeProfile":false,"maskDomains":false}"#;
+    let preview_body = r#"{"upserts":[],"removeIds":[],"request":{"processName":"a.exe","targetHost":"example.com","targetPort":443,"protocol":"tcp"}}"#;
+    let cases = [
+        ("GET", "/api/blocked", ""),
+        ("GET", "/api/blocked?since=5&limit=10", ""),
+        ("POST", "/api/logs/query", query_body),
+        ("POST", "/api/diagnostics/analyze", "{}"),
+        ("POST", "/api/diagnostics/collect", collect_body),
+        ("POST", "/api/rules/preview", preview_body),
+        ("POST", "/api/system/flush-os-dns", ""),
+    ];
+    for (method, path, body) in cases {
+        let res = handle_api_route(method, path, body, &bridge, None)
+            .await
+            .expect("route response");
+        assert_eq!(res.0, 503, "{path} must report the missing daemon");
+        let json: serde_json::Value = serde_json::from_slice(&res.2).expect("json");
+        assert_eq!(json["errorKey"], "errors.daemon.disconnected", "{path}");
+    }
+
+    // The old routes keep answering.
+    let logs = handle_api_route("GET", "/api/logs", "", &bridge, None)
+        .await
+        .expect("route response");
+    assert_eq!(logs.0, 200);
+    let diag = handle_api_route("GET", "/api/diagnostics", "", &bridge, None)
+        .await
+        .expect("route response");
+    assert_eq!(diag.0, 200);
+}
+
+mod desktop_log_bundle {
+    use crate::desktop_logs::{add_desktop_logs, DesktopLogSource};
+    use routeward_core::diagnostics::bundle::{BundleLimits, CollectOptions};
+    use routeward_core::diagnostics::redact::{mask_domain, Redactor};
+    use routeward_core::logger::log_file_name;
+    use serde_json::{json, Value};
+
+    const APP: &str = "RouteWardTest";
+    const SECRET_HOST: &str = "secret.example.com";
+    const SECRET_PASSWORD: &str = "hunter2pw";
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "routeward_desktop_logs_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn write_log(dir: &std::path::Path, date: &str, text: &str) {
+        std::fs::write(dir.join(log_file_name(APP, date)), text).expect("log file");
+    }
+
+    fn base_bundle() -> Value {
+        json!({
+            "manifest": {"sections": [
+                {"name": "system", "bytes": 10},
+                {"name": "logs", "bytes": 40}
+            ]},
+            "system": {},
+            "logs": {"files": [
+                {"source": "daemon", "date": "20261122", "truncated": false, "text": "daemon line"}
+            ]},
+        })
+    }
+
+    fn source<'a>(
+        dir: &'a std::path::Path,
+        mask: bool,
+        limits: BundleLimits,
+    ) -> DesktopLogSource<'a> {
+        DesktopLogSource {
+            log_dir: dir,
+            app_name: APP,
+            options: CollectOptions {
+                log_days: 2,
+                include_connections: false,
+                include_profile: false,
+                mask_domains: mask,
+            },
+            limits,
+            known_domains: vec![SECRET_HOST.to_string()],
+            redactor: Redactor::default().with_machine_name(None),
+        }
+    }
+
+    const ROOMY: BundleLimits = BundleLimits {
+        max_log_days: 14,
+        logs_max_bytes: 3_145_728,
+        bundle_max_bytes: 6_291_456,
+        hard_max_bytes: 8_388_608,
+    };
+
+    fn sensitive_line() -> String {
+        format!(
+            "[2026-11-22 10:00:00 +01:00] [INFO] [proxy] GET https://bob:{SECRET_PASSWORD}@{SECRET_HOST}/p?token=abc123 Authorization: Bearer abcDEF0123456789xyz\n"
+        )
+    }
+
+    fn desktop_text(bundle: &Value) -> String {
+        bundle["logs"]["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .filter(|f| f["source"] == "desktop")
+            .map(|f| f["text"].as_str().expect("text").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn desktop_log_is_added_redacted_and_the_manifest_is_updated() {
+        let dir = temp_dir("redact");
+        write_log(&dir, "20261122", &sensitive_line());
+        let mut bundle = base_bundle();
+        add_desktop_logs(&mut bundle, &source(&dir, false, ROOMY));
+
+        let files = bundle["logs"]["files"].as_array().expect("files");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["source"], "daemon");
+        assert_eq!(files[1]["source"], "desktop");
+        let text = desktop_text(&bundle);
+        assert!(!text.contains(SECRET_PASSWORD), "password leaked: {text}");
+        assert!(!text.contains("abc123"), "query leaked: {text}");
+        assert!(
+            !text.contains("abcDEF0123456789xyz"),
+            "token leaked: {text}"
+        );
+        assert!(text.contains(SECRET_HOST), "host kept without masking");
+
+        let logs_bytes = serde_json::to_vec(&bundle["logs"]).expect("json").len();
+        let manifest = bundle["manifest"]["sections"].as_array().expect("sections");
+        let entry = manifest.iter().find(|s| s["name"] == "logs").expect("logs");
+        assert_eq!(entry["bytes"], logs_bytes);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn desktop_part_lists_its_redaction_codes_and_keeps_mask_domains_consistent() {
+        let dir = temp_dir("codes");
+        write_log(&dir, "20261122", &sensitive_line());
+
+        let mut plain = base_bundle();
+        plain["manifest"]["maskDomains"] = json!(false);
+        plain["manifest"]["redactions"] = json!(["passwords"]);
+        add_desktop_logs(&mut plain, &source(&dir, false, ROOMY));
+        let codes = plain["manifest"]["redactions"].as_array().expect("codes");
+        assert!(codes.iter().any(|c| c == "passwords"));
+        assert!(codes.iter().any(|c| c == "userPaths"));
+        assert!(!codes.iter().any(|c| c == "domains"));
+        assert_eq!(plain["manifest"]["maskDomains"], false);
+
+        let mut masked = base_bundle();
+        masked["manifest"]["maskDomains"] = json!(false);
+        add_desktop_logs(&mut masked, &source(&dir, true, ROOMY));
+        let codes = masked["manifest"]["redactions"].as_array().expect("codes");
+        assert!(codes.iter().any(|c| c == "domains"));
+        assert_eq!(masked["manifest"]["maskDomains"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn desktop_log_masks_sites_with_the_core_hash_when_asked() {
+        let dir = temp_dir("mask");
+        write_log(&dir, "20261122", &sensitive_line());
+        let mut bundle = base_bundle();
+        add_desktop_logs(&mut bundle, &source(&dir, true, ROOMY));
+        let text = desktop_text(&bundle);
+        assert!(!text.contains(SECRET_HOST), "site leaked: {text}");
+        assert!(!text.contains(SECRET_PASSWORD));
+        assert!(
+            text.contains(&mask_domain(SECRET_HOST)),
+            "masked name must match the core hash: {text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn desktop_log_never_pushes_the_bundle_over_its_cap() {
+        let dir = temp_dir("cap");
+        let big = sensitive_line().repeat(2000);
+        write_log(&dir, "20261122", &big);
+        write_log(&dir, "20261121", &big);
+
+        let limits = BundleLimits {
+            max_log_days: 14,
+            logs_max_bytes: 200_000,
+            bundle_max_bytes: 60_000,
+            hard_max_bytes: 8_388_608,
+        };
+        let mut bundle = base_bundle();
+        add_desktop_logs(&mut bundle, &source(&dir, false, limits));
+        let size = serde_json::to_vec(&bundle).expect("json").len();
+        assert!(size <= limits.bundle_max_bytes, "bundle is {size} bytes");
+        assert!(!desktop_text(&bundle).is_empty(), "halved, not dropped");
+
+        // When even the smallest desktop part does not fit, the bundle is left as it was.
+        let tight = BundleLimits {
+            max_log_days: 14,
+            logs_max_bytes: 200_000,
+            bundle_max_bytes: 400,
+            hard_max_bytes: 8_388_608,
+        };
+        let mut unchanged = base_bundle();
+        add_desktop_logs(&mut unchanged, &source(&dir, false, tight));
+        assert_eq!(unchanged, base_bundle());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn desktop_log_is_skipped_when_logs_are_off_or_missing() {
+        let dir = temp_dir("none");
+        let mut bundle = base_bundle();
+        let mut src = source(&dir, false, ROOMY);
+        add_desktop_logs(&mut bundle, &src);
+        assert_eq!(bundle, base_bundle(), "no desktop file, nothing added");
+
+        write_log(&dir, "20261122", &sensitive_line());
+        src.options.log_days = 0;
+        add_desktop_logs(&mut bundle, &src);
+        assert_eq!(bundle, base_bundle(), "logDays 0 leaves the logs out");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

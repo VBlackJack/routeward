@@ -164,7 +164,8 @@
         "completed_direct_no_proxy": "Setup saved. No proxy yet: your IP address stays visible and only your app rules apply."
       },
       "dns": {
-        "flushed": "DNS memory cleared"
+        "flushed": "DNS memory cleared",
+        "os_flushed": "Windows DNS cache cleared"
       },
       "profile": {
         "imported": "Profile imported",
@@ -533,7 +534,8 @@
         "block_process": "Block Process Always",
         "block_domain": "Block Target Domain",
         "terminate_socket": "Terminate Active Socket",
-        "close": "Close Inspector"
+        "close": "Close Inspector",
+        "see_logs": "See logs of this connection"
       }
     },
     "quick": {
@@ -690,6 +692,11 @@
     }
   },
   "rules": {
+    "temporary": {
+      "badge": "Temporary - {{time}} left",
+      "minutes": "{{count}} min",
+      "hours_minutes": "{{hours}} h {{minutes}} min"
+    },
     "simple": {
       "title": "My Apps & Websites",
       "subtitle": "Pick which apps or websites go through your proxy, connect directly, or stay blocked.",
@@ -937,6 +944,28 @@
       "component": "Subsystem",
       "message": "Event Description",
       "empty": "No log events recorded."
+    },
+    "query": {
+      "search_label": "Search",
+      "search_placeholder": "Search in the messages...",
+      "component_label": "Part of RouteWard",
+      "component_all": "All parts",
+      "range_label": "Period",
+      "range_all": "Everything",
+      "range_15min": "Last 15 minutes",
+      "range_1h": "Last hour",
+      "range_24h": "Last 24 hours",
+      "source_label": "Source",
+      "source_memory": "Live (since start)",
+      "source_file": "File of {{date}}",
+      "search_button": "Search",
+      "jump_active": "Showing only this connection, within {{seconds}} seconds around it.",
+      "jump_clear": "Show all logs",
+      "error": "Could not read the logs.",
+      "truncated": "More lines exist than shown. Narrow the search to see them.",
+      "loading": "Loading...",
+      "load_more": "Load more",
+      "context_pid": "(app number {{pid}})"
     }
   },
   "cli": {
@@ -988,6 +1017,29 @@
       "next_step": "Open RouteWard to turn protection back on.",
       "failed": "RouteWard could not restore your Internet settings. Follow the \"I have no Internet anymore\" steps in the RouteWard troubleshooting guide, or open Windows Settings, go to Network and Internet, then Proxy, and turn off the proxy.",
       "press_enter": "Press Enter to close this window."
+    },
+    "diagnose": {
+      "header": "RouteWard check-up",
+      "no_findings": "Nothing worrying found."
+    },
+    "blocked": {
+      "header": "Blocked connections",
+      "empty": "Nothing has been blocked.",
+      "counters": "Dropped without a known app: {{syn}} connection attempts, {{udp}} UDP packets."
+    },
+    "ctl": {
+      "empty_result": "Nothing to show."
+    },
+    "logs": {
+      "invalid_level": "Unknown log level: {{value}}.",
+      "invalid_since": "Unreadable time value: {{value}}.",
+      "more_available": "More lines are available. Continue with the cursor {{cursor}}.",
+      "empty": "No log line matches."
+    },
+    "export": {
+      "written": "Diagnostic file written to {{path}}",
+      "exists": "The file {{path}} already exists. Use --force to replace it.",
+      "sections": "Sections included: {{sections}}"
     }
   },
   "errors": {
@@ -1273,7 +1325,8 @@
       "hide_title": "Hide diagnostics",
       "subtab_overview": "Overview",
       "subtab_dns": "Fake-IP DNS Cache",
-      "subtab_logs": "Event Logs"
+      "subtab_logs": "Event Logs",
+      "subtab_checkup": "Check-up"
     }
   },
   "format": {
@@ -1361,6 +1414,354 @@
       "start_failed": "RouteWard could not start protection. Open RouteWard for details.",
       "toggle_failed": "RouteWard could not change protection. Open RouteWard for details.",
       "pause_failed": "RouteWard could not pause protection. Open RouteWard for details."
+    }
+  },
+  "activity": {
+    "subtabs": {
+      "label": "Activity sections",
+      "connections": "Connections",
+      "blocked": "Blocked"
+    }
+  },
+  "blocked": {
+    "focus": {
+      "notice": "Showing only what the check-up pointed to.",
+      "clear": "Show everything"
+    },
+    "title": "Blocked connections",
+    "subtitle": "Everything RouteWard stopped, grouped by app and site, with the reason in plain words.",
+    "checkup": "Run a check-up",
+    "refresh": "Refresh",
+    "error": "Could not load the list of blocked connections.",
+    "empty": "Nothing has been blocked since RouteWard started.",
+    "row": {
+      "count_one": "{{count}} time",
+      "count_other": "{{count}} times",
+      "rule": "Rule: {{name}}",
+      "proxy": "Proxy: {{name}}",
+      "last_seen": "Last time: {{time}}",
+      "unblock": "Unblock",
+      "see_logs": "See logs"
+    },
+    "counters": {
+      "line": "Also stopped without knowing which app sent it: {{syn}} connection attempts and {{udp}} UDP packets.",
+      "limit": "Limit: some traffic is stopped by the system or the Linux firewall before RouteWard can tell which app sent it. That traffic is only counted here, never listed."
+    },
+    "home": {
+      "text_one": "{{count}} connection was blocked.",
+      "text_other": "{{count}} connections were blocked.",
+      "cta": "See what was blocked"
+    },
+    "reasons": {
+      "ruleBlock": {
+        "title": "Blocked by one of your rules",
+        "body": "A protection rule tells RouteWard to stop this connection."
+      },
+      "defaultPolicyBlock": {
+        "title": "Blocked because nothing allows it",
+        "body": "No rule covers this app, and your default setting is to block what is not allowed. Add an exception to let it through."
+      },
+      "killSwitchProxyUnreachable": {
+        "title": "Safety cutoff: the proxy cannot be reached",
+        "body": "This app is meant to go through your proxy, but RouteWard cannot reach it. To protect your real address, the connection was stopped instead of going out unprotected."
+      },
+      "killSwitchProxyRefused": {
+        "title": "Safety cutoff: the proxy refused the connection",
+        "body": "The proxy computer answered but would not accept this connection. Check that the proxy is running and that its address and port are right."
+      },
+      "killSwitchProxyTimeout": {
+        "title": "Safety cutoff: the proxy took too long to answer",
+        "body": "The proxy did not reply in time, so the connection was stopped instead of going out unprotected. The proxy may be down or very slow."
+      },
+      "killSwitchProxyAuthRejected": {
+        "title": "Safety cutoff: the proxy refused your login",
+        "body": "The user name or password saved for the proxy is not accepted. Open the proxy settings and check them."
+      },
+      "killSwitchProxyHandshake": {
+        "title": "Safety cutoff: the proxy answered in an unexpected way",
+        "body": "RouteWard reached the proxy but the exchange failed. The proxy type (SOCKS5, HTTP...) may be wrong in its settings."
+      },
+      "killSwitchProxyMisconfigured": {
+        "title": "Safety cutoff: the proxy settings are incomplete",
+        "body": "This app should use a proxy that does not exist or is turned off. Open the proxy list and choose one that is on."
+      },
+      "udpProxyUnsupported": {
+        "title": "Your proxy cannot carry this kind of traffic",
+        "body": "Calls, games and some streaming use UDP, a type of traffic this proxy cannot carry. The connection was stopped so it could not leave without the proxy. This is not a proxy outage."
+      },
+      "killSwitchDirectUdpFailed": {
+        "title": "Safety cutoff on direct traffic",
+        "body": "This traffic would have left your computer without going through the proxy while the safety cutoff is on, so it was stopped."
+      },
+      "fragmentedUdpBlocked": {
+        "title": "Data split into pieces was stopped",
+        "body": "This data arrived cut into several pieces, which RouteWard cannot send through a proxy safely. Letting the app connect directly, or using a proxy that supports UDP, avoids it."
+      },
+      "unknownProcessPolicy": {
+        "title": "RouteWard could not tell which program this is",
+        "body": "The program behind this connection could not be identified, so your setting for unknown programs was applied. In most cases nothing needs fixing."
+      },
+      "unknownProcessKillSwitch": {
+        "title": "Unknown program stopped by the safety cutoff",
+        "body": "RouteWard could not identify the program behind this connection, and the safety cutoff stops what it cannot identify. In most cases nothing needs fixing."
+      },
+      "fakeIpEgressGuard": {
+        "title": "An app used a stand-in address that no longer exists",
+        "body": "RouteWard hands out temporary stand-in addresses to follow website names. An app kept using one after it expired, so the traffic was stopped. Clear the DNS cache, then restart the app."
+      },
+      "quicBlocked": {
+        "title": "Fast web protocol (QUIC) turned off on purpose",
+        "body": "Browsers try QUIC first. RouteWard blocks it so the browser falls back to the normal secure connection, which can go through your proxy. This is normal and the site still loads."
+      },
+      "encryptedDnsBlocked": {
+        "title": "The app's private name lookup was blocked",
+        "body": "Some apps look up website names through their own private channel, which would skip your protection. RouteWard stops it so the app uses the normal lookup. This is expected."
+      },
+      "localNameGuard": {
+        "title": "A private network name was kept off the Internet",
+        "body": "A name that only exists on your home or office network was about to be looked up on the public Internet. It was stopped so it does not reveal your network."
+      },
+      "dnsServerBlockedByRule": {
+        "title": "A rule blocked a website name lookup",
+        "body": "A rule stopped this app from asking a DNS server (the address book of the Internet) for a website address."
+      },
+      "unknown": {
+        "title": "Blocked, reason not given",
+        "body": "RouteWard blocked this connection but this version cannot tell why. Open the logs to see more."
+      }
+    }
+  },
+  "unblock": {
+    "duration": {
+      "legend": "For how long?",
+      "minutes15": "15 minutes",
+      "hour1": "1 hour",
+      "always": "Always"
+    },
+    "option": {
+      "change_rule_direct": {
+        "title": "Let it connect directly",
+        "desc": "Edits your existing rule so this app or site goes out without the proxy. The site will see your real address."
+      },
+      "change_rule_proxy": {
+        "title": "Send it through the proxy",
+        "desc": "Edits your existing rule so it uses your proxy instead of being blocked."
+      },
+      "exception_app_direct": {
+        "title": "Let this app through (directly)",
+        "desc": "Adds a rule for this app only. It will connect without the proxy, so websites see your real address."
+      },
+      "exception_app_proxy": {
+        "title": "Let this app through the proxy",
+        "desc": "Adds a rule for this app only, so it connects through your proxy."
+      },
+      "exception_site_direct": {
+        "title": "Let this site through (directly)",
+        "desc": "Adds a rule for this site only, for every app. It will connect without the proxy."
+      },
+      "exception_site_proxy": {
+        "title": "Let this site through the proxy",
+        "desc": "Adds a rule for this site only, so it connects through your proxy."
+      },
+      "exception_app_site_direct": {
+        "title": "Let this app reach only this site",
+        "desc": "Adds a narrow rule: only this app, only this site, connecting directly."
+      },
+      "disable_rule": {
+        "title": "Turn off the rule: {{rule}}",
+        "desc": "This rule also covers other apps and sites. They will no longer be protected by it."
+      },
+      "cannot_outrank": {
+        "title": "This rule cannot be overruled",
+        "desc": "It has the highest priority, so no exception can beat it. Turn the rule off, or change it in the rules list."
+      },
+      "app_direct_unprotected": {
+        "title": "Let this app go out directly (unprotected)",
+        "desc": "Warning: the app connects without the proxy, so your real address is exposed. The safety cutoff stays on for everything else."
+      },
+      "test_proxy": {
+        "title": "Test the proxy",
+        "desc": "Checks whether RouteWard can reach it right now."
+      },
+      "open_proxy": {
+        "title": "Open the proxy settings",
+        "desc": "Check or change the address, the port and the login, or add a backup proxy."
+      },
+      "pause": {
+        "title": "Pause protection for {{minutes}} minutes",
+        "desc": "Everything connects directly for a while, so websites see your real address. Protection then resumes by itself."
+      },
+      "flush_dns": {
+        "title": "Clear the Windows DNS cache",
+        "desc": "Makes Windows forget the old addresses it remembered, so the app asks again and gets fresh ones."
+      },
+      "restart_app": {
+        "title": "Then restart the app",
+        "desc": "Close the app completely and open it again so it asks for fresh addresses."
+      }
+    },
+    "rules": {
+      "app_proxy": "{{name}} - connects through the proxy",
+      "site_proxy": "{{name}} - connects through the proxy",
+      "app_site_direct": "{{app}} on {{site}} - connects directly"
+    },
+    "diff": {
+      "added": "Add the rule: {{name}}",
+      "changed": "Change the rule: {{name}}",
+      "disabled": "Turn off the rule: {{name}}",
+      "removed": "Remove the rule: {{name}}",
+      "expires": "This rule stops by itself at {{time}}.",
+      "outranks": "Careful: this exception also overrides your proxy rules for other traffic of the same app or site: {{names}}."
+    },
+    "confirm": {
+      "title": "Unblock {{name}}?",
+      "intro": "These changes will be made:",
+      "outcome_direct": "Result: the connection will go out directly, without the proxy.",
+      "outcome_proxy": "Result: the connection will go through your proxy.",
+      "outcome_block": "Result: the connection would still be blocked.",
+      "outcome_unknown": "RouteWard could not predict the result before applying.",
+      "override_warning": "A security setting would still block it: {{reason}}. This change alone will not be enough.",
+      "still_blocked_warning": "This change does not unblock the connection by itself. Another rule or setting still blocks it."
+    },
+    "toast": {
+      "done": "{{name}} is unblocked"
+    }
+  },
+  "analyzer": {
+    "pause_confirm": {
+      "title": "Pause protection for {{minutes}} minutes?",
+      "intro": "Protection will stop for a while:",
+      "change": "Everything connects directly for {{minutes}} minutes, then protection resumes by itself.",
+      "warning": "While it is paused, websites see your real address and nothing is blocked."
+    },
+    "title": "Check-up",
+    "subtitle": "RouteWard looks at what was blocked and at your settings, then tells you what to do.",
+    "run": "Run the check-up",
+    "running": "Checking...",
+    "export": "Export a diagnostic file",
+    "error": "The check-up could not run.",
+    "none": "Nothing worrying found.",
+    "evidence_one": "Seen {{count}} time",
+    "evidence_other": "Seen {{count}} times",
+    "last_seen": "last at {{time}}",
+    "action": {
+      "open_proxy": "Open the proxy",
+      "test_proxy": "Test the proxy",
+      "unblock": "See what is blocked",
+      "edit_rule": "Open the rules",
+      "pause": "Pause protection",
+      "open_setting": "Open the settings"
+    },
+    "unknown": {
+      "title": "Something to look at",
+      "body": "The check-up found a problem this version cannot describe.",
+      "fix": "Update RouteWard, or open the logs for details."
+    },
+    "findings": {
+      "proxyUnreachable": {
+        "title": "The proxy {{proxy}} cannot be reached",
+        "body": "Apps that should use it are being stopped by the safety cutoff ({{count}} connections blocked).",
+        "fix": "Test the proxy. If it fails, check its address and that it is running, or switch to a backup."
+      },
+      "proxyAuthRejected": {
+        "title": "The proxy {{proxy}} refuses your login",
+        "body": "The user name or password saved for it does not match what the proxy expects.",
+        "fix": "Open the proxy and type the login again."
+      },
+      "defaultPolicyBlocking": {
+        "title": "{{app}} is blocked because no rule allows it",
+        "body": "Your default setting blocks anything not covered by a rule, and {{app}} is not covered.",
+        "fix": "Unblock it from the Blocked tab, or change the default action."
+      },
+      "appBlockedBySimpleRule": {
+        "title": "{{app}} is blocked by a rule you set",
+        "body": "You, or a setup assistant, set {{app}} to Blocked.",
+        "fix": "Set the app to Direct or Via proxy in the Apps page, or unblock it from the Blocked tab."
+      },
+      "appBlockedByPack": {
+        "title": "{{app}} is blocked by a protection pack",
+        "body": "A ready-made protection ({{rule}}) blocks traffic that this app uses.",
+        "fix": "Add an exception for this app, or turn that protection off."
+      },
+      "appBlockedByRule": {
+        "title": "{{app}} is blocked by one of your rules",
+        "body": "The rule {{rule}} blocks traffic that this app uses.",
+        "fix": "Edit that rule or add an exception for this app."
+      },
+      "ruleShadowed": {
+        "title": "The rule {{rule}} never applies",
+        "body": "Another rule with a lower number decides first, so this one is never reached.",
+        "fix": "Open the rules and reorder or remove one of them."
+      },
+      "quicOrDohBlockedInfo": {
+        "title": "Fast web protocol and private name lookup are blocked on purpose",
+        "body": "{{count}} attempts were stopped. Browsers fall back to the normal secure connection, so sites still load.",
+        "fix": "Nothing to do, unless an app really needs them. In that case turn the option off in Settings."
+      },
+      "unattributedDropsHigh": {
+        "title": "Many connections were stopped without knowing which app",
+        "body": "{{count}} attempts were dropped by the safety cutoff before RouteWard could identify the app, so the Blocked list cannot show them.",
+        "fix": "Check that the proxy works. These drops usually stop once it does."
+      },
+      "fakeIpGuardHits": {
+        "title": "An app kept using an expired stand-in address",
+        "body": "RouteWard stopped {{count}} connections to addresses it had handed out earlier.",
+        "fix": "Use Unblock on the blocked item to clear the Windows DNS cache, then restart the app."
+      },
+      "protectionPausedOrStopped": {
+        "title": "Protection is paused or stopped",
+        "body": "Nothing is being routed or blocked right now, so your apps connect as they would without RouteWard.",
+        "fix": "Turn protection back on from the Home page."
+      },
+      "logFolderLarge": {
+        "title": "The log folder is getting large",
+        "body": "Old log files are removed automatically, but the folder is bigger than expected.",
+        "fix": "Export what you need, then clear the logs from Settings."
+      }
+    }
+  },
+  "diagnostics": {
+    "export": {
+      "title": "Export a diagnostic file",
+      "intro": "Creates one file you can send to the person who helps you. It is built here and saved on your computer. Nothing is sent anywhere.",
+      "options": "What to include",
+      "log_days": "Days of logs",
+      "days_one": "{{count}} day",
+      "days_other": "{{count}} days",
+      "include_connections": "Recent connections",
+      "include_profile": "My settings (passwords are never included)",
+      "mask_sites": "Hide website names (each one is replaced by a short code)",
+      "sites_warning": "This file lists the websites your apps contacted. Tick the box above to hide them before you share it.",
+      "error": "The file could not be prepared.",
+      "manifest_title": "What the file contains",
+      "col_section": "Part",
+      "col_size": "Size",
+      "total": "Total",
+      "redaction": {
+        "passwords": "passwords",
+        "authHeaders": "login headers",
+        "tokens": "access tokens",
+        "urlSecrets": "secrets inside web addresses",
+        "userPaths": "user folder names",
+        "usernames": "user names",
+        "machineName": "computer name",
+        "exitIp": "proxy exit address",
+        "domains": "website names"
+      },
+      "redactions": "Removed or hidden: {{list}}.",
+      "never_sent": "Check the list, then download. RouteWard does not send the file anywhere.",
+      "close": "Close",
+      "download": "Download the file",
+      "prepare": "Prepare the file",
+      "preparing": "Preparing...",
+      "done": "Diagnostic saved as {{name}}",
+      "section": {
+        "system": "System",
+        "profile": "Settings",
+        "connections": "Connections",
+        "blocked": "Blocked list",
+        "logs": "Logs"
+      }
     }
   }
 }

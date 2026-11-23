@@ -14,11 +14,14 @@
  * limitations under the License.
  */
 
+mod ctl_reports;
+
 use clap::{Parser, Subcommand};
 use routeward_core::config::security::load_or_init_secure_daemon_profile;
 use routeward_core::config::{
-    ProfileConfig, ProxyNode, RoutingRule, SystemConstants, TransportProtocol,
+    ProfileConfig, ProxyNode, RoutingRule, SystemConstants, TelemetryConstants, TransportProtocol,
 };
+use routeward_core::diagnostics::logs::LogQuerySource;
 use routeward_core::error::{
     RouteWardError, RouteWardResult, ERR_KEY_CLEANUP_DAEMON_ACTIVE, ERR_KEY_CONFIG_JSON,
     ERR_KEY_CONFIG_LOAD, ERR_KEY_DAEMON_NOT_ELEVATED,
@@ -526,8 +529,70 @@ enum CtlCommands {
     },
     /// List tracked connections from the daemon
     Connections,
-    /// List recent log entries from the daemon
-    Logs,
+    /// List recent log entries from the daemon. Without any option the raw log buffer is
+    /// printed as JSON; with an option the entries are filtered by the daemon and printed as lines
+    Logs {
+        /// Lowest level to show: debug, info, warn or error
+        #[arg(long)]
+        level: Option<String>,
+        /// Only this component (repeatable)
+        #[arg(long)]
+        component: Vec<String>,
+        /// Only lines containing this text (case-insensitive)
+        #[arg(long)]
+        grep: Option<String>,
+        /// Only lines about this process id
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Only lines newer than this age, for example 15m, 2h or 1d
+        #[arg(long, value_name = "AGE")]
+        since: Option<String>,
+        /// Read the daemon log file of this day (yyyyMMdd) instead of the live buffer
+        #[arg(long, value_name = "YYYYMMDD")]
+        file: Option<String>,
+        /// Most lines to show
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// List the connections the daemon blocked, grouped by application, destination and reason
+    Blocked {
+        /// Print the daemon answer as JSON
+        #[arg(long)]
+        json: bool,
+        /// Most entries to show
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Run the check-up: what is wrong and what to do about it
+    Diagnose {
+        /// Print the findings as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a redacted diagnostic file (settings without passwords, blocked list, recent logs)
+    ExportDiagnostics {
+        /// File to write
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        /// Leave the logs out
+        #[arg(long = "no-logs")]
+        no_logs: bool,
+        /// Leave the settings out
+        #[arg(long = "no-profile")]
+        no_profile: bool,
+        /// Leave the recent connections out
+        #[arg(long = "no-connections")]
+        no_connections: bool,
+        /// Replace every website name by a short code
+        #[arg(long = "mask-domains")]
+        mask_domains: bool,
+        /// Replace the file when it already exists
+        #[arg(long)]
+        force: bool,
+        /// Days of logs to include (default from the system constants)
+        #[arg(long = "log-days", value_name = "N")]
+        log_days: Option<u32>,
+    },
     /// List active Fake-IP allocations from the daemon
     FakeIps,
     /// Flush all Fake-IP allocations on the daemon
@@ -647,7 +712,10 @@ fn ctl_action_label(action: &CtlCommands) -> &'static str {
         CtlCommands::Stop => "stop",
         CtlCommands::Pause { .. } => "pause",
         CtlCommands::Connections => "connections",
-        CtlCommands::Logs => "logs",
+        CtlCommands::Logs { .. } => "logs",
+        CtlCommands::Blocked { .. } => "blocked",
+        CtlCommands::Diagnose { .. } => "diagnose",
+        CtlCommands::ExportDiagnostics { .. } => "export-diagnostics",
         CtlCommands::FakeIps => "fake-ips",
         CtlCommands::FlushFakeIps => "flush-fake-ips",
         CtlCommands::UpsertRule { .. } => "upsert-rule",
@@ -659,7 +727,88 @@ fn ctl_action_label(action: &CtlCommands) -> &'static str {
     }
 }
 
-fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, IpcCommand)> {
+/// Milliseconds since the Unix epoch.
+fn epoch_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// How the answer of a ctl command is printed.
+enum CtlRender {
+    /// The daemon answer as pretty JSON.
+    Raw,
+    Logs,
+    Blocked,
+    Diagnose,
+    Export {
+        output: PathBuf,
+        force: bool,
+    },
+}
+
+impl CtlRender {
+    fn for_action(action: &CtlCommands) -> Self {
+        match action {
+            CtlCommands::Logs {
+                level: None,
+                component,
+                grep: None,
+                pid: None,
+                since: None,
+                file: None,
+                limit: None,
+            } if component.is_empty() => Self::Raw,
+            CtlCommands::Logs { .. } => Self::Logs,
+            CtlCommands::Blocked { json: false, .. } => Self::Blocked,
+            CtlCommands::Diagnose { json: false } => Self::Diagnose,
+            CtlCommands::ExportDiagnostics { output, force, .. } => Self::Export {
+                output: output.clone(),
+                force: *force,
+            },
+            _ => Self::Raw,
+        }
+    }
+}
+
+/// Prints the answer of a successful ctl command; the export is written to its file.
+fn print_ctl_result(
+    render: CtlRender,
+    result: serde_json::Value,
+    i18n: &I18nRegistry,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match render {
+        CtlRender::Raw => {}
+        CtlRender::Logs => {
+            let response = serde_json::from_value(result)?;
+            print!("{}", ctl_reports::format_logs(i18n, &response));
+        }
+        CtlRender::Blocked => {
+            let response = serde_json::from_value(result)?;
+            print!("{}", ctl_reports::format_blocked(i18n, &response));
+        }
+        CtlRender::Diagnose => {
+            let response = serde_json::from_value(result)?;
+            print!("{}", ctl_reports::format_findings(i18n, &response));
+        }
+        CtlRender::Export { output, force } => {
+            match ctl_reports::write_export(&output, &result, force) {
+                Ok(()) => print!("{}", ctl_reports::export_summary(i18n, &output, &result)),
+                Err(ctl_reports::ExportError::Exists) => {
+                    return Err(ctl_reports::export_exists_message(i18n, &output).into());
+                }
+                Err(ctl_reports::ExportError::Io(err)) => return Err(err.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ctl_action_into_ipc(
+    action: CtlCommands,
+    i18n: &I18nRegistry,
+) -> Result<(&'static str, IpcCommand), Box<dyn std::error::Error>> {
     let label = ctl_action_label(&action);
     let ipc_cmd = match action {
         CtlCommands::Status => IpcCommand::GetDiagnostics,
@@ -670,7 +819,76 @@ fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, Ip
             duration_secs: seconds,
         },
         CtlCommands::Connections => IpcCommand::ListConnections,
-        CtlCommands::Logs => IpcCommand::ListLogs,
+        CtlCommands::Logs {
+            level,
+            component,
+            grep,
+            pid,
+            since,
+            file,
+            limit,
+        } => {
+            let unfiltered = level.is_none()
+                && component.is_empty()
+                && grep.is_none()
+                && pid.is_none()
+                && since.is_none()
+                && file.is_none()
+                && limit.is_none();
+            if unfiltered {
+                IpcCommand::ListLogs
+            } else {
+                let min_level = level
+                    .as_deref()
+                    .map(|raw| ctl_reports::parse_level(i18n, raw))
+                    .transpose()?;
+                let age = since
+                    .as_deref()
+                    .map(|raw| ctl_reports::parse_since(i18n, raw))
+                    .transpose()?;
+                IpcCommand::QueryLogs {
+                    source: match file {
+                        Some(date) => LogQuerySource::DaemonFile { date },
+                        None => LogQuerySource::Memory,
+                    },
+                    min_level,
+                    components: component,
+                    text: grep,
+                    pid,
+                    connection_id: None,
+                    since: age.map(|age| epoch_ms_now().saturating_sub(age.as_millis() as i64)),
+                    until: None,
+                    limit: limit.unwrap_or(ctl_reports::DEFAULT_LOG_LIMIT),
+                    cursor: None,
+                }
+            }
+        }
+        CtlCommands::Blocked { limit, .. } => IpcCommand::ListBlocked { since: None, limit },
+        CtlCommands::Diagnose { .. } => IpcCommand::Analyze,
+        CtlCommands::ExportDiagnostics {
+            no_logs,
+            no_profile,
+            no_connections,
+            mask_domains,
+            log_days,
+            ..
+        } => IpcCommand::CollectDiagnostics {
+            log_days: if no_logs {
+                0
+            } else {
+                match log_days {
+                    Some(days) => days,
+                    None => {
+                        SystemConstants::load_embedded()?
+                            .telemetry
+                            .diagnostics_default_log_days
+                    }
+                }
+            },
+            include_connections: !no_connections,
+            include_profile: !no_profile,
+            mask_domains,
+        },
         CtlCommands::FakeIps => IpcCommand::ListFakeIps,
         CtlCommands::FlushFakeIps => IpcCommand::FlushFakeIps,
         CtlCommands::UpsertRule { json, json_file } => {
@@ -697,10 +915,11 @@ fn ctl_action_into_ipc(action: CtlCommands) -> RouteWardResult<(&'static str, Ip
 async fn execute_ctl_action(
     client: &IpcClient,
     user_logger: &FileLogger,
+    i18n: &I18nRegistry,
     action: CtlCommands,
 ) -> Result<routeward_core::ipc::protocol::IpcResponse, Box<dyn std::error::Error>> {
     let expected_label = ctl_action_label(&action);
-    let (cmd_label, ipc_cmd) = match ctl_action_into_ipc(action) {
+    let (cmd_label, ipc_cmd) = match ctl_action_into_ipc(action, i18n) {
         Ok(pair) => pair,
         Err(err) => {
             user_logger.log(
@@ -708,7 +927,7 @@ async fn execute_ctl_action(
                 COMPONENT_CLI_CTL,
                 &format!("Executed ctl command '{expected_label}': outcome=invalid_input ({err})"),
             );
-            return Err(err.into());
+            return Err(err);
         }
     };
 
@@ -1035,25 +1254,50 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// The per-user CLI log, pruned like every other log (`logRetentionDays`).
+fn open_user_logger(log_dir: std::path::PathBuf, telemetry: &TelemetryConstants) -> FileLogger {
+    let logger = FileLogger::new(log_dir, &telemetry.log_app_name, true);
+    logger.set_retention_days(telemetry.log_retention_days);
+    logger
+}
+
 async fn async_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let constants = SystemConstants::load_embedded()?;
 
     if let Commands::Ctl { action } = args.command {
-        let user_logger = FileLogger::new(
+        let user_logger = open_user_logger(
             constants.telemetry.resolve_user_log_dir(),
-            &constants.telemetry.log_app_name,
-            true,
+            &constants.telemetry,
         );
         let client = IpcClient::new(constants.ipc);
-        let response = execute_ctl_action(&client, &user_logger, action).await?;
-        println!("{}", serde_json::to_string_pretty(&response)?);
+        let i18n = I18nRegistry::new(&args.locale);
+        let render = CtlRender::for_action(&action);
+        if let CtlRender::Export {
+            output,
+            force: false,
+        } = &render
+        {
+            // Refuse before asking the daemon for a bundle that could not be saved.
+            if output.exists() {
+                return Err(ctl_reports::export_exists_message(&i18n, output).into());
+            }
+        }
+        let response = execute_ctl_action(&client, &user_logger, &i18n, action).await?;
         if !response.ok {
+            println!("{}", serde_json::to_string_pretty(&response)?);
             let err_msg = response
                 .error
                 .unwrap_or_else(|| "Daemon returned error".to_string());
             return Err(err_msg.into());
         }
-        return Ok(());
+        if matches!(render, CtlRender::Raw) {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(());
+        }
+        let Some(result) = response.result else {
+            return Err(ctl_reports::empty_result_message(&i18n).into());
+        };
+        return print_ctl_result(render, result, &i18n);
     }
 
     if let Commands::Daemon {
@@ -1257,6 +1501,29 @@ mod tests {
     use routeward_core::ipc::protocol::DaemonFullState;
 
     #[test]
+    fn the_user_cli_log_prunes_files_past_the_retention() {
+        let dir = std::env::temp_dir().join(format!(
+            "routeward_cli_retention_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let constants = SystemConstants::load_embedded().expect("constants");
+        let old = dir.join(routeward_core::logger::log_file_name(
+            &constants.telemetry.log_app_name,
+            "20200101",
+        ));
+        std::fs::write(&old, "old").expect("old log");
+        let logger = open_user_logger(dir.clone(), &constants.telemetry);
+        logger.log(routeward_core::telemetry::LogLevel::Info, "Test", "today");
+        assert!(!old.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn cleanup_accepts_fail_closed_on_crash_flag() {
         let args =
             CliArgs::try_parse_from(["routeward", "cleanup", "--force", "--fail-closed-on-crash"])
@@ -1397,7 +1664,7 @@ mod tests {
         let Commands::Ctl { action } = args.command else {
             panic!("expected ctl");
         };
-        let (label, cmd) = ctl_action_into_ipc(action).expect("maps");
+        let (label, cmd) = ctl_action_into_ipc(action, &I18nRegistry::new("en")).expect("maps");
         assert_eq!(label, "pause");
         assert!(matches!(
             cmd,
@@ -1408,6 +1675,204 @@ mod tests {
         assert!(
             CliArgs::try_parse_from(["routeward", "ctl", "pause", "--seconds", "86401"]).is_err()
         );
+    }
+
+    fn ctl_ipc(args: &[&str]) -> (&'static str, IpcCommand) {
+        let mut argv = vec!["routeward", "ctl"];
+        argv.extend_from_slice(args);
+        let parsed = CliArgs::try_parse_from(argv).expect("parses");
+        let Commands::Ctl { action } = parsed.command else {
+            panic!("expected ctl");
+        };
+        ctl_action_into_ipc(action, &I18nRegistry::new("en")).expect("maps")
+    }
+
+    #[test]
+    fn ctl_logs_without_options_keeps_the_raw_buffer_dump() {
+        let (label, cmd) = ctl_ipc(&["logs"]);
+        assert_eq!(label, "logs");
+        assert!(matches!(cmd, IpcCommand::ListLogs));
+    }
+
+    #[test]
+    fn ctl_logs_options_become_a_query_for_the_daemon() {
+        let (_, cmd) = ctl_ipc(&[
+            "logs",
+            "--level",
+            "warn",
+            "--component",
+            "ProxyConnector",
+            "--component",
+            "RuleEngine",
+            "--grep",
+            "timeout",
+            "--pid",
+            "42",
+            "--since",
+            "15m",
+            "--limit",
+            "50",
+        ]);
+        match cmd {
+            IpcCommand::QueryLogs {
+                source,
+                min_level,
+                components,
+                text,
+                pid,
+                since,
+                limit,
+                ..
+            } => {
+                assert_eq!(source, LogQuerySource::Memory);
+                assert_eq!(min_level, Some(LogLevel::Warn));
+                assert_eq!(components, vec!["ProxyConnector", "RuleEngine"]);
+                assert_eq!(text.as_deref(), Some("timeout"));
+                assert_eq!(pid, Some(42));
+                assert_eq!(limit, 50);
+                let age_ms = epoch_ms_now() - since.expect("since");
+                assert!((15 * 60 * 1000..15 * 60 * 1000 + 5000).contains(&age_ms));
+            }
+            other => panic!("expected query_logs, got {other:?}"),
+        }
+
+        let (_, cmd) = ctl_ipc(&["logs", "--file", "20261122"]);
+        match cmd {
+            IpcCommand::QueryLogs { source, limit, .. } => {
+                assert_eq!(
+                    source,
+                    LogQuerySource::DaemonFile {
+                        date: "20261122".to_string()
+                    }
+                );
+                assert_eq!(limit, ctl_reports::DEFAULT_LOG_LIMIT);
+            }
+            other => panic!("expected query_logs, got {other:?}"),
+        }
+        // Bad values are refused with the localized message once the locale is known.
+        let i18n = I18nRegistry::new("en");
+        for (flag, value, key) in [
+            ("--level", "loud", "cli.logs.invalid_level"),
+            ("--since", "soon", "cli.logs.invalid_since"),
+        ] {
+            let parsed =
+                CliArgs::try_parse_from(["routeward", "ctl", "logs", flag, value]).expect("parses");
+            let Commands::Ctl { action } = parsed.command else {
+                panic!("expected ctl");
+            };
+            let err = ctl_action_into_ipc(action, &i18n).expect_err("refused");
+            assert_eq!(
+                err.to_string(),
+                ctl_reports::interpolate(&i18n.t(key), &[("value", value.to_string())])
+            );
+        }
+    }
+
+    #[test]
+    fn ctl_blocked_and_diagnose_map_to_their_commands() {
+        let (label, cmd) = ctl_ipc(&["blocked"]);
+        assert_eq!(label, "blocked");
+        assert!(matches!(
+            cmd,
+            IpcCommand::ListBlocked {
+                since: None,
+                limit: None
+            }
+        ));
+        let (_, cmd) = ctl_ipc(&["blocked", "--limit", "10", "--json"]);
+        assert!(matches!(
+            cmd,
+            IpcCommand::ListBlocked {
+                since: None,
+                limit: Some(10)
+            }
+        ));
+        let (label, cmd) = ctl_ipc(&["diagnose", "--json"]);
+        assert_eq!(label, "diagnose");
+        assert!(matches!(cmd, IpcCommand::Analyze));
+        assert!(matches!(
+            CtlRender::for_action(&CtlCommands::Diagnose { json: true }),
+            CtlRender::Raw
+        ));
+        assert!(matches!(
+            CtlRender::for_action(&CtlCommands::Diagnose { json: false }),
+            CtlRender::Diagnose
+        ));
+    }
+
+    #[test]
+    fn ctl_export_diagnostics_parses_every_option() {
+        let default_days = SystemConstants::load_embedded()
+            .expect("constants")
+            .telemetry
+            .diagnostics_default_log_days;
+        let (label, cmd) = ctl_ipc(&["export-diagnostics", "--output", "out.json"]);
+        assert_eq!(label, "export-diagnostics");
+        match cmd {
+            IpcCommand::CollectDiagnostics {
+                log_days,
+                include_connections,
+                include_profile,
+                mask_domains,
+            } => {
+                assert_eq!(log_days, default_days);
+                assert!(include_connections && include_profile && !mask_domains);
+            }
+            other => panic!("expected collect_diagnostics, got {other:?}"),
+        }
+
+        let (_, cmd) = ctl_ipc(&[
+            "export-diagnostics",
+            "--output",
+            "out.json",
+            "--no-logs",
+            "--no-profile",
+            "--no-connections",
+            "--mask-domains",
+            "--force",
+        ]);
+        match cmd {
+            IpcCommand::CollectDiagnostics {
+                log_days,
+                include_connections,
+                include_profile,
+                mask_domains,
+            } => {
+                assert_eq!(log_days, 0);
+                assert!(!include_connections && !include_profile && mask_domains);
+            }
+            other => panic!("expected collect_diagnostics, got {other:?}"),
+        }
+        let (_, cmd) = ctl_ipc(&["export-diagnostics", "--output", "o", "--log-days", "7"]);
+        assert!(matches!(
+            cmd,
+            IpcCommand::CollectDiagnostics { log_days: 7, .. }
+        ));
+        // --output is required.
+        assert!(CliArgs::try_parse_from(["routeward", "ctl", "export-diagnostics"]).is_err());
+    }
+
+    #[test]
+    fn export_refuses_an_existing_file_before_calling_the_daemon() {
+        let parsed = CliArgs::try_parse_from([
+            "routeward",
+            "ctl",
+            "export-diagnostics",
+            "--output",
+            "x.json",
+            "--force",
+        ])
+        .expect("parses");
+        let Commands::Ctl { action } = parsed.command else {
+            panic!("expected ctl");
+        };
+        match CtlRender::for_action(&action) {
+            CtlRender::Export { output, force } => {
+                assert_eq!(output, PathBuf::from("x.json"));
+                assert!(force);
+            }
+            _ => panic!("expected export render"),
+        }
     }
 
     #[test]
@@ -1604,6 +2069,7 @@ mod tests {
         let upsert_resp = execute_ctl_action(
             &client,
             &user_logger,
+            &I18nRegistry::new("en"),
             CtlCommands::UpsertRule {
                 json: Some(temp_rule_json),
                 json_file: None,
@@ -1613,9 +2079,14 @@ mod tests {
         .expect("execute ctl upsert-rule");
         assert!(upsert_resp.ok);
 
-        let state_after_add = execute_ctl_action(&client, &user_logger, CtlCommands::State)
-            .await
-            .expect("execute ctl state");
+        let state_after_add = execute_ctl_action(
+            &client,
+            &user_logger,
+            &I18nRegistry::new("en"),
+            CtlCommands::State,
+        )
+        .await
+        .expect("execute ctl state");
         let parsed_after_add: DaemonFullState =
             serde_json::from_value(state_after_add.result.expect("state result"))
                 .expect("decode DaemonFullState");
@@ -1629,6 +2100,7 @@ mod tests {
         let remove_resp = execute_ctl_action(
             &client,
             &user_logger,
+            &I18nRegistry::new("en"),
             CtlCommands::RemoveRule {
                 id: "rule-temp-block-test".to_string(),
             },
@@ -1637,9 +2109,14 @@ mod tests {
         .expect("execute ctl remove-rule");
         assert!(remove_resp.ok);
 
-        let state_after_remove = execute_ctl_action(&client, &user_logger, CtlCommands::State)
-            .await
-            .expect("execute ctl state after remove");
+        let state_after_remove = execute_ctl_action(
+            &client,
+            &user_logger,
+            &I18nRegistry::new("en"),
+            CtlCommands::State,
+        )
+        .await
+        .expect("execute ctl state after remove");
         let parsed_after_remove: DaemonFullState =
             serde_json::from_value(state_after_remove.result.expect("state result"))
                 .expect("decode DaemonFullState");
@@ -1720,6 +2197,7 @@ mod tests {
         let resp_valid = execute_ctl_action(
             &client,
             &user_logger,
+            &I18nRegistry::new("en"),
             CtlCommands::UpsertRule {
                 json: None,
                 json_file: Some(valid_file_path.clone()),
@@ -1743,6 +2221,7 @@ mod tests {
         let resp_bom = execute_ctl_action(
             &client,
             &user_logger,
+            &I18nRegistry::new("en"),
             CtlCommands::UpsertRule {
                 json: None,
                 json_file: Some(bom_file_path.clone()),
@@ -1752,9 +2231,14 @@ mod tests {
         .expect("upsert-rule via UTF-8 BOM --json-file");
         assert!(resp_bom.ok);
 
-        let state_resp = execute_ctl_action(&client, &user_logger, CtlCommands::State)
-            .await
-            .expect("query state");
+        let state_resp = execute_ctl_action(
+            &client,
+            &user_logger,
+            &I18nRegistry::new("en"),
+            CtlCommands::State,
+        )
+        .await
+        .expect("query state");
         let parsed_state: DaemonFullState =
             serde_json::from_value(state_resp.result.expect("state result")).expect("decode state");
         let stored_rule = parsed_state

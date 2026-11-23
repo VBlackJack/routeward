@@ -16,6 +16,10 @@
 
 #[cfg(not(windows))]
 use super::nftables::NftablesInterceptor;
+use super::policy::{
+    block_reason_for_decision, block_reason_for_rule, port_policy_override,
+    unknown_process_block_reason, upstream_proxy_id, UNKNOWN_PROCESS_RULE_ID,
+};
 use super::{
     RouteWardController, COMPONENT_DNS, COMPONENT_ENGINE, COMPONENT_TRANSPARENT, ROUTE_BLOCK_LABEL,
 };
@@ -28,7 +32,7 @@ use crate::proxy::sni::TlsSniExtractor;
 use crate::proxy::udp::{decode_socks5_udp_datagram, encode_socks5_udp_datagram};
 use crate::proxy::{AsyncTunnelStream, ProxyConnector};
 use crate::rules::ConnectionRequest;
-use crate::telemetry::{ConnectionStatus, LogLevel, TrackedConnection};
+use crate::telemetry::{BlockReason, BlockedRecord, ConnectionStatus, LogLevel, TrackedConnection};
 use chrono::Utc;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -176,10 +180,11 @@ impl RouteWardController {
             process_name: proc_id.name.clone(),
             process_path: Some(proc_id.executable_path.clone()),
             target_host: target_host.clone(),
-            target_ip: target_ip_str,
+            target_ip: target_ip_str.clone(),
             target_port,
             protocol: TransportProtocol::Tcp,
         });
+        let mut policy_block_reason: Option<BlockReason> = None;
         if proc_id.is_unattributed() && eval.action == RuleAction::Direct {
             let (action, matched_rule_name) = self.resolve_unknown_process_action(
                 COMPONENT_ENGINE,
@@ -188,7 +193,10 @@ impl RouteWardController {
                 target_port,
                 "local SOCKS5 client PID or executable image unavailable",
             );
-            eval.matched_rule_id = "unknown-process-action".to_string();
+            eval.matched_rule_id = UNKNOWN_PROCESS_RULE_ID.to_string();
+            if action == RuleAction::Block {
+                policy_block_reason = Some(unknown_process_block_reason(&matched_rule_name));
+            }
             eval.matched_rule_name = matched_rule_name;
             eval.action = action;
         }
@@ -198,45 +206,44 @@ impl RouteWardController {
             .clone()
             .unwrap_or_else(|| target_host.clone());
 
-        if target_port == self.constants.dns.dns_over_tls_port
-            && self
-                .profile
-                .read()
-                .security_policy
-                .block_encrypted_dns_bypass
-        {
-            self.telemetry.push_log(
-                LogLevel::Warn,
-                COMPONENT_DNS,
-                format!(
-                    "Blocked encrypted DNS bypass (DoT TCP port {}) via local SOCKS5 for PID={} process=\"{}\" -> {}",
-                    target_port, proc_id.pid, proc_id.name, effective_host
-                ),
-            );
-            eval.matched_rule_name = "SecurityPolicy:blockEncryptedDnsBypass".to_string();
-            eval.action = RuleAction::Block;
+        let dot_override = port_policy_override(
+            &self.profile.read().security_policy,
+            self.policy_ports(),
+            TransportProtocol::Tcp,
+            target_port,
+        );
+        if let Some(over) = dot_override {
+            over.apply(&mut eval);
+            policy_block_reason = Some(over.reason);
         }
 
         if eval.action == RuleAction::Block {
-            let blocked_conn = TrackedConnection {
-                id: Uuid::new_v4().to_string(),
-                pid: proc_id.pid,
-                process_name: proc_id.name,
-                process_path: proc_id.executable_path,
-                target_host,
-                resolved_domain: eval.effective_domain,
-                target_port,
-                protocol: TransportProtocol::Tcp,
-                matched_rule: eval.matched_rule_name,
-                route_label: ROUTE_BLOCK_LABEL.to_string(),
-                latency_ms: 0,
-                rx_bytes: 0,
-                tx_bytes: 0,
-                status: ConnectionStatus::Blocked,
-                started_at: Utc::now(),
-                error_detail: None,
-            };
-            self.telemetry.record_connection(blocked_conn, false);
+            let reason =
+                policy_block_reason.unwrap_or_else(|| block_reason_for_rule(&eval.matched_rule_id));
+            let blocked_conn = TrackedConnection::blocked(
+                BlockedRecord::new(reason, TransportProtocol::Tcp, eval.matched_rule_name)
+                    .process(
+                        proc_id.name.clone(),
+                        proc_id.executable_path.clone(),
+                        proc_id.pid,
+                    )
+                    .target(target_host, target_port)
+                    .with_ip(target_ip_str.clone())
+                    .with_domain(eval.effective_domain)
+                    .with_rule_id(eval.matched_rule_id),
+            );
+            if reason == BlockReason::EncryptedDnsBlocked {
+                self.log_and_record_blocked(
+                    COMPONENT_DNS,
+                    format!(
+                        "Blocked encrypted DNS bypass (DoT TCP port {}) via local SOCKS5 for PID={} process=\"{}\" -> {}",
+                        target_port, proc_id.pid, proc_id.name, effective_host
+                    ),
+                    blocked_conn,
+                );
+            } else {
+                self.telemetry.record_connection(blocked_conn, false);
+            }
             Self::send_socks5_failure_and_close(&mut client, proto).await;
             return Ok(());
         }
@@ -255,40 +262,32 @@ impl RouteWardController {
             Ok(stream) => (stream, eval.action.clone()),
             Err(err) => {
                 if is_proxied_rule && kill_switch_enabled {
-                    self.telemetry.push_log(
-                        LogLevel::Warn,
-                        COMPONENT_ENGINE,
-                        format!(
-                            "Kill-Switch blocked local SOCKS5 connection PID={} process=\"{}\" exe=\"{}\" -> {}:{} [rule=\"{}\", killSwitchEnabled=true]: {}",
-                            proc_id.pid,
-                            proc_id.name,
-                            proc_id.executable_path,
-                            effective_host,
-                            target_port,
-                            eval.matched_rule_name,
-                            err
-                        ),
+                    let message = format!(
+                        "Kill-Switch blocked local SOCKS5 connection PID={} process=\"{}\" exe=\"{}\" -> {}:{} [rule=\"{}\", killSwitchEnabled=true]: {}",
+                        proc_id.pid,
+                        proc_id.name,
+                        proc_id.executable_path,
+                        effective_host,
+                        target_port,
+                        eval.matched_rule_name,
+                        err
                     );
-                    self.telemetry.record_connection(
-                        TrackedConnection {
-                            id: Uuid::new_v4().to_string(),
-                            pid: proc_id.pid,
-                            process_name: proc_id.name,
-                            process_path: proc_id.executable_path,
-                            target_host,
-                            resolved_domain: eval.effective_domain,
-                            target_port,
-                            protocol: TransportProtocol::Tcp,
-                            matched_rule: eval.matched_rule_name,
-                            route_label: ROUTE_BLOCK_LABEL.to_string(),
-                            latency_ms: 0,
-                            rx_bytes: 0,
-                            tx_bytes: 0,
-                            status: ConnectionStatus::Blocked,
-                            started_at: Utc::now(),
-                            error_detail: Some(err.to_string()),
-                        },
-                        false,
+                    let record = BlockedRecord::new(
+                        BlockReason::from_upstream_error(&err),
+                        TransportProtocol::Tcp,
+                        eval.matched_rule_name,
+                    )
+                    .process(proc_id.name, proc_id.executable_path, proc_id.pid)
+                    .target(target_host, target_port)
+                    .with_ip(target_ip_str.clone())
+                    .with_domain(eval.effective_domain)
+                    .with_rule_id(eval.matched_rule_id)
+                    .with_proxy(upstream_proxy_id(&eval.action))
+                    .with_error(err.to_string());
+                    self.log_and_record_blocked(
+                        COMPONENT_ENGINE,
+                        message,
+                        TrackedConnection::blocked(record),
                     );
                     Self::send_socks5_failure_and_close(&mut client, proto).await;
                     return Err(err);
@@ -357,6 +356,11 @@ impl RouteWardController {
             status: ConnectionStatus::Active,
             started_at: Utc::now(),
             error_detail: None,
+            block_reason: None,
+            matched_rule_id: None,
+            proxy_id: None,
+            target_ip: None,
+            simulated: false,
         };
         self.telemetry.record_connection(tracked, is_proxied);
         let _ = self
@@ -524,6 +528,8 @@ impl RouteWardController {
             }
             let is_fake_ip = self.is_in_fake_subnet_any(&session.orig_dst_ip);
             let mut resolved_domain = self.resolve_fake_ip_any(&session.orig_dst_ip);
+            // Id of the rule that decided this session; known only after the SNI / Host re-evaluation.
+            let mut session_rule_id: Option<String> = None;
 
             // When destination is not a Fake-IP, inspect TLS ClientHello SNI or HTTP Host header
             // and re-evaluate domain routing rules.
@@ -540,46 +546,46 @@ impl RouteWardController {
                     });
                     session.action = eval.action;
                     session.matched_rule_name = eval.matched_rule_name;
+                    session_rule_id = Some(eval.matched_rule_id);
                     resolved_domain = Some(inspected_domain);
                 }
             }
 
             if session.action == RuleAction::Block {
-                self.telemetry.push_log(
-                    LogLevel::Warn,
-                    COMPONENT_TRANSPARENT,
-                    format!(
-                        "Blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} (domain={:?}) [rule=\"{}\"]",
-                        session.pid,
-                        session.process_name,
-                        session.process_path,
-                        session.resolution_source.as_str(),
-                        target_host,
-                        target_port,
-                        resolved_domain,
-                        session.matched_rule_name
-                    ),
+                let message = format!(
+                    "Blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} (domain={:?}) [rule=\"{}\"]",
+                    session.pid,
+                    session.process_name,
+                    session.process_path,
+                    session.resolution_source.as_str(),
+                    target_host,
+                    target_port,
+                    resolved_domain,
+                    session.matched_rule_name
                 );
-                self.telemetry.record_connection(
-                    TrackedConnection {
-                        id: Uuid::new_v4().to_string(),
-                        pid: session.pid,
-                        process_name: session.process_name.clone(),
-                        process_path: session.process_path.clone(),
-                        target_host,
-                        resolved_domain,
-                        target_port,
-                        protocol: TransportProtocol::Tcp,
-                        matched_rule: session.matched_rule_name.clone(),
-                        route_label: ROUTE_BLOCK_LABEL.to_string(),
-                        latency_ms: 0,
-                        rx_bytes: 0,
-                        tx_bytes: 0,
-                        status: ConnectionStatus::Blocked,
-                        started_at: Utc::now(),
-                        error_detail: None,
-                    },
-                    false,
+                let reason = block_reason_for_decision(
+                    session_rule_id.as_deref(),
+                    &session.matched_rule_name,
+                );
+                let mut record = BlockedRecord::new(
+                    reason,
+                    TransportProtocol::Tcp,
+                    session.matched_rule_name.clone(),
+                )
+                .process(
+                    session.process_name.clone(),
+                    session.process_path.clone(),
+                    session.pid,
+                )
+                .target(target_host, target_port)
+                .with_domain(resolved_domain);
+                if let Some(id) = session_rule_id {
+                    record = record.with_rule_id(id);
+                }
+                self.log_and_record_blocked(
+                    COMPONENT_TRANSPARENT,
+                    message,
+                    TrackedConnection::blocked(record),
                 );
                 let _ = client.shutdown().await;
                 self.nat_table
@@ -613,41 +619,38 @@ impl RouteWardController {
                 Ok(stream) => (stream, session.action.clone()),
                 Err(err) => {
                     if is_proxied_rule && kill_switch_enabled {
-                        self.telemetry.push_log(
-                            LogLevel::Warn,
-                            COMPONENT_TRANSPARENT,
-                            format!(
-                                "Kill-Switch blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\", killSwitchEnabled=true]: {}",
-                                session.pid,
-                                session.process_name,
-                                session.process_path,
-                                session.resolution_source.as_str(),
-                                target_host,
-                                target_port,
-                                session.matched_rule_name,
-                                err
-                            ),
+                        let message = format!(
+                            "Kill-Switch blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\", killSwitchEnabled=true]: {}",
+                            session.pid,
+                            session.process_name,
+                            session.process_path,
+                            session.resolution_source.as_str(),
+                            target_host,
+                            target_port,
+                            session.matched_rule_name,
+                            err
                         );
-                        self.telemetry.record_connection(
-                            TrackedConnection {
-                                id: Uuid::new_v4().to_string(),
-                                pid: session.pid,
-                                process_name: session.process_name.clone(),
-                                process_path: session.process_path.clone(),
-                                target_host,
-                                resolved_domain,
-                                target_port,
-                                protocol: TransportProtocol::Tcp,
-                                matched_rule: session.matched_rule_name.clone(),
-                                route_label: ROUTE_BLOCK_LABEL.to_string(),
-                                latency_ms: 0,
-                                rx_bytes: 0,
-                                tx_bytes: 0,
-                                status: ConnectionStatus::Blocked,
-                                started_at: Utc::now(),
-                                error_detail: Some(err.to_string()),
-                            },
-                            false,
+                        let mut record = BlockedRecord::new(
+                            BlockReason::from_upstream_error(&err),
+                            TransportProtocol::Tcp,
+                            session.matched_rule_name.clone(),
+                        )
+                        .process(
+                            session.process_name.clone(),
+                            session.process_path.clone(),
+                            session.pid,
+                        )
+                        .target(target_host, target_port)
+                        .with_domain(resolved_domain)
+                        .with_proxy(upstream_proxy_id(&session.action))
+                        .with_error(err.to_string());
+                        if let Some(id) = session_rule_id {
+                            record = record.with_rule_id(id);
+                        }
+                        self.log_and_record_blocked(
+                            COMPONENT_TRANSPARENT,
+                            message,
+                            TrackedConnection::blocked(record),
                         );
                         let _ = client.shutdown().await;
                         self.nat_table
@@ -744,6 +747,11 @@ impl RouteWardController {
                 status: ConnectionStatus::Active,
                 started_at: Utc::now(),
                 error_detail: None,
+                block_reason: None,
+                matched_rule_id: None,
+                proxy_id: None,
+                target_ip: None,
+                simulated: false,
             };
             self.telemetry.record_connection(tracked, is_proxied);
 
@@ -802,6 +810,7 @@ impl RouteWardController {
                     Some(&orig_dst_ip),
                 );
 
+                let mut nat_rule_id: Option<String> = None;
                 if let Some(ref sni) = sni_domain {
                     if proc_name != "unknown" {
                         let sni_eval = self.evaluate_rule(&ConnectionRequest {
@@ -814,17 +823,18 @@ impl RouteWardController {
                         });
                         eval_action = sni_eval.action;
                         matched_rule_name = sni_eval.matched_rule_name;
+                        nat_rule_id = Some(sni_eval.matched_rule_id);
                     }
                     effective_domain = Some(sni.clone());
                 }
 
-                if target_port == self.constants.dns.dns_over_tls_port
-                    && self
-                        .profile
-                        .read()
-                        .security_policy
-                        .block_encrypted_dns_bypass
-                {
+                let nat_dot_override = port_policy_override(
+                    &self.profile.read().security_policy,
+                    self.policy_ports(),
+                    TransportProtocol::Tcp,
+                    target_port,
+                );
+                if let Some(over) = nat_dot_override {
                     self.telemetry.push_log(
                         LogLevel::Warn,
                         COMPONENT_DNS,
@@ -834,7 +844,8 @@ impl RouteWardController {
                         ),
                     );
                     eval_action = RuleAction::Block;
-                    matched_rule_name = "SecurityPolicy:blockEncryptedDnsBypass".to_string();
+                    matched_rule_name = over.rule_name.to_string();
+                    nat_rule_id = Some(over.rule_id.to_string());
                 }
 
                 let is_proxied_rule = matches!(
@@ -855,40 +866,30 @@ impl RouteWardController {
                 };
 
                 if eval_action == RuleAction::Block {
-                    self.telemetry.push_log(
-                        LogLevel::Warn,
-                        COMPONENT_TRANSPARENT,
-                        format!(
-                            "Blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\"] (TCP RST)",
-                            pid,
-                            proc_name,
-                            proc_path,
-                            res_source,
-                            target_host,
-                            target_port,
-                            matched_rule_name
-                        ),
+                    let message = format!(
+                        "Blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\"] (TCP RST)",
+                        pid,
+                        proc_name,
+                        proc_path,
+                        res_source,
+                        target_host,
+                        target_port,
+                        matched_rule_name
                     );
-                    self.telemetry.record_connection(
-                        TrackedConnection {
-                            id: Uuid::new_v4().to_string(),
-                            pid,
-                            process_name: proc_name,
-                            process_path: proc_path,
-                            target_host,
-                            resolved_domain: effective_domain,
-                            target_port,
-                            protocol: TransportProtocol::Tcp,
-                            matched_rule: matched_rule_name,
-                            route_label: ROUTE_BLOCK_LABEL.to_string(),
-                            latency_ms: 0,
-                            rx_bytes: 0,
-                            tx_bytes: 0,
-                            status: ConnectionStatus::Blocked,
-                            started_at: Utc::now(),
-                            error_detail: None,
-                        },
-                        false,
+                    let rule_id = nat_rule_id.or_else(|| self.rule_id_by_name(&matched_rule_name));
+                    let reason = block_reason_for_decision(rule_id.as_deref(), &matched_rule_name);
+                    let mut record =
+                        BlockedRecord::new(reason, TransportProtocol::Tcp, matched_rule_name)
+                            .process(proc_name, proc_path, pid)
+                            .target(target_host, target_port)
+                            .with_domain(effective_domain);
+                    if let Some(id) = rule_id {
+                        record = record.with_rule_id(id);
+                    }
+                    self.log_and_record_blocked(
+                        COMPONENT_TRANSPARENT,
+                        message,
+                        TrackedConnection::blocked(record),
                     );
                     NftablesInterceptor::reset_and_close_tcp_stream(client);
                     return Ok(());
@@ -904,41 +905,36 @@ impl RouteWardController {
                     Ok(stream) => (stream, eval_action.clone()),
                     Err(err) => {
                         if is_proxied_rule && kill_switch_enabled {
-                            self.telemetry.push_log(
-                                LogLevel::Warn,
-                                COMPONENT_TRANSPARENT,
-                                format!(
-                                    "Kill-Switch blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\", killSwitchEnabled=true]: {}",
-                                    pid,
-                                    proc_name,
-                                    proc_path,
-                                    res_source,
-                                    target_host,
-                                    target_port,
-                                    matched_rule_name,
-                                    err
-                                ),
+                            let message = format!(
+                                "Kill-Switch blocked connection PID={} process=\"{}\" exe=\"{}\" resolvedVia={} -> {}:{} [rule=\"{}\", killSwitchEnabled=true]: {}",
+                                pid,
+                                proc_name,
+                                proc_path,
+                                res_source,
+                                target_host,
+                                target_port,
+                                matched_rule_name,
+                                err
                             );
-                            self.telemetry.record_connection(
-                                TrackedConnection {
-                                    id: Uuid::new_v4().to_string(),
-                                    pid,
-                                    process_name: proc_name,
-                                    process_path: proc_path,
-                                    target_host,
-                                    resolved_domain: effective_domain,
-                                    target_port,
-                                    protocol: TransportProtocol::Tcp,
-                                    matched_rule: matched_rule_name,
-                                    route_label: ROUTE_BLOCK_LABEL.to_string(),
-                                    latency_ms: 0,
-                                    rx_bytes: 0,
-                                    tx_bytes: 0,
-                                    status: ConnectionStatus::Blocked,
-                                    started_at: Utc::now(),
-                                    error_detail: Some(err.to_string()),
-                                },
-                                false,
+                            let rule_id =
+                                nat_rule_id.or_else(|| self.rule_id_by_name(&matched_rule_name));
+                            let mut record = BlockedRecord::new(
+                                BlockReason::from_upstream_error(&err),
+                                TransportProtocol::Tcp,
+                                matched_rule_name,
+                            )
+                            .process(proc_name, proc_path, pid)
+                            .target(target_host, target_port)
+                            .with_domain(effective_domain)
+                            .with_proxy(upstream_proxy_id(&eval_action))
+                            .with_error(err.to_string());
+                            if let Some(id) = rule_id {
+                                record = record.with_rule_id(id);
+                            }
+                            self.log_and_record_blocked(
+                                COMPONENT_TRANSPARENT,
+                                message,
+                                TrackedConnection::blocked(record),
                             );
                             NftablesInterceptor::reset_and_close_tcp_stream(client);
                             return Err(err);
@@ -1017,6 +1013,11 @@ impl RouteWardController {
                     status: ConnectionStatus::Active,
                     started_at: Utc::now(),
                     error_detail: None,
+                    block_reason: None,
+                    matched_rule_id: None,
+                    proxy_id: None,
+                    target_ip: None,
+                    simulated: false,
                 };
                 self.telemetry.record_connection(tracked, is_proxied);
                 let _ = self

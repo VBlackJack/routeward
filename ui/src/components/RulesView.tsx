@@ -68,6 +68,7 @@ import {
 import { ExperienceMode } from './QuickSetupWizardModal';
 import { ModalContainer } from './ModalContainer';
 import { ConfirmDeleteButton } from './ConfirmDeleteButton';
+import { TemporaryRuleBadge } from './TemporaryRuleBadge';
 
 interface RulesViewProps {
   rules: RoutingRule[];
@@ -1229,6 +1230,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                         <div>
                           <div className="text-xs font-bold text-tf-primary">
                             {rule.name}
+                            <TemporaryRuleBadge expiresAt={rule.expiresAt} />
                           </div>
                           <div className="font-mono text-[11px] text-tf-secondary">
                             {targetSummary.length > 0
@@ -1356,6 +1358,7 @@ export const RulesView: React.FC<RulesViewProps> = ({
                     </td>
                     <td className="min-w-[160px] px-3 py-3 font-semibold text-tf-primary">
                       {rule.name}
+                      <TemporaryRuleBadge expiresAt={rule.expiresAt} />
                     </td>
                     <td className="px-3 py-3 font-mono text-[11px] text-tf-secondary">
                       {rule.processPatterns.length > 0

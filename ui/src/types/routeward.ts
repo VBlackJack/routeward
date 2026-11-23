@@ -127,6 +127,8 @@ export interface RoutingRule {
   portRanges: PortRange[];
   protocol: TransportProtocol;
   action: RuleAction;
+  /** When set, the rule stops applying at that instant and the daemon removes it (temporary unblock). */
+  expiresAt?: string | null;
 }
 
 export interface DnsConfig {
@@ -182,6 +184,15 @@ export interface TrackedConnection {
   status: ConnectionStatus;
   startedAt: string;
   errorDetail?: string | null;
+  /** Why the connection was blocked; absent on records from older daemons. */
+  blockReason?: BlockReason;
+  /** Identifier of the rule that decided; absent when no rule applied. */
+  matchedRuleId?: string;
+  /** Proxy that failed, for kill switch blocks. */
+  proxyId?: string;
+  targetIp?: string;
+  /** True for records created by a socket scan or a simulation, never by real traffic. */
+  simulated?: boolean;
 }
 
 export interface ProfileSummary {
@@ -278,12 +289,172 @@ export interface FakeIpEntry {
   ttlRemainingSeconds: number;
 }
 
+export interface LogContext {
+  pid?: number;
+  connectionId?: string;
+  host?: string;
+  port?: number;
+}
+
 export interface LogEntry {
   id: string;
   timestamp: string;
   level: LogLevel;
   component: string;
   message: string;
+  context?: LogContext;
+}
+
+/** Why a connection was blocked (mirrors the engine's BlockReason, camelCase). */
+export type BlockReason =
+  | 'ruleBlock'
+  | 'defaultPolicyBlock'
+  | 'killSwitchProxyUnreachable'
+  | 'killSwitchProxyRefused'
+  | 'killSwitchProxyTimeout'
+  | 'killSwitchProxyAuthRejected'
+  | 'killSwitchProxyHandshake'
+  | 'killSwitchProxyMisconfigured'
+  | 'udpProxyUnsupported'
+  | 'killSwitchDirectUdpFailed'
+  | 'fragmentedUdpBlocked'
+  | 'unknownProcessPolicy'
+  | 'unknownProcessKillSwitch'
+  | 'fakeIpEgressGuard'
+  | 'quicBlocked'
+  | 'encryptedDnsBlocked'
+  | 'localNameGuard'
+  | 'dnsServerBlockedByRule'
+  | 'unknown';
+
+/** One aggregated line of the daemon's blocked summary. */
+export interface BlockedSummaryEntry {
+  processName: string;
+  processPath: string;
+  /** Domain when known, else the IP address. */
+  destination: string;
+  targetPort: number;
+  protocol: TransportProtocol;
+  blockReason: BlockReason;
+  matchedRuleId?: string;
+  matchedRule?: string;
+  proxyId?: string;
+  count: number;
+  firstSeen: string;
+  lastSeen: string;
+  lastConnectionId: string;
+  lastPid: number;
+  lastErrorDetail?: string;
+}
+
+/** Packets dropped without an owning application (never listed as rows). */
+export interface BlockedCounters {
+  droppedUnattributedSyn: number;
+  droppedUnattributedUdp: number;
+  [extra: string]: number | undefined;
+}
+
+export interface BlockedResponse {
+  entries: BlockedSummaryEntry[];
+  counters: BlockedCounters;
+}
+
+/** Where a log query reads from: the live memory ring or one daemon file by date (yyyyMMdd). */
+export type LogQuerySource = 'memory' | { daemonFile: { date: string } };
+
+export interface QueryLogsRequest {
+  source: LogQuerySource;
+  minLevel?: LogLevel;
+  components?: string[];
+  text?: string;
+  pid?: number;
+  connectionId?: string;
+  /** Epoch milliseconds. */
+  since?: number;
+  until?: number;
+  limit: number;
+  cursor?: string;
+}
+
+export interface QueryLogsResponse {
+  entries: LogEntry[];
+  truncated: boolean;
+  /** Dates (yyyyMMdd) of the log files the daemon holds. */
+  availableDates: string[];
+  nextCursor?: string;
+}
+
+export type FindingSeverity = 'info' | 'warning' | 'critical';
+
+export interface FindingSubject {
+  app?: string;
+  site?: string;
+  proxyId?: string;
+  ruleId?: string;
+}
+
+export type FixAction =
+  | { type: 'openProxy'; id: string }
+  | { type: 'testProxy'; id: string }
+  | { type: 'unblock'; key: Partial<BlockedSummaryEntry> }
+  | { type: 'editRule'; id: string }
+  | { type: 'pauseProtection' }
+  | { type: 'openSetting'; key: string }
+  | { type: 'restartApp' }
+  | { type: 'runElevated' }
+  | { type: 'none' };
+
+export interface Finding {
+  code: string;
+  severity: FindingSeverity;
+  subject: FindingSubject;
+  evidenceCount: number;
+  lastSeen?: string;
+  fix: FixAction;
+}
+
+export interface AnalyzeResponse {
+  findings: Finding[];
+}
+
+export interface CollectDiagnosticsRequest {
+  logDays: number;
+  includeConnections: boolean;
+  includeProfile: boolean;
+  maskDomains: boolean;
+}
+
+export interface DiagnosticSectionInfo {
+  name: string;
+  bytes: number;
+}
+
+export interface DiagnosticManifest {
+  version: string | number;
+  os?: string;
+  generatedAt?: string;
+  sections: DiagnosticSectionInfo[];
+  /** Plain list of the redactions applied (for example "passwords", "proxy usernames"). */
+  redactions?: string[];
+  maskDomains?: boolean;
+}
+
+/** The redacted diagnostic file: a manifest describing the sections that follow. */
+export interface DiagnosticBundle {
+  manifest: DiagnosticManifest;
+  [section: string]: unknown;
+}
+
+export interface PreviewRuleChangeRequest {
+  upserts: RoutingRule[];
+  removeIds: string[];
+  request: ConnectionRequest;
+}
+
+export interface PreviewRuleChangeResponse {
+  evaluation: RuleEvaluationResult;
+  /** Set when a security policy would still block the connection despite the rule change. */
+  policyOverride?: BlockReason;
 }
 
 export interface ConnectionRequest {

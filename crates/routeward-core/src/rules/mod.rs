@@ -17,6 +17,7 @@
 use crate::config::{RoutingRule, RuleAction, TransportProtocol};
 use crate::dns::FakeIpEngine;
 use crate::process::ProcessResolver;
+use chrono::{DateTime, Utc};
 use ipnet::IpNet;
 use parking_lot::RwLock;
 use regex::{Regex, RegexBuilder};
@@ -28,7 +29,7 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 
 pub(crate) const DEFAULT_FALLBACK_RULE_ID: &str = "default-policy";
-const DEFAULT_FALLBACK_RULE_NAME: &str = "Default Profile Policy";
+pub(crate) const DEFAULT_FALLBACK_RULE_NAME: &str = "Default Profile Policy";
 const REGEX_PREFIX: &str = "regex:";
 /// Maximum number of compiled patterns kept per cache (user regexes and wildcard-derived
 /// regexes are cached separately). When full, the oldest entry is evicted (FIFO).
@@ -101,6 +102,32 @@ impl RuleEngine {
         default_action: &RuleAction,
         fake_ip_engine: Option<&FakeIpEngine>,
     ) -> RuleEvaluationResult {
+        Self::evaluate_at(request, rules, default_action, fake_ip_engine, Utc::now())
+    }
+
+    /// True when the rule carries an `expiresAt` that is not after `now`.
+    pub fn is_expired(rule: &RoutingRule, now: DateTime<Utc>) -> bool {
+        rule.expires_at.is_some_and(|at| at <= now)
+    }
+
+    /// Ids of the rules whose `expiresAt` has passed at `now`: what the periodic sweeper removes.
+    pub fn expired_rule_ids(rules: &[RoutingRule], now: DateTime<Utc>) -> Vec<String> {
+        rules
+            .iter()
+            .filter(|r| Self::is_expired(r, now))
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
+    /// [`Self::evaluate`] with an explicit clock: enabled rules whose `expiresAt` has passed at
+    /// `now` are skipped.
+    pub fn evaluate_at(
+        request: &ConnectionRequest,
+        rules: &[RoutingRule],
+        default_action: &RuleAction,
+        fake_ip_engine: Option<&FakeIpEngine>,
+        now: DateTime<Utc>,
+    ) -> RuleEvaluationResult {
         let mut effective_domain: Option<String> = None;
         let mut resolved_from_fake_ip = false;
 
@@ -133,7 +160,10 @@ impl RuleEngine {
             Cow::Owned(copy)
         };
 
-        for rule in ordered.iter().filter(|r| r.enabled) {
+        for rule in ordered
+            .iter()
+            .filter(|r| r.enabled && !Self::is_expired(r, now))
+        {
             if Self::matches_rule(
                 rule,
                 request,
@@ -463,6 +493,7 @@ mod tests {
             action: RuleAction::Proxy {
                 target_id: "test-proxy".to_string(),
             },
+            expires_at: None,
         });
         let dns = FakeIpEngine::new(&profile.dns_config, &constants.dns);
 
@@ -544,6 +575,7 @@ mod tests {
                 action: RuleAction::Proxy {
                     target_id: "corp-proxy".to_string(),
                 },
+                expires_at: None,
             },
             crate::config::RoutingRule {
                 id: "all-except-system".to_string(),
@@ -558,6 +590,7 @@ mod tests {
                 action: RuleAction::Proxy {
                     target_id: "default-proxy".to_string(),
                 },
+                expires_at: None,
             },
         ];
 
@@ -657,6 +690,7 @@ mod tests {
             action: RuleAction::Proxy {
                 target_id: "ext-proxy".to_string(),
             },
+            expires_at: None,
         }];
 
         for host in ["meshcore.net", "map.meshcore.net", "api.eu.meshcore.net"] {
@@ -737,6 +771,7 @@ mod tests {
             port_ranges: vec![],
             protocol: TransportProtocol::Any,
             action: RuleAction::Direct,
+            expires_at: None,
         }
     }
 
@@ -797,6 +832,7 @@ mod tests {
             action: RuleAction::Proxy {
                 target_id: TABLE_PROXY_ID.to_string(),
             },
+            expires_at: None,
         }
     }
 
@@ -1170,3 +1206,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "expiry_tests.rs"]
+mod expiry_tests;
