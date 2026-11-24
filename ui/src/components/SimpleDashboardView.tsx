@@ -55,11 +55,7 @@ import {
 } from '../types/routeward';
 import { DashboardUseCaseId } from './DashboardView';
 import { BlockedShortcut } from './BlockedShortcut';
-
-/** The desktop starts (Windows) or checks (Linux: group and service) the daemon for these systems. */
-const DAEMON_START_OS_NAMES: readonly string[] = ['WINDOWS', 'LINUX'];
-const canStartDaemonFromUi = (osName: string): boolean =>
-  DAEMON_START_OS_NAMES.includes(osName);
+import { canStartDaemonFromUi } from '../services/platform';
 
 interface SimpleDashboardViewProps {
   telemetry: TelemetrySnapshot;

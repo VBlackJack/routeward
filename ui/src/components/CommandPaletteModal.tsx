@@ -228,10 +228,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
   }, [selectedIndex, filteredItems.length]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      onClose();
-    } else if (e.key === 'ArrowDown') {
+    if (e.key === 'ArrowDown') {
       e.preventDefault();
       setSelectedIndex((prev) =>
         filteredItems.length > 0 ? (prev + 1) % filteredItems.length : 0
