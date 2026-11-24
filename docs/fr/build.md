@@ -14,7 +14,7 @@
 
 ## Étape 1 : Compiler le Bundle Frontend
 
-`routeward-desktop` embarque `ui/dist/index.html`, `ui/dist/assets/app.js`, `ui/dist/assets/app.css` ainsi que les ressources de marque de `assets/branding/` (`routeward-glyph.svg`, `routeward-icon.svg`, `routeward-32.rgba`, `routeward-256.rgba`) à la compilation via `include_bytes!`. Sous Windows, `build.rs` incorpore également `assets/branding/routeward.ico` dans `routeward.exe` et `routeward-desktop.exe` via `embed-resource`.
+`routeward-desktop` embarque `ui/dist/index.html`, tous les chunks JavaScript et CSS générés sous `ui/dist/assets/` (découverts à la compilation par `apps/desktop/build.rs`) ainsi que les ressources de marque de `assets/branding/` (`routeward-glyph.svg`, `routeward-icon.svg`, `routeward-32.rgba`, `routeward-256.rgba`) à la compilation via `include_bytes!`. Sous Windows, `build.rs` incorpore également `assets/branding/routeward.ico` dans `routeward.exe` et `routeward-desktop.exe` via `embed-resource`.
 
 Tous les fichiers générés dans `assets/branding/` (`routeward-16.png` à `routeward-512.png`, `routeward.ico`, `routeward-32.rgba`, `routeward-256.rgba`) sont versionnés dans le dépôt afin que la compilation standard n'ait pas besoin d'exécuter le script. Pour les régénérer à partir de `assets/branding/routeward-icon.svg`, exécuter :
 
