@@ -23,6 +23,7 @@ pub mod dns_server_exempt;
 pub mod nat;
 pub mod nftables;
 pub mod policy;
+mod profiles;
 mod protection;
 mod tcp_relay;
 #[cfg(test)]
