@@ -14,13 +14,19 @@
  * limitations under the License.
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState
+} from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Activity,
   AlertTriangle,
   BookOpen,
-  CheckCircle2,
   Home,
   Power,
   RefreshCw,
@@ -30,8 +36,7 @@ import {
   ShieldAlert,
   Sparkles,
   Terminal,
-  Wand2,
-  X
+  Wand2
 } from 'lucide-react';
 import {
   buildDefaultPacUrl,
@@ -85,25 +90,49 @@ import { ConnectionsView } from './components/ConnectionsView';
 import { ProxiesView } from './components/ProxiesView';
 import { RulesView } from './components/RulesView';
 import { SettingsView } from './components/SettingsView';
-import { ThemeForgeModal } from './components/ThemeForgeModal';
 import {
   CommandPaletteModal,
   NavTabId
 } from './components/CommandPaletteModal';
 import { RouteWardLogo } from './components/RouteWardLogo';
-import { ProcessLauncherModal } from './components/ProcessLauncherModal';
-import {
-  ExperienceMode,
-  QuickSetupWizardModal
-} from './components/QuickSetupWizardModal';
-import { GlossaryModal } from './components/GlossaryModal';
-import { TroubleshootModal } from './components/TroubleshootModal';
+import type { ExperienceMode } from './components/QuickSetupWizardModal';
 import { ConfirmApplyModal } from './components/ConfirmApplyModal';
 import { ActivitySubtab, ActivitySubtabs } from './components/ActivitySubtabs';
 import { AnalyzerPanel } from './components/AnalyzerPanel';
 import { BlockedView } from './components/BlockedView';
-import { DiagnosticExportModal } from './components/DiagnosticExportModal';
+import { ToastStack } from './components/ToastStack';
 import { useUnblockFlow } from './components/useUnblockFlow';
+
+const ThemeForgeModal = lazy(() =>
+  import('./components/ThemeForgeModal').then((m) => ({
+    default: m.ThemeForgeModal
+  }))
+);
+const ProcessLauncherModal = lazy(() =>
+  import('./components/ProcessLauncherModal').then((m) => ({
+    default: m.ProcessLauncherModal
+  }))
+);
+const QuickSetupWizardModal = lazy(() =>
+  import('./components/QuickSetupWizardModal').then((m) => ({
+    default: m.QuickSetupWizardModal
+  }))
+);
+const GlossaryModal = lazy(() =>
+  import('./components/GlossaryModal').then((m) => ({
+    default: m.GlossaryModal
+  }))
+);
+const TroubleshootModal = lazy(() =>
+  import('./components/TroubleshootModal').then((m) => ({
+    default: m.TroubleshootModal
+  }))
+);
+const DiagnosticExportModal = lazy(() =>
+  import('./components/DiagnosticExportModal').then((m) => ({
+    default: m.DiagnosticExportModal
+  }))
+);
 import { LogsJump } from './services/logQuery';
 import { canStartDaemonFromUi } from './services/platform';
 import { safeStorageGet, safeStorageSet } from './services/storage';
@@ -2258,54 +2287,12 @@ export const App: React.FC = () => {
       )}
 
       {/* Floating ThemeForge Toasts */}
-      {toasts.length > 0 && (
-        <div className="fixed bottom-12 right-6 z-50 flex flex-col gap-2">
-          {toasts.map((toast) => (
-            <div
-              key={toast.id}
-              role={toast.severity === 'error' ? 'alert' : 'status'}
-              className={`tf-card flex items-center gap-2.5 border-l-4 px-4 py-2.5 text-xs font-medium text-tf-primary shadow-xl ${
-                toast.severity === 'error'
-                  ? 'border-l-tf-red'
-                  : 'border-l-tf-accent'
-              }`}
-            >
-              {toast.severity === 'error' ? (
-                <AlertTriangle className="h-4 w-4 text-tf-red" />
-              ) : (
-                <CheckCircle2 className="h-4 w-4 text-tf-accent" />
-              )}
-              <span>{toast.message}</span>
-              {toast.actionLabel && toast.onAction && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    toast.onAction?.();
-                    dismissToast(toast.id);
-                  }}
-                  className="ml-1 rounded-tf-sm bg-tf-accent/20 px-2 py-0.5 text-[11px] font-bold text-tf-accent transition hover:bg-tf-accent/30"
-                >
-                  {toast.actionLabel}
-                </button>
-              )}
-              {toast.severity === 'error' && (
-                <button
-                  type="button"
-                  onClick={() => dismissToast(toast.id)}
-                  aria-label={t('app.toast.dismiss')}
-                  className="ml-1 rounded-tf-sm p-0.5 text-tf-secondary hover:bg-tf-surface-alt hover:text-tf-primary"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
 
-      {showThemeModal && (
-        <ThemeForgeModal onClose={() => setShowThemeModal(false)} />
-      )}
+      <Suspense fallback={null}>
+        {showThemeModal && (
+          <ThemeForgeModal onClose={() => setShowThemeModal(false)} />
+        )}
 
       {showGlossaryModal && (
         <GlossaryModal
@@ -2464,6 +2451,7 @@ export const App: React.FC = () => {
           onClose={() => setShowLauncherModal(false)}
         />
       )}
+      </Suspense>
 
       {showCommandPalette && (
         <CommandPaletteModal

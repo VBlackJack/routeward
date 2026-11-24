@@ -84,7 +84,7 @@ describe('App navigation and accessible modals', () => {
     expect(screen.getByRole('contentinfo')).toBeInTheDocument();
   });
 
-  it('opens ThemeForge modal from Settings tab with ARIA dialog attributes and closes on Escape', () => {
+  it('opens ThemeForge modal from Settings tab with ARIA dialog attributes and closes on Escape', async () => {
     renderApp();
 
     fireEvent.keyDown(window, { key: '5', altKey: true });
@@ -92,7 +92,7 @@ describe('App navigation and accessible modals', () => {
     const themeButton = screen.getByRole('button', { name: /themeforge/i });
     fireEvent.click(themeButton);
 
-    const dialog = screen.getByRole('dialog');
+    const dialog = await screen.findByRole('dialog');
     expect(dialog).toHaveAttribute('aria-modal', 'true');
 
     fireEvent.keyDown(window, { key: 'Escape' });
