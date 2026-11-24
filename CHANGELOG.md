@@ -5,6 +5,24 @@ Format follows Keep a Changelog and RouteWard Calendar Versioning (`vYYYY.MMDD.N
 
 ## [Unreleased]
 
+## [v2026.1124.00] - 2026-11-24
+
+### Security
+- Windows desktop launcher: validate `allow_sid` on the plain-daemon fallback and escape elevated `ShellExecuteExW` parameters using Win32 `CommandLineToArgvW` quoting rules.
+- Windows proxy/network discovery: resolve `reg.exe` and `netsh.exe` via `windows_system_tool_path` instead of bare command names.
+- Linux `.deb` `postinst`: ignore `ROUTEWARD_*` test environment overrides whenever running under uid 0 (`root`).
+- Core & desktop safety: use `read_unaligned` in `iphelper_rows` to avoid slice alignment UB, and drop `RefCell` borrows before `Shell_NotifyIconW` in `tray.rs` with checked timestamp arithmetic.
+
+### Changed
+- Daemon & desktop async runtime: offload profile saves, OS socket scans, named-profile CRUD, `FileLogger` error flushes (dedicated `Condvar`), and desktop diagnostic log bundling off Tokio worker threads; split `dispatch_command`, `handle_api_route`, `profiles.rs`, and `windivert/decision.rs`.
+- Desktop SSE & UI performance: add per-frame SSE write timeouts and a dedicated SSE concurrency cap; switch `App.tsx` to `useSyncExternalStore` slices, cap rendered rows in `ConnectionsView`/`LogsView`, extract `ToastStack.tsx`, lazy-load 6 modals (`app.js` reduced from 694 kB to 419 kB, -40%), and auto-embed all `ui/dist/assets/*.{js,css}` chunks in `apps/desktop/build.rs`.
+- Testing & CI: enable Vitest `vmThreads`, eliminate React `act(...)` warnings and fixed desktop test sleeps, add `CommandPaletteModal`/`ThemeForgeModal` and TCP/UDP relay unit tests, add `rustfmt.toml`, and pass `--locked` to Linux/Windows CI `cargo clippy`/`cargo test`.
+
+### Fixed
+- Desktop bridge: stop swallowing IPC errors on clear/flush/scan/test/profile routes and standardize `{error, errorKey}` HTTP status mapping across all mutating endpoints.
+- UI accessibility & reliability: restore visible focus ring, `scrollIntoView`, and `combobox`/`listbox` semantics in `CommandPaletteModal` (fixing double `onClose` on Escape); guard `localStorage` access; clear typed proxy passwords on modal close; remove unreachable IPC error fallback branches.
+- Release & docs: fix Jan-Sep CalVer `MMDD` leading-zero handling in `release.yml` and `repo_guards.rs`; fix ASCII control characters in `CHANGELOG.md` and add a control-character guard + `postrm` scan in `repo_guards.rs`; add GTK/WebKitGTK deps to `tests/linux/systemd/Dockerfile`; update `docs/build.md`, `docs/architecture.md`, `README.fr.md`, and `.env.example`.
+
 ## [v2026.1123.01] - 2026-11-23
 
 ### Fixed
