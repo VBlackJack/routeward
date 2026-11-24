@@ -207,6 +207,7 @@ pub struct DesktopCommandBridge {
     state: Arc<RwLock<DaemonFullState>>,
     profiles: Arc<RwLock<Vec<ProfileSummary>>>,
     daemon_connected: Arc<AtomicBool>,
+    subscription_active: Arc<AtomicBool>,
     event_tx: tokio::sync::broadcast::Sender<IpcStreamEvent>,
     daemon_start_guard: Arc<DaemonStartGuard>,
     tray_notify: Arc<Mutex<Option<TrayNotifyCallback>>>,
@@ -293,6 +294,7 @@ impl DesktopCommandBridge {
             state: Arc::new(RwLock::new(initial_state)),
             profiles: Arc::new(RwLock::new(initial_profiles)),
             daemon_connected: Arc::new(AtomicBool::new(false)),
+            subscription_active: Arc::new(AtomicBool::new(false)),
             event_tx,
             daemon_start_guard: Arc::new(DaemonStartGuard::default()),
             tray_notify: Arc::new(Mutex::new(None)),
@@ -572,29 +574,31 @@ impl DesktopCommandBridge {
             other => return Err(format!("subscribe handshake failed: {other:?}")),
         }
 
+        self.subscription_active.store(true, Ordering::SeqCst);
         self.log_info(format!(
             "Connected and subscribed to daemon IPC event stream ({})",
             self.ipc_endpoint_label()
         ));
 
-        loop {
+        let loop_res = loop {
             match read_bounded_line(&mut reader, max_line, sub_timeout_ms).await {
                 ReadLineOutcome::Line(line) => {
-                    if let Ok(stream_ev) = serde_json::from_str::<IpcStreamEvent>(&line) {
-                        match stream_ev {
-                            IpcStreamEvent::Event(ev) => self.apply_telemetry_event(ev),
-                            IpcStreamEvent::Resync { skipped_events } => {
-                                if let Ok(fresh) = self
-                                    .ipc_client
-                                    .call_typed::<DaemonFullState>(IpcCommand::GetState)
-                                    .await
-                                {
-                                    self.apply_full_state(fresh);
-                                }
-                                let _ = self
-                                    .event_tx
-                                    .send(IpcStreamEvent::Resync { skipped_events });
+                    match serde_json::from_str::<IpcStreamEvent>(&line) {
+                        Ok(IpcStreamEvent::Event(ev)) => self.apply_telemetry_event(ev),
+                        Ok(IpcStreamEvent::Resync { skipped_events }) => {
+                            if let Ok(fresh) = self
+                                .ipc_client
+                                .call_typed::<DaemonFullState>(IpcCommand::GetState)
+                                .await
+                            {
+                                self.apply_full_state(fresh);
                             }
+                            let _ = self
+                                .event_tx
+                                .send(IpcStreamEvent::Resync { skipped_events });
+                        }
+                        Err(err) => {
+                            self.log_warn(format!("Ignored malformed IPC stream event: {err}"));
                         }
                     }
                 }
@@ -610,16 +614,18 @@ impl DesktopCommandBridge {
                             self.state.write().diagnostics = diag;
                             self.notify_tray();
                         }
-                        Err(err) => return Err(err.to_string()),
+                        Err(err) => break Err(err.to_string()),
                     }
                 }
                 ReadLineOutcome::Eof
                 | ReadLineOutcome::LineTooLong
                 | ReadLineOutcome::IoError(_) => {
-                    return Err("IPC event stream closed".to_string());
+                    break Err("IPC event stream closed".to_string());
                 }
             }
-        }
+        };
+        self.subscription_active.store(false, Ordering::SeqCst);
+        loop_res
     }
 
     fn apply_full_state(&self, mut full_state: DaemonFullState) {
@@ -815,6 +821,11 @@ impl DesktopCommandBridge {
         self.daemon_connected.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub fn is_subscription_active(&self) -> bool {
+        self.subscription_active.load(Ordering::SeqCst)
+    }
+
     pub async fn refresh_state(&self) -> DaemonFullState {
         if let Ok(fresh) = self
             .call_daemon::<DaemonFullState>(IpcCommand::GetState)
@@ -826,17 +837,12 @@ impl DesktopCommandBridge {
         self.state.read().clone()
     }
 
-    pub async fn scan_os_sockets(&self) -> Vec<TrackedConnection> {
-        match self
-            .call_daemon::<Vec<TrackedConnection>>(IpcCommand::ScanOsSockets)
-            .await
-        {
-            Ok(sockets) => {
-                self.state.write().connections = sockets.clone();
-                sockets
-            }
-            Err(_) => Vec::new(),
-        }
+    pub async fn scan_os_sockets(&self) -> Result<Vec<TrackedConnection>, IpcCallError> {
+        let sockets = self
+            .call_daemon_detailed::<Vec<TrackedConnection>>(IpcCommand::ScanOsSockets)
+            .await?;
+        self.state.write().connections = sockets.clone();
+        Ok(sockets)
     }
 
     /// Runs a blocking system call (registry tools, process spawn) off the async worker.
@@ -1124,9 +1130,9 @@ impl DesktopCommandBridge {
         &self,
         json: String,
         process_patterns: Vec<String>,
-    ) -> Result<FoxyProxyImportResult, String> {
+    ) -> Result<FoxyProxyImportResult, IpcCallError> {
         let report = self
-            .call_daemon::<FoxyProxyImportResult>(IpcCommand::ImportFoxyProxyJson {
+            .call_daemon_detailed::<FoxyProxyImportResult>(IpcCommand::ImportFoxyProxyJson {
                 json,
                 process_patterns,
             })
@@ -1151,18 +1157,21 @@ impl DesktopCommandBridge {
         &self,
         profile_id: Option<String>,
         name: Option<String>,
-    ) -> Result<Vec<ProfileSummary>, String> {
+    ) -> Result<Vec<ProfileSummary>, IpcCallError> {
         let list = self
-            .call_daemon::<Vec<ProfileSummary>>(IpcCommand::SaveNamedProfile { profile_id, name })
+            .call_daemon_detailed::<Vec<ProfileSummary>>(IpcCommand::SaveNamedProfile {
+                profile_id,
+                name,
+            })
             .await?;
         *self.profiles.write() = list.clone();
         let _ = self.refresh_state().await;
         Ok(list)
     }
 
-    pub async fn switch_profile(&self, profile_id: String) -> Result<ProfileConfig, String> {
+    pub async fn switch_profile(&self, profile_id: String) -> Result<ProfileConfig, IpcCallError> {
         let prof = self
-            .call_daemon::<ProfileConfig>(IpcCommand::SwitchProfile { profile_id })
+            .call_daemon_detailed::<ProfileConfig>(IpcCommand::SwitchProfile { profile_id })
             .await?;
         let _ = self.list_profiles().await;
         let _ = self.refresh_state().await;
@@ -1177,13 +1186,21 @@ impl DesktopCommandBridge {
             .get(index)
             .map(|p| p.profile_id.clone());
         if let Some(id) = target_id {
-            let _ = self.switch_profile(id).await;
+            if let Err(err) = self.switch_profile(id.clone()).await {
+                self.log_warn(format!(
+                    "Tray profile switch to '{id}' failed: {}",
+                    err.message()
+                ));
+            }
         }
     }
 
-    pub async fn delete_profile(&self, profile_id: String) -> Result<Vec<ProfileSummary>, String> {
+    pub async fn delete_profile(
+        &self,
+        profile_id: String,
+    ) -> Result<Vec<ProfileSummary>, IpcCallError> {
         let list = self
-            .call_daemon::<Vec<ProfileSummary>>(IpcCommand::DeleteProfile { profile_id })
+            .call_daemon_detailed::<Vec<ProfileSummary>>(IpcCommand::DeleteProfile { profile_id })
             .await?;
         *self.profiles.write() = list.clone();
         self.notify_tray();
@@ -1299,14 +1316,14 @@ impl DesktopCommandBridge {
             .map(|ack| ack.terminated)
     }
 
-    pub async fn clear_closed_connections(&self) {
-        let _ = self
-            .call_daemon::<serde_json::Value>(IpcCommand::ClearClosedConnections)
-            .await;
+    pub async fn clear_closed_connections(&self) -> Result<(), IpcCallError> {
+        self.call_daemon_detailed::<serde_json::Value>(IpcCommand::ClearClosedConnections)
+            .await?;
         self.state
             .write()
             .connections
             .retain(|c| c.status == ConnectionStatus::Active);
+        Ok(())
     }
 
     pub async fn simulate_connection(
@@ -1320,20 +1337,19 @@ impl DesktopCommandBridge {
     pub async fn evaluate_rule(
         &self,
         request: ConnectionRequest,
-    ) -> Result<RuleEvaluationResult, String> {
-        self.call_daemon::<RuleEvaluationResult>(IpcCommand::EvaluateRule { request })
+    ) -> Result<RuleEvaluationResult, IpcCallError> {
+        self.call_daemon_detailed::<RuleEvaluationResult>(IpcCommand::EvaluateRule { request })
             .await
     }
 
-    pub async fn test_proxy(&self, proxy_id: String) -> Result<ProxyHealthReport, String> {
-        self.call_daemon::<ProxyHealthReport>(IpcCommand::TestProxy { proxy_id })
+    pub async fn test_proxy(&self, proxy_id: String) -> Result<ProxyHealthReport, IpcCallError> {
+        self.call_daemon_detailed::<ProxyHealthReport>(IpcCommand::TestProxy { proxy_id })
             .await
     }
 
-    pub async fn test_all_proxies(&self) -> Vec<ProxyHealthReport> {
-        self.call_daemon::<Vec<ProxyHealthReport>>(IpcCommand::TestAllProxies)
+    pub async fn test_all_proxies(&self) -> Result<Vec<ProxyHealthReport>, IpcCallError> {
+        self.call_daemon_detailed::<Vec<ProxyHealthReport>>(IpcCommand::TestAllProxies)
             .await
-            .unwrap_or_default()
     }
 
     pub async fn upsert_proxy(&self, node: ProxyNode) -> Result<ProfileConfig, IpcCallError> {
@@ -1539,11 +1555,11 @@ impl DesktopCommandBridge {
         outcome
     }
 
-    pub async fn flush_fake_ip_cache(&self) {
-        let _ = self
-            .call_daemon::<serde_json::Value>(IpcCommand::FlushFakeIps)
-            .await;
+    pub async fn flush_fake_ip_cache(&self) -> Result<(), IpcCallError> {
+        self.call_daemon_detailed::<serde_json::Value>(IpcCommand::FlushFakeIps)
+            .await?;
         self.state.write().fake_ips.clear();
+        Ok(())
     }
 
     /// Flushes the operating system DNS resolver cache through the daemon (not the Fake-IP
@@ -1674,11 +1690,11 @@ impl DesktopCommandBridge {
         self.state.read().logs.clone()
     }
 
-    pub async fn clear_logs(&self) {
-        let _ = self
-            .call_daemon::<serde_json::Value>(IpcCommand::ClearLogs)
-            .await;
+    pub async fn clear_logs(&self) -> Result<(), IpcCallError> {
+        self.call_daemon_detailed::<serde_json::Value>(IpcCommand::ClearLogs)
+            .await?;
         self.state.write().logs.clear();
+        Ok(())
     }
 }
 
