@@ -901,4 +901,87 @@ mod tests {
         assert_eq!(snapshot.direct_count, 1);
         assert_eq!(snapshot.proxied_count, 0, "Direct flows are never proxied");
     }
+
+    #[tokio::test]
+    async fn udp_routed_to_http_only_proxy_is_blocked_under_kill_switch() {
+        use crate::config::{ProxyNode, ProxyProtocol};
+
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.security_policy.kill_switch_enabled = true;
+        profile.security_policy.block_udp_on_tcp_only_proxy = true;
+        profile.proxies = vec![ProxyNode {
+            id: "http-only".to_string(),
+            name: "HTTP Only".to_string(),
+            protocol: ProxyProtocol::Http,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            auth: None,
+            udp_enabled: false,
+            tls: false,
+            tls_skip_verify: false,
+            sni: None,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        }];
+        profile.rules.clear();
+        profile.default_action = RuleAction::Proxy {
+            target_id: "http-only".to_string(),
+        };
+        let controller = RouteWardController::new(constants, profile, "en");
+
+        let client = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 16)), 50124);
+        let target = Socks5UdpTarget::Ipv4(std::net::Ipv4Addr::new(1, 1, 1, 1), 12345);
+        let res = controller
+            .forward_udp_datagram(
+                client,
+                "game.exe",
+                Some("C:\\game.exe"),
+                88,
+                &target,
+                b"ping",
+                false,
+            )
+            .await;
+        assert!(res.is_err(), "UDP over HTTP-only proxy must be rejected");
+        let blocked = controller
+            .telemetry
+            .list_connections()
+            .into_iter()
+            .find(|c| {
+                c.protocol == TransportProtocol::Udp && c.status == ConnectionStatus::Blocked
+            });
+        assert!(
+            blocked.is_some(),
+            "UDP rejection must record a Blocked connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_routed_to_block_rule_records_blocked_reason_without_sending() {
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.rules.clear();
+        profile.default_action = RuleAction::Block;
+        let controller = RouteWardController::new(constants, profile, "en");
+
+        let client = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 17)), 50125);
+        let target = Socks5UdpTarget::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8), 9999);
+        let res = controller
+            .forward_udp_datagram(
+                client,
+                "blocked-app.exe",
+                None,
+                99,
+                &target,
+                b"drop-me",
+                false,
+            )
+            .await;
+        assert!(res.is_err(), "Block policy must reject UDP datagram");
+        assert_eq!(controller.telemetry.snapshot().blocked_count, 1);
+    }
 }

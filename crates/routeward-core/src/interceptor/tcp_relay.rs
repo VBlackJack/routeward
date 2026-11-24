@@ -1327,4 +1327,76 @@ mod tests {
             assert!(endpoints.contains(&expected), "missing {expected:?}");
         }
     }
+
+    #[tokio::test]
+    async fn local_socks5_relay_rejects_unreachable_upstream_under_kill_switch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let mut profile = ProfileConfig::load_embedded_default().expect("ProfileConfig");
+        profile.enable_logging = false;
+        profile.security_policy.kill_switch_enabled = true;
+        // Reserve an ephemeral port and drop the listener so connecting to it refuses immediately.
+        let dead_port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral port")
+            .local_addr()
+            .unwrap()
+            .port();
+        profile.proxies = vec![ProxyNode {
+            id: "dead-proxy".to_string(),
+            name: "Dead Proxy".to_string(),
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: dead_port,
+            auth: None,
+            udp_enabled: false,
+            tls: false,
+            tls_skip_verify: false,
+            sni: None,
+            enabled: true,
+            last_latency_ms: None,
+            exit_ip: None,
+        }];
+        profile.rules.clear();
+        profile.default_action = RuleAction::Proxy {
+            target_id: "dead-proxy".to_string(),
+        };
+        let constants = SystemConstants::load_embedded().expect("SystemConstants");
+        let controller = RouteWardController::new(constants, profile, "en");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+        let relay_addr = listener.local_addr().unwrap();
+        let ctrl_clone = controller.clone();
+        let server = tokio::spawn(async move {
+            let (sock, peer) = listener.accept().await.expect("accept client");
+            let _ = ctrl_clone
+                .handle_local_socks5_client(sock, peer.port())
+                .await;
+        });
+
+        let mut client = TcpStream::connect(relay_addr).await.expect("connect relay");
+        // SOCKS5 greeting: ver=5, nmethods=1, no-auth=0
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greeting_reply = [0u8; 2];
+        client.read_exact(&mut greeting_reply).await.unwrap();
+        assert_eq!(greeting_reply, [0x05, 0x00]);
+
+        // SOCKS5 CONNECT 127.0.0.1:80
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50])
+            .await
+            .unwrap();
+        let mut connect_reply = [0u8; 4];
+        client.read_exact(&mut connect_reply).await.unwrap();
+        assert_ne!(
+            connect_reply[1], 0x00,
+            "kill switch must reject CONNECT when upstream proxy is down"
+        );
+        let _ = server.await;
+        assert!(
+            controller.telemetry.snapshot().blocked_count >= 1,
+            "kill switch failure must increment blocked_count"
+        );
+    }
 }
