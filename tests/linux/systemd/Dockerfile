@@ -35,7 +35,7 @@ FROM debian:bookworm
 ENV container=docker
 RUN apt-get update && apt-get install -y --no-install-recommends \
     systemd systemd-sysv dbus \
-    nftables iproute2 curl python3 procps ca-certificates kmod \
+    nftables iproute2 libwebkit2gtk-4.1-0 libgtk-3-0 curl python3 procps ca-certificates kmod \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /lib/systemd/system/multi-user.target.wants/* \
         /etc/systemd/system/*.wants/* \

@@ -216,15 +216,19 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
     );
   }, [allItems, query]);
 
+  const listboxId = useId();
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
   useEffect(() => {
     setSelectedIndex(0);
   }, [query]);
 
+  useEffect(() => {
+    itemRefs.current[selectedIndex]?.scrollIntoView?.({ block: 'nearest' });
+  }, [selectedIndex, filteredItems.length]);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      onClose();
-    } else if (e.key === 'ArrowDown') {
+    if (e.key === 'ArrowDown') {
       e.preventDefault();
       setSelectedIndex((prev) =>
         filteredItems.length > 0 ? (prev + 1) % filteredItems.length : 0
@@ -243,6 +247,11 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
     }
   };
 
+  const activeOptionId =
+    filteredItems.length > 0 && selectedIndex < filteredItems.length
+      ? `${listboxId}-opt-${selectedIndex}`
+      : undefined;
+
   return (
     <ModalContainer onClose={onClose} alignTop labelledBy={titleId}>
       <div
@@ -252,11 +261,17 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
         <h2 id={titleId} className="sr-only">
           {t('command_palette.modal.title')}
         </h2>
-        <div className="flex items-center border-b border-tf-border px-4 py-3">
+        <div className="flex items-center border-b border-tf-border px-4 py-3 focus-within:ring-2 focus-within:ring-inset focus-within:ring-tf-accent">
           <Search className="mr-3 h-4 w-4 text-tf-accent" />
-          <input name="command-palette-query"
+          <input
+            name="command-palette-query"
             ref={inputRef}
             type="text"
+            role="combobox"
+            aria-expanded={filteredItems.length > 0}
+            aria-controls={listboxId}
+            aria-autocomplete="list"
+            aria-activedescendant={activeOptionId}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder={t('command_palette.modal.search_placeholder')}
@@ -268,7 +283,12 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
           </span>
         </div>
 
-        <div className="max-h-96 overflow-y-auto p-2">
+        <div
+          id={listboxId}
+          role="listbox"
+          aria-label={t('command_palette.modal.title')}
+          className="max-h-96 overflow-y-auto p-2"
+        >
           {filteredItems.length === 0 ? (
             <div className="py-8 text-center text-xs text-tf-secondary">
               {t('command_palette.modal.empty')}
@@ -280,6 +300,13 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
               return (
                 <button
                   key={item.id}
+                  id={`${listboxId}-opt-${idx}`}
+                  ref={(el) => {
+                    itemRefs.current[idx] = el;
+                  }}
+                  type="button"
+                  role="option"
+                  aria-selected={isSelected}
                   onMouseEnter={() => setSelectedIndex(idx)}
                   onClick={() => {
                     item.onSelect();

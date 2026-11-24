@@ -221,8 +221,15 @@ async fn bridge_loopback_end_to_end_token_state_sse_and_reconnection() {
         "GET /api/state should report daemonConnected == true"
     );
 
-    // Wait briefly for the bridge's background subscription stream to be established
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Poll until the bridge's background subscription stream is active (bounded, no fixed sleep).
+    let sub_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !bridge.is_subscription_active() && tokio::time::Instant::now() < sub_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        bridge.is_subscription_active(),
+        "bridge background subscription stream should be active"
+    );
 
     // 3. Real-time event emitted on daemon is received over the bridge's SSE stream (/api/events)
     let mut sse_stream = TcpStream::connect(format!("127.0.0.1:{port}"))
@@ -602,16 +609,24 @@ async fn sse_incremental_stream_delivers_live_events_before_http_response_ends_a
     }
     assert!(saw_second_event);
 
-    // Close SSE client stream and verify DesktopCommandBridge logged startup, daemon connect, and SSE open/close
+    // Close SSE client stream and poll until the bridge logs SSE closure (bounded, no fixed sleep).
     drop(sse_stream);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let log_files: Vec<_> = std::fs::read_dir(&temp_log_dir)
-        .expect("desktop log dir exists")
-        .filter_map(|e| e.ok())
-        .collect();
-    assert_eq!(log_files.len(), 1, "Expected 1 daily desktop log file");
-    let log_content = std::fs::read_to_string(log_files[0].path()).expect("read desktop log file");
+    let log_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut log_content = String::new();
+    while tokio::time::Instant::now() < log_deadline {
+        let log_files: Vec<_> = std::fs::read_dir(&temp_log_dir)
+            .expect("desktop log dir exists")
+            .filter_map(|e| e.ok())
+            .collect();
+        if log_files.len() == 1 {
+            log_content =
+                std::fs::read_to_string(log_files[0].path()).expect("read desktop log file");
+            if log_content.contains("Closed SSE event stream (/api/events)") {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(log_content.contains("Initialized routeward-desktop bridge"));
     assert!(log_content.contains("Attempting IPC connection to daemon"));
     assert!(log_content.contains("Opening SSE event stream (/api/events)"));

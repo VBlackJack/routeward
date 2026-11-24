@@ -351,12 +351,12 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          # Tag v2026.1116.01 maps to Cargo version 2026.1116.1 (the sequence loses its leading zeros).
+          # Tag v2027.0105.01 maps to Cargo version 2027.105.1 (both MMDD and NN drop leading zeros).
           if ! [[ "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
             echo "Tag $TAG does not match vYYYY.MMDD.NN" >&2
             exit 1
           fi
-          version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((10#${BASH_REMATCH[3]}))"
+          version="${BASH_REMATCH[1]}.$((10#${BASH_REMATCH[2]})).$((10#${BASH_REMATCH[3]}))"
           echo "Expected package version: $version"
 
           shopt -s nullglob

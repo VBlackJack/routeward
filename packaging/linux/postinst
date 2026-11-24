@@ -19,8 +19,19 @@ set -eu
 # (default /usr/bin/routeward), ROUTEWARD_STATUS_TIMEOUT (seconds, default 10) and
 # ROUTEWARD_SYSTEMD_DIR (default /run/systemd/system) exist only so
 # tests/linux/postinst-upgrade-test.sh can run this script without root or systemd;
-# packages never set them.
-#
+# they are ignored whenever the script runs as root (uid 0).
+if [ "$(id -u)" -ne 0 ]; then
+    rw_state_dir="${ROUTEWARD_STATE_DIR:-/etc/routeward}"
+    rw_cli="${ROUTEWARD_CLI:-/usr/bin/routeward}"
+    rw_status_timeout="${ROUTEWARD_STATUS_TIMEOUT:-10}"
+    rw_systemd_dir="${ROUTEWARD_SYSTEMD_DIR:-/run/systemd/system}"
+else
+    rw_state_dir="/etc/routeward"
+    rw_cli="/usr/bin/routeward"
+    rw_status_timeout="10"
+    rw_systemd_dir="/run/systemd/system"
+fi
+
 # Side effect: `routeward ctl status` run as root creates the per-user log directory under
 # /root; this is harmless.
 #
@@ -31,13 +42,13 @@ set -eu
 carry_protection_over_upgrade() {
     (
         umask 077
-        dir="${ROUTEWARD_STATE_DIR:-/etc/routeward}"
-        cli="${ROUTEWARD_CLI:-/usr/bin/routeward}"
+        dir="$rw_state_dir"
+        cli="$rw_cli"
         [ -d "$dir" ] || exit 0
         [ ! -e "$dir/protection_state.json" ] || exit 0
         [ -x "$cli" ] || exit 0
         if command -v timeout >/dev/null 2>&1; then
-            status=$(timeout "${ROUTEWARD_STATUS_TIMEOUT:-10}" "$cli" ctl status 2>/dev/null) || exit 0
+            status=$(timeout "$rw_status_timeout" "$cli" ctl status 2>/dev/null) || exit 0
         else
             status=$("$cli" ctl status 2>/dev/null) || exit 0
         fi
@@ -66,7 +77,7 @@ if [ "${1:-}" = "configure" ]; then
         carry_protection_over_upgrade
     fi
 
-    if [ -d "${ROUTEWARD_SYSTEMD_DIR:-/run/systemd/system}" ] && command -v systemctl >/dev/null 2>&1; then
+    if [ -d "$rw_systemd_dir" ] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload || true
         if [ -n "${2:-}" ]; then
             systemctl try-restart routeward.service || true

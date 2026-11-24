@@ -25,7 +25,9 @@ use routeward_core::diagnostics::PreviewRuleChangeRequest;
 use routeward_core::error::{
     ERR_KEY_CHAIN_EMPTY, ERR_KEY_CLEANUP_DAEMON_ACTIVE, ERR_KEY_CONFIG_JSON, ERR_KEY_CONFIG_SAVE,
     ERR_KEY_DAEMON_ALREADY_RUNNING, ERR_KEY_DAEMON_INSECURE_PROFILE, ERR_KEY_DAEMON_INVALID_PAUSE,
-    ERR_KEY_INTERCEPTOR_NFT_FAILED, ERR_KEY_INTERCEPTOR_OPEN,
+    ERR_KEY_DAEMON_PAUSE_NOT_ACTIVE, ERR_KEY_INTERCEPTOR_DRIVER, ERR_KEY_INTERCEPTOR_NFT_FAILED,
+    ERR_KEY_INTERCEPTOR_NFT_MISSING, ERR_KEY_INTERCEPTOR_NOT_ROOT, ERR_KEY_INTERCEPTOR_OPEN,
+    ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT,
 };
 use routeward_core::ipc::IpcCallError;
 use routeward_core::rules::ConnectionRequest;
@@ -239,7 +241,15 @@ pub fn ipc_error_status(err: &IpcCallError) -> u16 {
         IpcCallError::Transport(_) => 503,
         IpcCallError::Protocol(_) => 500,
         IpcCallError::Remote { error_key, .. } => match error_key.as_deref() {
-            Some(ERR_KEY_DAEMON_ALREADY_RUNNING | ERR_KEY_CLEANUP_DAEMON_ACTIVE) => 409,
+            Some(
+                ERR_KEY_DAEMON_ALREADY_RUNNING
+                | ERR_KEY_CLEANUP_DAEMON_ACTIVE
+                | ERR_KEY_DAEMON_PAUSE_NOT_ACTIVE
+                | ERR_KEY_INTERCEPTOR_DRIVER
+                | ERR_KEY_INTERCEPTOR_NOT_ROOT
+                | ERR_KEY_INTERCEPTOR_NFT_MISSING
+                | ERR_KEY_INTERCEPTOR_TPROXY_CONFLICT,
+            ) => 409,
             Some(ERR_KEY_DAEMON_INSECURE_PROFILE | ERR_KEY_CONFIG_JSON | ERR_KEY_CHAIN_EMPTY) => {
                 422
             }
@@ -346,6 +356,8 @@ where
     }
 }
 
+const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+
 pub async fn handle_api_route(
     method: &str,
     path: &str,
@@ -353,7 +365,28 @@ pub async fn handle_api_route(
     bridge: &DesktopCommandBridge,
     on_window_cmd: Option<&(dyn Fn(DesktopWindowCommand) + Send + Sync)>,
 ) -> Option<(u16, String, Vec<u8>)> {
-    let json_ct = "application/json; charset=utf-8".to_string();
+    if let Some(resp) = handle_activity_and_diagnostics_routes(method, path, body_str, bridge).await
+    {
+        return Some(resp);
+    }
+    if let Some(resp) =
+        handle_engine_and_ui_routes(method, path, body_str, bridge, on_window_cmd).await
+    {
+        return Some(resp);
+    }
+    if let Some(resp) = handle_rules_proxies_dns_routes(method, path, body_str, bridge).await {
+        return Some(resp);
+    }
+    handle_system_profiles_window_routes(method, path, body_str, bridge, on_window_cmd).await
+}
+
+async fn handle_activity_and_diagnostics_routes(
+    method: &str,
+    path: &str,
+    body_str: &str,
+    bridge: &DesktopCommandBridge,
+) -> Option<(u16, String, Vec<u8>)> {
+    let json_ct = JSON_CONTENT_TYPE.to_string();
 
     if path.starts_with("/api/state") {
         let state = bridge.refresh_state().await;
@@ -458,8 +491,10 @@ pub async fn handle_api_route(
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
         }
-        bridge.clear_closed_connections().await;
-        return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
+        return Some(match bridge.clear_closed_connections().await {
+            Ok(()) => (200, json_ct, b"{\"ok\":true}".to_vec()),
+            Err(err) => ipc_error_response(&err, json_ct),
+        });
     }
 
     if path.starts_with("/api/connections") {
@@ -472,8 +507,10 @@ pub async fn handle_api_route(
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
         }
-        bridge.clear_logs().await;
-        return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
+        return Some(match bridge.clear_logs().await {
+            Ok(()) => (200, json_ct, b"{\"ok\":true}".to_vec()),
+            Err(err) => ipc_error_response(&err, json_ct),
+        });
     }
 
     if path.starts_with("/api/logs") {
@@ -482,26 +519,29 @@ pub async fn handle_api_route(
         return Some((200, json_ct, json));
     }
 
+    None
+}
+
+async fn handle_engine_and_ui_routes(
+    method: &str,
+    path: &str,
+    body_str: &str,
+    bridge: &DesktopCommandBridge,
+    on_window_cmd: Option<&(dyn Fn(DesktopWindowCommand) + Send + Sync)>,
+) -> Option<(u16, String, Vec<u8>)> {
+    let json_ct = JSON_CONTENT_TYPE.to_string();
+
     if path.starts_with("/api/engine/toggle") {
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
         }
         match serde_json::from_str::<ToggleEngineRequest>(body_str) {
-            Ok(parsed) => match bridge.toggle_engine(parsed.start).await {
-                Ok(diag) => {
-                    let json = serde_json::to_vec(&diag).unwrap_or_default();
-                    return Some((200, json_ct, json));
-                }
-                Err(err) => {
-                    let status = if err.is_transport() { 503 } else { 409 };
-                    let json = serde_json::to_vec(&serde_json::json!({
-                        "error": err.message(),
-                        "errorKey": err.error_key(),
-                    }))
-                    .unwrap_or_default();
-                    return Some((status, json_ct, json));
-                }
-            },
+            Ok(parsed) => {
+                return Some(match bridge.toggle_engine(parsed.start).await {
+                    Ok(diag) => ok_json_response(&diag, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
+            }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
                     .unwrap_or_default();
@@ -676,6 +716,17 @@ pub async fn handle_api_route(
         }
     }
 
+    None
+}
+
+async fn handle_rules_proxies_dns_routes(
+    method: &str,
+    path: &str,
+    body_str: &str,
+    bridge: &DesktopCommandBridge,
+) -> Option<(u16, String, Vec<u8>)> {
+    let json_ct = JSON_CONTENT_TYPE.to_string();
+
     if path.starts_with("/api/rules/upsert") {
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
@@ -719,17 +770,12 @@ pub async fn handle_api_route(
             return Some(rejection);
         }
         match serde_json::from_str::<ConnectionRequest>(body_str) {
-            Ok(request) => match bridge.evaluate_rule(request).await {
-                Ok(res) => {
-                    let json = serde_json::to_vec(&res).unwrap_or_default();
-                    return Some((200, json_ct, json));
-                }
-                Err(err) => {
-                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                        .unwrap_or_default();
-                    return Some((503, json_ct, json));
-                }
-            },
+            Ok(request) => {
+                return Some(match bridge.evaluate_rule(request).await {
+                    Ok(res) => ok_json_response(&res, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
+            }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
                     .unwrap_or_default();
@@ -799,9 +845,10 @@ pub async fn handle_api_route(
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
         }
-        let reports = bridge.test_all_proxies().await;
-        let json = serde_json::to_vec(&reports).unwrap_or_default();
-        return Some((200, json_ct, json));
+        return Some(match bridge.test_all_proxies().await {
+            Ok(reports) => ok_json_response(&reports, json_ct),
+            Err(err) => ipc_error_response(&err, json_ct),
+        });
     }
 
     if path.starts_with("/api/proxies/test") {
@@ -809,17 +856,12 @@ pub async fn handle_api_route(
             return Some(rejection);
         }
         match serde_json::from_str::<ProxyIdRequest>(body_str) {
-            Ok(req) => match bridge.test_proxy(req.proxy_id).await {
-                Ok(report) => {
-                    let json = serde_json::to_vec(&report).unwrap_or_default();
-                    return Some((200, json_ct, json));
-                }
-                Err(err) => {
-                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                        .unwrap_or_default();
-                    return Some((503, json_ct, json));
-                }
-            },
+            Ok(req) => {
+                return Some(match bridge.test_proxy(req.proxy_id).await {
+                    Ok(report) => ok_json_response(&report, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
+            }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
                     .unwrap_or_default();
@@ -898,18 +940,33 @@ pub async fn handle_api_route(
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
         }
-        bridge.flush_fake_ip_cache().await;
-        return Some((200, json_ct, b"{\"ok\":true}".to_vec()));
+        return Some(match bridge.flush_fake_ip_cache().await {
+            Ok(()) => (200, json_ct, b"{\"ok\":true}".to_vec()),
+            Err(err) => ipc_error_response(&err, json_ct),
+        });
     }
 
     if path.starts_with("/api/scan-os") {
         if let Some(rejection) = require_post(method, &json_ct) {
             return Some(rejection);
         }
-        let sockets = bridge.scan_os_sockets().await;
-        let json = serde_json::to_vec(&sockets).unwrap_or_default();
-        return Some((200, json_ct, json));
+        return Some(match bridge.scan_os_sockets().await {
+            Ok(sockets) => ok_json_response(&sockets, json_ct),
+            Err(err) => ipc_error_response(&err, json_ct),
+        });
     }
+
+    None
+}
+
+async fn handle_system_profiles_window_routes(
+    method: &str,
+    path: &str,
+    body_str: &str,
+    bridge: &DesktopCommandBridge,
+    on_window_cmd: Option<&(dyn Fn(DesktopWindowCommand) + Send + Sync)>,
+) -> Option<(u16, String, Vec<u8>)> {
+    let json_ct = JSON_CONTENT_TYPE.to_string();
 
     if path == "/api/system/flush-os-dns" || path.starts_with("/api/system/flush-os-dns?") {
         if let Some(rejection) = require_post(method, &json_ct) {
@@ -984,20 +1041,17 @@ pub async fn handle_api_route(
             return Some(rejection);
         }
         match serde_json::from_str::<ImportFoxyProxyRequest>(body_str) {
-            Ok(parsed) => match bridge
-                .import_foxyproxy_json(parsed.json, parsed.process_patterns)
-                .await
-            {
-                Ok(report) => {
-                    let json = serde_json::to_vec(&report).unwrap_or_default();
-                    return Some((200, json_ct, json));
-                }
-                Err(err) => {
-                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                        .unwrap_or_default();
-                    return Some((400, json_ct, json));
-                }
-            },
+            Ok(parsed) => {
+                return Some(
+                    match bridge
+                        .import_foxyproxy_json(parsed.json, parsed.process_patterns)
+                        .await
+                    {
+                        Ok(report) => ok_json_response(&report, json_ct),
+                        Err(err) => ipc_error_response(&err, json_ct),
+                    },
+                );
+            }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
                     .unwrap_or_default();
@@ -1011,20 +1065,17 @@ pub async fn handle_api_route(
             return Some(rejection);
         }
         match serde_json::from_str::<SaveProfileRequest>(body_str) {
-            Ok(parsed) => match bridge
-                .save_named_profile(parsed.profile_id, parsed.name)
-                .await
-            {
-                Ok(list) => {
-                    let json = serde_json::to_vec(&list).unwrap_or_default();
-                    return Some((200, json_ct, json));
-                }
-                Err(err) => {
-                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                        .unwrap_or_default();
-                    return Some((400, json_ct, json));
-                }
-            },
+            Ok(parsed) => {
+                return Some(
+                    match bridge
+                        .save_named_profile(parsed.profile_id, parsed.name)
+                        .await
+                    {
+                        Ok(list) => ok_json_response(&list, json_ct),
+                        Err(err) => ipc_error_response(&err, json_ct),
+                    },
+                );
+            }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
                     .unwrap_or_default();
@@ -1038,17 +1089,12 @@ pub async fn handle_api_route(
             return Some(rejection);
         }
         match serde_json::from_str::<ProfileIdRequest>(body_str) {
-            Ok(parsed) => match bridge.switch_profile(parsed.profile_id).await {
-                Ok(prof) => {
-                    let json = serde_json::to_vec(&prof).unwrap_or_default();
-                    return Some((200, json_ct, json));
-                }
-                Err(err) => {
-                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                        .unwrap_or_default();
-                    return Some((400, json_ct, json));
-                }
-            },
+            Ok(parsed) => {
+                return Some(match bridge.switch_profile(parsed.profile_id).await {
+                    Ok(prof) => ok_json_response(&prof, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
+            }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
                     .unwrap_or_default();
@@ -1062,17 +1108,12 @@ pub async fn handle_api_route(
             return Some(rejection);
         }
         match serde_json::from_str::<ProfileIdRequest>(body_str) {
-            Ok(parsed) => match bridge.delete_profile(parsed.profile_id).await {
-                Ok(list) => {
-                    let json = serde_json::to_vec(&list).unwrap_or_default();
-                    return Some((200, json_ct, json));
-                }
-                Err(err) => {
-                    let json = serde_json::to_vec(&serde_json::json!({ "error": err }))
-                        .unwrap_or_default();
-                    return Some((400, json_ct, json));
-                }
-            },
+            Ok(parsed) => {
+                return Some(match bridge.delete_profile(parsed.profile_id).await {
+                    Ok(list) => ok_json_response(&list, json_ct),
+                    Err(err) => ipc_error_response(&err, json_ct),
+                });
+            }
             Err(err) => {
                 let json = serde_json::to_vec(&serde_json::json!({ "error": err.to_string() }))
                     .unwrap_or_default();
@@ -1274,6 +1315,30 @@ pub async fn serve_loopback_http_connection<FStatic>(
         }
     };
 
+    // SSE streams are long-lived and use their own dedicated concurrency cap so they never
+    // starve short-lived `/api/*` requests sharing the `admission` semaphore.
+    if path.starts_with("/api/events") {
+        const LOOPBACK_MAX_SSE_STREAMS: usize = 16;
+        static SSE_SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+        let sse_slots =
+            SSE_SLOTS.get_or_init(|| tokio::sync::Semaphore::new(LOOPBACK_MAX_SSE_STREAMS));
+        let Ok(_sse_permit) = sse_slots.try_acquire() else {
+            let body = b"{\"error\":\"busy\"}";
+            let resp = format!(
+                "{}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+                http_status_line(503),
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+            let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
+            return;
+        };
+        stream_sse_events(stream, bound_port, bridge).await;
+        return;
+    }
+
     // The serving permit is taken only once the request is validated, so connections that never
     // finish or never authenticate cannot use up the slots reserved for real requests.
     let _admitted = match admission {
@@ -1295,11 +1360,6 @@ pub async fn serve_loopback_http_connection<FStatic>(
         },
         None => None,
     };
-
-    if path.starts_with("/api/events") {
-        stream_sse_events(stream, bound_port, bridge).await;
-        return;
-    }
 
     let body_str = extract_json_body(&req);
     let allowed_origin = format!("http://127.0.0.1:{bound_port}");

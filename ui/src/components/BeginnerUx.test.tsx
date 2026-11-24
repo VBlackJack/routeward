@@ -16,7 +16,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import i18n from '../i18n';
 import {
   computeProtectionHealth,
@@ -263,13 +263,16 @@ describe('Beginner UX: shared protection health on the home hero', () => {
 });
 
 describe('Beginner UX: setup assistant', () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage('en');
+  });
+
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
   });
 
-  async function goToStep2() {
-    await i18n.changeLanguage('en');
+  function goToStep2() {
     fireEvent.click(screen.getByRole('button', { name: i18n.t('wizard.modal.next') }));
   }
 
@@ -417,7 +420,6 @@ describe('Beginner UX: setup assistant', () => {
         onClose={vi.fn()}
       />
     );
-    await i18n.changeLanguage('en');
     fireEvent.click(
       screen.getByRole('radio', {
         name: new RegExp(i18n.t('wizard.modal.step1_work_title'))
@@ -443,7 +445,6 @@ describe('Beginner UX: setup assistant', () => {
         onClose={vi.fn()}
       />
     );
-    await i18n.changeLanguage('en');
     expect(screen.getAllByRole('radio')).toHaveLength(3);
     expect(screen.getAllByRole('radio').filter((r) => r.getAttribute('aria-checked') === 'true')).toHaveLength(1);
   });

@@ -36,7 +36,7 @@ All paths, endpoints, rule names, and timeouts are configurable via parameters (
 
 ## Scenario Execution Order & SOCKS5 Tunnel Lifecycle
 
-Each scenario retains a **stable letter identifier** (`(a)` through `(z)`) across reports, paired with an **explicit execution order** (`[Order 01/26]` through `[Order 25/26]`).
+Each scenario retains a **stable letter identifier** (`(a)` through `(z)`) across reports, paired with an **explicit execution order** (`[Order 01/26]` through `[Order 26/26]`).
 
 Because Scenario `(j)` stops the local SOCKS5 listener process on `-Socks5Port` to validate the Kill-Switch (and an interactive `ssh -D` tunnel that prompts for a password cannot be restarted unattended), Scenario `(j)` always executes **last (`Order 26/26`)**, after every other scenario:
 

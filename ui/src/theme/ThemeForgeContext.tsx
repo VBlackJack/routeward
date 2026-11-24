@@ -14,7 +14,14 @@
  * limitations under the License.
  */
 
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState
+} from 'react';
 import { THEMEFORGE_CATALOG_DATA, UI_CONFIG } from '../config/constants';
 import { routewardClient } from '../services/ipc';
 import {
@@ -127,17 +134,25 @@ export const ThemeForgeProvider: React.FC<{ children: React.ReactNode }> = ({
   });
 
   const [activeThemeName, setActiveThemeName] = useState<string>(() => {
-    return (
-      window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.THEME) ||
-      THEMEFORGE_CATALOG_DATA.defaultTheme
-    );
+    try {
+      return (
+        window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.THEME) ||
+        THEMEFORGE_CATALOG_DATA.defaultTheme
+      );
+    } catch {
+      return THEMEFORGE_CATALOG_DATA.defaultTheme;
+    }
   });
 
   const [activeAccent, setActiveAccent] = useState<AccentTint>(() => {
-    return (
-      (window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.ACCENT) as AccentTint) ||
-      (THEMEFORGE_CATALOG_DATA.defaultAccent as AccentTint)
-    );
+    try {
+      return (
+        (window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.ACCENT) as AccentTint) ||
+        (THEMEFORGE_CATALOG_DATA.defaultAccent as AccentTint)
+      );
+    } catch {
+      return THEMEFORGE_CATALOG_DATA.defaultAccent as AccentTint;
+    }
   });
 
   const palettes = useMemo(
@@ -202,59 +217,86 @@ export const ThemeForgeProvider: React.FC<{ children: React.ReactNode }> = ({
     });
   }, [effectiveColors, activePalette, activeAccent]);
 
-  const setTheme = (themeName: string) => {
+  const setTheme = useCallback((themeName: string) => {
     setActiveThemeName(themeName);
-    window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.THEME, themeName);
-  };
-
-  const setAccent = (accent: AccentTint) => {
-    setActiveAccent(accent);
-    window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.ACCENT, accent);
-  };
-
-  const importExternalPalette = (jsonText: string): boolean => {
     try {
-      const raw: unknown = JSON.parse(jsonText);
-      if (!isValidThemePalette(raw, requiredColorSlots)) {
+      window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.THEME, themeName);
+    } catch {
+      // Storage may be unavailable or full in restricted WebView profiles.
+    }
+  }, []);
+
+  const setAccent = useCallback((accent: AccentTint) => {
+    setActiveAccent(accent);
+    try {
+      window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.ACCENT, accent);
+    } catch {
+      // Storage may be unavailable or full in restricted WebView profiles.
+    }
+  }, []);
+
+  const importExternalPalette = useCallback(
+    (jsonText: string): boolean => {
+      try {
+        const raw: unknown = JSON.parse(jsonText);
+        if (!isValidThemePalette(raw, requiredColorSlots)) {
+          return false;
+        }
+        const parsed: ThemeForgePalette = {
+          ...raw,
+          displayName:
+            typeof raw.displayName === 'string' && raw.displayName.trim()
+              ? raw.displayName
+              : raw.name
+        };
+        setCustomPalettes((prev) => {
+          const next = [...prev.filter((p) => p.name !== parsed.name), parsed];
+          try {
+            window.localStorage.setItem(
+              UI_CONFIG.STORAGE_KEYS.CUSTOM_PALETTES,
+              JSON.stringify(next)
+            );
+          } catch {
+            // Storage may be unavailable or full.
+          }
+          return next;
+        });
+        setTheme(parsed.name);
+        return true;
+      } catch {
         return false;
       }
-      const parsed: ThemeForgePalette = {
-        ...raw,
-        displayName:
-          typeof raw.displayName === 'string' && raw.displayName.trim()
-            ? raw.displayName
-            : raw.name
-      };
-      const next = [
-        ...customPalettes.filter((p) => p.name !== parsed.name),
-        parsed
-      ];
-      setCustomPalettes(next);
-      window.localStorage.setItem(
-        UI_CONFIG.STORAGE_KEYS.CUSTOM_PALETTES,
-        JSON.stringify(next)
-      );
-      setTheme(parsed.name);
-      return true;
-    } catch {
-      return false;
-    }
-  };
+    },
+    [requiredColorSlots, setTheme]
+  );
+
+  const contextValue = useMemo<ThemeForgeContextValue>(
+    () => ({
+      palettes,
+      accents,
+      activeThemeName,
+      activeAccent,
+      activePalette,
+      effectiveColors,
+      setTheme,
+      setAccent,
+      importExternalPalette
+    }),
+    [
+      palettes,
+      accents,
+      activeThemeName,
+      activeAccent,
+      activePalette,
+      effectiveColors,
+      setTheme,
+      setAccent,
+      importExternalPalette
+    ]
+  );
 
   return (
-    <ThemeForgeContext.Provider
-      value={{
-        palettes,
-        accents,
-        activeThemeName,
-        activeAccent,
-        activePalette,
-        effectiveColors,
-        setTheme,
-        setAccent,
-        importExternalPalette
-      }}
-    >
+    <ThemeForgeContext.Provider value={contextValue}>
       {children}
     </ThemeForgeContext.Provider>
   );

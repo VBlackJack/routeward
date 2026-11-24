@@ -105,12 +105,17 @@ import { BlockedView } from './components/BlockedView';
 import { DiagnosticExportModal } from './components/DiagnosticExportModal';
 import { useUnblockFlow } from './components/useUnblockFlow';
 import { LogsJump } from './services/logQuery';
+import { canStartDaemonFromUi } from './services/platform';
+import { safeStorageGet, safeStorageSet } from './services/storage';
 import { useBlockedSummary } from './services/useBlockedSummary';
-
-/** The desktop starts (Windows) or checks (Linux: group and service) the daemon for these systems. */
-const DAEMON_START_OS_NAMES: readonly string[] = ['WINDOWS', 'LINUX'];
-const canStartDaemonFromUi = (osName: string): boolean =>
-  DAEMON_START_OS_NAMES.includes(osName);
+import {
+  useRouteWardConnections,
+  useRouteWardDiagnostics,
+  useRouteWardFakeIps,
+  useRouteWardLogs,
+  useRouteWardProfile,
+  useRouteWardTelemetry
+} from './services/useRouteWardState';
 
 interface PendingConfirm {
   title: string;
@@ -125,9 +130,7 @@ export const App: React.FC = () => {
 
   const [activeTab, setActiveTab] = useState<NavTabId>('home');
   const [experienceMode, setExperienceMode] = useState<ExperienceMode>(() => {
-    const saved = window.localStorage.getItem(
-      UI_CONFIG.STORAGE_KEYS.EXPERIENCE_MODE
-    );
+    const saved = safeStorageGet(UI_CONFIG.STORAGE_KEYS.EXPERIENCE_MODE);
     return saved === 'expert' ? 'expert' : 'simple';
   });
   const [showThemeModal, setShowThemeModal] = useState(false);
@@ -165,9 +168,7 @@ export const App: React.FC = () => {
   const [togglingEngine, setTogglingEngine] = useState(false);
   const togglingEngineRef = useRef(false);
   const [wizardCompleted, setWizardCompleted] = useState(
-    () =>
-      window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED) ===
-      'true'
+    () => safeStorageGet(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED) === 'true'
   );
   const [showServiceNotice, setShowServiceNotice] = useState(false);
   const [verifyRequestId, setVerifyRequestId] = useState(0);
@@ -185,21 +186,15 @@ export const App: React.FC = () => {
 
   const handleSetExperienceMode = (mode: ExperienceMode) => {
     setExperienceMode(mode);
-    window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.EXPERIENCE_MODE, mode);
+    safeStorageSet(UI_CONFIG.STORAGE_KEYS.EXPERIENCE_MODE, mode);
   };
 
-  const [profile, setProfile] = useState(() => routewardClient.getProfile());
-  const [diagnostics, setDiagnostics] = useState(() =>
-    routewardClient.getDiagnostics()
-  );
-  const [telemetry, setTelemetry] = useState(() =>
-    routewardClient.getTelemetry()
-  );
-  const [connections, setConnections] = useState(() =>
-    routewardClient.listConnections()
-  );
-  const [fakeIps, setFakeIps] = useState(() => routewardClient.listFakeIps());
-  const [logs, setLogs] = useState(() => routewardClient.listLogs());
+  const profile = useRouteWardProfile();
+  const diagnostics = useRouteWardDiagnostics();
+  const telemetry = useRouteWardTelemetry();
+  const connections = useRouteWardConnections();
+  const fakeIps = useRouteWardFakeIps();
+  const logs = useRouteWardLogs();
 
   const tabRefs = useRef<Partial<Record<NavTabId, HTMLButtonElement | null>>>({});
 
@@ -217,8 +212,7 @@ export const App: React.FC = () => {
     }
     wizardAutoCheckedRef.current = true;
     const alreadyCompleted =
-      window.localStorage.getItem(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED) ===
-      'true';
+      safeStorageGet(UI_CONFIG.STORAGE_KEYS.WIZARD_COMPLETED) === 'true';
     if (!alreadyCompleted) {
       setShowWizardModal(true);
     }
@@ -298,24 +292,13 @@ export const App: React.FC = () => {
     [pushErrorToast]
   );
 
-  const syncFromClient = useCallback(() => {
-    setProfile(routewardClient.getProfile());
-    setDiagnostics(routewardClient.getDiagnostics());
-    setTelemetry(routewardClient.getTelemetry());
-    setConnections(routewardClient.listConnections());
-    setFakeIps(routewardClient.listFakeIps());
-    setLogs(routewardClient.listLogs());
-  }, []);
-
   useEffect(() => {
-    const unsubscribe = routewardClient.subscribe(syncFromClient);
     const abortController = new AbortController();
     routewardClient.startRealtimeStream(abortController.signal);
     return () => {
       abortController.abort();
-      unsubscribe();
     };
-  }, [syncFromClient]);
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -342,7 +325,7 @@ export const App: React.FC = () => {
 
   const handleSetLanguage = (nextLang: 'en' | 'fr') => {
     i18n.changeLanguage(nextLang);
-    window.localStorage.setItem(UI_CONFIG.STORAGE_KEYS.LOCALE, nextLang);
+    safeStorageSet(UI_CONFIG.STORAGE_KEYS.LOCALE, nextLang);
   };
 
   const handleToggleLanguage = () => {
@@ -548,7 +531,7 @@ export const App: React.FC = () => {
       } else {
         next[networkName] = profileId;
       }
-      window.localStorage.setItem(
+      safeStorageSet(
         UI_CONFIG.STORAGE_KEYS.NETWORK_PROFILE_RULES,
         JSON.stringify(next)
       );

@@ -16,7 +16,7 @@
 
 use crate::telemetry::{LogContext, LogLevel};
 use chrono::{Local, NaiveDate};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -118,6 +118,9 @@ struct Inner {
     enabled: AtomicBool,
     queue: Mutex<VecDeque<String>>,
     handle: Mutex<Option<OpenLog>>,
+    /// Signals the background flusher to wake early on `LogLevel::Error` or shutdown.
+    /// Held behind its own `Arc` so the flusher thread can wait without holding a strong `Arc<Inner>`.
+    flush_signal: Arc<(Mutex<bool>, Condvar)>,
     /// When true, every `log` call flushes immediately (no background flusher is attached).
     flush_on_log: bool,
     /// Days of daily log files kept; 0 disables pruning. Applied each time a file is opened.
@@ -179,7 +182,10 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Last owner gone: never lose queued lines on a clean stop.
+        // Wake the background flusher if it is waiting, then flush any remaining lines.
+        let (lock, cv) = &*self.flush_signal;
+        *lock.lock() = true;
+        cv.notify_all();
         self.flush();
     }
 }
@@ -221,11 +227,19 @@ impl FileLogger {
         }
         let logger = Self::build(log_dir.clone(), app_name.clone(), initially_enabled, false);
         let weak: Weak<Inner> = Arc::downgrade(&logger.inner);
+        let signal = Arc::clone(&logger.inner.flush_signal);
         let interval = Duration::from_millis(flush_interval_ms);
         let spawned = std::thread::Builder::new()
             .name("routeward-log-flush".to_string())
             .spawn(move || loop {
-                std::thread::sleep(interval);
+                {
+                    let (lock, cv) = &*signal;
+                    let mut signaled = lock.lock();
+                    if !*signaled {
+                        cv.wait_for(&mut signaled, interval);
+                    }
+                    *signaled = false;
+                }
                 match weak.upgrade() {
                     Some(inner) => inner.flush(),
                     None => break,
@@ -246,6 +260,7 @@ impl FileLogger {
                 enabled: AtomicBool::new(enabled),
                 queue: Mutex::new(VecDeque::new()),
                 handle: Mutex::new(None),
+                flush_signal: Arc::new((Mutex::new(false), Condvar::new())),
                 flush_on_log,
                 retention_days: AtomicU32::new(0),
             }),
@@ -307,8 +322,14 @@ impl FileLogger {
             }
             q.push_back(line);
         }
-        if self.inner.flush_on_log || level == LogLevel::Error {
+        if self.inner.flush_on_log {
             self.flush();
+        } else if level == LogLevel::Error {
+            // Wake the dedicated flusher thread instead of blocking the caller (which may be a
+            // Tokio async worker thread).
+            let (lock, cv) = &*self.inner.flush_signal;
+            *lock.lock() = true;
+            cv.notify_one();
         }
     }
 
@@ -336,7 +357,8 @@ mod tests {
 
     #[test]
     fn writes_and_toggles_daily_log_file() {
-        let temp_dir = std::env::temp_dir().join("routeward_logger_test");
+        let temp_dir =
+            std::env::temp_dir().join(format!("routeward_logger_test_{}", uuid::Uuid::new_v4()));
         let _ = fs::remove_dir_all(&temp_dir);
 
         let logger = FileLogger::new(&temp_dir, "RouteWard", true);
@@ -463,7 +485,8 @@ mod tests {
 
     #[test]
     fn background_flusher_writes_and_drop_flushes_remaining_lines() {
-        let temp_dir = std::env::temp_dir().join("routeward_logger_bg_test");
+        let temp_dir =
+            std::env::temp_dir().join(format!("routeward_logger_bg_test_{}", uuid::Uuid::new_v4()));
         let _ = fs::remove_dir_all(&temp_dir);
         let date_suffix = Local::now().format("%Y%m%d");
         let expected_file = temp_dir.join(format!("RouteWard_{date_suffix}.log"));

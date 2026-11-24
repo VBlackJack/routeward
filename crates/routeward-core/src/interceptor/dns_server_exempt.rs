@@ -1089,7 +1089,7 @@ fn windows_ports_of(pids: &HashMap<u32, String>, state: &mut TrackerState) {
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
-    fn collect<R>(
+    fn collect<R: Copy>(
         buffer: Option<Vec<u8>>,
         pids: &HashMap<u32, String>,
         proto: DnsProto,
@@ -1099,8 +1099,8 @@ fn windows_ports_of(pids: &HashMap<u32, String>, state: &mut TrackerState) {
         let Some(buffer) = buffer else {
             return;
         };
-        let rows: &[R] = unsafe { ProcessResolver::iphelper_rows::<R>(&buffer) };
-        for row in rows {
+        let rows: Vec<R> = unsafe { ProcessResolver::iphelper_rows::<R>(&buffer) };
+        for row in &rows {
             let (ip, raw_port, pid) = row_socket(row);
             if pids.contains_key(&pid) {
                 state.add_socket(proto, u16::from_be((raw_port & 0xFFFF) as u16), pid, ip);

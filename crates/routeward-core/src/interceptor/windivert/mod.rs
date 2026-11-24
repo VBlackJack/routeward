@@ -103,6 +103,8 @@ pub(super) const BIT_OUTBOUND: u64 = 1 << 17;
 pub(super) const BIT_IMPOSTOR: u64 = 1 << 19;
 pub(super) const BIT_IPV6: u64 = 1 << 20;
 
+#[cfg(any(windows, test))]
+mod decision;
 mod ffi;
 mod filters;
 #[cfg(any(windows, test))]

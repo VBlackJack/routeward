@@ -18,6 +18,11 @@
 
 set -u
 
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Refusing to run postinst-upgrade-test.sh as root (postinst ignores test overrides under uid 0)." >&2
+    exit 1
+fi
+
 root=$(cd "$(dirname "$0")/../.." && pwd)
 postinst="$root/packaging/linux/postinst"
 work=$(mktemp -d)

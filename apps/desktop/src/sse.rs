@@ -21,6 +21,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const SSE_KEEPALIVE_INTERVAL_SECS: u64 = 15;
+const SSE_WRITE_TIMEOUT_SECS: u64 = 5;
+
+async fn write_sse_frame(stream: &mut TcpStream, bytes: &[u8]) -> bool {
+    let timeout = Duration::from_secs(SSE_WRITE_TIMEOUT_SECS);
+    matches!(
+        tokio::time::timeout(timeout, async {
+            stream.write_all(bytes).await?;
+            stream.flush().await
+        })
+        .await,
+        Ok(Ok(()))
+    )
+}
 
 pub async fn stream_sse_events(
     mut stream: TcpStream,
@@ -36,7 +49,7 @@ pub async fn stream_sse_events(
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store, no-cache, must-revalidate, no-transform\r\nX-Content-Type-Options: nosniff\r\nAccess-Control-Allow-Origin: {allowed_origin}\r\nConnection: keep-alive\r\n\r\n: connected {preamble_padding}\n\n"
     );
-    if stream.write_all(header.as_bytes()).await.is_err() || stream.flush().await.is_err() {
+    if !write_sse_frame(&mut stream, header.as_bytes()).await {
         bridge.log_info("Closed SSE event stream (/api/events) on initial write");
         return;
     }
@@ -45,7 +58,7 @@ pub async fn stream_sse_events(
         let initial_resync = IpcStreamEvent::Resync { skipped_events: 0 };
         if let Ok(json) = serde_json::to_string(&initial_resync) {
             let frame = format!("data: {json}\n\n");
-            if stream.write_all(frame.as_bytes()).await.is_err() || stream.flush().await.is_err() {
+            if !write_sse_frame(&mut stream, frame.as_bytes()).await {
                 bridge.log_info("Closed SSE event stream (/api/events) on initial resync");
                 return;
             }
@@ -68,9 +81,7 @@ pub async fn stream_sse_events(
                     Ok(Ok(ev)) => {
                         if let Ok(json) = serde_json::to_string(&ev) {
                             let frame = format!("data: {json}\n\n");
-                            if stream.write_all(frame.as_bytes()).await.is_err()
-                                || stream.flush().await.is_err()
-                            {
+                            if !write_sse_frame(&mut stream, frame.as_bytes()).await {
                                 break;
                             }
                         }
@@ -79,18 +90,14 @@ pub async fn stream_sse_events(
                         let resync = IpcStreamEvent::Resync { skipped_events };
                         if let Ok(json) = serde_json::to_string(&resync) {
                             let frame = format!("data: {json}\n\n");
-                            if stream.write_all(frame.as_bytes()).await.is_err()
-                                || stream.flush().await.is_err()
-                            {
+                            if !write_sse_frame(&mut stream, frame.as_bytes()).await {
                                 break;
                             }
                         }
                     }
                     Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
                     Err(_) => {
-                        if stream.write_all(b": keepalive\n\n").await.is_err()
-                            || stream.flush().await.is_err()
-                        {
+                        if !write_sse_frame(&mut stream, b": keepalive\n\n").await {
                             break;
                         }
                     }

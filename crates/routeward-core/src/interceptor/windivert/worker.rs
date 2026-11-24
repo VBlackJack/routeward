@@ -687,7 +687,11 @@ impl WinDivertInterceptor {
                                 .http_host_inspect_ports
                                 .contains(&meta.dst_port))
                         && ctrl.has_enabled_domain_rules();
-                    if is_fake_ip || needs_payload_inspection {
+                    if super::decision::should_reflect_direct_syn(
+                        false,
+                        is_fake_ip,
+                        needs_payload_inspection,
+                    ) {
                         ctrl.telemetry.push_log(
                             LogLevel::Info,
                             COMPONENT_WINDIVERT,
@@ -1133,7 +1137,11 @@ impl WinDivertInterceptor {
                                 .http_host_inspect_ports
                                 .contains(&meta.dst_port))
                         && ctrl.has_enabled_domain_rules();
-                    if needs_payload_inspection {
+                    if super::decision::should_reflect_direct_syn(
+                        true,
+                        is_fake_ip,
+                        needs_payload_inspection,
+                    ) {
                         ctrl.nat_table.insert_session(NatSessionEntry {
                             client_ip: IpAddr::V6(meta.src_ip),
                             client_port: meta.src_port,
@@ -1569,12 +1577,13 @@ impl WinDivertInterceptor {
             Ipv6TransportPacketMeta,
         >,
     ) {
-        let dns_port = ctrl_net.constants.dns.dns_standard_port;
-        let dot_port = ctrl_net.constants.dns.dns_over_tls_port;
-        let quic_port = ctrl_net.constants.network.quic_default_port;
-        let mdns_port = ctrl_net.constants.network.mdns_standard_port;
-        let llmnr_port = ctrl_net.constants.network.llmnr_standard_port;
-        let netbios_ns_port = ctrl_net.constants.network.netbios_ns_standard_port;
+        let ports = super::decision::NetworkPorts::from_constants(&ctrl_net.constants);
+        let dns_port = ports.dns;
+        let dot_port = ports.dot;
+        let quic_port = ports.quic;
+        let mdns_port = ports.mdns;
+        let llmnr_port = ports.llmnr;
+        let netbios_ns_port = ports.netbios_ns;
         std::thread::spawn(move || {
             let handle = recv_handle_usize as *mut c_void;
             let mut packet_buf = vec![0u8; PACKET_BUFFER_SIZE];
@@ -1829,9 +1838,7 @@ impl WinDivertInterceptor {
                             });
                             continue;
                         }
-                        if !v6_meta.dst_ip.is_multicast()
-                            && !v6_meta.dst_ip.is_loopback()
-                            && !v6_meta.dst_ip.is_unicast_link_local()
+                        if super::decision::is_routable_unicast_ipv6_udp_dest(v6_meta.dst_ip)
                             && !ctrl_net.nat_table.is_loop_or_excluded(
                                 None,
                                 v6_meta.src_ip,
@@ -2010,7 +2017,11 @@ impl WinDivertInterceptor {
 
                         // QUIC (UDP 443): reject with inbound ICMPv4 Port Unreachable (Type 3, Code 3), falling back to drop
                         if udp_meta.dst_port == quic_port
-                            && ctrl_net.profile.read().security_policy.block_quic_udp_443
+                            && super::decision::should_block_quic_udp(
+                                udp_meta.dst_port,
+                                quic_port,
+                                ctrl_net.profile.read().security_policy.block_quic_udp_443,
+                            )
                         {
                             if Self::icmp_rejection_allowed(
                                 IpAddr::V4(udp_meta.src_ip),
@@ -2042,7 +2053,7 @@ impl WinDivertInterceptor {
                         }
 
                         // LLMNR (5355) and mDNS (5353): allow local names directly, block public FQDNs
-                        if udp_meta.dst_port == llmnr_port || udp_meta.dst_port == mdns_port {
+                        if super::decision::is_local_discovery_udp_port(udp_meta.dst_port, ports) {
                             let proto_label = if udp_meta.dst_port == llmnr_port {
                                 "LLMNR"
                             } else {
@@ -2258,9 +2269,7 @@ impl WinDivertInterceptor {
                         }
 
                         // General outbound IPv4 UDP interception (skipping multicast/broadcast/loopback and upstream proxy exclusions)
-                        if !udp_meta.dst_ip.is_multicast()
-                            && !udp_meta.dst_ip.is_broadcast()
-                            && !udp_meta.dst_ip.is_loopback()
+                        if super::decision::is_routable_unicast_ipv4_udp_dest(udp_meta.dst_ip)
                             && !ctrl_net.nat_table.is_loop_or_excluded(
                                 None,
                                 udp_meta.src_ip,
@@ -2316,88 +2325,120 @@ impl WinDivertInterceptor {
                 }
 
                 if let Some(meta) = parse_ipv4_tcp_meta(packet) {
-                    // Case A: Outbound reply from our local transparent relay back to the client
-                    if meta.src_port == relay_port {
-                        let Some(session) = ctrl_net
-                            .nat_table
-                            .get_session_by_relay_peer(meta.dst_ip, meta.dst_port)
-                        else {
-                            // Never emit unreflected local relay teardown packets onto the wire
-                            continue;
-                        };
-                        if !reflect_relay_reply_to_client(packet, &session) {
-                            continue;
-                        }
-                        addr.set_outbound(false);
-                        addr.clear_impostor();
-                        unsafe {
-                            let _ = (api.calc_checksums)(
-                                packet.as_mut_ptr() as *mut c_void,
-                                pkt_len as u32,
-                                &mut addr as *mut WinDivertAddress,
-                                0,
-                            );
-                        }
-                    } else if Self::dns_server_syn_before_session(
-                        &ctrl_net, &api, handle, packet, &addr, &meta,
+                    if Self::handle_ipv4_tcp_network_packet(
+                        &ctrl_net,
+                        &api,
+                        handle,
+                        packet,
+                        &mut addr,
+                        meta,
+                        relay_port,
+                        dns_port,
+                        &syn_queue_producer,
                     ) {
-                        // Case B0: a DNS server SYN reusing a flow key that still has a stale
-                        // session: the handler removed the session and sent the SYN unmodified.
                         continue;
-                    } else if let Some(existing_session) = ctrl_net
-                        .nat_table
-                        .get_session_by_flow(&meta.outbound_flow_key())
-                    {
-                        // Case B: Subsequent packets of an already-redirected 4-tuple flow
-                        if matches!(
-                            existing_session.action,
-                            RuleAction::Proxy { .. }
-                                | RuleAction::Chain { .. }
-                                | RuleAction::Direct
-                        ) && reflect_outbound_to_local_relay(packet, relay_port)
-                        {
-                            addr.set_outbound(false);
-                            addr.clear_impostor();
-                            unsafe {
-                                let _ = (api.calc_checksums)(
-                                    packet.as_mut_ptr() as *mut c_void,
-                                    pkt_len as u32,
-                                    &mut addr as *mut WinDivertAddress,
-                                    0,
-                                );
-                            }
-                        }
-                    } else if meta.is_syn_only() {
-                        // Case C: New outbound TCP SYN -> try immediate non-blocking PID lookup
-                        let resolved = ctrl_net.nat_table.try_resolve_pid_nonblocking(
-                            SocketKey::new(IPPROTO_TCP, false, meta.src_port),
-                            ProcessResolver::find_pid_for_tcp_port,
-                        );
-                        if resolved.is_some()
-                            || (meta.dst_port == dns_port
-                                && !ctrl_net.nat_table.is_self_tcp_port(meta.src_port))
-                        {
-                            Self::dispatch_resolved_syn(
-                                &ctrl_net, &api, handle, packet, &mut addr, meta, resolved,
-                            );
-                            continue;
-                        } else {
-                            // Enqueue into non-blocking PendingSynQueue so the receive loop never stalls
-                            if let Some(evicted) =
-                                syn_queue_producer.enqueue((packet.to_vec(), addr), meta)
-                            {
-                                Self::warn_pending_syn_overflow(
-                                    &ctrl_net,
-                                    evicted.enqueued_at.elapsed().as_millis() as u64,
-                                );
-                            }
-                            continue;
-                        }
                     }
                 }
 
                 Self::send_packet_guarded(&ctrl_net, &api, handle, &packet[..pkt_len], &addr);
             }
         });
+    }
+
+    /// Handles an outbound IPv4 TCP packet in the network reflection loop.
+    /// Returns `true` when the packet has already been consumed, reflected-and-sent, queued, or
+    /// dropped, and `false` when the caller should pass it to `send_packet_guarded`.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_ipv4_tcp_network_packet(
+        ctrl_net: &RouteWardController,
+        api: &WinDivertApi,
+        handle: *mut c_void,
+        packet: &mut [u8],
+        addr: &mut WinDivertAddress,
+        meta: crate::interceptor::nat::Ipv4TcpPacketMeta,
+        relay_port: u16,
+        dns_port: u16,
+        syn_queue_producer: &PendingSynQueue<(Vec<u8>, WinDivertAddress)>,
+    ) -> bool {
+        let pkt_len = packet.len();
+        // Case A: Outbound reply from our local transparent relay back to the client
+        if meta.src_port == relay_port {
+            let Some(session) = ctrl_net
+                .nat_table
+                .get_session_by_relay_peer(meta.dst_ip, meta.dst_port)
+            else {
+                // Never emit unreflected local relay teardown packets onto the wire
+                return true;
+            };
+            if !reflect_relay_reply_to_client(packet, &session) {
+                return true;
+            }
+            addr.set_outbound(false);
+            addr.clear_impostor();
+            unsafe {
+                let _ = (api.calc_checksums)(
+                    packet.as_mut_ptr() as *mut c_void,
+                    pkt_len as u32,
+                    addr as *mut WinDivertAddress,
+                    0,
+                );
+            }
+            return false;
+        }
+
+        if Self::dns_server_syn_before_session(ctrl_net, api, handle, packet, addr, &meta) {
+            // Case B0: a DNS server SYN reusing a flow key that still has a stale
+            // session: the handler removed the session and sent the SYN unmodified.
+            return true;
+        }
+
+        if let Some(existing_session) = ctrl_net
+            .nat_table
+            .get_session_by_flow(&meta.outbound_flow_key())
+        {
+            // Case B: Subsequent packets of an already-redirected 4-tuple flow
+            if matches!(
+                existing_session.action,
+                RuleAction::Proxy { .. } | RuleAction::Chain { .. } | RuleAction::Direct
+            ) && reflect_outbound_to_local_relay(packet, relay_port)
+            {
+                addr.set_outbound(false);
+                addr.clear_impostor();
+                unsafe {
+                    let _ = (api.calc_checksums)(
+                        packet.as_mut_ptr() as *mut c_void,
+                        pkt_len as u32,
+                        addr as *mut WinDivertAddress,
+                        0,
+                    );
+                }
+            }
+            return false;
+        }
+
+        if meta.is_syn_only() {
+            // Case C: New outbound TCP SYN -> try immediate non-blocking PID lookup
+            let resolved = ctrl_net.nat_table.try_resolve_pid_nonblocking(
+                SocketKey::new(IPPROTO_TCP, false, meta.src_port),
+                ProcessResolver::find_pid_for_tcp_port,
+            );
+            if resolved.is_some()
+                || (meta.dst_port == dns_port
+                    && !ctrl_net.nat_table.is_self_tcp_port(meta.src_port))
+            {
+                Self::dispatch_resolved_syn(ctrl_net, api, handle, packet, addr, meta, resolved);
+                return true;
+            }
+            // Enqueue into non-blocking PendingSynQueue so the receive loop never stalls
+            if let Some(evicted) = syn_queue_producer.enqueue((packet.to_vec(), *addr), meta) {
+                Self::warn_pending_syn_overflow(
+                    ctrl_net,
+                    evicted.enqueued_at.elapsed().as_millis() as u64,
+                );
+            }
+            return true;
+        }
+
+        false
     }
 }

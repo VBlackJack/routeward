@@ -56,9 +56,9 @@ pub fn validate_loopback_http_request_with_method(
     expected_token: &str,
 ) -> Result<(String, String), HttpSecurityRejection> {
     let header_section = raw_request
-        .split("\r\n\r\n")
-        .next()
-        .or_else(|| raw_request.split("\n\n").next())
+        .split_once("\r\n\r\n")
+        .map(|(h, _)| h)
+        .or_else(|| raw_request.split_once("\n\n").map(|(h, _)| h))
         .unwrap_or(raw_request);
 
     let mut lines = header_section.lines();

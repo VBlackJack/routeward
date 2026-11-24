@@ -127,7 +127,8 @@ fn read_windows_registry_proxy() -> Vec<DetectedProxyCandidate> {
     const INTERNET_SETTINGS_KEY: &str =
         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
-    let enabled_out = Command::new("reg")
+    let reg_exe = super::windows_system_tool_path("reg.exe");
+    let enabled_out = Command::new(&reg_exe)
         .args(["query", INTERNET_SETTINGS_KEY, "/v", "ProxyEnable"])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
@@ -157,7 +158,7 @@ fn read_windows_registry_proxy() -> Vec<DetectedProxyCandidate> {
         return Vec::new();
     }
 
-    let server_out = Command::new("reg")
+    let server_out = Command::new(&reg_exe)
         .args(["query", INTERNET_SETTINGS_KEY, "/v", "ProxyServer"])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
@@ -258,7 +259,8 @@ pub fn detect_current_network() -> CurrentNetworkInfo {
         use std::process::Command;
 
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        if let Ok(output) = Command::new("netsh")
+        let netsh_exe = super::windows_system_tool_path("netsh.exe");
+        if let Ok(output) = Command::new(netsh_exe)
             .args(["wlan", "show", "interfaces"])
             .creation_flags(CREATE_NO_WINDOW)
             .output()

@@ -974,9 +974,7 @@ fn handle_owner_sid_string(handle: &std::os::windows::io::OwnedHandle) -> std::i
     use std::os::windows::io::AsRawHandle;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT,
-    };
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
     use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
 
     let mut owner: PSID = null_mut();
@@ -1002,21 +1000,9 @@ fn handle_owner_sid_string(handle: &std::os::windows::io::OwnedHandle) -> std::i
         unsafe { LocalFree(descriptor as _) };
         return Err(std::io::Error::other("pipe has no owner SID"));
     }
-    let mut out_ptr: *mut u16 = null_mut();
-    // SAFETY: `owner` is a valid SID inside `descriptor`; `out_ptr` is freed with LocalFree.
-    let result = unsafe {
-        if ConvertSidToStringSidW(owner, &mut out_ptr) == 0 || out_ptr.is_null() {
-            Err(std::io::Error::last_os_error())
-        } else {
-            let mut len = 0usize;
-            while *out_ptr.add(len) != 0 {
-                len += 1;
-            }
-            let text = String::from_utf16_lossy(std::slice::from_raw_parts(out_ptr, len));
-            LocalFree(out_ptr as _);
-            Ok(text)
-        }
-    };
+    // SAFETY: `owner` is a valid SID inside `descriptor`.
+    let result = unsafe { crate::config::security::sid_to_string(owner) }
+        .ok_or_else(std::io::Error::last_os_error);
     // SAFETY: `descriptor` was allocated by GetSecurityInfo and `owner` is no longer used.
     unsafe { LocalFree(descriptor as _) };
     result
