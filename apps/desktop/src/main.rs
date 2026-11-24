@@ -40,12 +40,12 @@ use tokio::sync::Semaphore;
 use wry::{WebContext, WebViewBuilder};
 
 const EMBEDDED_INDEX_HTML: &[u8] = include_bytes!("../../../ui/dist/index.html");
-const EMBEDDED_APP_JS: &[u8] = include_bytes!("../../../ui/dist/assets/app.js");
-const EMBEDDED_APP_CSS: &[u8] = include_bytes!("../../../ui/dist/assets/app.css");
 const EMBEDDED_GLYPH_SVG: &[u8] = include_bytes!("../../../assets/branding/routeward-glyph.svg");
 const EMBEDDED_ICON_SVG: &[u8] = include_bytes!("../../../assets/branding/routeward-icon.svg");
 const EMBEDDED_ICON_32_RGBA: &[u8] = include_bytes!("../../../assets/branding/routeward-32.rgba");
 const EMBEDDED_ICON_256_RGBA: &[u8] = include_bytes!("../../../assets/branding/routeward-256.rgba");
+
+include!(concat!(env!("OUT_DIR"), "/embedded_ui_assets.rs"));
 
 const WINDOW_TITLE: &str = "RouteWard";
 const ERR_KEY_DESKTOP_UI_INIT: &str = "errors.desktop.ui_init";
@@ -292,13 +292,12 @@ async fn serve_loopback_listener(
                 &bridge_ref,
                 Some(&win_cb),
                 Some(|path: &str| {
-                    if path.starts_with("/assets/app.js") {
-                        ("application/javascript; charset=utf-8", EMBEDDED_APP_JS)
-                    } else if path.starts_with("/assets/app.css") {
-                        ("text/css; charset=utf-8", EMBEDDED_APP_CSS)
-                    } else if path.starts_with("/routeward-glyph.svg") {
+                    let clean_path = path.split('?').next().unwrap_or(path);
+                    if let Some(asset) = lookup_embedded_ui_asset(clean_path) {
+                        asset
+                    } else if clean_path == "/routeward-glyph.svg" {
                         ("image/svg+xml", EMBEDDED_GLYPH_SVG)
-                    } else if path.starts_with("/routeward-icon.svg") {
+                    } else if clean_path == "/routeward-icon.svg" {
                         ("image/svg+xml", EMBEDDED_ICON_SVG)
                     } else {
                         ("text/html; charset=utf-8", EMBEDDED_INDEX_HTML)

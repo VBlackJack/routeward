@@ -28,7 +28,8 @@ export default defineConfig({
   },
   test: {
     environment: 'jsdom',
-    globals: true
+    globals: true,
+    pool: 'vmThreads'
   },
   build: {
     // routeward-desktop embeds a single app.js + app.css bundle via include_bytes!.
